@@ -6,7 +6,10 @@ use pricelevel::{MatchResult, OrderId, OrderType, Side, TimeInForce};
 use std::sync::Arc;
 use tracing::trace;
 
-impl OrderBook {
+impl<T> OrderBook<T>
+where
+    T: Clone + Send + Sync + Default + 'static,
+{
     /// Add a limit order to the book
     pub fn add_limit_order(
         &self,
@@ -15,7 +18,9 @@ impl OrderBook {
         quantity: u64,
         side: Side,
         time_in_force: TimeInForce,
-    ) -> Result<Arc<OrderType>, OrderBookError> {
+        extra_fields: Option<T>,
+    ) -> Result<Arc<OrderType<T>>, OrderBookError> {
+        let extra_fields: T = extra_fields.unwrap_or_default();
         let order = OrderType::Standard {
             id,
             price,
@@ -23,6 +28,7 @@ impl OrderBook {
             side,
             timestamp: crate::utils::current_time_millis(),
             time_in_force,
+            extra_fields,
         };
         trace!(
             "Adding limit order {} {} {} {} {}",
@@ -32,6 +38,7 @@ impl OrderBook {
     }
 
     /// Add an iceberg order to the book
+    #[allow(clippy::too_many_arguments)]
     pub fn add_iceberg_order(
         &self,
         id: OrderId,
@@ -40,7 +47,9 @@ impl OrderBook {
         hidden_quantity: u64,
         side: Side,
         time_in_force: TimeInForce,
-    ) -> Result<Arc<OrderType>, OrderBookError> {
+        extra_fields: Option<T>,
+    ) -> Result<Arc<OrderType<T>>, OrderBookError> {
+        let extra_fields: T = extra_fields.unwrap_or_default();
         let order = OrderType::IcebergOrder {
             id,
             price,
@@ -49,6 +58,7 @@ impl OrderBook {
             side,
             timestamp: crate::utils::current_time_millis(),
             time_in_force,
+            extra_fields,
         };
         trace!(
             "Adding iceberg order {} {} {} {} {}",
@@ -65,7 +75,9 @@ impl OrderBook {
         quantity: u64,
         side: Side,
         time_in_force: TimeInForce,
-    ) -> Result<Arc<OrderType>, OrderBookError> {
+        extra_fields: Option<T>,
+    ) -> Result<Arc<OrderType<T>>, OrderBookError> {
+        let extra_fields: T = extra_fields.unwrap_or_default();
         let order = OrderType::PostOnly {
             id,
             price,
@@ -73,6 +85,7 @@ impl OrderBook {
             side,
             timestamp: crate::utils::current_time_millis(),
             time_in_force,
+            extra_fields,
         };
         trace!(
             "Adding post-only order {} {} {} {} {}",
@@ -89,6 +102,6 @@ impl OrderBook {
         side: Side,
     ) -> Result<MatchResult, OrderBookError> {
         trace!("Submitting market order {} {} {}", id, quantity, side);
-        self.match_market_order(id, quantity, side)
+        OrderBook::<T>::match_market_order(self, id, quantity, side)
     }
 }

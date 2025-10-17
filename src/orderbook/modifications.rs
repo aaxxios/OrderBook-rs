@@ -1,11 +1,12 @@
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::error::OrderBookError;
+use crate::orderbook::trade::TradeResult;
 use pricelevel::{OrderId, OrderType, OrderUpdate, PriceLevel, Side};
 use std::sync::Arc;
 use tracing::trace;
 
 /// A trait to abstract quantity access and modification for different order types.
-pub trait OrderQuantity {
+pub trait OrderQuantity<T = ()> {
     /// Returns the primary quantity used for display or simple matching.
     /// For iceberg orders, this is the visible quantity.
     fn quantity(&self) -> u64;
@@ -18,7 +19,7 @@ pub trait OrderQuantity {
     fn set_quantity(&mut self, new_total_quantity: u64);
 }
 
-impl OrderQuantity for OrderType {
+impl<T> OrderQuantity<T> for OrderType<T> {
     fn quantity(&self) -> u64 {
         match self {
             OrderType::Standard { quantity, .. } => *quantity,
@@ -64,18 +65,12 @@ impl OrderQuantity for OrderType {
             | OrderType::MarketToLimit { quantity, .. } => *quantity = new_total_quantity,
 
             OrderType::IcebergOrder {
-                visible_quantity,
-                hidden_quantity,
-                ..
+                visible_quantity, ..
             } => {
-                let original_total = *visible_quantity + *hidden_quantity;
-                let amount_to_reduce = original_total.saturating_sub(new_total_quantity);
-
-                let filled_from_visible = amount_to_reduce.min(*visible_quantity);
-                *visible_quantity -= filled_from_visible;
-
-                let remaining_to_reduce = amount_to_reduce - filled_from_visible;
-                *hidden_quantity = hidden_quantity.saturating_sub(remaining_to_reduce);
+                // For iceberg orders, treat new_total_quantity as the new visible quantity
+                // This matches the expected behavior where quantity() returns visible_quantity
+                *visible_quantity = new_total_quantity;
+                // Hidden quantity remains unchanged
             }
             OrderType::ReserveOrder {
                 visible_quantity,
@@ -102,12 +97,15 @@ impl OrderQuantity for OrderType {
     }
 }
 
-impl OrderBook {
+impl<T> OrderBook<T>
+where
+    T: Clone + Send + Sync + Default + 'static,
+{
     /// Update an order's price and/or quantity
     pub fn update_order(
         &self,
         update: OrderUpdate,
-    ) -> Result<Option<Arc<OrderType>>, OrderBookError> {
+    ) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         self.cache.invalidate();
         trace!("Order book {}: Updating order {:?}", self.symbol, update);
         match update {
@@ -129,7 +127,7 @@ impl OrderBook {
                     // Get the original order without holding locks
                     let original_order = if let Some(order) = self.get_order(order_id) {
                         // Create a copy of the order
-                        Arc::try_unwrap(order.clone()).unwrap_or_else(|arc| (*arc))
+                        Arc::try_unwrap(order.clone()).unwrap_or_else(|arc| (*arc).clone())
                     } else {
                         return Ok(None); // Order not found
                     };
@@ -173,24 +171,26 @@ impl OrderBook {
                         Side::Sell => &self.asks,
                     };
 
-                    // Use entry() to safely modify the price level without deadlocks
+                    // Attempt to update the order within the price level
                     let mut result = None;
                     let mut is_empty = false;
 
-                    price_levels.entry(price).and_modify(|price_level| {
-                        // Create update operation
+                    // Get the price level and update it
+                    if let Some(entry) = price_levels.get(&price) {
+                        let price_level = entry.value();
                         let update = OrderUpdate::UpdateQuantity {
                             order_id,
                             new_quantity,
                         };
 
-                        // Try to update the order
-                        if let Ok(updated_order) = price_level.update_order(update) {
-                            result = updated_order;
-                            is_empty = price_level.order_count() == 0;
+                        if let Ok(updated_order) = price_level.update_order(update)
+                            && let Some(order) = updated_order
+                        {
+                            result = Some(Arc::new(self.convert_from_unit_type(&order)));
                         }
-                        self.cache.invalidate();
-                    });
+
+                        is_empty = price_level.order_count() == 0;
+                    }
 
                     // If the price level is now empty, remove it
                     if is_empty {
@@ -198,6 +198,7 @@ impl OrderBook {
                         self.order_locations.remove(&order_id);
                     }
 
+                    self.cache.invalidate();
                     Ok(result)
                 } else {
                     Ok(None) // Order not found
@@ -216,7 +217,7 @@ impl OrderBook {
                     // Get the original order without holding locks
                     let original_order = if let Some(order) = self.get_order(order_id) {
                         // Create a copy of the order
-                        Arc::try_unwrap(order.clone()).unwrap_or_else(|arc| (*arc))
+                        Arc::try_unwrap(order.clone()).unwrap_or_else(|arc| (*arc).clone())
                     } else {
                         return Ok(None); // Order not found
                     };
@@ -227,55 +228,19 @@ impl OrderBook {
                     // Create a new order with the updated price and quantity
                     let mut new_order = original_order;
 
-                    // Update the price and quantity based on order type
+                    // Update the price based on order type
                     match &mut new_order {
-                        OrderType::Standard {
-                            price, quantity, ..
-                        } => {
-                            *price = new_price;
-                            *quantity = new_quantity;
-                        }
-                        OrderType::IcebergOrder {
-                            price,
-                            visible_quantity,
-                            ..
-                        } => {
-                            *price = new_price;
-                            *visible_quantity = new_quantity;
-                        }
-                        OrderType::PostOnly {
-                            price, quantity, ..
-                        } => {
-                            *price = new_price;
-                            *quantity = new_quantity;
-                        }
-                        OrderType::TrailingStop {
-                            price, quantity, ..
-                        } => {
-                            *price = new_price;
-                            *quantity = new_quantity;
-                        }
-                        OrderType::PeggedOrder {
-                            price, quantity, ..
-                        } => {
-                            *price = new_price;
-                            *quantity = new_quantity;
-                        }
-                        OrderType::MarketToLimit {
-                            price, quantity, ..
-                        } => {
-                            *price = new_price;
-                            *quantity = new_quantity;
-                        }
-                        OrderType::ReserveOrder {
-                            price,
-                            visible_quantity,
-                            ..
-                        } => {
-                            *price = new_price;
-                            *visible_quantity = new_quantity;
-                        }
+                        OrderType::Standard { price, .. } => *price = new_price,
+                        OrderType::IcebergOrder { price, .. } => *price = new_price,
+                        OrderType::PostOnly { price, .. } => *price = new_price,
+                        OrderType::TrailingStop { price, .. } => *price = new_price,
+                        OrderType::PeggedOrder { price, .. } => *price = new_price,
+                        OrderType::MarketToLimit { price, .. } => *price = new_price,
+                        OrderType::ReserveOrder { price, .. } => *price = new_price,
                     }
+
+                    // Update the quantity using the trait method
+                    new_order.set_quantity(new_quantity);
 
                     // Add the updated order
                     let result = self.add_order(new_order)?;
@@ -296,29 +261,29 @@ impl OrderBook {
                         Side::Sell => &self.asks,
                     };
 
-                    // Use entry() to safely modify the price level
+                    // Attempt to cancel the order
                     let mut result = None;
                     let mut is_empty = false;
 
-                    price_levels.entry(price).and_modify(|price_level| {
-                        // Create cancel operation
-                        let update = OrderUpdate::Cancel { order_id };
+                    // Get the current order first
+                    if let Some(current_order) = self.get_order(order_id) {
+                        result = Some(current_order);
 
-                        // Try to cancel the order
-                        if let Ok(cancelled_order) = price_level.update_order(update) {
-                            result = cancelled_order;
+                        // Remove the order directly from the price level
+                        if let Some(entry) = price_levels.get(&price) {
+                            let price_level = entry.value();
+                            let cancel_update = OrderUpdate::Cancel { order_id };
+                            let _ = price_level.update_order(cancel_update);
                             is_empty = price_level.order_count() == 0;
                         }
-                    });
 
-                    // If we cancelled an order, remove it from tracking
-                    if result.is_some() {
+                        // Remove from order locations tracking
                         self.order_locations.remove(&order_id);
+                    }
 
-                        // If price level is empty, remove it
-                        if is_empty {
-                            price_levels.remove(&price);
-                        }
+                    // If price level is empty, remove it
+                    if is_empty {
+                        price_levels.remove(&price);
                     }
 
                     Ok(result)
@@ -337,65 +302,96 @@ impl OrderBook {
                 let original_opt = self.get_order(order_id);
 
                 if let Some(original) = original_opt {
-                    // Extract what we need from the original order
-                    let timestamp = original.timestamp();
-                    let time_in_force = original.time_in_force();
+                    // Create a new order by cloning and updating the original
+                    let mut new_order = (*original).clone();
 
-                    // Check which order type we need to create
-                    let new_order = match &*original {
-                        OrderType::Standard { .. } => OrderType::Standard {
-                            id: order_id,
-                            price,
-                            quantity,
-                            side,
-                            timestamp,
-                            time_in_force,
-                        },
-                        OrderType::IcebergOrder {
-                            hidden_quantity, ..
-                        } => OrderType::IcebergOrder {
-                            id: order_id,
-                            price,
-                            visible_quantity: quantity,
-                            hidden_quantity: *hidden_quantity,
-                            side,
-                            timestamp,
-                            time_in_force,
-                        },
-                        OrderType::PostOnly { .. } => OrderType::PostOnly {
-                            id: order_id,
-                            price,
-                            quantity,
-                            side,
-                            timestamp,
-                            time_in_force,
-                        },
-                        OrderType::ReserveOrder {
-                            hidden_quantity,
-                            replenish_threshold,
-                            replenish_amount,
-                            auto_replenish,
+                    // Update the order fields based on order type
+                    match &mut new_order {
+                        OrderType::Standard {
+                            id,
+                            price: p,
+                            quantity: q,
+                            side: s,
                             ..
-                        } => OrderType::ReserveOrder {
-                            id: order_id,
-                            price,
-                            visible_quantity: quantity,
-                            hidden_quantity: *hidden_quantity,
-                            side,
-                            timestamp,
-                            time_in_force,
-                            replenish_threshold: *replenish_threshold,
-                            replenish_amount: *replenish_amount,
-                            auto_replenish: *auto_replenish,
-                        },
-                        // Add cases for other order types if needed
-                        _ => {
-                            return Err(OrderBookError::InvalidOperation {
-                                message: "Replace operation not supported for this order type"
-                                    .to_string(),
-                            });
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *q = quantity;
+                            *s = side;
                         }
-                    };
+                        OrderType::IcebergOrder {
+                            id,
+                            price: p,
+                            visible_quantity,
+                            side: s,
+                            ..
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *visible_quantity = quantity;
+                            *s = side;
+                        }
+                        OrderType::PostOnly {
+                            id,
+                            price: p,
+                            quantity: q,
+                            side: s,
+                            ..
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *q = quantity;
+                            *s = side;
+                        }
+                        OrderType::TrailingStop {
+                            id,
+                            price: p,
+                            quantity: q,
+                            side: s,
+                            ..
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *q = quantity;
+                            *s = side;
+                        }
+                        OrderType::PeggedOrder {
+                            id,
+                            price: p,
+                            quantity: q,
+                            side: s,
+                            ..
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *q = quantity;
+                            *s = side;
+                        }
+                        OrderType::MarketToLimit {
+                            id,
+                            price: p,
+                            quantity: q,
+                            side: s,
+                            ..
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *q = quantity;
+                            *s = side;
+                        }
+                        OrderType::ReserveOrder {
+                            id,
+                            price: p,
+                            visible_quantity,
+                            side: s,
+                            ..
+                        } => {
+                            *id = order_id;
+                            *p = price;
+                            *visible_quantity = quantity;
+                            *s = side;
+                        }
+                    }
 
                     // Cancel the original order
                     self.cancel_order(order_id)?;
@@ -414,7 +410,7 @@ impl OrderBook {
     pub fn cancel_order(
         &self,
         order_id: OrderId,
-    ) -> Result<Option<Arc<OrderType>>, OrderBookError> {
+    ) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         self.cache.invalidate();
         // First, we find the order's location (price and side) without locking
         let location = self.order_locations.get(&order_id).map(|val| *val);
@@ -429,11 +425,12 @@ impl OrderBook {
             // Create the update to cancel
             let update = OrderUpdate::Cancel { order_id };
 
-            // Use entry() to safely modify the price level
+            // Attempt to cancel the order from the price level
             let mut result = None;
             let mut empty_level = false;
 
-            price_levels.entry(price).and_modify(|price_level| {
+            if let Some(entry) = price_levels.get(&price) {
+                let price_level = entry.value();
                 // Try to cancel the order
                 if let Ok(cancelled) = price_level.update_order(update) {
                     result = cancelled;
@@ -441,7 +438,7 @@ impl OrderBook {
                     // Check if the level became empty
                     empty_level = price_level.order_count() == 0;
                 }
-            });
+            }
 
             self.cache.invalidate();
             // If we got a result and the order was canceled
@@ -455,14 +452,14 @@ impl OrderBook {
                 }
             }
 
-            Ok(result)
+            Ok(result.map(|order| Arc::new(self.convert_from_unit_type(&order))))
         } else {
             Ok(None)
         }
     }
 
     /// Add a new order to the book, automatically matching it if it's aggressive.
-    pub fn add_order(&self, mut order: OrderType) -> Result<Arc<OrderType>, OrderBookError> {
+    pub fn add_order(&self, mut order: OrderType<T>) -> Result<Arc<OrderType<T>>, OrderBookError> {
         self.cache.invalidate();
 
         trace!(
@@ -512,10 +509,11 @@ impl OrderBook {
             Some(order.price()),
         )?;
 
-        if !match_result.transactions.transactions.is_empty() {
-            if let Some(ref listener) = self.trade_listener {
-                listener(&match_result) // emit trade events to listener
-            }
+        if !match_result.transactions.transactions.is_empty()
+            && let Some(ref listener) = self.trade_listener
+        {
+            let trade_result = TradeResult::new(self.symbol.clone(), match_result.clone());
+            listener(&trade_result) // emit trade events to listener
         }
 
         // If the order was not fully filled, add the remainder to the book
@@ -527,12 +525,17 @@ impl OrderBook {
                 return Err(OrderBookError::InsufficientLiquidity {
                     side: order.side(),
                     requested: order.quantity(), // Now uses the trait method
-                    available: order.quantity() - match_result.remaining_quantity,
+                    available: order
+                        .quantity()
+                        .saturating_sub(match_result.remaining_quantity),
                 });
             }
 
             // Update the order with the remaining quantity
-            order.set_quantity(match_result.remaining_quantity); // Now uses the trait method
+            // For iceberg orders, only update if there was actual matching (remaining < total)
+            if match_result.remaining_quantity < order.total_quantity() {
+                order.set_quantity(match_result.remaining_quantity); // Now uses the trait method
+            }
 
             let price = order.price();
             let side = order.side();
@@ -542,14 +545,17 @@ impl OrderBook {
                 Side::Sell => &self.asks,
             };
 
-            let price_level = price_levels
-                .entry(price)
-                .or_insert_with(|| Arc::new(PriceLevel::new(price)));
+            let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
 
-            let order_arc = price_level.add_order(order);
-            self.order_locations.insert(order_arc.id(), (price, side));
+            // Convert to unit type for PriceLevel compatibility
+            let unit_order = self.convert_to_unit_type(&order);
+            let unit_order_arc = price_level.value().add_order(unit_order);
+            self.order_locations
+                .insert(unit_order_arc.id(), (price, side));
 
-            Ok(order_arc)
+            // Convert back to generic type for return
+            let generic_order = self.convert_from_unit_type(&unit_order_arc);
+            Ok(Arc::new(generic_order))
         } else {
             // The order was fully matched, create an Arc from the matched result
             // Note: The original order object is consumed, but we can reconstruct its essence if needed.

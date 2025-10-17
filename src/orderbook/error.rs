@@ -40,6 +40,26 @@ pub enum OrderBookError {
         /// Description of the error
         message: String,
     },
+
+    /// Error while serializing snapshot data
+    SerializationError {
+        /// Underlying error message
+        message: String,
+    },
+
+    /// Error while deserializing snapshot data
+    DeserializationError {
+        /// Underlying error message
+        message: String,
+    },
+
+    /// Snapshot integrity check failed
+    ChecksumMismatch {
+        /// Expected checksum value
+        expected: String,
+        /// Actual checksum value
+        actual: String,
+    },
 }
 
 impl fmt::Display for OrderBookError {
@@ -70,6 +90,18 @@ impl fmt::Display for OrderBookError {
             }
             OrderBookError::InvalidOperation { message } => {
                 write!(f, "Invalid operation: {message}")
+            }
+            OrderBookError::SerializationError { message } => {
+                write!(f, "Serialization error: {message}")
+            }
+            OrderBookError::DeserializationError { message } => {
+                write!(f, "Deserialization error: {message}")
+            }
+            OrderBookError::ChecksumMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "Checksum mismatch: expected {expected}, but computed {actual}"
+                )
             }
         }
     }

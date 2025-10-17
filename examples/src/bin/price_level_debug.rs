@@ -15,7 +15,7 @@ const SYMBOL: &str = "TEST/USD";
 fn main() {
     setup_logger();
     info!("Price Level Distribution Debug Test");
-    info!("=================================");
+    info!("===================================");
 
     // Only test the problematic case
     let price_levels = 100; // Test with 100 price levels, like the last successful case
@@ -150,7 +150,7 @@ fn setup_orders_for_test(order_book: &OrderBook, price_levels: i32, orders_per_l
             let id = OrderId::from_u64(order_id);
             order_id += 1;
 
-            let _ = order_book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc);
+            let _ = order_book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc, None);
         }
     }
 
@@ -162,7 +162,7 @@ fn setup_orders_for_test(order_book: &OrderBook, price_levels: i32, orders_per_l
             let id = OrderId::from_u64(order_id);
             order_id += 1;
 
-            let _ = order_book.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc);
+            let _ = order_book.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc, None);
         }
     }
 }

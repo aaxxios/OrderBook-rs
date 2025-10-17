@@ -38,7 +38,7 @@ lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 .PHONY: lint-fix
-lint-fix: 
+lint-fix:
 	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
 
 # Clean the project
@@ -89,11 +89,18 @@ coverage-html:
 	export LOGLEVEL=WARN
 	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --exclude-files 'benches/**' --verbose --all-features --workspace --timeout 120 --out Html
+	cargo tarpaulin --exclude-files 'benches/**' --verbose --all-features --workspace --timeout 120 --out Html --output-dir coverage
+
+.PHONY: coverage-json
+coverage-json:
+	export LOGLEVEL=WARN
+	cargo install cargo-tarpaulin
+	mkdir -p coverage
+	cargo tarpaulin --exclude-files 'benches/**' --verbose --all-features --workspace --timeout 120 --out Json --output-dir coverage
 
 .PHONY: open-coverage
 open-coverage:
-	open tarpaulin-report.html
+	open coverage/tarpaulin-report.html
 
 # Rule to show git log
 git-log:
@@ -142,11 +149,11 @@ bench: check-cargo-criterion
 
 .PHONY: bench-show
 bench-show:
-	open target/criterion/report/index.html
+	open target/criterion/reports/index.html
 
 .PHONY: bench-save
 bench-save: check-cargo-criterion
-	cargo criterion --output-format quiet --history-id v0.3.2 --history-description "Version 0.3.2 baseline"
+	cargo criterion --output-format quiet --history-id v0.4.6 --history-description "Version 0.3.2 baseline"
 
 .PHONY: bench-compare
 bench-compare: check-cargo-criterion
@@ -184,5 +191,5 @@ workflow-test:
 workflow: workflow-build workflow-lint workflow-test workflow-coverage
 
 .PHONY: tree
-tree: 
+tree:
 	tree -I 'target|.idea|.run|.DS_Store|Cargo.lock|*.md|*.toml|*.zip|*.html|*.xml|*.json|*.txt|*.sh|*.yml|*.yaml|*.gitignore|*.gitattributes|*.gitmodules|*.git|*.gitkeep|*.gitlab-ci.yml' -a -L 3

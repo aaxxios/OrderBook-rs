@@ -4,7 +4,6 @@ use pricelevel::{OrderId, Side, TimeInForce};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 /// Register benchmarks that test different contention patterns
 #[allow(dead_code)]
@@ -54,16 +53,16 @@ fn measure_read_write_contention(
     iterations: u64,
     read_ratio: usize,
 ) -> Duration {
-    let order_book = Arc::new(OrderBook::new("TEST-SYMBOL"));
+    let order_book: Arc<OrderBook> = Arc::new(OrderBook::new("TEST-SYMBOL"));
     let barrier = Arc::new(Barrier::new(thread_count + 1)); // +1 for main thread
 
     // Pre-populate with orders to read against
     for i in 0..500 {
-        let id = OrderId(Uuid::new_v4());
+        let id = OrderId::new_uuid();
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         let price = if side == Side::Buy { 990 } else { 1010 };
         order_book
-            .add_limit_order(id, price, 10, side, TimeInForce::Gtc)
+            .add_limit_order(id, price, 10, side, TimeInForce::Gtc, None)
             .unwrap();
     }
 
@@ -99,7 +98,7 @@ fn measure_read_write_contention(
                     match op_type {
                         0 => {
                             // Add a new order
-                            let id = OrderId(Uuid::new_v4());
+                            let id = OrderId::new_uuid();
                             let side = if thread_id % 2 == 0 {
                                 Side::Buy
                             } else {
@@ -107,12 +106,12 @@ fn measure_read_write_contention(
                             };
                             let price = if side == Side::Buy { 990 } else { 1010 };
                             thread_order_book
-                                .add_limit_order(id, price, 10, side, TimeInForce::Gtc)
+                                .add_limit_order(id, price, 10, side, TimeInForce::Gtc, None)
                                 .unwrap();
                         }
                         1 => {
                             // Submit a market order
-                            let id = OrderId(Uuid::new_v4());
+                            let id = OrderId::new_uuid();
                             let side = if thread_id % 2 == 0 {
                                 Side::Buy
                             } else {
@@ -161,22 +160,22 @@ fn measure_hot_spot_contention(
     iterations: u64,
     hot_spot_percentage: usize,
 ) -> Duration {
-    let order_book = Arc::new(OrderBook::new("TEST-SYMBOL"));
+    let order_book: Arc<OrderBook> = Arc::new(OrderBook::new("TEST-SYMBOL"));
     let barrier = Arc::new(Barrier::new(thread_count + 1)); // +1 for main thread
 
     // Create "hot spot" price level at 1000
     for _i in 0..20 {
-        let id = OrderId(Uuid::new_v4());
+        let id = OrderId::new_uuid();
         order_book
-            .add_limit_order(id, 1000, 10, Side::Sell, TimeInForce::Gtc)
+            .add_limit_order(id, 1000, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
     }
 
     // Create other price levels from 1001-1020
     for i in 1..20 {
-        let id = OrderId(Uuid::new_v4());
+        let id = OrderId::new_uuid();
         order_book
-            .add_limit_order(id, 1000 + i, 10, Side::Sell, TimeInForce::Gtc)
+            .add_limit_order(id, 1000 + i, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
     }
 
@@ -206,9 +205,9 @@ fn measure_hot_spot_contention(
                 match op_type {
                     0 => {
                         // Add a new order at selected price
-                        let id = OrderId(Uuid::new_v4());
+                        let id = OrderId::new_uuid();
                         thread_order_book
-                            .add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc)
+                            .add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc, None)
                             .unwrap();
                     }
                     1 => {
@@ -217,7 +216,7 @@ fn measure_hot_spot_contention(
                     }
                     _ => {
                         // Submit a market order (will match against orders at the price)
-                        let id = OrderId(Uuid::new_v4());
+                        let id = OrderId::new_uuid();
                         thread_order_book.submit_market_order(id, 1, Side::Buy).ok();
                     }
                 }

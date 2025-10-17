@@ -2,15 +2,14 @@
 mod tests {
     use crate::{OrderBook, OrderBookError};
     use pricelevel::{OrderId, Side, TimeInForce};
-    use uuid::Uuid;
 
     // Helper function to create a random OrderId
     fn new_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     // Helper function to create an order book for testing
-    fn create_test_order_book() -> OrderBook {
+    fn create_test_order_book() -> OrderBook<()> {
         OrderBook::new("TEST-SYMBOL")
     }
 
@@ -23,7 +22,7 @@ mod tests {
         let side = Side::Buy;
         let time_in_force = TimeInForce::Gtc;
 
-        let result = order_book.add_limit_order(id, price, quantity, side, time_in_force);
+        let result = order_book.add_limit_order(id, price, quantity, side, time_in_force, None);
         assert!(result.is_ok(), "Adding a limit order should succeed");
 
         let order = result.unwrap();
@@ -59,6 +58,7 @@ mod tests {
             hidden_quantity,
             side,
             time_in_force,
+            None,
         );
         assert!(result.is_ok(), "Adding an iceberg order should succeed");
 
@@ -96,7 +96,7 @@ mod tests {
         let side = Side::Buy;
         let time_in_force = TimeInForce::Gtc;
 
-        let result = order_book.add_post_only_order(id, price, quantity, side, time_in_force);
+        let result = order_book.add_post_only_order(id, price, quantity, side, time_in_force, None);
         assert!(result.is_ok(), "Adding a post-only order should succeed");
 
         let order = result.unwrap();
@@ -123,13 +123,13 @@ mod tests {
         // First add a sell order at price 1000
         let sell_id = new_order_id();
         let sell_result =
-            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
         // Now try to add a post-only buy order at price 1000 (would cross)
         let buy_id = new_order_id();
         let buy_result =
-            order_book.add_post_only_order(buy_id, 1000, 10, Side::Buy, TimeInForce::Gtc);
+            order_book.add_post_only_order(buy_id, 1000, 10, Side::Buy, TimeInForce::Gtc, None);
 
         assert!(
             buy_result.is_err(),
@@ -156,7 +156,7 @@ mod tests {
         // First add a limit sell order
         let sell_id = new_order_id();
         let sell_result =
-            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
         // Now submit a market buy order
@@ -229,7 +229,7 @@ mod tests {
         // First add a limit sell order
         let sell_id = new_order_id();
         let sell_result =
-            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
         // Now submit a market buy order for the full amount
@@ -264,7 +264,7 @@ mod tests {
         // First add a limit sell order
         let sell_id = new_order_id();
         let sell_result =
-            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
         // Now submit a market buy order for more than available
@@ -323,7 +323,7 @@ mod tests {
         // Add a sell order
         let sell_id = new_order_id();
         let sell_result =
-            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
         // Add a buy IOC order
@@ -334,6 +334,7 @@ mod tests {
             5,    // Half of the available quantity
             Side::Buy,
             TimeInForce::Ioc,
+            None,
         );
 
         assert!(buy_result.is_ok(), "Adding IOC buy order should succeed");
@@ -365,7 +366,7 @@ mod tests {
         // Add a sell order
         let sell_id = new_order_id();
         let sell_result =
-            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+            order_book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
         // Add a buy FOK order that can be fully filled
@@ -376,6 +377,7 @@ mod tests {
             10, // Full quantity available
             Side::Buy,
             TimeInForce::Fok,
+            None,
         );
 
         assert!(
@@ -410,6 +412,7 @@ mod tests {
             5, // Only 5 units available
             Side::Sell,
             TimeInForce::Gtc,
+            None,
         );
         assert!(sell_result.is_ok(), "Adding sell order should succeed");
 
@@ -421,6 +424,7 @@ mod tests {
             10, // Requires more than available
             Side::Buy,
             TimeInForce::Fok,
+            None,
         );
 
         assert!(
@@ -455,18 +459,207 @@ mod tests {
 }
 
 #[cfg(test)]
+mod test_extra_fields {
+    use crate::OrderBook;
+    use pricelevel::{OrderId, Side, TimeInForce};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    struct OrderMetadata {
+        client_id: String,
+        strategy: String,
+        priority: u32,
+    }
+
+    fn create_order_id() -> OrderId {
+        OrderId::new_uuid()
+    }
+
+    fn create_test_metadata() -> OrderMetadata {
+        OrderMetadata {
+            client_id: "client_123".to_string(),
+            strategy: "momentum".to_string(),
+            priority: 1,
+        }
+    }
+
+    #[test]
+    fn test_add_limit_order_with_extra_fields() {
+        let order_book: OrderBook<OrderMetadata> = OrderBook::new("TEST-SYMBOL");
+        let id = create_order_id();
+        let metadata = create_test_metadata();
+
+        let result = order_book.add_limit_order(
+            id,
+            1000,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            Some(metadata.clone()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Adding limit order with extra fields should succeed"
+        );
+
+        let order = result.unwrap();
+        assert_eq!(order.id(), id);
+        assert_eq!(order.price(), 1000);
+        assert_eq!(order.visible_quantity(), 10);
+
+        // Verify the order is in the book and can be retrieved
+        let book_order = order_book.get_order(id);
+        assert!(book_order.is_some(), "Order should be in the book");
+
+        // Note: We can't directly access extra_fields from the order interface
+        // but we can verify the order was created successfully with the metadata
+    }
+
+    #[test]
+    fn test_add_iceberg_order_with_extra_fields() {
+        let order_book: OrderBook<OrderMetadata> = OrderBook::new("TEST-SYMBOL");
+        let id = create_order_id();
+        let metadata = OrderMetadata {
+            client_id: "client_456".to_string(),
+            strategy: "iceberg_algo".to_string(),
+            priority: 2,
+        };
+
+        let result = order_book.add_iceberg_order(
+            id,
+            1000,
+            10,
+            90,
+            Side::Sell,
+            TimeInForce::Gtc,
+            Some(metadata),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Adding iceberg order with extra fields should succeed"
+        );
+
+        let order = result.unwrap();
+        assert_eq!(order.id(), id);
+        assert_eq!(order.price(), 1000);
+        assert_eq!(order.visible_quantity(), 10);
+        assert_eq!(order.hidden_quantity(), 90);
+
+        // Verify the order is in the book
+        let book_order = order_book.get_order(id);
+        assert!(book_order.is_some(), "Order should be in the book");
+    }
+
+    #[test]
+    fn test_add_post_only_order_with_extra_fields() {
+        let order_book: OrderBook<OrderMetadata> = OrderBook::new("TEST-SYMBOL");
+        let id = create_order_id();
+        let metadata = OrderMetadata {
+            client_id: "client_789".to_string(),
+            strategy: "post_only_maker".to_string(),
+            priority: 3,
+        };
+
+        let result = order_book.add_post_only_order(
+            id,
+            1000,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            Some(metadata),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Adding post-only order with extra fields should succeed"
+        );
+
+        let order = result.unwrap();
+        assert_eq!(order.id(), id);
+        assert_eq!(order.price(), 1000);
+        assert_eq!(order.visible_quantity(), 10);
+        assert!(order.is_post_only());
+
+        // Verify the order is in the book
+        let book_order = order_book.get_order(id);
+        assert!(book_order.is_some(), "Order should be in the book");
+    }
+
+    #[test]
+    fn test_mixed_orders_with_and_without_extra_fields() {
+        let order_book: OrderBook<OrderMetadata> = OrderBook::new("TEST-SYMBOL");
+
+        // Add order without extra fields
+        let id1 = create_order_id();
+        let result1 = order_book.add_limit_order(id1, 1000, 10, Side::Buy, TimeInForce::Gtc, None);
+        assert!(result1.is_ok(), "Order without extra fields should succeed");
+
+        // Add order with extra fields
+        let id2 = create_order_id();
+        let metadata = create_test_metadata();
+        let result2 =
+            order_book.add_limit_order(id2, 1001, 15, Side::Buy, TimeInForce::Gtc, Some(metadata));
+        assert!(result2.is_ok(), "Order with extra fields should succeed");
+
+        // Both orders should be in the book
+        assert!(order_book.get_order(id1).is_some());
+        assert!(order_book.get_order(id2).is_some());
+    }
+
+    #[test]
+    fn test_market_order_matching_with_extra_fields() {
+        let order_book: OrderBook<OrderMetadata> = OrderBook::new("TEST-SYMBOL");
+
+        // Add a limit sell order with metadata
+        let sell_id = create_order_id();
+        let sell_metadata = OrderMetadata {
+            client_id: "seller_123".to_string(),
+            strategy: "market_making".to_string(),
+            priority: 1,
+        };
+
+        let sell_result = order_book.add_limit_order(
+            sell_id,
+            1000,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            Some(sell_metadata),
+        );
+        assert!(sell_result.is_ok(), "Adding sell order should succeed");
+
+        // Submit a market buy order
+        let buy_id = create_order_id();
+        let market_result = order_book.submit_market_order(buy_id, 5, Side::Buy);
+
+        assert!(market_result.is_ok(), "Market order should succeed");
+        let match_result = market_result.unwrap();
+
+        // Verify the match occurred correctly
+        assert_eq!(match_result.executed_quantity(), 5);
+        assert_eq!(match_result.transactions.len(), 1);
+
+        // The remaining sell order should still be in the book
+        let remaining_sell = order_book.get_order(sell_id);
+        assert!(remaining_sell.is_some());
+        assert_eq!(remaining_sell.unwrap().visible_quantity(), 5);
+    }
+}
+
+#[cfg(test)]
 mod test_operations_remaining {
     use crate::OrderBook;
     use pricelevel::{OrderId, Side, TimeInForce};
-    use uuid::Uuid;
 
     fn create_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     #[test]
     fn test_add_limit_order_with_trace() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add a limit order with detailed tracing
         let id = create_order_id();
@@ -475,7 +668,7 @@ mod test_operations_remaining {
         let side = Side::Buy;
         let time_in_force = TimeInForce::Gtc;
 
-        let result = book.add_limit_order(id, price, quantity, side, time_in_force);
+        let result = book.add_limit_order(id, price, quantity, side, time_in_force, None);
         assert!(result.is_ok());
 
         // Verify order was added correctly
@@ -487,7 +680,7 @@ mod test_operations_remaining {
 
     #[test]
     fn test_add_iceberg_order_with_trace() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add an iceberg order with detailed tracing
         let id = create_order_id();
@@ -504,6 +697,7 @@ mod test_operations_remaining {
             hidden_quantity,
             side,
             time_in_force,
+            None,
         );
         assert!(result.is_ok());
 
@@ -517,7 +711,7 @@ mod test_operations_remaining {
 
     #[test]
     fn test_add_post_only_order_with_trace() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add a post-only order with detailed tracing
         let id = create_order_id();
@@ -526,7 +720,7 @@ mod test_operations_remaining {
         let side = Side::Buy;
         let time_in_force = TimeInForce::Gtc;
 
-        let result = book.add_post_only_order(id, price, quantity, side, time_in_force);
+        let result = book.add_post_only_order(id, price, quantity, side, time_in_force, None);
         assert!(result.is_ok());
 
         // Verify order was added correctly
@@ -542,21 +736,20 @@ mod test_operations_remaining {
 mod test_operations_specific {
     use crate::OrderBook;
     use pricelevel::{OrderId, Side, TimeInForce};
-    use uuid::Uuid;
 
     use tracing::trace;
 
     fn create_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     #[test]
     fn test_submit_market_order_with_tracing() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add a sell order
         let sell_id = create_order_id();
-        let _ = book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
 
         // Submit a market buy order with tracing enabled
         let buy_id = create_order_id();

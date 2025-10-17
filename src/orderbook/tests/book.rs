@@ -2,15 +2,14 @@
 mod tests {
     use crate::{OrderBook, OrderBookError};
     use pricelevel::{OrderId, OrderType, Side, TimeInForce};
-    use uuid::Uuid;
 
     // Helper function to create a unique order ID
     fn create_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     // Helper to create a standard limit order
-    fn create_standard_order(price: u64, quantity: u64, side: Side) -> OrderType {
+    fn create_standard_order(price: u64, quantity: u64, side: Side) -> OrderType<()> {
         OrderType::Standard {
             id: create_order_id(),
             price,
@@ -18,11 +17,12 @@ mod tests {
             side,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
         }
     }
 
     // Helper to create an iceberg order
-    fn create_iceberg_order(price: u64, visible: u64, hidden: u64, side: Side) -> OrderType {
+    fn create_iceberg_order(price: u64, visible: u64, hidden: u64, side: Side) -> OrderType<()> {
         OrderType::IcebergOrder {
             id: create_order_id(),
             price,
@@ -31,11 +31,12 @@ mod tests {
             side,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
         }
     }
 
     // Helper to create a post-only order
-    fn create_post_only_order(price: u64, quantity: u64, side: Side) -> OrderType {
+    fn create_post_only_order(price: u64, quantity: u64, side: Side) -> OrderType<()> {
         OrderType::PostOnly {
             id: create_order_id(),
             price,
@@ -43,13 +44,14 @@ mod tests {
             side,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
         }
     }
 
     #[test]
     fn test_new_order_book() {
         let symbol = "BTCUSD";
-        let book = OrderBook::new(symbol);
+        let book: OrderBook<()> = OrderBook::new(symbol);
 
         assert_eq!(book.symbol(), symbol);
         assert_eq!(book.best_bid(), None);
@@ -61,7 +63,7 @@ mod tests {
 
     #[test]
     fn test_add_standard_order() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
         let order = create_standard_order(1000, 10, Side::Buy);
         let order_id = order.id();
 
@@ -80,7 +82,7 @@ mod tests {
 
     #[test]
     fn test_add_multiple_bids() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add three buy orders at different prices
         let _ = book.add_order(create_standard_order(1000, 10, Side::Buy));
@@ -144,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_cancel_nonexistent_order() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
         let result = book.cancel_order(create_order_id());
 
         // Should not error, just return None
@@ -154,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_update_order_quantity() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add an order
         let order = create_standard_order(1000, 10, Side::Buy);
@@ -177,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_update_order_price() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add an order
         let order = create_standard_order(1000, 10, Side::Buy);
@@ -208,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_update_nonexistent_order() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
         let update = pricelevel::OrderUpdate::UpdateQuantity {
             order_id: create_order_id(),
             new_quantity: 20,
@@ -221,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_mid_price_calculation() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // No orders, no mid price
         assert_eq!(book.mid_price(), None);
@@ -241,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_spread_calculation() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // No orders, no spread
         assert_eq!(book.spread(), None);
@@ -261,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_market_order_match() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add two buy orders
         let _ = book.add_order(create_standard_order(1000, 5, Side::Buy));
@@ -287,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_market_order_insufficient_liquidity() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add a buy order with 10 quantity
         let _ = book.add_order(create_standard_order(1000, 10, Side::Buy));
@@ -311,7 +313,8 @@ mod tests {
                 _ => panic!("Unexpected error type"),
             }
         } else {
-            // Si no devuelve error, verificamos que se haya ejecutado parcialmente
+            // If it doesn't return an error, we verify that it has been executed partially
+            #[allow(clippy::unnecessary_unwrap)]
             let match_result = result.unwrap();
             assert_eq!(match_result.executed_quantity(), 10);
             assert_eq!(match_result.remaining_quantity, 10);
@@ -324,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_iceberg_order() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add an iceberg order with 10 visible and 90 hidden
         let order = create_iceberg_order(1000, 10, 90, Side::Buy);
@@ -360,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_post_only_order_no_crossing() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add a sell order at 1100
         let _ = book.add_order(create_standard_order(1100, 10, Side::Sell));
@@ -375,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_post_only_order_with_crossing() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add a sell order at 1100
         let _ = book.add_order(create_standard_order(1100, 10, Side::Sell));
@@ -402,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_immediate_or_cancel_order_full_fill() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add a sell order
         let _ = book.add_order(create_standard_order(1000, 10, Side::Sell));
@@ -415,6 +418,7 @@ mod tests {
             side: Side::Buy,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Ioc,
+            extra_fields: (),
         };
 
         // The order should match and not be added to the book
@@ -428,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_fill_or_kill_order_full_fill() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add a sell order
         let _ = book.add_order(create_standard_order(1000, 10, Side::Sell));
@@ -441,6 +445,7 @@ mod tests {
             side: Side::Buy,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Fok,
+            extra_fields: (),
         };
 
         // The order should match successfully
@@ -450,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_fill_or_kill_order_partial_fill() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add a sell order with less quantity than we'll request
         let _ = book.add_order(create_standard_order(1000, 5, Side::Sell));
@@ -463,6 +468,7 @@ mod tests {
             side: Side::Buy,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Fok,
+            extra_fields: (),
         };
 
         // The order should be rejected
@@ -485,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_book_snapshot() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add some orders
         let _ = book.add_order(create_standard_order(1000, 10, Side::Buy));
@@ -510,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_volume_by_price() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Add multiple orders at the same price level
         let _ = book.add_order(create_standard_order(1000, 10, Side::Buy));
@@ -535,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_market_close_timestamp() {
-        let book = OrderBook::new("BTCUSD");
+        let book: OrderBook<()> = OrderBook::new("BTCUSD");
 
         // Set market close timestamp
         let close_time = crate::utils::current_time_millis() + 1000;
@@ -549,6 +555,7 @@ mod tests {
             side: Side::Buy,
             timestamp: crate::utils::current_time_millis(),
             time_in_force: TimeInForce::Day,
+            extra_fields: (),
         };
 
         // Order should be accepted
@@ -564,16 +571,15 @@ mod tests {
 mod test_orderbook_book {
     use crate::OrderBook;
     use pricelevel::{OrderId, Side, TimeInForce};
-    use uuid::Uuid;
 
     // Helper function to create a unique order ID
     fn create_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     #[test]
     fn test_market_close_timestamp() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Set market close timestamp
         let close_time = crate::utils::current_time_millis() + 60000; // 1 minute in the future
@@ -581,7 +587,7 @@ mod test_orderbook_book {
 
         // Add a standard limit order with DAY time-in-force
         let id = create_order_id();
-        let result = book.add_limit_order(id, 1000, 10, Side::Buy, TimeInForce::Day);
+        let result = book.add_limit_order(id, 1000, 10, Side::Buy, TimeInForce::Day, None);
         assert!(result.is_ok());
 
         // Order should be in the book
@@ -596,29 +602,29 @@ mod test_orderbook_book {
 
         // Add another day order
         let id2 = create_order_id();
-        let result = book.add_limit_order(id2, 1000, 10, Side::Buy, TimeInForce::Day);
+        let result = book.add_limit_order(id2, 1000, 10, Side::Buy, TimeInForce::Day, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_get_volume_by_price() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add multiple orders at different price levels
         let id1 = create_order_id();
-        let _ = book.add_limit_order(id1, 1000, 10, Side::Buy, TimeInForce::Gtc);
+        let _ = book.add_limit_order(id1, 1000, 10, Side::Buy, TimeInForce::Gtc, None);
 
         let id2 = create_order_id();
-        let _ = book.add_limit_order(id2, 1000, 15, Side::Buy, TimeInForce::Gtc); // Same price
+        let _ = book.add_limit_order(id2, 1000, 15, Side::Buy, TimeInForce::Gtc, None); // Same price
 
         let id3 = create_order_id();
-        let _ = book.add_limit_order(id3, 990, 20, Side::Buy, TimeInForce::Gtc); // Different price
+        let _ = book.add_limit_order(id3, 990, 20, Side::Buy, TimeInForce::Gtc, None); // Different price
 
         let id4 = create_order_id();
-        let _ = book.add_limit_order(id4, 1010, 5, Side::Sell, TimeInForce::Gtc); // Sell side
+        let _ = book.add_limit_order(id4, 1010, 5, Side::Sell, TimeInForce::Gtc, None); // Sell side
 
         let id5 = create_order_id();
-        let _ = book.add_limit_order(id5, 1010, 8, Side::Sell, TimeInForce::Gtc); // Same price
+        let _ = book.add_limit_order(id5, 1010, 8, Side::Sell, TimeInForce::Gtc, None); // Same price
 
         // Get volumes by price
         let (bid_volumes, ask_volumes) = book.get_volume_by_price();
@@ -635,16 +641,58 @@ mod test_orderbook_book {
 
     #[test]
     fn test_snapshot_creation() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add orders on both sides
-        let _ = book.add_limit_order(create_order_id(), 1000, 10, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 990, 15, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 980, 20, Side::Buy, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1000,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            990,
+            15,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            980,
+            20,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
 
-        let _ = book.add_limit_order(create_order_id(), 1010, 5, Side::Sell, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1020, 8, Side::Sell, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1030, 12, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1010,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1020,
+            8,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1030,
+            12,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
 
         // Create snapshot with limited depth
         let snapshot = book.create_snapshot(2);
@@ -669,43 +717,99 @@ mod test_orderbook_book {
 
     #[test]
     fn test_mid_price_calculation() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Initially no orders, mid price should be None
         assert_eq!(book.mid_price(), None);
 
         // Add a bid only
-        let _ = book.add_limit_order(create_order_id(), 1000, 10, Side::Buy, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1000,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
         assert_eq!(book.mid_price(), None); // Still None with just bids
 
         // Add an ask
-        let _ = book.add_limit_order(create_order_id(), 1040, 10, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1040,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
         assert_eq!(book.mid_price(), Some(1020.0)); // Mid price is (1000 + 1040) / 2
 
         // Add better bid and ask
-        let _ = book.add_limit_order(create_order_id(), 1010, 5, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1030, 5, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1010,
+            5,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1030,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
         assert_eq!(book.mid_price(), Some(1020.0)); // Mid price is (1010 + 1030) / 2
     }
 
     #[test]
     fn test_spread_calculation() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Initially no orders, spread should be None
         assert_eq!(book.spread(), None);
 
         // Add a bid only
-        let _ = book.add_limit_order(create_order_id(), 1000, 10, Side::Buy, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1000,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
         assert_eq!(book.spread(), None); // Still None with just bids
 
         // Add an ask
-        let _ = book.add_limit_order(create_order_id(), 1040, 10, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1040,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
         assert_eq!(book.spread(), Some(40)); // Spread is 1040 - 1000
 
         // Add better bid and ask
-        let _ = book.add_limit_order(create_order_id(), 1010, 5, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1030, 5, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1010,
+            5,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1030,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
         assert_eq!(book.spread(), Some(20)); // Spread is 1030 - 1010
     }
 }
@@ -714,23 +818,22 @@ mod test_orderbook_book {
 mod test_book_remaining {
     use crate::OrderBook;
     use pricelevel::{OrderId, Side, TimeInForce};
-    use uuid::Uuid;
 
     fn create_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     #[test]
     fn test_symbol_accessor() {
         let symbol = "BTCUSD";
-        let book = OrderBook::new(symbol);
+        let book: OrderBook<()> = OrderBook::new(symbol);
 
         assert_eq!(book.symbol(), symbol);
     }
 
     #[test]
     fn test_market_close_accessors() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Initially, market close is not set
         assert!(
@@ -767,17 +870,59 @@ mod test_book_remaining {
 
     #[test]
     fn test_best_bid_ask_with_multiple_levels() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add multiple bids at different prices
-        let _ = book.add_limit_order(create_order_id(), 1000, 10, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 990, 10, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1010, 10, Side::Buy, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1000,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            990,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1010,
+            10,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        );
 
         // Add multiple asks at different prices
-        let _ = book.add_limit_order(create_order_id(), 1030, 10, Side::Sell, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1020, 10, Side::Sell, TimeInForce::Gtc);
-        let _ = book.add_limit_order(create_order_id(), 1040, 10, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1030,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1020,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let _ = book.add_limit_order(
+            create_order_id(),
+            1040,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
 
         // Test best bid and ask
         assert_eq!(book.best_bid(), Some(1010));
@@ -792,14 +937,14 @@ mod test_book_remaining {
 
     #[test]
     fn test_last_trade_price() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Initially, no trades
         assert_eq!(book.last_trade_price(), None);
 
         // Add a sell order
         let sell_id = create_order_id();
-        let _ = book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(sell_id, 1000, 10, Side::Sell, TimeInForce::Gtc, None);
 
         // Submit a market buy order
         let buy_id = create_order_id();
@@ -811,7 +956,7 @@ mod test_book_remaining {
 
         // Submit another market order at a different price
         let sell_id2 = create_order_id();
-        let _ = book.add_limit_order(sell_id2, 1010, 10, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(sell_id2, 1010, 10, Side::Sell, TimeInForce::Gtc, None);
 
         let buy_id2 = create_order_id();
         let result = book.submit_market_order(buy_id2, 5, Side::Buy);
@@ -824,7 +969,7 @@ mod test_book_remaining {
 
     #[test]
     fn test_create_snapshot_empty_book() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Create a snapshot of an empty book
         let snapshot = book.create_snapshot(10);
@@ -841,23 +986,22 @@ mod test_book_remaining {
 mod test_book_specific {
     use crate::OrderBook;
     use pricelevel::{OrderId, Side, TimeInForce};
-    use uuid::Uuid;
 
     fn create_order_id() -> OrderId {
-        OrderId(Uuid::new_v4())
+        OrderId::new_uuid()
     }
 
     #[test]
     fn test_get_orders_at_price() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add multiple orders at the same price
         let id1 = create_order_id();
         let id2 = create_order_id();
         let price = 1000;
 
-        let _ = book.add_limit_order(id1, price, 10, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(id2, price, 15, Side::Buy, TimeInForce::Gtc);
+        let _ = book.add_limit_order(id1, price, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(id2, price, 15, Side::Buy, TimeInForce::Gtc, None);
 
         // Get orders at this price
         let orders = book.get_orders_at_price(price, Side::Buy);
@@ -877,16 +1021,16 @@ mod test_book_specific {
 
     #[test]
     fn test_get_all_orders() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add orders on both sides
         let id1 = create_order_id();
         let id2 = create_order_id();
         let id3 = create_order_id();
 
-        let _ = book.add_limit_order(id1, 1000, 10, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(id2, 990, 15, Side::Buy, TimeInForce::Gtc);
-        let _ = book.add_limit_order(id3, 1010, 5, Side::Sell, TimeInForce::Gtc);
+        let _ = book.add_limit_order(id1, 1000, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(id2, 990, 15, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(id3, 1010, 5, Side::Sell, TimeInForce::Gtc, None);
 
         // Get all orders
         let all_orders = book.get_all_orders();
@@ -903,7 +1047,7 @@ mod test_book_specific {
 
     #[test]
     fn test_match_market_order_empty_book() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Try to match a market order on an empty book
         let id = create_order_id();

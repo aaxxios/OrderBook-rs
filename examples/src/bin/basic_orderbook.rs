@@ -2,9 +2,7 @@
 
 use orderbook_rs::{OrderBook, current_time_millis};
 use pricelevel::{OrderId, Side, TimeInForce, setup_logger};
-use std::time::{Duration, Instant};
-use tracing::{Level, info};
-use uuid::Uuid;
+use tracing::info;
 
 fn main() {
     // Set up logging
@@ -50,7 +48,7 @@ fn create_orderbook(symbol: &str) -> OrderBook {
     book
 }
 
-fn demo_adding_orders(book: &crate::OrderBook) {
+fn demo_adding_orders(book: &OrderBook) {
     info!("\nAdding orders to the OrderBook...");
 
     // Add some buy limit orders at different price levels
@@ -59,7 +57,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
         let quantity = 10 + (i * 5); // 10, 15, 20, 25, 30
         let id = new_order_id();
 
-        let result = book.add_limit_order(id, price, quantity, Side::Buy, TimeInForce::Gtc);
+        let result = book.add_limit_order(id, price, quantity, Side::Buy, TimeInForce::Gtc, None);
 
         match result {
             Ok(order) => info!(
@@ -78,7 +76,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
         let quantity = 10 + (i * 5); // 10, 15, 20, 25, 30
         let id = new_order_id();
 
-        let result = book.add_limit_order(id, price, quantity, Side::Sell, TimeInForce::Gtc);
+        let result = book.add_limit_order(id, price, quantity, Side::Sell, TimeInForce::Gtc, None);
 
         match result {
             Ok(order) => info!(
@@ -93,7 +91,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
 
     // Add an iceberg order
     let id = new_order_id();
-    let result = book.add_iceberg_order(id, 9990, 5, 45, Side::Buy, TimeInForce::Gtc);
+    let result = book.add_iceberg_order(id, 9990, 5, 45, Side::Buy, TimeInForce::Gtc, None);
 
     match result {
         Ok(order) => info!(
@@ -108,7 +106,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
 
     // Add a post-only order
     let id = new_order_id();
-    let result = book.add_post_only_order(id, 10100, 20, Side::Sell, TimeInForce::Gtc);
+    let result = book.add_post_only_order(id, 10100, 20, Side::Sell, TimeInForce::Gtc, None);
 
     match result {
         Ok(order) => info!(
@@ -122,7 +120,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
 
     // Try to add a post-only order that would cross the market (should fail)
     let id = new_order_id();
-    let result = book.add_post_only_order(id, 9980, 10, Side::Sell, TimeInForce::Gtc);
+    let result = book.add_post_only_order(id, 9980, 10, Side::Sell, TimeInForce::Gtc, None);
 
     match result {
         Ok(_) => info!("Added post-only order (unexpected)"),
@@ -131,7 +129,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
 
     // Add a Fill-or-Kill order
     let id = new_order_id();
-    let result = book.add_limit_order(id, 9970, 5, Side::Sell, TimeInForce::Fok);
+    let result = book.add_limit_order(id, 9970, 5, Side::Sell, TimeInForce::Fok, None);
 
     match result {
         Ok(order) => info!(
@@ -145,7 +143,7 @@ fn demo_adding_orders(book: &crate::OrderBook) {
 
     // Add an Immediate-or-Cancel order
     let id = new_order_id();
-    let result = book.add_limit_order(id, 9975, 8, Side::Sell, TimeInForce::Ioc);
+    let result = book.add_limit_order(id, 9975, 8, Side::Sell, TimeInForce::Ioc, None);
 
     match result {
         Ok(order) => info!(
@@ -288,7 +286,7 @@ fn demo_limit_order_matching(book: &crate::OrderBook) {
 
     // Add a limit order that would cross the market (automatic execution)
     let id = new_order_id();
-    let result = book.add_limit_order(id, 10040, 15, Side::Buy, TimeInForce::Gtc);
+    let result = book.add_limit_order(id, 10040, 15, Side::Buy, TimeInForce::Gtc, None);
 
     match result {
         Ok(order) => info!(
@@ -302,7 +300,7 @@ fn demo_limit_order_matching(book: &crate::OrderBook) {
 
     // Add an IOC order that should partially execute
     let id = new_order_id();
-    let result = book.add_limit_order(id, 10060, 50, Side::Buy, TimeInForce::Ioc);
+    let result = book.add_limit_order(id, 10060, 50, Side::Buy, TimeInForce::Ioc, None);
 
     match result {
         Ok(order) => info!(
@@ -316,7 +314,7 @@ fn demo_limit_order_matching(book: &crate::OrderBook) {
 
     // Add a FOK order that should fully execute
     let id = new_order_id();
-    let result = book.add_limit_order(id, 10080, 10, Side::Buy, TimeInForce::Fok);
+    let result = book.add_limit_order(id, 10080, 10, Side::Buy, TimeInForce::Fok, None);
 
     match result {
         Ok(order) => info!(
@@ -330,7 +328,7 @@ fn demo_limit_order_matching(book: &crate::OrderBook) {
 
     // Add a FOK order that shouldn't execute (not enough liquidity)
     let id = new_order_id();
-    let result = book.add_limit_order(id, 10080, 100, Side::Buy, TimeInForce::Fok);
+    let result = book.add_limit_order(id, 10080, 100, Side::Buy, TimeInForce::Fok, None);
 
     match result {
         Ok(_) => info!("Added FOK order (unexpected)"),
@@ -343,7 +341,7 @@ fn demo_cancel_orders(book: &crate::OrderBook) {
 
     // Add an order to cancel later
     let id = new_order_id();
-    let result = book.add_limit_order(id, 9850, 30, Side::Buy, TimeInForce::Gtc);
+    let result = book.add_limit_order(id, 9850, 30, Side::Buy, TimeInForce::Gtc, None);
 
     let order_id = match result {
         Ok(order) => {
@@ -441,5 +439,5 @@ fn display_orderbook_state(book: &crate::OrderBook) {
 }
 
 fn new_order_id() -> OrderId {
-    OrderId(Uuid::new_v4())
+    OrderId::new_uuid()
 }

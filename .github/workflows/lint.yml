@@ -17,17 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         
       - name: Install dependencies
         run: |
-          if [ "${{ matrix.container }}" = "archlinux:latest" ]; then
-            pacman -Syu --noconfirm make fontconfig pkgconf
-          elif [ "${{ runner.os }}" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            brew install make fontconfig pkg-config
-          fi
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
 
       - name: Install Rust
         uses: actions-rs/toolchain@v1
@@ -35,9 +29,7 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
-
-      - name: Install make
-        run: sudo apt-get install make
+          components: clippy
 
       - name: Lint
         run: make lint

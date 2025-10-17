@@ -4,8 +4,10 @@
    Date: 15/7/25
 ******************************************************************************/
 
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[derive(Debug, Serialize, Default)]
 pub struct PriceLevelCache {
     best_bid_price: AtomicU64,
     best_ask_price: AtomicU64,

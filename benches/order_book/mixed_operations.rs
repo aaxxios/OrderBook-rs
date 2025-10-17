@@ -2,7 +2,6 @@ use criterion::Criterion;
 use orderbook_rs::OrderBook;
 use pricelevel::{OrderId, Side, TimeInForce};
 use std::hint::black_box;
-use uuid::Uuid;
 
 /// Register benchmarks for mixed/realistic order book operations
 pub fn register_benchmarks(c: &mut Criterion) {
@@ -11,18 +10,19 @@ pub fn register_benchmarks(c: &mut Criterion) {
     // Benchmark a realistic trading scenario with mixed operations
     group.bench_function("realistic_trading_scenario", |b| {
         b.iter(|| {
-            let order_book = OrderBook::new("TEST-SYMBOL");
+            let order_book: OrderBook = OrderBook::new("TEST-SYMBOL");
 
             // Phase 1: Add initial orders on both sides of the book
             for i in 0..50 {
-                let bid_id = OrderId(Uuid::new_v4());
-                let ask_id = OrderId(Uuid::new_v4());
+                let bid_id = OrderId::new_uuid();
+                let ask_id = OrderId::new_uuid();
                 let _ = black_box(order_book.add_limit_order(
                     bid_id,
                     990 + i % 10,
                     10,
                     Side::Buy,
                     TimeInForce::Gtc,
+                    None,
                 ));
                 let _ = black_box(order_book.add_limit_order(
                     ask_id,
@@ -30,13 +30,14 @@ pub fn register_benchmarks(c: &mut Criterion) {
                     10,
                     Side::Sell,
                     TimeInForce::Gtc,
+                    None,
                 ));
             }
 
             // Phase 2: Add some iceberg orders
             for _i in 0..10 {
-                let bid_id = OrderId(Uuid::new_v4());
-                let ask_id = OrderId(Uuid::new_v4());
+                let bid_id = OrderId::new_uuid();
+                let ask_id = OrderId::new_uuid();
                 let _ = black_box(order_book.add_iceberg_order(
                     bid_id,
                     985,
@@ -44,6 +45,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                     15,
                     Side::Buy,
                     TimeInForce::Gtc,
+                    None,
                 ));
                 let _ = black_box(order_book.add_iceberg_order(
                     ask_id,
@@ -52,12 +54,13 @@ pub fn register_benchmarks(c: &mut Criterion) {
                     15,
                     Side::Sell,
                     TimeInForce::Gtc,
+                    None,
                 ));
             }
 
             // Phase 3: Execute some market orders
             for i in 0..5 {
-                let market_id = OrderId(Uuid::new_v4());
+                let market_id = OrderId::new_uuid();
                 let _ = black_box(order_book.submit_market_order(
                     market_id,
                     50,
@@ -81,7 +84,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
     // Benchmark high-frequency trading scenario
     group.bench_function("high_frequency_scenario", |b| {
         b.iter(|| {
-            let order_book = OrderBook::new("TEST-SYMBOL");
+            let order_book: OrderBook = OrderBook::new("TEST-SYMBOL");
 
             // Set up initial orderbook
             for i in 0..200 {
@@ -92,20 +95,27 @@ pub fn register_benchmarks(c: &mut Criterion) {
                     1001 + (i / 2)
                 };
 
-                let id = OrderId(Uuid::new_v4());
-                let _ = black_box(order_book.add_limit_order(id, price, 5, side, TimeInForce::Gtc));
+                let id = OrderId::new_uuid();
+                let _ = black_box(order_book.add_limit_order(
+                    id,
+                    price,
+                    5,
+                    side,
+                    TimeInForce::Gtc,
+                    None,
+                ));
             }
 
             // Execute many small orders and modifications
             for i in 0..100 {
-                let market_id = OrderId(Uuid::new_v4());
+                let market_id = OrderId::new_uuid();
                 let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
 
                 // Submit small market order
                 let _ = black_box(order_book.submit_market_order(market_id, 2, side));
 
                 // Add new limit order
-                let limit_id = OrderId(Uuid::new_v4());
+                let limit_id = OrderId::new_uuid();
                 let price = if side == Side::Buy {
                     999 - (i % 10)
                 } else {
@@ -117,6 +127,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                     5,
                     side.opposite(),
                     TimeInForce::Gtc,
+                    None,
                 ));
             }
         })

@@ -15,7 +15,7 @@ const SYMBOL: &str = "TEST/USD";
 fn main() {
     setup_logger();
     info!("Price Level Transition Test");
-    info!("=========================");
+    info!("===========================");
 
     // Try two different price level configurations
     let test_cases = [100, 5]; // Test with 100 levels, then 5 levels
@@ -95,6 +95,7 @@ fn main() {
                                 10,
                                 Side::Buy,
                                 TimeInForce::Gtc,
+                                None,
                             );
                         }
                         1 => {
@@ -108,6 +109,7 @@ fn main() {
                                 10,
                                 Side::Sell,
                                 TimeInForce::Gtc,
+                                None,
                             );
                         }
                         2 => {
@@ -225,7 +227,7 @@ fn setup_orders_for_test(order_book: &OrderBook, price_levels: i32, orders_per_l
             let id = OrderId::from_u64(order_id);
             order_id += 1;
 
-            let _ = order_book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc);
+            let _ = order_book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc, None);
         }
     }
 
@@ -237,7 +239,7 @@ fn setup_orders_for_test(order_book: &OrderBook, price_levels: i32, orders_per_l
             let id = OrderId::from_u64(order_id);
             order_id += 1;
 
-            let _ = order_book.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc);
+            let _ = order_book.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc, None);
         }
     }
 }

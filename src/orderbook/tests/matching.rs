@@ -7,7 +7,7 @@ mod tests {
     use pricelevel::{OrderId, OrderType, Side, TimeInForce};
 
     // Helper function to create a new order book for testing.
-    fn setup_book() -> OrderBook {
+    fn setup_book() -> OrderBook<()> {
         OrderBook::new("TEST_SYMBOL")
     }
 
@@ -20,6 +20,7 @@ mod tests {
             quantity,
             time_in_force: TimeInForce::Gtc, // Good-Til-Canceled
             timestamp: 0,                    // Not relevant for these tests
+            extra_fields: (),
         };
         let order_id = order.id();
         book.add_order(order).unwrap();
@@ -128,7 +129,7 @@ mod tests {
         assert_eq!(book.asks.len(), 1); // One price level should remain
 
         let remaining_level = book.asks.get(&102).unwrap();
-        assert_eq!(remaining_level.total_quantity(), 20); // 40 - 20 = 20 remaining
+        assert_eq!(remaining_level.value().total_quantity(), 20); // 40 - 20 = 20 remaining
         assert_eq!(
             book.last_trade_price
                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -138,10 +139,10 @@ mod tests {
 
     #[test]
     fn test_peek_match_buy_side_full_match() {
-        let book = OrderBook::new("TEST");
-        book.add_limit_order(OrderId::new(), 101, 10, Side::Sell, TimeInForce::Gtc)
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        book.add_limit_order(OrderId::new(), 101, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
-        book.add_limit_order(OrderId::new(), 102, 5, Side::Sell, TimeInForce::Gtc)
+        book.add_limit_order(OrderId::new(), 102, 5, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Request 15, which is fully available (10 at 101, 5 at 102)
@@ -151,8 +152,8 @@ mod tests {
 
     #[test]
     fn test_peek_match_buy_side_partial_match() {
-        let book = OrderBook::new("TEST");
-        book.add_limit_order(OrderId::new(), 101, 10, Side::Sell, TimeInForce::Gtc)
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        book.add_limit_order(OrderId::new(), 101, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Request 20, but only 10 is available
@@ -162,12 +163,12 @@ mod tests {
 
     #[test]
     fn test_peek_match_sell_side_with_price_limit() {
-        let book = OrderBook::new("TEST");
-        book.add_limit_order(OrderId::new(), 98, 10, Side::Buy, TimeInForce::Gtc)
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        book.add_limit_order(OrderId::new(), 98, 10, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
-        book.add_limit_order(OrderId::new(), 99, 5, Side::Buy, TimeInForce::Gtc)
+        book.add_limit_order(OrderId::new(), 99, 5, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
-        book.add_limit_order(OrderId::new(), 100, 20, Side::Buy, TimeInForce::Gtc)
+        book.add_limit_order(OrderId::new(), 100, 20, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
 
         // Request to sell with a limit of 99. Should only match with bids at 99 and 100.
@@ -177,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_peek_match_no_liquidity() {
-        let book = OrderBook::new("TEST");
+        let book: OrderBook<()> = OrderBook::new("TEST");
 
         // No orders in the book
         let matched_quantity = book.peek_match(Side::Buy, 10, None);

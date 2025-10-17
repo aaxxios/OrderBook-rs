@@ -1,12 +1,22 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use orderbook_rs::orderbook::book::OrderBook;
 use pricelevel::{OrderId, OrderType, Side, TimeInForce};
+use serde::{Deserialize, Serialize};
 use std::hint::black_box;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OrderMetadata {
+    pub client_id: Option<u64>,
+    pub user_id: Option<u64>,
+    pub exchange_id: Option<u8>,
+    pub priority: u8,
+}
 
 /// Sets up a deep order book for benchmarking.
 /// Populates the book with a significant number of orders on the ask side.
-fn setup_deep_book() -> OrderBook {
+fn setup_deep_book() -> OrderBook<OrderMetadata> {
     let book = OrderBook::new("BENCH_SYMBOL");
+
     // Create 100 price levels, from 10001 to 10100
     for i in 0..100 {
         let price = 10001 + i;
@@ -19,6 +29,12 @@ fn setup_deep_book() -> OrderBook {
                 quantity: 10,
                 time_in_force: TimeInForce::Gtc,
                 timestamp: 0,
+                extra_fields: OrderMetadata {
+                    client_id: Some(1),
+                    user_id: Some(2),
+                    exchange_id: Some(3),
+                    priority: 4,
+                },
             };
             book.add_order(order).unwrap();
         }

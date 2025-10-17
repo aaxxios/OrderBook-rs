@@ -13,7 +13,7 @@ pub fn setup_orders_for_read_write_test(order_book: &OrderBook) {
         let id = OrderId::from_u64(i as u64);
         let quantity = 10 + (i % 10);
 
-        let _ = order_book.add_limit_order(id, price, quantity, Side::Buy, TimeInForce::Gtc);
+        let _ = order_book.add_limit_order(id, price, quantity, Side::Buy, TimeInForce::Gtc, None);
     }
 
     // Sell orders
@@ -22,7 +22,7 @@ pub fn setup_orders_for_read_write_test(order_book: &OrderBook) {
         let id = OrderId::from_u64((i + 250) as u64);
         let quantity = 10 + (i % 10);
 
-        let _ = order_book.add_limit_order(id, price, quantity, Side::Sell, TimeInForce::Gtc);
+        let _ = order_book.add_limit_order(id, price, quantity, Side::Sell, TimeInForce::Gtc, None);
     }
 
     info!("Read/write test setup complete: 500 orders added across 40 price levels");
@@ -40,7 +40,7 @@ pub fn setup_orders_for_hot_spot_test(order_book: &crate::OrderBook) {
         let price = if is_buy { 9950 } else { 10050 };
         let id = OrderId::from_u64(i as u64);
 
-        let _ = order_book.add_limit_order(id, price, 10, side, TimeInForce::Gtc);
+        let _ = order_book.add_limit_order(id, price, 10, side, TimeInForce::Gtc, None);
     }
 
     // Remaining orders (ID 20-499)
@@ -56,7 +56,7 @@ pub fn setup_orders_for_hot_spot_test(order_book: &crate::OrderBook) {
         };
         let id = OrderId::from_u64(i as u64);
 
-        let _ = order_book.add_limit_order(id, price, 10, side, TimeInForce::Gtc);
+        let _ = order_book.add_limit_order(id, price, 10, side, TimeInForce::Gtc, None);
     }
 
     info!("Hot spot test setup complete: 20 hot spot orders + 480 regular orders");
@@ -97,7 +97,7 @@ pub fn setup_orders_for_price_level_test(
             let id = OrderId::from_u64(order_id);
             order_id += 1;
 
-            let _ = order_book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc);
+            let _ = order_book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc, None);
         }
     }
 
@@ -109,7 +109,7 @@ pub fn setup_orders_for_price_level_test(
             let id = OrderId::from_u64(order_id);
             order_id += 1;
 
-            let _ = order_book.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc);
+            let _ = order_book.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc, None);
         }
     }
 
