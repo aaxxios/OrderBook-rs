@@ -22,6 +22,7 @@ pub mod snapshot;
 mod tests;
 /// Trade-related types including TradeResult and TradeListener for monitoring order executions.
 pub mod trade;
+pub mod book_change_event;
 
 pub use book::OrderBook;
 pub use error::OrderBookError;

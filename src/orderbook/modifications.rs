@@ -1,4 +1,5 @@
 use crate::orderbook::book::OrderBook;
+use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::trade::TradeResult;
 use pricelevel::{OrderId, OrderType, OrderUpdate, PriceLevel, Side};
@@ -186,6 +187,14 @@ where
                         if let Ok(updated_order) = price_level.update_order(update)
                             && let Some(order) = updated_order
                         {
+                            // notify price level changes
+                            if let Some(ref listener) = self.price_level_changed_listener {
+                                listener(PriceLevelChangedEvent {
+                                    side,
+                                    price: price_level.price(),
+                                    quantity: price_level.visible_quantity(),
+                                })
+                            }
                             result = Some(Arc::new(self.convert_from_unit_type(&order)));
                         }
 
@@ -273,7 +282,18 @@ where
                         if let Some(entry) = price_levels.get(&price) {
                             let price_level = entry.value();
                             let cancel_update = OrderUpdate::Cancel { order_id };
-                            let _ = price_level.update_order(cancel_update);
+                            let result = price_level.update_order(cancel_update);
+                            // notify price level changes
+                            if let Some(ref listener) = self.price_level_changed_listener
+                                && let Ok(updated_order) = result
+                                && updated_order.is_some()
+                            {
+                                listener(PriceLevelChangedEvent {
+                                    side,
+                                    price: price_level.price(),
+                                    quantity: price_level.visible_quantity(),
+                                })
+                            }
                             is_empty = price_level.order_count() == 0;
                         }
 
@@ -435,6 +455,17 @@ where
                 if let Ok(cancelled) = price_level.update_order(update) {
                     result = cancelled;
 
+                    // notify price level changes
+                    if result.is_some()
+                        && let Some(ref listener) = self.price_level_changed_listener
+                    {
+                        listener(PriceLevelChangedEvent {
+                            side,
+                            price: price_level.price(),
+                            quantity: price_level.visible_quantity(),
+                        })
+                    }
+
                     // Check if the level became empty
                     empty_level = price_level.order_count() == 0;
                 }
@@ -546,10 +577,20 @@ where
             };
 
             let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
+            let level = price_level.value();
+
 
             // Convert to unit type for PriceLevel compatibility
             let unit_order = self.convert_to_unit_type(&order);
             let unit_order_arc = price_level.value().add_order(unit_order);
+            // notify price level changes
+            if let Some(ref listener) = self.price_level_changed_listener {
+                listener(PriceLevelChangedEvent {
+                    side,
+                    price: level.price(),
+                    quantity: level.visible_quantity(),
+                })
+            }
             self.order_locations
                 .insert(unit_order_arc.id(), (price, side));
 

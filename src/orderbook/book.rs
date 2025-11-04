@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::trace;
 use uuid::Uuid;
+use crate::orderbook::book_change_event::PriceLevelChangedListener;
 
 /// Default basis points multiplier for spread calculations
 /// One basis point = 0.01% = 0.0001
@@ -68,6 +69,9 @@ pub struct OrderBook<T = ()> {
 
     /// Phantom data to maintain generic type parameter
     _phantom: PhantomData<T>,
+    
+    /// listens to order book changes. This provides a point to update a corresponding external order book e.g. in the UI
+    pub price_level_changed_listener: Option<PriceLevelChangedListener>,
 }
 
 impl<T> Serialize for OrderBook<T>
@@ -302,6 +306,7 @@ where
             cache: PriceLevelCache::new(),
             trade_listener: None,
             _phantom: PhantomData,
+            price_level_changed_listener: None,
         }
     }
 
@@ -322,6 +327,27 @@ where
             cache: PriceLevelCache::new(),
             trade_listener: Some(trade_listener),
             _phantom: PhantomData,
+            price_level_changed_listener: None,
+        }
+    }
+    
+    pub fn with_trade_and_price_level_listener(symbol: &str, trade_listener: TradeListener, book_changed_listener: PriceLevelChangedListener) -> Self {
+        let namespace = Uuid::new_v4();
+
+        Self {
+            symbol: symbol.to_string(),
+            bids: SkipMap::new(),
+            asks: SkipMap::new(),
+            order_locations: DashMap::new(),
+            transaction_id_generator: UuidGenerator::new(namespace),
+            last_trade_price: AtomicU64::new(0),
+            has_traded: AtomicBool::new(false),
+            market_close_timestamp: AtomicU64::new(0),
+            has_market_close: AtomicBool::new(false),
+            cache: PriceLevelCache::new(),
+            trade_listener: Some(trade_listener),
+            _phantom: PhantomData,
+            price_level_changed_listener: Some(book_changed_listener),
         }
     }
 
@@ -333,6 +359,16 @@ where
     /// Remove the trade listener from this order book
     pub fn remove_trade_listener(&mut self) {
         self.trade_listener = None;
+    }
+
+    /// set price level listener for this order book
+    pub fn set_price_level_listener(&mut self, listener: PriceLevelChangedListener) {
+        self.price_level_changed_listener = Some(listener);
+    }
+    
+    /// remove price level listener for this order book
+    pub fn remove_price_level_listener(&mut self) {
+        self.price_level_changed_listener = None;
     }
 
     /// Get the symbol of this order book

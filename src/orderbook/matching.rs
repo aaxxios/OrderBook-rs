@@ -1,5 +1,6 @@
 //! Contains the core matching engine logic for the order book.
 
+use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::pool::MatchingPool;
 use crate::{OrderBook, OrderBookError};
 use pricelevel::{MatchResult, OrderId, Side};
@@ -100,6 +101,15 @@ where
                 // Add transactions to result
                 for transaction in price_level_match.transactions.as_vec() {
                     match_result.add_transaction(*transaction);
+                }
+
+                // notify price level changes
+                if let Some(ref listener) = self.price_level_changed_listener {
+                    listener(PriceLevelChangedEvent {
+                        side: side.opposite(),
+                        price: price_level.price(),
+                        quantity: price_level.visible_quantity(),
+                    });
                 }
             }
 
