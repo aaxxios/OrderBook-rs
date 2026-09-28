@@ -70,6 +70,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order, account and counter and increments the anomaly count. A fill
   larger than the tracked remainder releases only the tracked remainder.
   The maker-price `debug_assert_eq!` in `on_fill` is now a `WARN`.
+- **Risk reservations cannot be released by a same-id loser (#243
+  review).** `on_admission` claims the order id and the counters under the
+  order map's shard lock, rejects an id that is already tracked before
+  touching any counter, and returns a generation-tagged reservation; the
+  cleanup after a failed level placement releases only the entry carrying
+  that generation. Before, a concurrent same-id submission could overwrite
+  the winner's entry and its cleanup then released it, leaving the resting
+  winner untracked.
+- **Discarded reserve remainders are released (#243 review).** A
+  non-auto-replenishing reserve maker removed after its visible tranche is
+  exhausted (#230) kept its discarded hidden quantity booked in the
+  account's risk counters forever (pre-existing on 0.13), counting against
+  `max_open_orders_per_account` and `max_notional_per_account`. The
+  matcher now releases it in the same removal.
+- **Quantity increases reserve risk before the level changes (#243
+  review).** An in-place quantity increase now pre-books its notional
+  before the price level applies it and settles or rolls it back once the
+  level answers, so a risk overflow is a rejection with the order
+  unchanged instead of a divergence between the book and the risk state.
 - **Snapshot restore computes risk aggregates in the prepare phase
   (#243, prepares #250).** When the package carries a risk config, the
   per-account open-order counts and resting notional are accumulated with

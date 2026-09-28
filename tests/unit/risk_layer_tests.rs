@@ -808,4 +808,149 @@ mod tests_risk_layer {
         assert!(target.get_order(keep).is_some(), "live book untouched");
         assert!(target.risk_config().is_none(), "config untouched");
     }
+
+    /// #243 review: a non-auto-replenishing reserve maker is removed once
+    /// its visible tranche is exhausted and its hidden tranche is discarded
+    /// (#230). The discarded remainder must be released from the maker's
+    /// risk counters, or it stays booked and locks the account.
+    #[test]
+    fn discarded_reserve_remainder_is_released_from_risk() {
+        use pricelevel::{OrderType, Price, Quantity, TimestampMs};
+
+        let mut book = new_book();
+        book.set_risk_config(
+            RiskConfig::new()
+                .with_max_open_orders_per_account(1)
+                .with_max_notional_per_account(1_500),
+        );
+        let maker = account(64);
+        let taker = account(65);
+
+        let reserve = OrderType::ReserveOrder {
+            id: new_id(),
+            price: Price::new(100),
+            visible_quantity: Quantity::new(5),
+            hidden_quantity: Quantity::new(10),
+            side: Side::Sell,
+            user_id: maker,
+            timestamp: TimestampMs::new(1_700_000_000_000),
+            time_in_force: TimeInForce::Gtc,
+            replenish_threshold: Quantity::new(1),
+            replenish_amount: None,
+            auto_replenish: false,
+            extra_fields: (),
+        };
+        let reserve_id = reserve.id();
+        book.add_order(reserve)
+            .expect("reserve maker rests (15 @ 100)");
+
+        // Exhaust the visible tranche: the maker leaves the book and its
+        // hidden 10 is discarded.
+        book.add_limit_order_with_user(new_id(), 100, 5, Side::Buy, TimeInForce::Gtc, taker, None)
+            .expect("taker");
+        assert!(book.get_order(reserve_id).is_none(), "maker removed");
+
+        // The account holds nothing: a full-size order must fit both the
+        // open-order slot and the notional limit again.
+        book.add_limit_order_with_user(
+            new_id(),
+            100,
+            15,
+            Side::Sell,
+            TimeInForce::Gtc,
+            maker,
+            None,
+        )
+        .expect("maker account fully released");
+        assert_eq!(book.risk_accounting_anomalies(), 0);
+    }
+
+    /// #243 review: concurrent submissions of the same id must leave the
+    /// winner tracked by the risk layer; a loser can never release the
+    /// winner's reservation.
+    #[test]
+    fn concurrent_same_id_submissions_keep_the_winner_tracked() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 50;
+        let acct = account(66);
+
+        for round in 0..ROUNDS {
+            let mut book = new_book();
+            book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(2));
+            let book = Arc::new(book);
+            let id = new_id();
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let book = Arc::clone(&book);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        book.add_limit_order_with_user(
+                            id,
+                            100,
+                            1,
+                            Side::Buy,
+                            TimeInForce::Gtc,
+                            acct,
+                            None,
+                        )
+                        .is_ok()
+                    })
+                })
+                .collect();
+            let admitted = handles
+                .into_iter()
+                .map(|h| h.join().expect("submit thread"))
+                .filter(|ok| *ok)
+                .count();
+            assert_eq!(admitted, 1, "round {round}: exactly one submission rests");
+            assert!(book.get_order(id).is_some());
+
+            // The winner holds exactly one slot: one more fits, a third
+            // does not.
+            book.add_limit_order_with_user(
+                new_id(),
+                99,
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+                acct,
+                None,
+            )
+            .expect("second slot free");
+            assert!(
+                matches!(
+                    book.add_limit_order_with_user(
+                        new_id(),
+                        98,
+                        1,
+                        Side::Buy,
+                        TimeInForce::Gtc,
+                        acct,
+                        None
+                    ),
+                    Err(OrderBookError::RiskMaxOpenOrders { current: 2, .. })
+                ),
+                "round {round}: winner still counted"
+            );
+
+            // Cancelling the winner releases its slot.
+            assert!(book.cancel_order(id).expect("cancel").is_some());
+            book.add_limit_order_with_user(
+                new_id(),
+                97,
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+                acct,
+                None,
+            )
+            .expect("winner's slot released on cancel");
+            assert_eq!(book.risk_accounting_anomalies(), 0, "round {round}");
+        }
+    }
 }

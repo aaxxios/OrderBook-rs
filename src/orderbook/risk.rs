@@ -200,6 +200,47 @@ pub(super) struct RiskEntry {
     pub(super) account: Hash32,
     pub(super) price: u128,
     pub(super) remaining_qty: u64,
+    /// Reservation generation (#243 review): unique per live admission,
+    /// so only the admission that created this entry can release it
+    /// through its [`RiskReservation`]. `0` for entries rebuilt from a
+    /// snapshot, which no reservation token ever carries.
+    pub(super) generation: u64,
+}
+
+/// Proof that [`RiskState::on_admission`] reserved an order's risk
+/// contribution (#243 review).
+///
+/// Handed back to [`RiskState::release_reservation`] when the order then
+/// fails to rest. The release only removes the entry whose generation
+/// matches, so a caller that lost a same-id race can never release the
+/// winner's entry. `generation == 0` means nothing was reserved (no
+/// `RiskConfig` installed) and the release is a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a reservation must be released if the order does not rest"]
+pub(super) struct RiskReservation {
+    order_id: Id,
+    generation: u64,
+}
+
+/// Notional pre-booked by [`RiskState::reserve_quantity_update`] before an
+/// in-place quantity update mutates the price level (#243 review).
+///
+/// Settle it with [`RiskState::commit_quantity_update`] once the level
+/// applied the update, or [`RiskState::rollback_quantity_update`] if it
+/// did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a quantity reservation must be committed or rolled back"]
+pub(super) struct QuantityReservation {
+    order_id: Id,
+    account: Hash32,
+    price: u128,
+    /// Generation of the entry the reservation was booked against, so
+    /// settlement never touches a different entry for the same id.
+    generation: u64,
+    /// `false` when the order is untracked (nothing reserved or settled).
+    tracked: bool,
+    /// Quantity whose notional was added to the account's counter.
+    reserved_qty: u64,
 }
 
 /// Risk state bound to a single [`OrderBook`](crate::OrderBook).
@@ -218,6 +259,8 @@ pub struct RiskState {
     /// counter, fill larger than the tracked remainder, a post-trade
     /// counter overflow). Diagnostic only; see [`Self::accounting_anomalies`].
     pub(super) accounting_anomalies: AtomicU64,
+    /// Last reservation generation handed out by [`Self::on_admission`].
+    pub(super) generations: AtomicU64,
 }
 
 /// Basis points per unit (100 % = 10 000 bps).
@@ -424,6 +467,7 @@ impl RiskRebuild {
                 account,
                 price,
                 remaining_qty,
+                generation: 0,
             },
         ));
         Ok(())
@@ -824,39 +868,63 @@ impl RiskState {
 
     /// Reserve the risk contribution of an order that is about to rest.
     ///
-    /// Increments the account's `open_count` and `resting_notional` with
-    /// checked CAS loops and then inserts the [`RiskEntry`]. All or
-    /// nothing: on error no counter is changed and no entry is inserted,
-    /// so the caller must not rest the order. Call it **before** placing
-    /// the order on its level and release it with [`Self::on_cancel`] if
-    /// the placement then fails.
+    /// Claims `order_id` in the per-order map and increments the
+    /// account's `open_count` and `resting_notional` with checked CAS
+    /// loops, all while holding the order map shard's write guard, so the
+    /// claim and the counters commit together. All or nothing: on error no
+    /// counter is changed and no entry is inserted, so the caller must not
+    /// rest the order. Call it **before** placing the order on its level
+    /// and hand the returned [`RiskReservation`] to
+    /// [`Self::release_reservation`] if the placement then fails.
+    ///
+    /// An id that is already tracked is rejected before any counter is
+    /// touched (#243 review): the book's duplicate-id check is not atomic
+    /// with admission, and overwriting the entry would let a same-id loser
+    /// release the winner's contribution.
     ///
     /// The pre-trade [`Self::check_limit_admission`] already rejects any
-    /// submission whose worst-case notional would overflow, so this can
-    /// only fail when concurrent admissions on the same account raced
-    /// past that check.
+    /// submission whose worst-case notional would overflow, so the
+    /// counter errors can only occur when concurrent admissions on the
+    /// same account raced past that check.
     ///
     /// Allocation only when a new account counter is created
     /// (first-ever order from that account on this book) or the
     /// per-order map's bucket grows.
     ///
     /// # Errors
-    /// [`OrderBookError::RiskMaxOpenOrders`] when the open-order count
-    /// would overflow `u64`, [`OrderBookError::RiskMaxNotional`] when the
-    /// order's notional or the account's resting notional would overflow
-    /// `u128`. `limit` carries the configured limit, or the type's `MAX`
-    /// when none is set.
+    /// [`OrderBookError::DuplicateOrderId`] when `order_id` is already
+    /// tracked, [`OrderBookError::RiskMaxOpenOrders`] when the open-order
+    /// count would overflow `u64`, [`OrderBookError::RiskMaxNotional`]
+    /// when the order's notional or the account's resting notional would
+    /// overflow `u128` (`limit` carries the configured limit, or the
+    /// type's `MAX` when none is set), and
+    /// [`OrderBookError::InvalidOperation`] if the reservation generation
+    /// counter is exhausted (`u64::MAX` admissions).
     pub(super) fn on_admission(
         &self,
         order_id: Id,
         account: Hash32,
         price: u128,
         remaining_qty: u64,
-    ) -> Result<(), OrderBookError> {
+    ) -> Result<RiskReservation, OrderBookError> {
         let Some(cfg) = self.config.as_ref() else {
-            return Ok(());
+            return Ok(RiskReservation {
+                order_id,
+                generation: 0,
+            });
         };
+        let generation = self.next_generation()?;
         let notional_delta = checked_notional(remaining_qty, price);
+
+        // Lock order: the orders shard, then the counters shard. No other
+        // path holds a counters guard while taking an orders guard, so the
+        // nesting cannot deadlock.
+        let slot = match self.orders.entry(order_id) {
+            dashmap::Entry::Occupied(_) => {
+                return Err(OrderBookError::DuplicateOrderId { order_id });
+            }
+            dashmap::Entry::Vacant(slot) => slot,
+        };
 
         let reserved = {
             // `entry` holds the counters shard's write guard for the whole
@@ -896,21 +964,65 @@ impl RiskState {
             }
         };
         if let Err(err) = reserved {
+            drop(slot);
             // A first-ever account leaves a zeroed counters entry behind;
             // reclaim it.
             self.evict_if_zeroed(account);
             return Err(err);
         }
 
-        self.orders.insert(
+        slot.insert(RiskEntry {
+            account,
+            price,
+            remaining_qty,
+            generation,
+        });
+        Ok(RiskReservation {
             order_id,
-            RiskEntry {
-                account,
-                price,
-                remaining_qty,
-            },
+            generation,
+        })
+    }
+
+    /// Next reservation generation (never `0`). Checked: exhaustion after
+    /// `u64::MAX` admissions is a typed error, never a wrap that could make
+    /// two live reservations share a generation.
+    #[inline]
+    fn next_generation(&self) -> Result<u64, OrderBookError> {
+        checked_add_u64(&self.generations, 1)
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+            .ok_or_else(Self::generation_exhausted)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn generation_exhausted() -> OrderBookError {
+        OrderBookError::InvalidOperation {
+            message: "risk reservation generation counter exhausted".to_string(),
+        }
+    }
+
+    /// Undo a [`Self::on_admission`] reservation for an order that did not
+    /// rest. Releases the entry and its counter contribution only when the
+    /// entry still carries this reservation's generation, so it can never
+    /// release another admission's entry for the same id. No-op for a
+    /// reservation taken without a `RiskConfig`.
+    pub(super) fn release_reservation(&self, reservation: RiskReservation) {
+        if reservation.generation == 0 {
+            return;
+        }
+        let Some((_, entry)) = self.orders.remove_if(&reservation.order_id, |_, entry| {
+            entry.generation == reservation.generation
+        }) else {
+            return;
+        };
+        self.release(
+            reservation.order_id,
+            entry.account,
+            checked_notional(entry.remaining_qty, entry.price),
+            true,
         );
-        Ok(())
+        self.evict_if_zeroed(entry.account);
     }
 
     /// Hook per fill against a resting maker order.
@@ -1019,78 +1131,199 @@ impl RiskState {
         );
     }
 
-    /// Hook per in-place quantity update on a resting maker (#211):
-    /// adjusts the order's tracked remaining quantity and the account's
-    /// resting-notional counter by the signed delta at the entry's
-    /// admission price. No-op when no `RiskConfig` is installed or the
-    /// order is not tracked (e.g. admitted before the config was set).
+    /// Pre-book the notional of an in-place quantity **increase** before
+    /// the price level applies it (#211, #243 review).
     ///
-    /// An increase is pre-validated by [`Self::check_modify_admission`];
-    /// if a concurrent admission still makes it overflow, the counter is
-    /// left unchanged, the entry keeps its previous quantity (so later
-    /// releases stay within what was booked), and the anomaly is logged
-    /// at `ERROR` and counted. A decrease releases like a fill.
-    pub(super) fn on_quantity_update(&self, order_id: Id, new_remaining: u64) {
-        if self.config.is_none() {
-            return;
-        }
-        let (account, entry_price, old_remaining) = {
-            let Some(mut entry) = self.orders.get_mut(&order_id) else {
-                return;
-            };
-            let account = entry.account;
-            let entry_price = entry.price;
-            let old_remaining = entry.remaining_qty;
-            entry.remaining_qty = new_remaining;
-            (account, entry_price, old_remaining)
+    /// `projected_remaining` is the order's total remaining quantity after
+    /// the update. When it exceeds the tracked remainder, the extra
+    /// notional is added to the account's counter with a checked CAS; an
+    /// overflow is a typed rejection and nothing is changed, so the level
+    /// must not be updated. A decrease reserves nothing. The returned
+    /// [`QuantityReservation`] must be settled with
+    /// [`Self::commit_quantity_update`] after the level update succeeds, or
+    /// [`Self::rollback_quantity_update`] if it does not happen.
+    ///
+    /// Untracked orders (no `RiskConfig`, or admitted before one was
+    /// installed) get an empty reservation whose settlement is a no-op.
+    ///
+    /// # Errors
+    /// [`OrderBookError::RiskMaxNotional`] when the increase's notional,
+    /// or the account's resting notional plus it, would overflow `u128`.
+    pub(super) fn reserve_quantity_update(
+        &self,
+        order_id: Id,
+        projected_remaining: u64,
+    ) -> Result<QuantityReservation, OrderBookError> {
+        let untracked = QuantityReservation {
+            order_id,
+            account: Hash32::zero(),
+            price: 0,
+            generation: 0,
+            tracked: false,
+            reserved_qty: 0,
         };
-
-        if let Some(increase) = new_remaining.checked_sub(old_remaining) {
-            let overflowed = match self.counters.get(&account) {
-                None => false,
-                Some(counters) => match checked_notional(increase, entry_price) {
-                    None => true,
-                    Some(delta) => checked_add_u128(&counters.resting_notional, delta).is_err(),
-                },
+        let Some(cfg) = self.config.as_ref() else {
+            return Ok(untracked);
+        };
+        let (account, price, tracked_qty, generation) = {
+            let Some(entry) = self.orders.get(&order_id) else {
+                return Ok(untracked);
             };
-            // The counters read guard is dropped above, before the orders
-            // shard is taken again below.
-            if overflowed {
-                self.revert_quantity_update(order_id, account, old_remaining, new_remaining);
+            (
+                entry.account,
+                entry.price,
+                entry.remaining_qty,
+                entry.generation,
+            )
+        };
+        let mut reservation = QuantityReservation {
+            order_id,
+            account,
+            price,
+            generation,
+            tracked: true,
+            reserved_qty: 0,
+        };
+        let Some(increase) = projected_remaining
+            .checked_sub(tracked_qty)
+            .filter(|increase| *increase > 0)
+        else {
+            return Ok(reservation);
+        };
+        let Some(counters) = self.counters.get(&account) else {
+            // Tracked entry without counters cannot happen through the
+            // hooks; there is nothing to reserve against.
+            return Ok(reservation);
+        };
+        let delta = checked_notional(increase, price);
+        match delta.map(|delta| checked_add_u128(&counters.resting_notional, delta)) {
+            Some(Ok(_)) => {
+                reservation.reserved_qty = increase;
+                Ok(reservation)
             }
-        } else if let Some(decrease) = old_remaining.checked_sub(new_remaining) {
-            self.release(
-                order_id,
+            Some(Err(current)) => Err(notional_rejection(cfg, account, current, delta)),
+            None => Err(notional_rejection(
+                cfg,
                 account,
-                checked_notional(decrease, entry_price),
-                false,
-            );
+                counters.resting_notional.load(),
+                None,
+            )),
         }
     }
 
-    /// Cold path of [`Self::on_quantity_update`]: restore the entry's
-    /// previous quantity (only if nothing changed it since) and report.
+    /// Settle a [`QuantityReservation`] once the price level applied the
+    /// update: set the entry's remaining quantity to `actual_remaining`
+    /// (the level's post-update total) and adjust the account's notional
+    /// from what is booked (the entry's current remainder plus the
+    /// reservation) to exactly `actual_remaining × price`.
+    ///
+    /// The adjustment is normally a release (or nothing). An extra
+    /// increment is only needed if the level stored more than was
+    /// reserved, e.g. a fill raced in between; if that increment would
+    /// overflow, the entry keeps the booked quantity and the anomaly is
+    /// logged at `ERROR` and counted, so later releases stay within what
+    /// the counter holds.
+    pub(super) fn commit_quantity_update(
+        &self,
+        reservation: QuantityReservation,
+        actual_remaining: u64,
+    ) {
+        if !reservation.tracked {
+            return;
+        }
+        let QuantityReservation {
+            order_id,
+            account,
+            price,
+            reserved_qty,
+            generation,
+            ..
+        } = reservation;
+        let current = {
+            let entry = self
+                .orders
+                .get_mut(&order_id)
+                .filter(|entry| entry.generation == generation);
+            let Some(mut entry) = entry else {
+                // The order left the risk map in between (cancelled or
+                // fully filled): its release did not include the
+                // reservation, so give the reservation back.
+                self.rollback_quantity_update(reservation);
+                return;
+            };
+            let current = entry.remaining_qty;
+            entry.remaining_qty = actual_remaining;
+            current
+        };
+        // Booked for this order: `current + reserved_qty`. Target:
+        // `actual_remaining`. Settle the difference.
+        let booked = current.checked_add(reserved_qty);
+        match booked.map(|booked| (actual_remaining.checked_sub(booked), booked)) {
+            Some((Some(extra), booked)) if extra > 0 => {
+                let added = self.counters.get(&account).is_none_or(|counters| {
+                    checked_notional(extra, price).is_some_and(|delta| {
+                        checked_add_u128(&counters.resting_notional, delta).is_ok()
+                    })
+                });
+                if !added {
+                    self.keep_booked_quantity(order_id, account, actual_remaining, booked);
+                }
+            }
+            Some((None, booked)) => {
+                if let Some(surplus) = booked.checked_sub(actual_remaining) {
+                    self.release(order_id, account, checked_notional(surplus, price), false);
+                }
+            }
+            Some((Some(_), _)) => {}
+            // Unreachable: fills only lower `current`, so
+            // `current + reserved_qty <= projected_remaining <= u64::MAX`.
+            // Give the reservation back and report it.
+            None => {
+                self.rollback_quantity_update(reservation);
+                self.keep_booked_quantity(order_id, account, actual_remaining, current);
+            }
+        }
+    }
+
+    /// Release a [`QuantityReservation`] whose level update did not
+    /// happen (rejected, absent order, or error).
+    pub(super) fn rollback_quantity_update(&self, reservation: QuantityReservation) {
+        if !reservation.tracked || reservation.reserved_qty == 0 {
+            return;
+        }
+        self.release(
+            reservation.order_id,
+            reservation.account,
+            checked_notional(reservation.reserved_qty, reservation.price),
+            false,
+        );
+        // The order may have left the book in between; its cancel could
+        // not evict the account while the reservation was still booked.
+        self.evict_if_zeroed(reservation.account);
+    }
+
+    /// Cold path of [`Self::commit_quantity_update`]: the extra increment
+    /// would overflow, so track the quantity that is actually booked.
     #[cold]
     #[inline(never)]
-    fn revert_quantity_update(
+    fn keep_booked_quantity(
         &self,
         order_id: Id,
         account: Hash32,
-        old_remaining: u64,
-        new_remaining: u64,
+        actual_remaining: u64,
+        booked: u64,
     ) {
         if let Some(mut entry) = self.orders.get_mut(&order_id)
-            && entry.remaining_qty == new_remaining
+            && entry.remaining_qty == actual_remaining
         {
-            entry.remaining_qty = old_remaining;
+            entry.remaining_qty = booked;
         }
         self.count_anomaly();
         error!(
             order_id = %order_id,
             account = %account,
-            old_remaining,
-            new_remaining,
-            "risk: quantity increase would overflow the account's resting notional; risk tracking keeps the previous quantity"
+            booked,
+            "risk: settling a quantity update would overflow the account's resting notional; risk tracking keeps the booked quantity"
         );
     }
 
@@ -1146,6 +1379,20 @@ impl RiskState {
         // `release` dropped its read guard before the write guard in
         // `evict_if_zeroed` — same non-reentrant shard, must not overlap.
         self.evict_if_zeroed(entry.account);
+    }
+
+    /// Hook when the matcher removes a maker from its level (#243 review).
+    ///
+    /// For a normally exhausted maker [`Self::on_fill`] already removed
+    /// the entry and this is a no-op. A non-auto-replenishing reserve
+    /// maker is removed when its visible tranche is exhausted, discarding
+    /// its hidden tranche without a trade (#230); the fills released only
+    /// the visible quantity, so the discarded remainder is released here,
+    /// exactly like a cancel. Without this the discarded quantity stayed
+    /// booked forever and counted against the account's limits.
+    #[inline]
+    pub(super) fn on_maker_removed(&self, maker_id: Id) {
+        self.on_cancel(maker_id);
     }
 
     /// Install the per-order entries and per-account counters computed
@@ -1233,7 +1480,7 @@ mod tests {
                 thread::spawn(move || {
                     barrier.wait();
                     if state.check_limit_admission(acct, 100, 1, Some(100)).is_ok() {
-                        state
+                        let _ = state
                             .on_admission(Id::from_u64(i as u64), acct, 100, 1)
                             .expect("admission");
                         1u64
@@ -1279,7 +1526,7 @@ mod tests {
         let acct = account(9);
         // Pre-admit ORDERS resting orders (open_count == ORDERS).
         for i in 0..ORDERS {
-            state
+            let _ = state
                 .on_admission(Id::from_u64(i), acct, 100, 10)
                 .expect("admission");
         }
@@ -1354,7 +1601,7 @@ mod tests {
         assert!(state.check_market_admission(acct).is_ok());
 
         // Hooks are no-ops.
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 10)
             .expect("admission");
         state.on_fill(order_id, 5, 100);
@@ -1376,7 +1623,7 @@ mod tests {
 
         let acct = account(2);
         let order_id = new_id();
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 10)
             .expect("admission");
 
@@ -1407,7 +1654,7 @@ mod tests {
 
         let acct = account(4);
         let order_id = new_id();
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 10)
             .expect("admission");
 
@@ -1431,7 +1678,7 @@ mod tests {
         let acct = account(5);
         let order_id = new_id();
         // Admit 10 @ 100 → resting_notional 1_000.
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 10)
             .expect("admission");
         assert_eq!(
@@ -1486,7 +1733,7 @@ mod tests {
             let mut state = RiskState::new();
             state.set_config(RiskConfig::new().with_max_open_orders_per_account(10_000));
             // Pre-admit A so the account sits at open_count == 1.
-            state.on_admission(a, acct, 100, 1).expect("admission");
+            let _ = state.on_admission(a, acct, 100, 1).expect("admission");
             let state = Arc::new(state);
             let barrier = Arc::new(Barrier::new(2));
 
@@ -1498,7 +1745,7 @@ mod tests {
             let (s2, b2) = (Arc::clone(&state), Arc::clone(&barrier));
             let t2 = thread::spawn(move || {
                 b2.wait();
-                s2.on_admission(b, acct, 100, 1).expect("admission"); // concurrent admission of B
+                let _ = s2.on_admission(b, acct, 100, 1).expect("admission"); // concurrent admission of B
             });
             t1.join().expect("fill thread");
             t2.join().expect("admission thread");
@@ -1543,7 +1790,7 @@ mod tests {
 
         let acct = account(3);
         let order_id = new_id();
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 10)
             .expect("admission");
 
@@ -1578,8 +1825,8 @@ mod tests {
         // Two resting orders for the account. Fully filling one decrements
         // open_count by exactly one; the entry is retained because the
         // account still has a resting order (eviction needs both counters at 0).
-        state.on_admission(keep, acct, 100, 10).expect("admission");
-        state.on_admission(fill, acct, 100, 10).expect("admission");
+        let _ = state.on_admission(keep, acct, 100, 10).expect("admission");
+        let _ = state.on_admission(fill, acct, 100, 10).expect("admission");
 
         state.on_fill(fill, 10, 100);
 
@@ -1599,10 +1846,10 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(2));
 
         let acct = account(5);
-        state
+        let _ = state
             .on_admission(new_id(), acct, 100, 1)
             .expect("admission");
-        state
+        let _ = state
             .on_admission(new_id(), acct, 100, 1)
             .expect("admission");
 
@@ -1630,7 +1877,7 @@ mod tests {
 
         let acct = account(6);
         // Pre-load 800 of notional.
-        state
+        let _ = state
             .on_admission(new_id(), acct, 100, 8)
             .expect("admission");
 
@@ -1780,7 +2027,7 @@ mod tests {
 
         let acct = account(11);
         let order_id = new_id();
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 10)
             .expect("admission");
 
@@ -1809,7 +2056,7 @@ mod tests {
 
         let acct = account(12);
         let order_id = new_id();
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 5)
             .expect("admission");
 
@@ -1838,7 +2085,7 @@ mod tests {
 
         let acct = account(13);
         let order_id = new_id();
-        state
+        let _ = state
             .on_admission(order_id, acct, 100, 5)
             .expect("admission");
         state.on_fill(order_id, 5, 100); // entry removed, counters evicted at 0
@@ -1876,7 +2123,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(1));
         let acct = account(20);
         let id = new_id();
-        state.on_admission(id, acct, 100, 10).expect("admission"); // account at the limit
+        let _ = state.on_admission(id, acct, 100, 10).expect("admission"); // account at the limit
 
         assert!(
             state
@@ -1893,7 +2140,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000));
         let acct = account(21);
         let id = new_id();
-        state.on_admission(id, acct, 100, 8).expect("admission"); // resting_notional = 800
+        let _ = state.on_admission(id, acct, 100, 8).expect("admission"); // resting_notional = 800
 
         // Modify to 100*9 = 900 projects to 800 - 800 + 900 = 900 ≤ 1_000.
         assert!(
@@ -1928,7 +2175,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000));
         let acct = account(22);
         let id = new_id();
-        state.on_admission(id, acct, 100, 10).expect("admission"); // resting_notional = 1_000 (at ceiling)
+        let _ = state.on_admission(id, acct, 100, 10).expect("admission"); // resting_notional = 1_000 (at ceiling)
 
         // Re-price to the same notional: 1_000 - 1_000 + 1_000 = 1_000 ≤ 1_000.
         assert!(
@@ -1947,7 +2194,7 @@ mod tests {
         );
         let acct = account(23);
         let id = new_id();
-        state
+        let _ = state
             .on_admission(id, acct, 1_000_000, 1)
             .expect("admission");
 
@@ -1986,7 +2233,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(1));
         let acct = account(24);
         // One OTHER tracked resting order already at the limit.
-        state
+        let _ = state
             .on_admission(new_id(), acct, 100, 10)
             .expect("admission");
 
@@ -2029,7 +2276,7 @@ mod tests {
         state
             .check_limit_admission(acct, HALF_PLUS_ONE, 1, None)
             .expect("first order fits");
-        state
+        let _ = state
             .on_admission(new_id(), acct, HALF_PLUS_ONE, 1)
             .expect("first reservation fits");
 
@@ -2084,7 +2331,7 @@ mod tests {
         assert!(state.counters.is_empty(), "failed first reservation evicts");
 
         // Sum overflow across two orders.
-        state
+        let _ = state
             .on_admission(new_id(), acct, HALF_PLUS_ONE, 1)
             .expect("first order fits");
         assert!(matches!(
@@ -2100,7 +2347,7 @@ mod tests {
         // rejection.
         state.set_config(RiskConfig::new().with_max_notional_per_account(u128::MAX));
         let acct = account(42);
-        state
+        let _ = state
             .on_admission(new_id(), acct, 1, 1)
             .expect("seed the account");
         if let Some(c) = state.counters.get(&acct) {
@@ -2215,10 +2462,10 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
         let acct = account(44);
         let id = new_id();
-        state
+        let _ = state
             .on_admission(id, acct, HALF_PLUS_ONE, 1)
             .expect("original");
-        state
+        let _ = state
             .on_admission(new_id(), acct, HALF_PLUS_ONE - 1, 1)
             .expect("second order, sum = u128::MAX");
         // Doubling the first order's quantity overflows the projection
@@ -2245,7 +2492,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000_000));
         let acct = account(45);
         let id = new_id();
-        state.on_admission(id, acct, 100, 10).expect("admission");
+        let _ = state.on_admission(id, acct, 100, 10).expect("admission");
 
         // Simulate a prior double release: the counter holds less than the
         // entry's booked contribution (1_000).
@@ -2273,7 +2520,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
         let acct = account(46);
         let id = new_id();
-        state.on_admission(id, acct, 100, 1).expect("admission");
+        let _ = state.on_admission(id, acct, 100, 1).expect("admission");
         if let Some(c) = state.counters.get(&acct) {
             c.open_count.store(0, Ordering::Relaxed);
         }
@@ -2284,25 +2531,178 @@ mod tests {
     }
 
     #[test]
-    fn test_quantity_increase_overflow_reverts_tracking_issue_243() {
+    fn test_quantity_increase_overflow_is_rejected_before_the_level_changes_issue_243() {
+        // Review: the increase is reserved BEFORE the level mutates, so an
+        // overflow is a typed rejection with nothing changed, not a
+        // post-commit revert that leaves book and risk diverged.
         let mut state = RiskState::new();
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
         let acct = account(47);
         let id = new_id();
-        state.on_admission(id, acct, 100, 1).expect("admission");
+        let _ = state.on_admission(id, acct, 100, 1).expect("admission");
         // Another admission raced the counter close to the ceiling.
         if let Some(c) = state.counters.get(&acct) {
             c.resting_notional.store(u128::MAX - 50);
         }
-        state.on_quantity_update(id, 2); // +100 would overflow
-
-        assert_eq!(state.accounting_anomalies(), 1);
+        assert!(matches!(
+            state.reserve_quantity_update(id, 2), // +100 would overflow
+            Err(OrderBookError::RiskMaxNotional { .. })
+        ));
         assert_eq!(notional_of(&state, acct), u128::MAX - 50, "no wrap");
+        assert_eq!(state.orders.get(&id).map(|e| e.remaining_qty), Some(1));
         assert_eq!(
-            state.orders.get(&id).map(|e| e.remaining_qty),
-            Some(1),
-            "tracking keeps the previous quantity"
+            state.accounting_anomalies(),
+            0,
+            "a rejection, not an anomaly"
         );
+    }
+
+    #[test]
+    fn test_quantity_reservation_commit_and_rollback_settle_exactly_issue_243() {
+        let mut state = RiskState::new();
+        state.set_config(RiskConfig::new().with_max_notional_per_account(1_000_000));
+        let acct = account(52);
+        let id = new_id();
+        let _ = state.on_admission(id, acct, 100, 10).expect("admission");
+
+        // Increase 10 → 15, level applies it: +500 exactly.
+        let r = state.reserve_quantity_update(id, 15).expect("reserve");
+        assert_eq!(notional_of(&state, acct), 1_500, "pre-booked");
+        state.commit_quantity_update(r, 15);
+        assert_eq!(notional_of(&state, acct), 1_500);
+        assert_eq!(state.orders.get(&id).map(|e| e.remaining_qty), Some(15));
+
+        // Increase 15 → 20, level refuses: the reservation is given back.
+        let r = state.reserve_quantity_update(id, 20).expect("reserve");
+        assert_eq!(notional_of(&state, acct), 2_000);
+        state.rollback_quantity_update(r);
+        assert_eq!(notional_of(&state, acct), 1_500);
+        assert_eq!(state.orders.get(&id).map(|e| e.remaining_qty), Some(15));
+
+        // Decrease 15 → 4 reserves nothing and releases on commit.
+        let r = state.reserve_quantity_update(id, 4).expect("reserve");
+        assert_eq!(notional_of(&state, acct), 1_500);
+        state.commit_quantity_update(r, 4);
+        assert_eq!(notional_of(&state, acct), 400);
+
+        // A fill races between reserve and commit (4 → 1 via 3 filled);
+        // the level then stores the new total 8: settle to 8 × 100.
+        let r = state.reserve_quantity_update(id, 8).expect("reserve");
+        state.on_fill(id, 3, 100);
+        state.commit_quantity_update(r, 8);
+        assert_eq!(notional_of(&state, acct), 800);
+        assert_eq!(state.orders.get(&id).map(|e| e.remaining_qty), Some(8));
+
+        // The order leaves between reserve and commit: reservation returned.
+        let r = state.reserve_quantity_update(id, 12).expect("reserve");
+        state.on_cancel(id);
+        state.commit_quantity_update(r, 12);
+        assert!(state.counters.get(&acct).is_none(), "fully released");
+        assert_eq!(state.accounting_anomalies(), 0);
+    }
+
+    #[test]
+    fn test_admission_rejects_tracked_id_without_touching_counters_issue_243() {
+        let mut state = RiskState::new();
+        state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
+        let acct = account(53);
+        let id = new_id();
+        let winner = state.on_admission(id, acct, 100, 10).expect("winner");
+        assert!(matches!(
+            state.on_admission(id, account(54), 200, 5),
+            Err(OrderBookError::DuplicateOrderId { order_id }) if order_id == id
+        ));
+        // Winner's entry and counters untouched; the loser left nothing.
+        assert_eq!(state.orders.get(&id).map(|e| e.account), Some(acct));
+        assert_eq!(open_count_of(&state, acct), 1);
+        assert_eq!(notional_of(&state, acct), 1_000);
+        assert!(state.counters.get(&account(54)).is_none());
+
+        // A stale token for the same id (different generation) cannot
+        // release the winner's entry.
+        let stale = RiskReservation {
+            order_id: id,
+            generation: winner.generation + 1,
+        };
+        state.release_reservation(stale);
+        assert!(state.orders.contains_key(&id));
+        assert_eq!(open_count_of(&state, acct), 1);
+
+        // The winner's own token releases exactly its contribution.
+        state.release_reservation(winner);
+        assert!(state.orders.is_empty());
+        assert!(state.counters.is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_same_id_admission_keeps_winner_tracked_issue_243() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const ROUNDS: u64 = 200;
+
+        let mut state = RiskState::new();
+        state.set_config(RiskConfig::new().with_max_open_orders_per_account(u64::MAX));
+        let state = Arc::new(state);
+        let acct = account(55);
+
+        for round in 0..ROUNDS {
+            let id = Id::from_u64(round);
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        match state.on_admission(id, acct, 100, 1) {
+                            Ok(token) => Some(token),
+                            Err(OrderBookError::DuplicateOrderId { .. }) => None,
+                            Err(other) => panic!("unexpected error {other:?}"),
+                        }
+                    })
+                })
+                .collect();
+            let winners: Vec<RiskReservation> = handles
+                .into_iter()
+                .filter_map(|h| h.join().expect("admission thread"))
+                .collect();
+            assert_eq!(winners.len(), 1, "round {round}: exactly one winner");
+            assert!(
+                state.orders.contains_key(&id),
+                "round {round}: winner tracked"
+            );
+        }
+        // Every round left exactly one tracked order and one count each.
+        assert_eq!(open_count_of(&state, acct), ROUNDS);
+        assert_eq!(notional_of(&state, acct), u128::from(ROUNDS) * 100);
+        assert_eq!(state.accounting_anomalies(), 0);
+    }
+
+    #[test]
+    fn test_on_maker_removed_releases_discarded_remainder_issue_243() {
+        // A non-auto reserve maker tracked at visible + hidden = 15 is
+        // removed after its visible 5 fill: the discarded hidden 10 must be
+        // released, not stay booked.
+        let mut state = RiskState::new();
+        state.set_config(RiskConfig::new().with_max_open_orders_per_account(1));
+        let acct = account(56);
+        let id = new_id();
+        let _ = state.on_admission(id, acct, 100, 15).expect("admission");
+        state.on_fill(id, 5, 100);
+        assert_eq!(notional_of(&state, acct), 1_000, "hidden still booked");
+        state.on_maker_removed(id);
+        assert!(state.counters.is_empty(), "discarded remainder released");
+        assert!(state.orders.is_empty());
+        assert_eq!(state.accounting_anomalies(), 0);
+        // A normally exhausted maker: no-op after on_fill.
+        let other = new_id();
+        let _ = state.on_admission(other, acct, 100, 2).expect("admission");
+        state.on_fill(other, 2, 100);
+        state.on_maker_removed(other);
+        assert!(state.counters.is_empty());
+        assert_eq!(state.accounting_anomalies(), 0);
     }
 
     #[test]
@@ -2313,7 +2713,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000_000));
         let acct = account(48);
         let id = new_id();
-        state.on_admission(id, acct, 100, 10).expect("admission");
+        let _ = state.on_admission(id, acct, 100, 10).expect("admission");
         state.on_fill(id, 4, 250);
         assert_eq!(notional_of(&state, acct), 600);
         assert_eq!(state.accounting_anomalies(), 0);
@@ -2345,7 +2745,7 @@ mod tests {
                     barrier.wait();
                     for i in 0..ORDERS_PER_THREAD {
                         let id = Id::from_u64(t * ORDERS_PER_THREAD + i);
-                        state.on_admission(id, acct, PRICE, QTY).expect("admission");
+                        let _ = state.on_admission(id, acct, PRICE, QTY).expect("admission");
                     }
                 })
             })

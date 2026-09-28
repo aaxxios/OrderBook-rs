@@ -699,6 +699,14 @@ where
                             projected.total_quantity(),
                         )?;
 
+                        // #243 review: pre-book an increase's notional
+                        // BEFORE the level commits the larger quantity, so
+                        // no risk failure path remains after the level
+                        // mutation. Settled below once the level answers.
+                        let risk_reservation = self
+                            .risk_state
+                            .reserve_quantity_update(order_id, projected.total_quantity())?;
+
                         let update = OrderUpdate::UpdateQuantity {
                             order_id,
                             new_quantity,
@@ -711,8 +719,8 @@ where
                             Ok(Some(order)) => {
                                 // Keep the per-account risk counters in
                                 // lockstep with the applied update.
-                                self.risk_state.on_quantity_update(
-                                    order_id,
+                                self.risk_state.commit_quantity_update(
+                                    risk_reservation,
                                     OrderQuantity::<()>::total_quantity(order.as_ref()),
                                 );
                                 // notify price level changes
@@ -727,8 +735,11 @@ where
                                 }
                                 result = Some(Arc::new(self.convert_from_unit_type(&order)));
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                self.risk_state.rollback_quantity_update(risk_reservation);
+                            }
                             Err(err) => {
+                                self.risk_state.rollback_quantity_update(risk_reservation);
                                 return Err(OrderBookError::PriceLevelError(err));
                             }
                         }
@@ -2402,24 +2413,32 @@ where
             // remainder instead of resting it untracked. Checked and
             // all-or-nothing; released below if the placement fails. No-op
             // when no `RiskConfig` is installed.
-            if let Err(err) = self.risk_state.on_admission(
+            let risk_reservation = match self.risk_state.on_admission(
                 order.id(),
                 order.user_id(),
                 price,
                 match_result.remaining_quantity().as_u64(),
             ) {
-                if filled_qty == 0 {
-                    self.reject_with_risk(order.id(), &err);
+                Ok(reservation) => reservation,
+                Err(err) => {
+                    // A same-id order won a concurrent admission race
+                    // (#243 review): the id belongs to that live order, so
+                    // its tracked state must not be clobbered with a
+                    // rejection, mirroring the pre-trade duplicate check.
+                    let duplicate = matches!(err, OrderBookError::DuplicateOrderId { .. });
+                    if filled_qty == 0 && !duplicate {
+                        self.reject_with_risk(order.id(), &err);
+                    }
+                    tracing::error!(
+                        order_id = %order.id(),
+                        price,
+                        executed_quantity = filled_qty,
+                        error = %err,
+                        "risk reservation for the resting remainder failed; remainder not rested"
+                    );
+                    return Err(err);
                 }
-                tracing::error!(
-                    order_id = %order.id(),
-                    price,
-                    executed_quantity = filled_qty,
-                    error = %err,
-                    "risk reservation for the resting remainder failed; remainder not rested"
-                );
-                return Err(err);
-            }
+            };
 
             let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
             let level = price_level.value();
@@ -2438,8 +2457,10 @@ where
                 Ok(admitted) => admitted,
                 Err(err) => {
                     // Release the risk reservation taken above: the
-                    // order does not rest.
-                    self.risk_state.on_cancel(order.id());
+                    // order does not rest. Keyed by the reservation's
+                    // generation, so this can never release a same-id
+                    // order's entry (#243 review).
+                    self.risk_state.release_reservation(risk_reservation);
                     if level.order_count() == 0 {
                         price_levels.remove(&price);
                     }
