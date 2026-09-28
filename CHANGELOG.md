@@ -40,6 +40,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `panic_policy_allowlist.txt`. `check_panic_policy.py` also now denies
   `catch_unwind`, `panic_any` and `resume_unwind` in production (tests may
   still use all three).
+- `OrderBook::risk_accounting_anomalies()` and
+  `RiskState::accounting_anomalies()`, plus the
+  `orderbook_risk_accounting_anomalies_total` counter under the `metrics`
+  feature (#243): the number of pre-trade risk accounting anomalies (a
+  release larger than an account counter, a fill larger than a maker's
+  tracked remainder, a post-trade counter increment that would overflow).
+  Expected to stay at zero; every anomaly is also logged.
+
+### Fixed
+
+- **Pre-trade risk uses checked notional arithmetic (#243).** The
+  per-account `resting_notional` counter was updated with a wrapping
+  `fetch_add` and the notional check used `saturating_*`, so two orders
+  whose notional sum exceeded `u128::MAX` could wrap the counter to a
+  small value and bypass `max_notional_per_account`. Every counter update
+  is now a compare-and-swap loop with `checked_add` / `checked_sub`, and
+  admission is all or nothing: the resting remainder's contribution is
+  reserved before the order is placed on its level and released if the
+  placement fails.
+- **Price band no longer passes at extreme prices (#243).** Both sides of
+  the band comparison saturated to `u128::MAX` at extreme prices and
+  compared equal, so any deviation passed. The comparison is now exact
+  over the whole `u128` domain, with the common path unchanged.
+- **Release-side underflows are visible (#243).** A fill, cancel or
+  quantity decrease that would take a risk counter below zero (a double
+  release) used to floor silently. It still sets the counter to zero, the
+  only value that keeps the account usable, but now logs a `WARN` with the
+  order, account and counter and increments the anomaly count. A fill
+  larger than the tracked remainder releases only the tracked remainder.
+  The maker-price `debug_assert_eq!` in `on_fill` is now a `WARN`.
+- **Risk reservations cannot be released by a same-id loser (#243
+  review).** `on_admission` claims the order id and the counters under the
+  order map's shard lock, rejects an id that is already tracked before
+  touching any counter, and returns a generation-tagged reservation; the
+  cleanup after a failed level placement releases only the entry carrying
+  that generation. Before, a concurrent same-id submission could overwrite
+  the winner's entry and its cleanup then released it, leaving the resting
+  winner untracked.
+- **Discarded reserve remainders are released (#243 review).** A
+  non-auto-replenishing reserve maker removed after its visible tranche is
+  exhausted (#230) kept its discarded hidden quantity booked in the
+  account's risk counters forever (pre-existing on 0.13), counting against
+  `max_open_orders_per_account` and `max_notional_per_account`. The
+  matcher now releases it in the same removal.
+- **Quantity increases reserve risk before the level changes (#243
+  review).** An in-place quantity increase now pre-books its notional
+  before the price level applies it and settles or rolls it back once the
+  level answers, so a risk overflow is a rejection with the order
+  unchanged instead of a divergence between the book and the risk state.
+- **Snapshot restore computes risk aggregates in the prepare phase
+  (#243, prepares #250).** When the package carries a risk config, the
+  per-account open-order counts and resting notional are accumulated with
+  checked arithmetic before any live state changes, so an overflowing
+  package fails with a typed error and leaves the book untouched instead
+  of being clamped in the commit phase.
+
+**Compatibility.** Only books with a `RiskConfig` installed are affected.
+An admission that previously wrapped the notional counter, or passed the
+price band because both sides saturated, is now rejected with the
+existing typed errors (`RiskMaxNotional`, `RiskMaxOpenOrders`,
+`RiskPriceBand`; same `RejectReason` codes). This applies even when the
+corresponding limit is `None`: an exposure the counters cannot represent
+is rejected with `limit = u128::MAX` (or `u64::MAX` for the open-order
+count), and `attempted = u128::MAX` when `price × quantity` itself
+overflows. `restore_from_snapshot_package` / `restore_from_snapshot_json`
+can now return `RiskMaxNotional`, `RiskMaxOpenOrders` or
+`QuantityOverflow` for a package whose risk aggregates overflow. No
+snapshot format change; realistic prices and quantities see no behaviour
+change.
 
 ### Changed
 

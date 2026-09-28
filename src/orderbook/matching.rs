@@ -1274,6 +1274,12 @@ where
                 .map(|trade| trade.quantity().as_u64())
                 .sum();
             filled_orders.push((filled_order_id, filled_quantity));
+            // The maker left its level. `on_fill` above already released a
+            // normally exhausted maker (no-op here); a non-auto-replenishing
+            // reserve maker was removed with its hidden tranche discarded
+            // (#230), and that remainder is released now, in the same
+            // removal, instead of staying booked forever (#243 review).
+            self.risk_state.on_maker_removed(filled_order_id);
         }
 
         // Check if price level is empty and mark for removal

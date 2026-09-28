@@ -169,7 +169,9 @@ pub enum OrderBookError {
     /// Returned by limit-order admission when the requesting account
     /// already has `current` resting orders and the configured ceiling
     /// is `limit`. `current >= limit` always holds when this variant
-    /// is constructed.
+    /// is constructed. When no ceiling is configured, `limit` is
+    /// `u64::MAX` and the rejection means the count is no longer
+    /// representable (#243).
     RiskMaxOpenOrders {
         /// Account that breached the limit.
         account: Hash32,
@@ -182,8 +184,12 @@ pub enum OrderBookError {
     /// Per-account notional limit would be breached by this admission.
     ///
     /// `current + attempted > limit` always holds when this variant
-    /// is constructed. `attempted` is computed as
-    /// `submitted_quantity * submitted_price`.
+    /// is constructed, where an addition that overflows `u128` counts as
+    /// exceeding every limit (#243). `attempted` is computed as
+    /// `submitted_quantity * submitted_price` and is `u128::MAX` when
+    /// that product itself overflows. When no notional ceiling is
+    /// configured, `limit` is `u128::MAX` and the rejection means the
+    /// account's exposure is no longer representable.
     RiskMaxNotional {
         /// Account that breached the limit.
         account: Hash32,

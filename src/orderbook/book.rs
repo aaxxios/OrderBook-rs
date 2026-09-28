@@ -14,7 +14,7 @@ use super::error::OrderBookError;
 use super::fees::FeeSchedule;
 use super::iterators::{LevelInfo, LevelsInRange, LevelsUntilDepth, LevelsWithCumulativeDepth};
 use super::market_impact::{MarketImpact, OrderSimulation};
-use super::risk::{ReferencePriceSource, RiskConfig, RiskState};
+use super::risk::{ReferencePriceSource, RiskConfig, RiskRebuild, RiskState};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
 use crate::orderbook::book_change_event::PriceLevelChangedListener;
@@ -816,6 +816,19 @@ where
     #[must_use]
     pub fn risk_config(&self) -> Option<&RiskConfig> {
         self.risk_state.config()
+    }
+
+    /// Number of pre-trade risk accounting anomalies observed on this
+    /// book (#243): a release larger than an account counter (a double
+    /// release), a fill larger than a maker's tracked remainder, or a
+    /// post-trade counter increment that would overflow. Each one is
+    /// also logged with the order and account involved. Expected to be
+    /// zero; see [`RiskState::accounting_anomalies`]. Not part of the
+    /// snapshot.
+    #[inline]
+    #[must_use]
+    pub fn risk_accounting_anomalies(&self) -> u64 {
+        self.risk_state.accounting_anomalies()
     }
 
     /// Drop the active risk configuration. Counters and per-order risk
@@ -3570,7 +3583,10 @@ where
         // book, indices, risk, config — is touched, so an invalid package
         // leaves the complete pre-restore state intact.
         self.ensure_snapshot_symbol(&snapshot)?;
-        let prepared = Self::prepare_snapshot_levels(snapshot)?;
+        // #243: when a risk config is restored, the per-account risk
+        // aggregates are computed (checked) here too, so an overflowing
+        // snapshot is a typed error before any live state is touched.
+        let prepared = Self::prepare_snapshot_levels(snapshot, risk_config.is_some())?;
 
         // ---- Point of no return: everything below is infallible. ----
 
@@ -3578,9 +3594,9 @@ where
         // install only when a config was snapshotted, otherwise
         // explicitly disable risk so a `risk_config()` call post-restore
         // returns `None` rather than `Some(empty)`. Entries and counters
-        // are cleared here and rebuilt during the commit walk below
-        // (`rebuild_risk = true`), which registers every restored resting
-        // order exactly like the live admission path.
+        // are cleared here and replaced during the commit below by the
+        // aggregates the prepare phase computed from every restored
+        // resting order (#243).
         if let Some(risk_config) = risk_config {
             self.risk_state.set_config(risk_config);
         } else {
@@ -3588,7 +3604,7 @@ where
         }
         self.risk_state.clear();
 
-        self.commit_restored_levels(&prepared, true);
+        self.commit_restored_levels(&prepared);
 
         // Apply configuration that was captured in the package.
         self.fee_schedule = fee_schedule;
@@ -3682,7 +3698,7 @@ where
     /// acquisition deadlocks.
     pub fn restore_from_snapshot(&self, snapshot: OrderBookSnapshot) -> Result<(), OrderBookError> {
         self.ensure_snapshot_symbol(&snapshot)?;
-        let prepared = Self::prepare_snapshot_levels(snapshot)?;
+        let prepared = Self::prepare_snapshot_levels(snapshot, false)?;
         // #225: a live restore replaces every level and rebuilds the
         // `order_locations` / `user_orders` indices, so it must exclude
         // every in-flight submit, cancel and modify exactly like a
@@ -3691,7 +3707,7 @@ where
         // needs the exclusive side. `commit_restored_levels` acquires
         // nothing itself, so this is the single acquisition.
         let _gate = self.submit_gate_write();
-        self.commit_restored_levels(&prepared, false);
+        self.commit_restored_levels(&prepared);
         Ok(())
     }
 
@@ -3715,8 +3731,15 @@ where
     /// returned sorted ascending by price so the commit phase's index
     /// rebuild keeps the deterministic price-then-insertion-sequence
     /// traversal (#192).
+    ///
+    /// When `rebuild_risk` is set (the package-restore path with a risk
+    /// config), the per-account risk aggregates are also accumulated here
+    /// with checked arithmetic (#243), so a snapshot whose open-order
+    /// count, remaining quantity or resting notional is not representable
+    /// fails with a typed error instead of being clamped in the commit.
     fn prepare_snapshot_levels(
         snapshot: OrderBookSnapshot,
+        rebuild_risk: bool,
     ) -> Result<PreparedSnapshotLevels, OrderBookError> {
         let convert = |levels: Vec<pricelevel::PriceLevelSnapshot>,
                        side: &str|
@@ -3767,6 +3790,7 @@ where
         let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
         let mut orders: Vec<(u128, Side, Arc<OrderType<()>>)> = Vec::new();
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
+        let mut risk = rebuild_risk.then(RiskRebuild::default);
         let sides = bids
             .iter()
             .map(|entry| (entry, Side::Buy))
@@ -3784,6 +3808,14 @@ where
                     return Err(OrderBookError::DuplicateOrderId {
                         order_id: order.id(),
                     });
+                }
+                if let Some(risk) = risk.as_mut() {
+                    let visible = order.visible_quantity().as_u64();
+                    let hidden = order.hidden_quantity().as_u64();
+                    let remaining_qty = visible
+                        .checked_add(hidden)
+                        .ok_or(OrderBookError::QuantityOverflow { visible, hidden })?;
+                    risk.accumulate(order.id(), order.user_id(), *price, remaining_qty)?;
                 }
                 // #230: a legacy package can carry the one two-tranche shape
                 // `pricelevel` cannot execute — a non-auto-replenishing
@@ -3803,15 +3835,21 @@ where
             }
         }
 
-        Ok(PreparedSnapshotLevels { bids, asks, orders })
+        Ok(PreparedSnapshotLevels {
+            bids,
+            asks,
+            orders,
+            risk,
+        })
     }
 
     /// Infallible commit phase of a snapshot restore (#207): clears the
     /// live book and installs the pre-validated levels, then rebuilds the
     /// `order_locations` and `user_orders` indices, the special-order
-    /// tracker (under `special_orders`), and — when `rebuild_risk` is set
-    /// (the package-restore path) — the per-account risk entries via
-    /// [`RiskState::on_admission`]-equivalent registration.
+    /// tracker (under `special_orders`), and — when the prepare phase
+    /// computed risk aggregates (the package-restore path with a risk
+    /// config) — the per-account risk entries and counters, installed in
+    /// one shot from the checked [`RiskRebuild`] (#243).
     ///
     /// The index rebuild runs in one fixed, replay-stable pass: bids
     /// ascending price then asks ascending price (the prepared vectors are
@@ -3828,7 +3866,7 @@ where
     /// per-user `Vec` order is consumed by `cancel_orders_by_user`, needs
     /// the fixed traversal. Every level read happened in the prepare phase,
     /// so no fallible pricelevel call remains here.
-    fn commit_restored_levels(&self, prepared: &PreparedSnapshotLevels, rebuild_risk: bool) {
+    fn commit_restored_levels(&self, prepared: &PreparedSnapshotLevels) {
         self.cache.invalidate();
 
         // Clear all existing data
@@ -3876,17 +3914,11 @@ where
             self.note_rested_order(order.as_ref());
             #[cfg(feature = "special_orders")]
             self.reregister_special_order(order.as_ref());
-            if rebuild_risk {
-                // Same per-order registration the live admission
-                // path uses; keeps the saturating remaining-qty
-                // semantics of the previous snapshot-based rebuild.
-                let remaining_qty = order
-                    .visible_quantity()
-                    .as_u64()
-                    .saturating_add(order.hidden_quantity().as_u64());
-                self.risk_state
-                    .on_admission(order.id(), order.user_id(), price, remaining_qty);
-            }
+        }
+        // #243: the risk aggregates were accumulated with checked
+        // arithmetic in the prepare phase; installing them cannot fail.
+        if let Some(risk) = prepared.risk.as_ref() {
+            self.risk_state.install_rebuild(risk);
         }
     }
 
@@ -4818,6 +4850,10 @@ struct PreparedSnapshotLevels {
     /// fallible prepare phase so the commit phase performs no fallible
     /// level read.
     orders: Vec<(u128, Side, Arc<OrderType<()>>)>,
+    /// Checked per-account risk aggregates for the restored resting
+    /// orders (#243); `Some` only on the package-restore path with a risk
+    /// config.
+    risk: Option<RiskRebuild>,
 }
 
 /// Guard over the submit gate (#209 / #225) in either mode — held for the

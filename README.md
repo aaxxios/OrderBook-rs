@@ -72,6 +72,12 @@ This order book engine is built with the following design principles:
   are bounded by the input length, and payloads over `DEFAULT_MAX_BINCODE_PAYLOAD_BYTES` (8 MiB,
   configurable via `BincodeEventSerializer::with_max_payload_bytes`) are
   rejected with `SerializationError::PayloadTooLarge`.
+- Pre-trade risk uses checked notional arithmetic (#243): two orders whose
+  notional sum overflows `u128` can no longer wrap the account counter and
+  bypass `max_notional_per_account`, and the price band no longer passes
+  at extreme prices. Such admissions are now rejected with the existing
+  typed risk errors. Release-side underflows are logged and counted in
+  `OrderBook::risk_accounting_anomalies`.
 
 #### Migration from 0.13
 
