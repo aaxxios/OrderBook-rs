@@ -18,7 +18,9 @@ use orderbook_rs::Id;
 use orderbook_rs::Side;
 use std::time::Instant;
 
-use crate::adapter::{add_limit_order, cancel_order, new_book, submit_market_order};
+use crate::adapter::{
+    add_limit_order_with_user, cancel_order, new_book, owner, submit_market_order_with_user,
+};
 use crate::rng::Rng;
 
 const BATCH: u64 = 32;
@@ -47,7 +49,8 @@ fn record_batch<F: FnMut(u64)>(h: &mut Histogram<u64>, k: u64, mut f: F) {
 }
 
 /// Pure passive limit-order entry, no crossings. Mirrors
-/// `benches/order_book/add_only_hdr.rs`.
+/// `benches/order_book/add_only_hdr.rs`'s `submit_gtc` shape exactly,
+/// including the `user_id` every seed/measured op carries there.
 pub fn add_only(warmup_ops: u64, measured_ops: u64) -> Histogram<u64> {
     let book = new_book("BENCH");
     let mut rng = Rng::new(0xA5A5_A5A5_A5A5_A5A5);
@@ -63,6 +66,14 @@ pub fn add_only(warmup_ops: u64, measured_ops: u64) -> Histogram<u64> {
     hist
 }
 
+/// Owner pool mirroring `hdr_common::OWNERS` / `pick_owner` — every
+/// submit/cancel below picks one of these, never the userless path.
+const OWNERS: u8 = 4;
+
+fn pick_owner(rng: &mut Rng) -> pricelevel::Hash32 {
+    owner(((rng.next() % OWNERS as u64) as u8) + 1)
+}
+
 fn submit_one(book: &crate::adapter::Book, rng: &mut Rng, id: u64) {
     let price = rng.range(99, 101) as u128;
     let qty = rng.range(1, 100);
@@ -71,12 +82,15 @@ fn submit_one(book: &crate::adapter::Book, rng: &mut Rng, id: u64) {
     } else {
         Side::Sell
     };
-    add_limit_order(book, Id::from_u64(id), price, qty, side);
+    add_limit_order_with_user(book, Id::from_u64(id), price, qty, side, pick_owner(rng));
 }
 
 /// Pre-loaded book, sequential cancels. Mirrors
 /// `benches/order_book/cancel_only_hdr.rs`; batched per issue #258 (a
-/// single cancel here is at or below the host clock tick).
+/// single cancel here is at or below the host clock tick). The preload
+/// uses the same user-bearing `submit_one` as `add_only` so this
+/// scenario cancels against the same book/index shape
+/// `cancel_only_hdr` does, not a userless one (#258 PR review).
 pub fn cancel_only(preload_ops: u64) -> Histogram<u64> {
     let book = new_book("BENCH");
     let mut rng = Rng::new(0xA5A5_A5A5_A5A5_A5A5);
@@ -99,7 +113,8 @@ pub fn cancel_only(preload_ops: u64) -> Histogram<u64> {
 }
 
 /// Taker market orders sweep a multi-level book. Mirrors
-/// `benches/order_book/aggressive_walk_hdr.rs`; batched per issue #258.
+/// `benches/order_book/aggressive_walk_hdr.rs`, including its distinct
+/// maker/taker owners.
 pub fn aggressive_walk(
     resting_per_level: u64,
     num_levels: u64,
@@ -108,17 +123,20 @@ pub fn aggressive_walk(
     let book = new_book("BENCH");
     let mut rng = Rng::new(0xA5A5_A5A5_A5A5_A5A5);
     let mut hist = new_histogram();
+    let maker = owner(0xAA);
+    let taker = owner(0xBB);
 
     let mut next_id = 1u64;
     for level in 0..num_levels {
         let price = (100 + level) as u128;
         for _ in 0..resting_per_level {
-            add_limit_order(
+            add_limit_order_with_user(
                 &book,
                 Id::from_u64(next_id),
                 price,
                 rng.range(1, 10),
                 Side::Sell,
+                maker,
             );
             next_id += 1;
         }
@@ -130,7 +148,7 @@ pub fn aggressive_walk(
         record_batch(&mut hist, k, |j| {
             let qty = rng.range(5, 20);
             let id = Id::from_u64(next_id + done + j);
-            submit_market_order(&book, id, qty, Side::Buy);
+            submit_market_order_with_user(&book, id, qty, Side::Buy, taker);
         });
         done += k;
     }

@@ -12,10 +12,19 @@
 //! (`create_snapshot` going from a plain return value pre-`v0.14.0` to a
 //! `Result`, or a future `pricelevel::Id` constructor rename) by adding
 //! a diverging match arm here, not by branching inside `workloads.rs`.
+//!
+//! Every scenario submits and cancels with a `user_id` (never the
+//! userless `add_limit_order` / `submit_market_order` paths), matching
+//! the headline `benches/order_book/*_hdr.rs` shape exactly — a PR
+//! review on #258 caught `cancel_only` diverging from
+//! `cancel_only_hdr`'s `submit_gtc` (which always attaches an owner),
+//! which meant this crate was comparing a different book/index shape
+//! than the scenario it claims to mirror.
 
 #[cfg(feature = "head")]
 mod imp {
     use orderbook_rs::{Id, OrderBook, Side, TimeInForce};
+    use pricelevel::Hash32;
 
     pub type Book = OrderBook<()>;
 
@@ -25,8 +34,22 @@ mod imp {
     }
 
     #[inline]
-    pub fn add_limit_order(book: &Book, id: Id, price: u128, qty: u64, side: Side) {
-        let _ = book.add_limit_order(id, price, qty, side, TimeInForce::Gtc, None);
+    pub fn owner(byte: u8) -> Hash32 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        Hash32::new(bytes)
+    }
+
+    #[inline]
+    pub fn add_limit_order_with_user(
+        book: &Book,
+        id: Id,
+        price: u128,
+        qty: u64,
+        side: Side,
+        user: Hash32,
+    ) {
+        let _ = book.add_limit_order_with_user(id, price, qty, side, TimeInForce::Gtc, user, None);
     }
 
     #[inline]
@@ -35,8 +58,8 @@ mod imp {
     }
 
     #[inline]
-    pub fn submit_market_order(book: &Book, id: Id, qty: u64, side: Side) {
-        let _ = book.submit_market_order(id, qty, side);
+    pub fn submit_market_order_with_user(book: &Book, id: Id, qty: u64, side: Side, user: Hash32) {
+        let _ = book.submit_market_order_with_user(id, qty, side, user);
     }
 }
 
@@ -47,6 +70,7 @@ mod imp {
     // divergence is a one-file edit here instead of a rewrite of every
     // call site in `workloads.rs`.
     use orderbook_rs::{Id, OrderBook, Side, TimeInForce};
+    use pricelevel::Hash32;
 
     pub type Book = OrderBook<()>;
 
@@ -56,8 +80,22 @@ mod imp {
     }
 
     #[inline]
-    pub fn add_limit_order(book: &Book, id: Id, price: u128, qty: u64, side: Side) {
-        let _ = book.add_limit_order(id, price, qty, side, TimeInForce::Gtc, None);
+    pub fn owner(byte: u8) -> Hash32 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        Hash32::new(bytes)
+    }
+
+    #[inline]
+    pub fn add_limit_order_with_user(
+        book: &Book,
+        id: Id,
+        price: u128,
+        qty: u64,
+        side: Side,
+        user: Hash32,
+    ) {
+        let _ = book.add_limit_order_with_user(id, price, qty, side, TimeInForce::Gtc, user, None);
     }
 
     #[inline]
@@ -66,8 +104,8 @@ mod imp {
     }
 
     #[inline]
-    pub fn submit_market_order(book: &Book, id: Id, qty: u64, side: Side) {
-        let _ = book.submit_market_order(id, qty, side);
+    pub fn submit_market_order_with_user(book: &Book, id: Id, qty: u64, side: Side, user: Hash32) {
+        let _ = book.submit_market_order_with_user(id, qty, side, user);
     }
 }
 

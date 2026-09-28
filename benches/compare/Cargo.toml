@@ -37,10 +37,19 @@ head = []
 # this whole `benches/compare/` directory into two independent git
 # worktrees, so `../..` always resolves to *that worktree's own*
 # `orderbook-rs` checkout, whatever ref it has checked out. This is
-# what makes "one bench crate, two checkouts" work without needing two
-# different `pricelevel`/`orderbook-rs` versions in the same
-# dependency graph.
+# what makes "one bench crate, two checkouts" work: each side's
+# `orderbook-rs` pulls in whichever `pricelevel` it depends on
+# (`0.9.1` for `v0.13.1`, `0.10` for HEAD), and the version range below
+# is wide enough that Cargo's resolver unifies our own direct
+# `pricelevel` dependency with that same transitive one on both sides,
+# rather than needing two copies of the crate in one dependency graph.
 orderbook-rs = { path = "../.." }
+# `Hash32::new` (needed so every scenario seeds/cancels/matches with a
+# `user_id`, matching the headline `benches/order_book/*_hdr.rs` shape
+# exactly — see `adapter::owner`) is stable across every version this
+# range spans; verified identical in `pricelevel` `0.9.1` and `0.10.0`
+# during the #258 review.
+pricelevel = ">=0.9.0, <0.11.0"
 hdrhistogram = "7.6"
 
 [[bin]]
