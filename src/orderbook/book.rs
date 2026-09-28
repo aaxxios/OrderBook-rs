@@ -18,10 +18,11 @@ use super::risk::{ReferencePriceSource, RiskConfig, RiskRebuild, RiskState};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
 use crate::orderbook::book_change_event::PriceLevelChangedListener;
+use crate::orderbook::matching::MatchOutcome;
 #[cfg(feature = "special_orders")]
 use crate::orderbook::repricing::SpecialOrderTracker;
 use crate::orderbook::stp::STPMode;
-use crate::orderbook::trade::{TradeListener, TradeResult};
+use crate::orderbook::trade::{SubmitFailure, TradeListener, TradeResult};
 use crossbeam::atomic::AtomicCell;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
@@ -29,7 +30,7 @@ use either::Either;
 use pricelevel::OrderUpdate;
 use pricelevel::{
     Hash32, Id, MatchResult, OrderType, PriceLevel, PriceLevelError, PriceLevelSnapshot, Side,
-    UuidGenerator,
+    TakerKind, UuidGenerator,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -160,6 +161,21 @@ pub struct OrderBook<T = ()> {
     /// be admitted while a sweep holds the shared side. The once-per-sweep
     /// read and the per-level captures therefore observe the same set.
     pub(super) strandable_makers_resting: AtomicUsize,
+
+    /// Matching sweeps aborted by a failed price level since the book was
+    /// built (#240). Diagnostic only: not part of the snapshot format.
+    pub(super) match_aborts: AtomicU64,
+
+    /// Price levels whose committed trades could not be folded into the
+    /// taker's result (#240): the only path where the trade stream can
+    /// disagree with the book, risk and order-state streams. Diagnostic
+    /// only: not part of the snapshot format.
+    pub(super) match_fold_failures: AtomicU64,
+
+    /// Latched the first time the book finds its trade-id generator
+    /// exhausted (#240). A latched book cannot trade again until its
+    /// generator is replaced. Not part of the snapshot format.
+    pub(super) trade_ids_exhausted: AtomicBool,
 
     /// The timestamp of market close, if applicable (for DAY orders)
     pub(super) market_close_timestamp: AtomicU64,
@@ -578,6 +594,9 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             strandable_makers_resting: AtomicUsize::new(0),
+            match_aborts: AtomicU64::new(0),
+            match_fold_failures: AtomicU64::new(0),
+            trade_ids_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -659,6 +678,70 @@ where
     /// [`Self::with_clock_and_namespace`] directly.
     pub fn set_trade_id_namespace(&mut self, namespace: Uuid) {
         self.transaction_id_generator = UuidGenerator::new(namespace);
+        // #240: a fresh generator clears a latched exhaustion.
+        *self.trade_ids_exhausted.get_mut() = false;
+    }
+
+    /// Number of matching sweeps this book aborted because a price level
+    /// failed mid-sweep (#240), across every submission path. A growing
+    /// value means the book is running into resource exhaustion (trade-id
+    /// sequence, level counters, allocation); see
+    /// [`OrderBookError::MatchAborted`].
+    #[must_use]
+    #[inline]
+    pub fn match_aborts(&self) -> u64 {
+        self.match_aborts.load(Ordering::Relaxed)
+    }
+
+    /// Number of price levels whose committed trades could not be folded
+    /// into the taker's result (#240). This is the only path on which the
+    /// trade stream (listener / journal) can disagree with the book, risk
+    /// and order-state streams; any non-zero value needs attention. See
+    /// `doc/panic-boundaries.md`.
+    #[must_use]
+    #[inline]
+    pub fn match_fold_failures(&self) -> u64 {
+        self.match_fold_failures.load(Ordering::Relaxed)
+    }
+
+    /// `true` once the book has found its trade-id generator exhausted
+    /// (#240). Latched: every crossing submit is then rejected untouched
+    /// (`RejectReason::CapacityExceeded`) until the generator is replaced
+    /// with [`Self::set_trade_id_namespace`]. The book does not engage the
+    /// kill switch by itself.
+    #[must_use]
+    #[inline]
+    pub fn trade_ids_exhausted(&self) -> bool {
+        self.trade_ids_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Increment a diagnostic counter with checked arithmetic. At `u64::MAX`
+    /// the counter stays put and the refusal is logged.
+    #[inline]
+    pub(super) fn bump_diagnostic_counter(counter: &AtomicU64, name: &'static str) {
+        if counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .is_err()
+        {
+            tracing::warn!(
+                counter = name,
+                "diagnostic counter at u64::MAX; not incremented"
+            );
+        }
+    }
+
+    /// Latch trade-id exhaustion (#240): the first caller logs at `ERROR`
+    /// and bumps the metric; later calls are no-ops.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn latch_trade_ids_exhausted(&self) {
+        if !self.trade_ids_exhausted.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                symbol = %self.symbol,
+                "trade-id generator exhausted: every crossing submit is rejected until the generator is replaced"
+            );
+            crate::orderbook::metrics::record_trade_ids_exhausted();
+        }
     }
 
     /// Access the currently-installed clock.
@@ -1277,6 +1360,9 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             strandable_makers_resting: AtomicUsize::new(0),
+            match_aborts: AtomicU64::new(0),
+            match_fold_failures: AtomicU64::new(0),
+            trade_ids_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1331,6 +1417,9 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             strandable_makers_resting: AtomicUsize::new(0),
+            match_aborts: AtomicU64::new(0),
+            match_fold_failures: AtomicU64::new(0),
+            trade_ids_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -3231,7 +3320,10 @@ where
     /// # Errors
     /// Returns [`OrderBookError::InsufficientLiquidity`] when no liquidity
     /// is available, or [`OrderBookError::SelfTradePrevented`] when STP
-    /// cancels the taker before any fills occur.
+    /// cancels the taker before any fills occur. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a price
+    /// level that reported a failure (#240); the trades committed before it
+    /// have already reached the trade listener, exactly like a partial fill.
     pub fn match_market_order_with_user(
         &self,
         order_id: Id,
@@ -3239,32 +3331,151 @@ where
         side: Side,
         user_id: Hash32,
     ) -> Result<MatchResult, OrderBookError> {
+        self.match_market_order_committed(order_id, quantity, side, user_id, false)
+            .map_err(SubmitFailure::into_error)
+    }
+
+    /// Shared body of the base-quantity market sweep: match, then publish
+    /// the trades (including an aborted sweep's committed prefix, #240).
+    /// `want_committed` builds the committed `TradeResult` for the caller
+    /// even when no trade listener is installed.
+    pub(crate) fn match_market_order_committed(
+        &self,
+        order_id: Id,
+        quantity: u64,
+        side: Side,
+        user_id: Hash32,
+        want_committed: bool,
+    ) -> Result<MatchResult, SubmitFailure> {
         trace!(
             "Order book {}: Matching market order {} for {} at side {:?}",
             self.symbol, order_id, quantity, side
         );
-        let match_result =
-            OrderBook::<T>::match_order_with_user(self, order_id, side, quantity, None, user_id)?;
+        let outcome = {
+            // #209 / #225: same gate as `match_order_with_user`, released
+            // before the trades are published, as before.
+            let _gate = self.acquire_coherent_submit_gate(
+                self.submit_needs_exclusive_gate(false, user_id, false, false),
+            );
+            // #240: under the same gate the sweep holds, before any mutation.
+            self.check_trade_id_headroom(order_id, side, None)?;
+            self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                None,
+                user_id,
+                TakerKind::Standard,
+                0,
+            )?
+        };
+        self.publish_match_outcome(outcome, want_committed)
+    }
 
-        // Emit trade-count metric and trigger trade listener if any
-        // transactions printed. The metric is independent of whether
-        // a listener is configured; the listener emission still gates
-        // on `Some(ref listener)`.
-        let trades_emitted = match_result.trades().len() as u64;
-        if trades_emitted > 0 {
-            super::metrics::record_trades(trades_emitted);
-            if let Some(ref listener) = self.trade_listener {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                listener(&trade_result);
-            }
+    /// Reject a taker untouched when the trade-id generator is exhausted
+    /// and the taker would trade (#240): its sweep could not mint a single
+    /// trade id. A market taker (`limit_price == None`) trades whenever the
+    /// opposite side holds liquidity; a limit taker only when its price
+    /// crosses the best opposite price. Records `Rejected { CapacityExceeded }`
+    /// and latches [`Self::trade_ids_exhausted`].
+    ///
+    /// Callers run it while holding the submit gate the sweep holds, before
+    /// any mutation. It is exact under the exclusive gate (and for a single
+    /// writer). Under the shared gate it is best-effort: pricelevel 0.10
+    /// exposes no public atomic reservation on the generator, so concurrent
+    /// takers racing for the last ids can all pass this check, and the ones
+    /// that lose the race abort inside the sweep with
+    /// [`OrderBookError::MatchAborted`] (their committed prefix published,
+    /// possibly empty) instead of this untouched rejection.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::PriceLevelError`] (`CapacityExceeded { IdSequence }`).
+    #[inline]
+    pub(crate) fn check_trade_id_headroom(
+        &self,
+        order_id: Id,
+        side: Side,
+        limit_price: Option<u128>,
+    ) -> Result<(), OrderBookError> {
+        if !self.transaction_id_generator.is_exhausted() {
+            return Ok(());
         }
+        let crosses = match limit_price {
+            Some(price) => self.will_cross_market(price, side),
+            None => match side {
+                Side::Buy => !self.asks.is_empty(),
+                Side::Sell => !self.bids.is_empty(),
+            },
+        };
+        if !crosses {
+            return Ok(());
+        }
+        let source = PriceLevelError::CapacityExceeded {
+            resource: pricelevel::CapacityResource::IdSequence,
+            additional: 1,
+        };
+        Err(self.reject_untouched(order_id, source))
+    }
 
-        Ok(match_result)
+    /// Publish a sweep's trades and resolve its outcome (#240).
+    ///
+    /// Emits the trade-count metric and, when a listener is installed, the
+    /// `TradeResult` for every trade the sweep committed — for an aborted
+    /// sweep that is the committed prefix, published exactly like a partial
+    /// fill. Then returns the `MatchResult`, or the abort wrapped with that
+    /// same `TradeResult` (built when `want_committed` even without a
+    /// listener).
+    ///
+    /// # Errors
+    ///
+    /// [`SubmitFailure`] carrying [`OrderBookError::MatchAborted`] when the
+    /// outcome was aborted.
+    pub(crate) fn publish_match_outcome(
+        &self,
+        outcome: MatchOutcome,
+        want_committed: bool,
+    ) -> Result<MatchResult, SubmitFailure> {
+        let want_result = want_committed && outcome.aborted.is_some();
+        let committed = self.publish_trades(&outcome.result, want_result);
+        match outcome.aborted {
+            // Only a `*_with_committed` caller keeps the prefix; everyone
+            // else would drop it, so it is not boxed for them.
+            Some(error) => Err(SubmitFailure::with_committed(
+                error,
+                committed.filter(|_| want_committed),
+            )),
+            None => Ok(outcome.result),
+        }
+    }
+
+    /// Emit the trade-count metric and the trade listener for
+    /// `match_result`'s trades. Returns the emitted `TradeResult` when
+    /// `want_result` is set or a listener consumed it; `None` when there
+    /// were no trades. Every emission consumes one `engine_seq` tick.
+    pub(crate) fn publish_trades(
+        &self,
+        match_result: &MatchResult,
+        want_result: bool,
+    ) -> Option<TradeResult> {
+        let trades_emitted = u64::try_from(match_result.trades().len()).unwrap_or(u64::MAX);
+        if trades_emitted == 0 {
+            return None;
+        }
+        // The metric is independent of whether a listener is configured;
+        // the `TradeResult` is only built when someone consumes it.
+        super::metrics::record_trades(trades_emitted);
+        let listener = self.trade_listener.as_ref();
+        if !want_result && listener.is_none() {
+            return None;
+        }
+        let mut trade_result =
+            TradeResult::with_fees(self.symbol.clone(), match_result.clone(), self.fee_schedule);
+        trade_result.engine_seq = self.next_engine_seq();
+        if let Some(listener) = listener {
+            listener(&trade_result);
+        }
+        Some(trade_result)
     }
 
     /// Match a market order specified by quote-notional amount.
@@ -3338,7 +3549,10 @@ where
     ///
     /// Returns [`OrderBookError::InsufficientLiquidityNotional`] when no
     /// liquidity is available, or [`OrderBookError::SelfTradePrevented`]
-    /// when STP cancels the taker before any fills occur.
+    /// when STP cancels the taker before any fills occur. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a price
+    /// level that reported a failure (#240); the committed prefix has
+    /// already reached the trade listener.
     pub fn match_market_order_by_amount_with_user(
         &self,
         order_id: Id,
@@ -3346,6 +3560,20 @@ where
         side: Side,
         user_id: Hash32,
     ) -> Result<MatchResult, OrderBookError> {
+        self.match_market_order_by_amount_committed(order_id, amount, side, user_id, false)
+            .map_err(SubmitFailure::into_error)
+    }
+
+    /// Shared body of the quote-notional market sweep; see
+    /// [`Self::match_market_order_committed`].
+    pub(crate) fn match_market_order_by_amount_committed(
+        &self,
+        order_id: Id,
+        amount: u128,
+        side: Side,
+        user_id: Hash32,
+        want_committed: bool,
+    ) -> Result<MatchResult, SubmitFailure> {
         trace!(
             "Order book {}: Matching notional market order {} for {} at side {:?}",
             self.symbol, order_id, amount, side
@@ -3358,24 +3586,11 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
-        let match_result =
+        // #240: under the gate the sweep holds, before any mutation.
+        self.check_trade_id_headroom(order_id, side, None)?;
+        let outcome =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
-
-        let trades_emitted = match_result.trades().len() as u64;
-        if trades_emitted > 0 {
-            super::metrics::record_trades(trades_emitted);
-            if let Some(ref listener) = self.trade_listener {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                listener(&trade_result);
-            }
-        }
-
-        Ok(match_result)
+        self.publish_match_outcome(outcome, want_committed)
     }
 
     /// Attempts to match a limit order in the order book.
@@ -3416,7 +3631,10 @@ where
     ///
     /// # Errors
     /// Returns [`OrderBookError::SelfTradePrevented`] when STP cancels the
-    /// taker before any fills occur.
+    /// taker before any fills occur. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a price
+    /// level that reported a failure (#240); the committed prefix has
+    /// already reached the trade listener.
     pub fn match_limit_order_with_user(
         &self,
         order_id: Id,
@@ -3429,34 +3647,27 @@ where
             "Order book {}: Matching limit order {} for {} at side {:?} with limit price {}",
             self.symbol, order_id, quantity, side, limit_price
         );
-        let match_result = OrderBook::<T>::match_order_with_user(
-            self,
-            order_id,
-            side,
-            quantity,
-            Some(limit_price),
-            user_id,
-        )?;
-
-        // Emit trade-count metric and trigger trade listener if any
-        // transactions printed. The metric is independent of whether
-        // a listener is configured; the listener emission still gates
-        // on `Some(ref listener)`.
-        let trades_emitted = match_result.trades().len() as u64;
-        if trades_emitted > 0 {
-            super::metrics::record_trades(trades_emitted);
-            if let Some(ref listener) = self.trade_listener {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                listener(&trade_result);
-            }
-        }
-
-        Ok(match_result)
+        let outcome = {
+            // #209 / #225: same gate as `match_order_with_user`, released
+            // before the trades are published, as before.
+            let _gate = self.acquire_coherent_submit_gate(
+                self.submit_needs_exclusive_gate(false, user_id, false, false),
+            );
+            // #240: under the same gate the sweep holds, before any
+            // mutation; only a limit that actually crosses is refused.
+            self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
+            self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                Some(limit_price),
+                user_id,
+                TakerKind::Standard,
+                0,
+            )?
+        };
+        self.publish_match_outcome(outcome, false)
+            .map_err(SubmitFailure::into_error)
     }
 
     /// Create a snapshot of the current order book state, up to `depth`

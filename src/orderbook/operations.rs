@@ -2,7 +2,7 @@
 
 use super::book::OrderBook;
 use super::error::OrderBookError;
-use super::trade::TradeResult;
+use super::trade::{SubmitFailure, TradeResult};
 use pricelevel::{Hash32, Id, MatchResult, OrderType, Price, Quantity, Side, TimeInForce};
 use std::sync::Arc;
 use tracing::trace;
@@ -391,6 +391,34 @@ where
         OrderBook::<T>::match_market_order(self, id, quantity, side)
     }
 
+    /// [`Self::submit_market_order`] for callers that must record what a
+    /// failed submit committed — typically a sequencer journaling the
+    /// outcome (#240).
+    ///
+    /// Identical gating, matching and publication; on failure the
+    /// [`SubmitFailure`] carries the typed error together with the
+    /// committed [`TradeResult`] (the value the trade
+    /// listener received), so the caller can build
+    /// [`SequencerResult::from_submit_failure`](crate::SequencerResult::from_submit_failure).
+    ///
+    /// # Errors
+    ///
+    /// A [`SubmitFailure`] whose `error` is what
+    /// [`Self::submit_market_order`] returns for the same call; `committed`
+    /// is `Some` when trades executed before the failure (an aborted
+    /// sweep).
+    pub fn submit_market_order_with_committed(
+        &self,
+        id: Id,
+        quantity: u64,
+        side: Side,
+    ) -> Result<MatchResult, SubmitFailure> {
+        self.check_kill_switch_or_reject(id)?;
+        self.risk_state.check_market_admission(Hash32::zero())?;
+        trace!("Submitting market order {} {} {}", id, quantity, side);
+        self.match_market_order_committed(id, quantity, side, Hash32::zero(), true)
+    }
+
     /// Submit a market order with Self-Trade Prevention support.
     ///
     /// When STP is enabled and `user_id` is non-zero, the matching engine
@@ -458,6 +486,30 @@ where
             id, amount, side
         );
         OrderBook::<T>::match_market_order_by_amount(self, id, amount, side)
+    }
+
+    /// [`Self::submit_market_order_by_amount`] for callers that must record
+    /// what a failed submit committed (#240); see
+    /// [`Self::submit_market_order_with_committed`].
+    ///
+    /// # Errors
+    ///
+    /// A [`SubmitFailure`] whose `error` is what
+    /// [`Self::submit_market_order_by_amount`] returns for the same call;
+    /// `committed` is `Some` when trades executed before the failure.
+    pub fn submit_market_order_by_amount_with_committed(
+        &self,
+        id: Id,
+        amount: u128,
+        side: Side,
+    ) -> Result<MatchResult, SubmitFailure> {
+        self.check_kill_switch_or_reject(id)?;
+        self.risk_state.check_market_admission(Hash32::zero())?;
+        trace!(
+            "Submitting notional market order {} amount={} {}",
+            id, amount, side
+        );
+        self.match_market_order_by_amount_committed(id, amount, side, Hash32::zero(), true)
     }
 
     /// Submit a quote-notional market order with Self-Trade Prevention.

@@ -4,14 +4,15 @@
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::error::OrderBookError;
+use crate::orderbook::matching::FokFeasibility;
 use crate::orderbook::matching::MatchOutcome;
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::reject_reason::RejectReason;
-use crate::orderbook::trade::TradeResult;
+use crate::orderbook::trade::{SubmitFailure, TradeResult};
 use either::Either;
 use pricelevel::{
-    DEFAULT_RESERVE_REPLENISH_AMOUNT, Id, OrderType, OrderUpdate, PriceLevel, Quantity, Side,
-    TakerKind,
+    CapacityResource, DEFAULT_RESERVE_REPLENISH_AMOUNT, Id, OrderType, OrderUpdate, PriceLevel,
+    PriceLevelError, Quantity, Side, TakerKind,
 };
 use std::sync::Arc;
 use tracing::trace;
@@ -360,6 +361,18 @@ fn reserve_residual_would_be_discarded(
     }
 }
 
+/// The untouched rejection of a crossing taker when the book's trade-id
+/// generator is exhausted (#240): `CapacityExceeded { IdSequence }`, wire
+/// code `RejectReason::CapacityExceeded` (16).
+#[cold]
+#[inline(never)]
+pub(crate) fn trade_ids_exhausted_error() -> OrderBookError {
+    OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+        resource: CapacityResource::IdSequence,
+        additional: 1,
+    })
+}
+
 impl<T> OrderBook<T>
 where
     T: Clone + Send + Sync + Default + 'static,
@@ -421,7 +434,7 @@ where
     /// (#211): the projected post-update order must pass the shared shape
     /// validator (tick / lot / min-max / two-tranche representability)
     /// and the modify-aware risk check, and any upstream
-    /// [`PriceLevelError`](pricelevel::PriceLevelError) from applying the
+    /// [`PriceLevelError`] from applying the
     /// update is propagated as [`OrderBookError::PriceLevelError`] — a
     /// rejected update leaves the maker unchanged, and `Ok(None)` means
     /// only that the requested order is absent.
@@ -493,6 +506,17 @@ where
     /// On a book holding none, a re-price of some *other* order runs
     /// shared, where the #168 self-cross dry run keeps its existing
     /// best-effort character.
+    ///
+    /// # Aborted re-adds (#240)
+    ///
+    /// A re-price that crosses while the book's trade-id generator is
+    /// exhausted is refused in the validate-first phase, **before** the
+    /// original is cancelled: the original keeps resting and the call
+    /// returns `PriceLevelError(CapacityExceeded)` (reject code 16). Any
+    /// other price-level failure during the re-add's sweep happens **after**
+    /// the original was cancelled: the committed prefix is published, the
+    /// remainder does not rest, the call returns
+    /// [`OrderBookError::MatchAborted`], and the original order is gone.
     pub fn update_order(
         &self,
         update: OrderUpdate,
@@ -611,7 +635,7 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false)?.0;
+                    let result = self.add_order_inner(new_order, false, false)?.0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Order not found
@@ -843,7 +867,7 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false)?.0;
+                    let result = self.add_order_inner(new_order, false, false)?.0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Order not found
@@ -1051,7 +1075,7 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false)?.0;
+                    let result = self.add_order_inner(new_order, false, false)?.0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Original order not found
@@ -1381,7 +1405,10 @@ where
     ///
     /// # Errors
     /// Returns the first failing check's typed [`OrderBookError`].
-    pub(super) fn validate_order_shape(&self, order: &OrderType<T>) -> Result<(), OrderBookError> {
+    pub(super) fn validate_order_shape(
+        &self,
+        order: &OrderType<T>,
+    ) -> Result<Option<FokFeasibility>, OrderBookError> {
         // Two-tranche total representability (#210): an Iceberg / Reserve
         // whose visible + hidden overflows u64 cannot be tracked by any of
         // the engine's quantity arithmetic — reject it before every other
@@ -1543,24 +1570,60 @@ where
         // without altering the book. Use the faithful feasibility check (lot_size
         // + STP aware), not the raw-depth `peek_match`, so fill-or-kill stays
         // all-or-nothing and never emits a partial fill it then reports as killed (#96).
+        //
+        // Exhausted trade-id generator (#240): a crossing taker would mint at
+        // least one trade id, and none is left, so its sweep would abort at
+        // the first level. Reject it untouched here instead — for the modify
+        // path this runs before the original is cancelled, so the original
+        // keeps resting. Post-only takers never trade and are exempt. It runs
+        // under the submit / modify gate the sweep holds; exact under the
+        // exclusive gate, best-effort under the shared one (see
+        // `check_trade_id_headroom` in book.rs).
+        if !order.is_post_only()
+            && self.transaction_id_generator.is_exhausted()
+            && self.will_cross_market(order.price().as_u128(), order.side())
+        {
+            self.latch_trade_ids_exhausted();
+            return Err(trade_ids_exhausted_error());
+        }
+
+        //
+        // Fill-or-kill preflight (#240): a later level can fail after earlier
+        // levels committed, which would turn the FOK into a partial fill.
+        // Everything the sweep can exhaust and the book can observe is
+        // checked here, before any mutation: the trade-id headroom of the
+        // book's `UuidGenerator` against the walk's upper bound on trades;
+        // the result buffers are reserved by the sweep itself from
+        // `maker_steps` before it touches the first level. A failed dry run
+        // (`matchable_quantity` / insertion-sequence view) propagates as a
+        // kill, never as zero depth.
         if order.is_fill_or_kill() {
-            let potential_match = self.fok_fillable_quantity(
+            let feasibility = self.fok_fillable_quantity(
                 order.side(),
                 order.total_quantity(),
                 Some(order.price().as_u128()),
                 order.user_id(),
                 order.id(),
             )?;
-            if potential_match < order.total_quantity() {
+            if feasibility.fillable < order.total_quantity() {
                 return Err(OrderBookError::InsufficientLiquidity {
                     side: order.side(),
                     requested: order.total_quantity(),
-                    available: potential_match,
+                    available: feasibility.fillable,
                 });
             }
+            if self.transaction_id_generator.remaining() < feasibility.max_trades {
+                return Err(OrderBookError::PriceLevelError(
+                    PriceLevelError::CapacityExceeded {
+                        resource: CapacityResource::IdSequence,
+                        additional: usize::try_from(feasibility.max_trades).unwrap_or(usize::MAX),
+                    },
+                ));
+            }
+            return Ok(Some(feasibility));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// STP self-cross pre-check for the validate-first atomic modify (#168).
@@ -1807,13 +1870,15 @@ where
         }
 
         let total = visible.saturating_add(hidden);
-        let crossable = self.fok_fillable_quantity(
-            new_order.side(),
-            total,
-            Some(new_order.price().as_u128()),
-            new_order.user_id(),
-            new_order.id(),
-        )?;
+        let crossable = self
+            .fok_fillable_quantity(
+                new_order.side(),
+                total,
+                Some(new_order.price().as_u128()),
+                new_order.user_id(),
+                new_order.id(),
+            )?
+            .fillable;
         // `crossable < visible`: the sweep leaves a positive visible tranche
         // and the residual rests normally. `crossable >= total`: the order
         // fills completely, so nothing is discarded. Only the band in
@@ -1902,6 +1967,15 @@ where
                 );
                 crate::orderbook::metrics::record_reject(RejectReason::InsufficientLiquidity);
             }
+            // A fill-or-kill preflight kill (#240): the feasibility dry run
+            // failed or a resource the sweep would exhaust (trade-id
+            // headroom) is short. The book is untouched; record the
+            // dedicated resource code.
+            OrderBookError::PriceLevelError(_) => {
+                let reason = RejectReason::from(err);
+                self.track_state(order.id(), OrderStatus::Rejected { reason });
+                crate::orderbook::metrics::record_reject(reason);
+            }
             // The already-expired `InvalidOperation` path historically
             // recorded no terminal transition; preserve that.
             _ => {}
@@ -1980,10 +2054,46 @@ where
     /// `PriceLevel::iter_orders` read-locks every shard of the level's
     /// `DashMap` regardless of how few orders rest there.
     ///
+    /// # Aborted sweeps (#240)
+    ///
+    /// When a price level fails mid-sweep (pricelevel reports it through
+    /// `MatchResult::error()`, e.g. an exhausted trade-id sequence or level
+    /// counter, or a refused allocation) the sweep stops at that level and
+    /// never trades at a worse price. The trades committed before the
+    /// failure are real and are published exactly like a partial fill —
+    /// trade listener, price-level listener, risk, maker states — and the
+    /// remainder never rests, whatever the time-in-force. The call returns
+    /// [`OrderBookError::MatchAborted`] and the taker ends
+    /// `Cancelled { filled_quantity, reason: CancelReason::MatchAborted }`.
+    /// Use [`Self::add_order_with_committed`] to receive the committed
+    /// `TradeResult` with the error.
+    ///
+    /// A fill-or-kill taker is killed in one of two shapes, both before any
+    /// mutation: not enough reachable depth is
+    /// [`OrderBookError::InsufficientLiquidity`] with
+    /// `Cancelled { InsufficientLiquidity }`; a resource shortfall (trade-id
+    /// headroom, result buffers, a failed feasibility dry run) is
+    /// [`OrderBookError::PriceLevelError`] with `Rejected` under
+    /// `RejectReason::CapacityExceeded` (16) / `CounterExhausted` (17).
+    ///
+    /// A crossing taker of any time-in-force is rejected the same untouched
+    /// way when the book's trade-id generator is exhausted
+    /// ([`Self::trade_ids_exhausted`]).
+    ///
+    /// A fill-or-kill taker is preflighted before any mutation: the trade-id
+    /// headroom is checked against an upper bound on its trades and its
+    /// result buffers are reserved; a shortfall rejects it untouched with
+    /// `PriceLevelError(CapacityExceeded)`. Residual: pricelevel's per-level
+    /// counters are not observable and replenishment trades beyond the
+    /// reserved maker steps still grow the buffers, so a FOK can still abort
+    /// mid-sweep in those cases, following the rules above. See
+    /// `doc/panic-boundaries.md` for every residual.
+    ///
     /// # Errors
     /// Returns [`OrderBookError::KillSwitchActive`] when the kill switch
     /// is engaged. The check runs before any cache invalidation, STP
-    /// validation, tick/lot validation, or matching work.
+    /// validation, tick/lot validation, or matching work. Returns
+    /// [`OrderBookError::MatchAborted`] for an aborted sweep (see above).
     #[inline]
     pub fn add_order(&self, order: OrderType<T>) -> Result<Arc<OrderType<T>>, OrderBookError> {
         // #209: shared gate for ordinary submits, exclusive for FOK so its
@@ -1999,7 +2109,9 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, false).map(|(order, _)| order)
+        self.add_order_inner(order, false, false)
+            .map(|(order, _)| order)
+            .map_err(SubmitFailure::into_error)
     }
 
     /// Add a new order to the book, automatically matching it if it's
@@ -2039,7 +2151,11 @@ where
     /// # Errors
     /// Returns [`OrderBookError::KillSwitchActive`] when the kill switch
     /// is engaged. The check runs before any cache invalidation, STP
-    /// validation, tick/lot validation, or matching work.
+    /// validation, tick/lot validation, or matching work. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a failed
+    /// price level (#240): the committed prefix reached the trade listener
+    /// but is not returned here; use [`Self::add_order_with_committed`] to
+    /// receive it with the error.
     pub fn add_order_with_result(
         &self,
         order: OrderType<T>,
@@ -2053,18 +2169,62 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true)
+        self.add_order_inner(order, true, false)
+            .map_err(SubmitFailure::into_error)
+    }
+
+    /// [`Self::add_order_with_result`] for callers that must record what a
+    /// failed submit committed — typically a sequencer journaling the
+    /// outcome (#240).
+    ///
+    /// Identical matching, gating and publication; the only difference is
+    /// the error type. A submit can execute real trades and *then* fail
+    /// (a sweep aborted by a failed price level, an unfillable IOC
+    /// remainder, a taker self-trade prevention cancels after non-self
+    /// fills, a residual that cannot be admitted); the returned
+    /// [`SubmitFailure`] carries that typed error together with the
+    /// committed [`TradeResult`] — the very value the trade listener
+    /// received — so the caller can build
+    /// [`SequencerResult::from_submit_failure`](crate::SequencerResult::from_submit_failure).
+    ///
+    /// # Errors
+    ///
+    /// A [`SubmitFailure`] whose `error` is exactly what
+    /// [`Self::add_order_with_result`] returns for the same call, and whose
+    /// `committed` is `Some` when trades executed before the failure.
+    pub fn add_order_with_committed(
+        &self,
+        order: OrderType<T>,
+    ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
+        // #209 / #225 / #230: same gating as `add_order`.
+        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
+            order.is_fill_or_kill(),
+            order.user_id(),
+            order.is_post_only(),
+            Self::is_strandable_maker(&order),
+        ));
+        self.add_order_inner(order, true, true)
     }
 
     /// Shared implementation behind [`Self::add_order`] and
     /// [`Self::add_order_with_result`]. `want_result` gates `TradeResult`
     /// construction so the plain `add_order` path only pays for it when an
     /// installed trade listener needs it anyway.
+    ///
+    /// `want_committed` (set only by [`Self::add_order_with_committed`])
+    /// hands the committed `TradeResult` back inside a failure. Every other
+    /// caller drops it, so the failure paths that follow real fills (IOC
+    /// remainder, STP taker cancel, residual admission, abort) do not box a
+    /// `TradeResult` just to discard it.
     fn add_order_inner(
         &self,
         mut order: OrderType<T>,
         want_result: bool,
-    ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), OrderBookError> {
+        want_committed: bool,
+    ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
+        let committed = |trade_result: Option<TradeResult>| {
+            if want_committed { trade_result } else { None }
+        };
         self.check_kill_switch_or_reject(order.id())?;
         // Representability gate (#210): an unrepresentable two-tranche
         // total must be rejected before the risk gate below, which would
@@ -2078,7 +2238,7 @@ where
                 hidden: order.hidden_quantity().as_u64(),
             };
             self.record_shape_rejection(&order, &err);
-            return Err(err);
+            return Err(err.into());
         }
         // Pre-trade risk gate: per-account open-orders / notional /
         // price band. No-op when no `RiskConfig` is installed.
@@ -2092,7 +2252,7 @@ where
             order.total_quantity(),
         ) {
             self.reject_with_risk(order.id(), &err);
-            return Err(err);
+            return Err(err.into());
         }
 
         // Reject a duplicate order id: an order with this id is already
@@ -2118,7 +2278,8 @@ where
             crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
             return Err(OrderBookError::DuplicateOrderId {
                 order_id: order.id(),
-            });
+            }
+            .into());
         }
 
         trace!(
@@ -2134,10 +2295,16 @@ where
         // record the matching terminal state transition / metric here so
         // the direct (non-modify) `add_order` behavior is preserved
         // exactly.
-        if let Err(err) = self.validate_order_shape(&order) {
-            self.record_shape_rejection(&order, &err);
-            return Err(err);
-        }
+        // `fok` is the fill-or-kill preflight measured by the feasibility
+        // walk (#240): trade-id headroom already checked, buffer
+        // reservation handed to the sweep below.
+        let fok = match self.validate_order_shape(&order) {
+            Ok(fok) => fok,
+            Err(err) => {
+                self.record_shape_rejection(&order, &err);
+                return Err(err.into());
+            }
+        };
 
         // Residual-admission headroom pre-check (#211): a non-immediate
         // taker may rest its residual at a same-side level whose checked
@@ -2172,7 +2339,7 @@ where
                             },
                         );
                         crate::orderbook::metrics::record_reject(RejectReason::InvalidQuantity);
-                        return Err(OrderBookError::PriceLevelError(err));
+                        return Err(OrderBookError::PriceLevelError(err).into());
                     }
                 };
                 if level_total.checked_add(order.total_quantity()).is_none() {
@@ -2190,7 +2357,7 @@ where
                         },
                     );
                     crate::orderbook::metrics::record_reject(RejectReason::InvalidQuantity);
-                    return Err(err);
+                    return Err(err.into());
                 }
             }
         }
@@ -2216,6 +2383,7 @@ where
             result: match_result,
             taker_stp_cancelled,
             taker_post_only_rejected,
+            aborted,
         } = self.match_order_with_user_outcome(
             order.id(),
             order.side(),
@@ -2223,6 +2391,7 @@ where
             Some(order.price().as_u128()),
             order.user_id(),
             taker_kind,
+            fok.map_or(0, |fok| fok.maker_steps),
         )?;
 
         // #209: the sweep reached a crossable level with a post-only taker.
@@ -2245,7 +2414,8 @@ where
                 } else {
                     self.best_bid().unwrap_or(0)
                 },
-            });
+            }
+            .into());
         }
 
         // Emit trades BEFORE any early return below: the STP taker-cancel and
@@ -2254,27 +2424,15 @@ where
         // listener. The `TradeResult` is only constructed when someone consumes
         // it — the installed listener and/or an `add_order_with_result` caller —
         // so the plain `add_order` hot path skips the `MatchResult` clone.
-        let trades_emitted = match_result.trades().len() as u64;
-        let trade_result = if trades_emitted > 0 {
-            crate::orderbook::metrics::record_trades(trades_emitted);
-            let listener = self.trade_listener.as_ref();
-            if want_result || listener.is_some() {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                if let Some(listener) = listener {
-                    listener(&trade_result) // emit trade events to listener
-                }
-                Some(trade_result)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let trade_result = self.publish_trades(&match_result, want_result);
+
+        // #240: the sweep stopped at a failed price level. The committed
+        // prefix was published above exactly like a partial fill; the
+        // taker's terminal `Cancelled { MatchAborted }` state was recorded
+        // by the sweep. The remainder must never rest, whatever the TIF.
+        if let Some(err) = aborted {
+            return Err(SubmitFailure::with_committed(err, committed(trade_result)));
+        }
 
         // True (non-self) executed quantity. `remaining_quantity` only decrements on
         // real trades, so STP-prevented self-fills never count toward it.
@@ -2294,11 +2452,14 @@ where
                 },
             );
             crate::orderbook::metrics::record_reject(RejectReason::SelfTradePrevention);
-            return Err(OrderBookError::SelfTradePrevented {
-                mode: self.stp_mode,
-                taker_order_id: order.id(),
-                user_id: order.user_id(),
-            });
+            return Err(SubmitFailure::with_committed(
+                OrderBookError::SelfTradePrevented {
+                    mode: self.stp_mode,
+                    taker_order_id: order.id(),
+                    user_id: order.user_id(),
+                },
+                committed(trade_result),
+            ));
         }
 
         // If the order was not fully filled, add the remainder to the book
@@ -2315,13 +2476,16 @@ where
                     },
                 );
                 crate::orderbook::metrics::record_reject(RejectReason::InsufficientLiquidity);
-                return Err(OrderBookError::InsufficientLiquidity {
-                    side: order.side(),
-                    requested: order.quantity(), // Now uses the trait method
-                    available: order
-                        .quantity()
-                        .saturating_sub(match_result.remaining_quantity().as_u64()),
-                });
+                return Err(SubmitFailure::with_committed(
+                    OrderBookError::InsufficientLiquidity {
+                        side: order.side(),
+                        requested: order.quantity(), // Now uses the trait method
+                        available: order
+                            .quantity()
+                            .saturating_sub(match_result.remaining_quantity().as_u64()),
+                    },
+                    committed(trade_result),
+                ));
             }
 
             // Rest the taker's residual. `remaining_quantity` is the TOTAL
@@ -2436,7 +2600,7 @@ where
                         error = %err,
                         "risk reservation for the resting remainder failed; remainder not rested"
                     );
-                    return Err(err);
+                    return Err(SubmitFailure::with_committed(err, committed(trade_result)));
                 }
             };
 
@@ -2472,7 +2636,10 @@ where
                         error = %err,
                         "residual admission failed after irreversible trades; level cleaned up"
                     );
-                    return Err(OrderBookError::PriceLevelError(err));
+                    return Err(SubmitFailure::with_committed(
+                        OrderBookError::PriceLevelError(err),
+                        committed(trade_result),
+                    ));
                 }
             };
             // #230: this is the single point where `add_order` rests an

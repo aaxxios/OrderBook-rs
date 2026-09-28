@@ -180,13 +180,100 @@ change.
   rejection, a mass cancel) decode, verify and replay under 0.14 (pinned by
   fixture tests). A bincode-encoded `MassCancelResult` from 0.13 does not
   decode either (new `failures` field).
-- **Matching surfaces level failures.** A sweep stopped by a pricelevel
-  failure (queue view, `add_trade` / `add_filled_order_id` growth) now
-  returns `Err(OrderBookError::PriceLevelError)` after the book's indices are
-  reconciled with the makers already consumed; trades executed before the
-  failure are not reported on this path (tracked in #240). Fill-or-kill
-  feasibility and modify self-trade checks refuse the order when the dry run
-  fails instead of guessing.
+- **Aborted sweeps surface as `OrderBookError::MatchAborted` (#240).**
+  pricelevel 0.10 reports a mid-sweep failure (`CounterExhausted`,
+  `CapacityExceeded`, e.g. an exhausted trade-id sequence) in
+  `MatchResult::error()` while keeping the prefix it committed. The sweep
+  now stops at the failed level and never walks on to a worse price; the
+  committed prefix is real and is published exactly like a partial fill
+  (trade listener, price-level listener, risk `on_fill`, maker order state
+  and location cleanup); the remainder never rests, whatever the
+  time-in-force; and every submission path (`add_order*`,
+  `add_limit_order*`, `submit_market_order*`, `match_market_order*`,
+  `match_limit_order*`, the raw `match_order*`, modify re-adds) returns
+  `Err(OrderBookError::MatchAborted { order_id, executed_quantity,
+  trade_count, source: Box<PriceLevelError> })` (boxed, so
+  `OrderBookError` stays 96 bytes). Each level's worst case
+  (`min(resting makers, quantity cap)`) is reserved in the result before the
+  level is touched; a refused reservation aborts before that level. The taker's terminal state is
+  `OrderStatus::Cancelled { filled_quantity: executed_quantity, reason:
+  CancelReason::MatchAborted }`. A failed STP queue view, or a refused
+  worst-case reservation for a level (taken before the STP arms touch it),
+  aborts the same way before that level is touched, with the prefix of the
+  earlier levels (empty only at the first level). A failed post-only probe
+  is a clean rejection instead: the book is provably untouched, so it
+  returns `PriceLevelError` with `Rejected { CapacityExceeded |
+  CounterExhausted }` rather than `PriceCrossing` or an abort.
+  Compatibility:
+  - `OrderBookError::MatchAborted` is a new variant; `OrderBookError` is
+    `#[non_exhaustive]`, so downstream matches keep compiling. Code that
+    matched `PriceLevelError` to detect a sweep failure matches
+    `MatchAborted` now. `std::error::Error::source` returns the
+    `PriceLevelError` for it.
+  - `CancelReason::MatchAborted` is appended (bincode index 8). The enum is
+    not `#[non_exhaustive]`: exhaustive downstream matches need a new arm.
+  - `RejectReason` gains `MatchAborted` (15), `CapacityExceeded` (16) and
+    `CounterExhausted` (17), appended; existing codes do not move. A
+    `PriceLevelError::CapacityExceeded` / `CounterExhausted` now maps to 16 /
+    17 instead of `Other(0)`; other `PriceLevelError`s stay `Other(0)`. Older
+    readers decode the new codes as `Other(n)`.
+  - `SequencerResult::MatchAborted { reason, code, committed:
+    CommittedPrefix }` is appended (additive, `#[non_exhaustive]` enum):
+    existing JSON and bincode journals decode unchanged; journals carrying
+    it fail to decode against older binaries. Build it with
+    `SequencerResult::from_submit_failure` from the new `SubmitFailure`
+    returned by `add_order_with_committed`,
+    `submit_market_order_with_committed` and
+    `submit_market_order_by_amount_with_committed` (the plain APIs keep
+    their signatures). `From<&OrderBookError>` records a `MatchAborted`
+    error as `RejectedWithCode` (code 15, `may_have_mutated: true`).
+  - Replay re-executes a journaled `MatchAborted` submit and requires the
+    same committed prefix (makers, prices, quantities, executed quantity;
+    trade ids are recorded but not compared); anything else is
+    `ReplayError::OutcomeMismatch`. An `UpdateOrder` journaled as
+    `RejectedWithCode` under code 15 is re-executed and reconciled by code
+    instead of being skipped. Aborts come from exhausted resources a fresh
+    replay book does not normally reproduce, so such a journal stops replay
+    loudly rather than diverging.
+  - No snapshot format change (`ORDERBOOK_SNAPSHOT_FORMAT_VERSION` stays 4).
+- **Fill-or-kill preflight (#240).** Before any mutation a fill-or-kill
+  taker now checks the book's trade-id headroom against an upper bound on
+  the trades its sweep can emit and reserves the result buffers for its
+  maker steps; a shortfall rejects it untouched with
+  `OrderBookError::PriceLevelError(CapacityExceeded)` (reject code 16,
+  `OrderStatus::Rejected`). A failed feasibility dry run is a kill
+  (`Rejected` with the resource code), never zero depth. The bound is
+  conservative (`min(makers, quantity taken)` per level without hidden
+  depth, the quantity taken where a replenishing maker can trade again),
+  so a FOK within that many ids of the sequence's exhaustion can be refused
+  although it would fit. Residual: pricelevel's per-level counters (queue
+  sequence, epochs) are not observable, and replenishment trades beyond the
+  reserved maker steps grow the buffers during the sweep; either can still
+  abort a FOK mid-sweep, which then follows the `MatchAborted` rules above.
+  A partial `MatchAborted` from a `*_with_committed` call is the only
+  failure that boxes the committed `TradeResult`; the plain APIs never box
+  it.
+- **Exhausted trade-id generator and dead-book signal (#240).** A crossing
+  submit (`add_order*`, `submit_market_order*`, `match_market_order*`,
+  `match_limit_order*`) or a crossing modify (in its validate-first phase,
+  before the original is cancelled, which keeps resting) is rejected
+  untouched with `PriceLevelError(CapacityExceeded { IdSequence })`, code
+  16, once the book's trade-id generator is exhausted; post-only and
+  non-crossing orders (a limit that does not cross the best opposite price)
+  are unaffected. The check runs under the gate the sweep holds and is exact
+  under the exclusive gate or a single writer; under the shared gate,
+  concurrent takers racing for the last ids may still abort with
+  `MatchAborted` (pricelevel 0.10 has no public atomic id reservation). New `OrderBook::match_aborts()`,
+  `OrderBook::match_fold_failures()` and `OrderBook::trade_ids_exhausted()`
+  (latched on the first exhaustion, logged once at `ERROR`, cleared by
+  `set_trade_id_namespace`); with `metrics`, the counters
+  `orderbook_match_aborts_total`, `orderbook_match_fold_failures_total` and
+  `orderbook_trade_ids_exhausted_total`. No automatic kill switch. An
+  abort during a modify's re-add for any other cause still destroys the
+  original (documented on `update_order`).
+  The residuals, including poisoned pricelevel levels (empty result without
+  an error) and why a journaled abort usually stops replay with
+  `OutcomeMismatch`, are documented in `doc/panic-boundaries.md`.
 - **Implied-volatility inputs are validated; Black-Scholes and Greeks
   return `Result` (#256).** `f64::clamp(min_iv, max_iv)` in the solver
   panicked when `min_iv > max_iv` or a bound was NaN, reachable through the

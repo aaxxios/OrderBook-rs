@@ -17,7 +17,7 @@ src/orderbook/book.rs:saturating_wrapping:26
 src/orderbook/iterators.rs:saturating_wrapping:2
 src/orderbook/market_impact.rs:saturating_wrapping:2
 src/orderbook/matching.rs:debug_assert:3
-src/orderbook/matching.rs:saturating_wrapping:10
+src/orderbook/matching.rs:saturating_wrapping:9
 src/orderbook/modifications.rs:debug_assert:3
 src/orderbook/modifications.rs:saturating_wrapping:15
 src/orderbook/nats.rs:saturating_wrapping:1

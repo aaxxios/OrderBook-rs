@@ -7,6 +7,7 @@ mod journal_compat_0_13;
 mod lot_size_validation;
 mod market_impact_tests;
 mod market_metrics;
+mod match_abort;
 mod matching;
 mod modifications;
 mod operations;

@@ -72,6 +72,33 @@
 //!   back NaN or infinity. `IVError` is `#[non_exhaustive]` and gains
 //!   `InvalidConfig`, `NonFiniteResult`, `ArithmeticOverflow` and
 //!   `PriceLevel`.
+//! - **Aborted sweeps (#240).** A price level that fails mid-sweep stops the
+//!   sweep: the committed prefix is published like a partial fill, the
+//!   remainder never rests, and the submit returns
+//!   `OrderBookError::MatchAborted` (taker state
+//!   `Cancelled { MatchAborted }`). New reject codes `MatchAborted` (15),
+//!   `CapacityExceeded` (16), `CounterExhausted` (17).
+//! - **Journaling aborted submits.** `add_order_with_committed`,
+//!   `submit_market_order_with_committed` and
+//!   `submit_market_order_by_amount_with_committed` return a `SubmitFailure`
+//!   carrying the committed `TradeResult`;
+//!   `SequencerResult::from_submit_failure` records it as the new
+//!   `SequencerResult::MatchAborted`, and replay requires the same prefix
+//!   (`ReplayError::OutcomeMismatch` otherwise).
+//! - **Fill-or-kill preflight.** A FOK checks trade-id headroom and reserves
+//!   its result buffers before any mutation; a shortfall rejects it
+//!   untouched.
+//! - **Dead-book signal.** `OrderBook::match_aborts()`,
+//!   `match_fold_failures()` and the latched `trade_ids_exhausted()` (plus
+//!   `metrics` counters). With an exhausted trade-id generator every
+//!   crossing submit / modify is rejected untouched (code 16); a failed
+//!   post-only probe is also a clean `Rejected`, not an abort.
+//! - **Limitations.** A journal holding a resource-exhaustion abort replays
+//!   at best from genesis, never from a mid-stream snapshot (the trade-id
+//!   generator is not in the snapshot); the committed-prefix check only
+//!   applies to submits recorded through `*_with_committed` /
+//!   `SequencerResult::from_submit_failure`, and aborted updates are
+//!   reconciled by code only. See `doc/panic-boundaries.md`.
 //!
 //! ### Migration from 0.13
 //!
@@ -93,6 +120,8 @@
 //! | `OrderBook::option_{vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
 //! | `IVError` (exhaustive) | `#[non_exhaustive]`; adds `InvalidConfig`, `NonFiniteResult`, `ArithmeticOverflow`, `PriceLevel` |
 //! | `solve_iv` / `solve_iv_bisection` / `implied_volatility*` accept any config | reject an invalid config with `IVError::InvalidConfig` |
+//! | sweep stopped by a level failure: `Err(PriceLevelError)` (prefix unreported) | `Err(MatchAborted { .. })`, prefix published |
+//! | `CancelReason` (8 variants) | adds `MatchAborted` (exhaustive matches need an arm) |
 //!
 //! Re-exported pricelevel items change with pricelevel 0.10:
 //! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
@@ -1241,14 +1270,17 @@ pub use orderbook::order_state::{
 pub use orderbook::reject_reason::RejectReason;
 pub use orderbook::risk::{ReferencePriceSource, RiskConfig, RiskState};
 pub use orderbook::sequencer::{
-    InMemoryJournal, Journal, JournalEntry, JournalError, JournalReadIter, ReplayBookConfig,
-    ReplayEngine, ReplayError, SequencerCommand, SequencerEvent, SequencerResult, snapshots_match,
+    CommittedPrefix, CommittedTrade, InMemoryJournal, Journal, JournalEntry, JournalError,
+    JournalReadIter, ReplayBookConfig, ReplayEngine, ReplayError, SequencerCommand, SequencerEvent,
+    SequencerResult, snapshots_match,
 };
 pub use orderbook::serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use orderbook::snapshot::{EnrichedSnapshot, MetricFlags};
 pub use orderbook::statistics::{DepthStats, DistributionBin};
 pub use orderbook::stp::STPMode;
-pub use orderbook::trade::{TradeEvent, TradeInfo, TradeListener, TradeResult, TransactionInfo};
+pub use orderbook::trade::{
+    SubmitFailure, TradeEvent, TradeInfo, TradeListener, TradeResult, TransactionInfo,
+};
 #[cfg(feature = "bincode")]
 pub use orderbook::{
     BincodeEventSerializer, DEFAULT_MAX_BINCODE_PAYLOAD_BYTES, MAX_BINCODE_PAYLOAD_BYTES_CEILING,

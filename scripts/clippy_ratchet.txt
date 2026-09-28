@@ -13,7 +13,7 @@ src/orderbook/book.rs:cast_possible_truncation:2
 src/orderbook/book.rs:cast_sign_loss:2
 src/orderbook/book.rs:indexing_slicing:12
 src/orderbook/fees.rs:arithmetic_side_effects:8
-src/orderbook/matching.rs:arithmetic_side_effects:8
+src/orderbook/matching.rs:arithmetic_side_effects:4
 src/orderbook/matching.rs:cast_possible_truncation:2
 src/orderbook/modifications.rs:arithmetic_side_effects:6
 src/orderbook/nats.rs:arithmetic_side_effects:12

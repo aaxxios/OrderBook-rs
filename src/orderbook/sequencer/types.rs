@@ -9,8 +9,11 @@ use crate::orderbook::error::OrderBookError;
 use crate::orderbook::mass_cancel::MassCancelResult;
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::stp::STPMode;
-use crate::orderbook::trade::TradeResult;
-use pricelevel::{Hash32, Id, OrderType, OrderUpdate, Side, TimestampMs};
+use crate::orderbook::trade::{SubmitFailure, TradeResult};
+use pricelevel::{
+    CapacityResource, Hash32, Id, MatchResult, OrderType, OrderUpdate, Price, PriceLevelError,
+    Quantity, Side, TimestampMs,
+};
 use serde::{Deserialize, Serialize};
 
 /// A command submitted to the Sequencer for total-ordered execution.
@@ -243,6 +246,156 @@ pub enum SequencerResult {
         /// cannot see.
         stp_mode: Option<STPMode>,
     },
+
+    /// A submit whose matching sweep stopped at a price level that
+    /// reported a failure, recorded with the trades it committed first
+    /// (#240, [`OrderBookError::MatchAborted`]).
+    ///
+    /// The committed prefix is real — those trades left the makers' levels
+    /// and were published — so replay re-executes the command and requires
+    /// the re-execution to abort again with the **same** prefix (same
+    /// makers, prices and quantities, in order, and the same executed
+    /// quantity). Anything else — a replay that fills further, rests, fails
+    /// differently or commits a different prefix — is
+    /// [`ReplayError::OutcomeMismatch`](crate::ReplayError::OutcomeMismatch),
+    /// never a silent divergence.
+    ///
+    /// Build it with [`Self::from_submit_failure`] from the
+    /// [`SubmitFailure`] a `*_with_committed` submit returns. The plain
+    /// `From<&OrderBookError>` impl cannot see the trades and records a
+    /// `MatchAborted` error as [`Self::RejectedWithCode`] instead, whose
+    /// replay reconciles the reject code only.
+    ///
+    /// Wire-compatible addition, appended after every existing variant of
+    /// this `#[non_exhaustive]` enum: journals written before it decode
+    /// unchanged and existing bincode variant indices do not move. Journals
+    /// carrying it fail to decode against older binaries, as for
+    /// [`Self::RejectedWithCode`]. It does not affect the snapshot package,
+    /// so `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged.
+    MatchAborted {
+        /// Human-readable reason (the error's `Display`).
+        reason: String,
+        /// The stable reject code, [`RejectReason::MatchAborted`].
+        code: RejectReason,
+        /// The trades the submit committed before the failure.
+        committed: CommittedPrefix,
+    },
+}
+
+/// One trade of a [`CommittedPrefix`], in emission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedTrade {
+    /// The trade id minted by the book's trade-id generator. Recorded for
+    /// audit; replay reproduces it only under a namespace-carrying full
+    /// replay, so reconciliation does not compare it.
+    pub trade_id: Id,
+    /// The resting order the taker traded with.
+    pub maker_order_id: Id,
+    /// Execution price, in price ticks.
+    pub price: Price,
+    /// Executed quantity, in quantity units.
+    pub quantity: Quantity,
+}
+
+/// The trades an aborted submit committed before its sweep stopped (#240).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedPrefix {
+    /// Total executed quantity of the prefix, in quantity units.
+    pub executed_quantity: u64,
+    /// The committed trades in emission order.
+    pub trades: Vec<CommittedTrade>,
+}
+
+impl CommittedPrefix {
+    /// Record the trades of `match_result`.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::PriceLevelError`] (`CapacityExceeded`) when the
+    /// trade vector cannot be allocated, or when the executed quantity
+    /// cannot be summed.
+    pub fn try_from_match_result(match_result: &MatchResult) -> Result<Self, OrderBookError> {
+        let source = match_result.trades().as_vec();
+        let mut trades = Vec::new();
+        trades.try_reserve_exact(source.len()).map_err(|_| {
+            OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+                resource: CapacityResource::Trades,
+                additional: source.len(),
+            })
+        })?;
+        trades.extend(source.iter().map(|trade| CommittedTrade {
+            trade_id: trade.trade_id(),
+            maker_order_id: trade.maker_order_id(),
+            price: trade.price(),
+            quantity: trade.quantity(),
+        }));
+        Ok(Self {
+            executed_quantity: match_result.executed_quantity()?.as_u64(),
+            trades,
+        })
+    }
+
+    /// Whether `other` commits the same trades: same makers, prices and
+    /// quantities in the same order, and the same executed quantity. Trade
+    /// ids are not compared (see [`CommittedTrade::trade_id`]).
+    #[must_use]
+    pub fn same_fills(&self, other: &Self) -> bool {
+        self.executed_quantity == other.executed_quantity
+            && self.trades.len() == other.trades.len()
+            && self.trades.iter().zip(&other.trades).all(|(a, b)| {
+                a.maker_order_id == b.maker_order_id
+                    && a.price == b.price
+                    && a.quantity == b.quantity
+            })
+    }
+}
+
+impl SequencerResult {
+    /// Record a failed submit from the [`SubmitFailure`] a
+    /// `*_with_committed` entry point returned.
+    ///
+    /// An [`OrderBookError::MatchAborted`] becomes
+    /// [`Self::MatchAborted`] carrying the committed prefix; every other
+    /// error is recorded exactly as `From<&OrderBookError>` records it.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::InvalidOperation`] when the committed trades do
+    /// not match the abort's `trade_count` / `executed_quantity` (the
+    /// failure was not produced by one `*_with_committed` call), or the
+    /// allocation error of [`CommittedPrefix::try_from_match_result`].
+    pub fn from_submit_failure(failure: &SubmitFailure) -> Result<Self, OrderBookError> {
+        let OrderBookError::MatchAborted {
+            executed_quantity,
+            trade_count,
+            ..
+        } = &failure.error
+        else {
+            return Ok(Self::from(&failure.error));
+        };
+        let committed = match &failure.committed {
+            Some(trade_result) => {
+                CommittedPrefix::try_from_match_result(&trade_result.match_result)?
+            }
+            None => CommittedPrefix::default(),
+        };
+        if committed.trades.len() != *trade_count
+            || committed.executed_quantity != *executed_quantity
+        {
+            return Err(OrderBookError::InvalidOperation {
+                message: format!(
+                    "committed trades ({} trades, {} executed) disagree with the aborted match ({trade_count} trades, {executed_quantity} executed)",
+                    committed.trades.len(),
+                    committed.executed_quantity
+                ),
+            });
+        }
+        Ok(Self::MatchAborted {
+            reason: failure.error.to_string(),
+            code: RejectReason::from(&failure.error),
+            committed,
+        })
+    }
 }
 
 /// Whether the engine may already have changed the book when it returned
@@ -275,7 +428,8 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         OrderBookError::InsufficientLiquidity { .. }
         | OrderBookError::InsufficientLiquidityNotional { .. }
         | OrderBookError::SelfTradePrevented { .. }
-        | OrderBookError::PriceLevelError(_) => true,
+        | OrderBookError::PriceLevelError(_)
+        | OrderBookError::MatchAborted { .. } => true,
         // Admission and shape checks (all evaluated before the sweep), the
         // operational gates, and the non-reject internal errors. The
         // post-sweep post-only rejection is here too: `pricelevel`

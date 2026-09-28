@@ -282,6 +282,39 @@ pub enum OrderBookError {
         limit_bps: u32,
     },
 
+    /// A matching sweep stopped at a price level that reported a failure
+    /// (#240): `pricelevel` 0.10 signals a mid-sweep failure such as
+    /// [`PriceLevelError::CounterExhausted`] or
+    /// [`PriceLevelError::CapacityExceeded`] through
+    /// `MatchResult::error()` while keeping the prefix it committed, and
+    /// the book's own fold of that prefix can refuse to grow as well.
+    ///
+    /// The sweep stops at the failed level and never walks on to a worse
+    /// price. Trades committed before the failure are **real**: they left
+    /// the makers' levels, so they are emitted exactly like a partial fill
+    /// (trade listener, price-level listener, risk `on_fill`, maker order
+    /// state and location cleanup). The taker's remainder never rests; its
+    /// terminal state is
+    /// `OrderStatus::Cancelled { filled_quantity: executed_quantity,
+    /// reason: CancelReason::MatchAborted }`.
+    ///
+    /// Carries primitive and upstream types only, so this module stays a
+    /// leaf: the committed trades themselves travel through the listeners
+    /// and, for a journal, through `SubmitFailure::committed`. Maps to the
+    /// stable wire code `RejectReason::MatchAborted`.
+    MatchAborted {
+        /// The taker whose sweep was aborted.
+        order_id: pricelevel::Id,
+        /// Quantity the taker executed before the abort, in quantity
+        /// units (the committed prefix; `0` when the first level failed).
+        executed_quantity: u64,
+        /// Number of trades in the committed prefix.
+        trade_count: usize,
+        /// The price-level failure that stopped the sweep. Boxed so the
+        /// variant does not widen every `Result<_, OrderBookError>`.
+        source: Box<PriceLevelError>,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -453,6 +486,17 @@ impl fmt::Display for OrderBookError {
                     "reserve residual would be discarded: re-adding order {order_id} would cross {crossable_quantity} units, exhausting its visible tranche of {visible_quantity} and discarding {discarded_quantity} of its {hidden_quantity} hidden units because automatic replenishment is off; cancel and resubmit deliberately instead"
                 )
             }
+            OrderBookError::MatchAborted {
+                order_id,
+                executed_quantity,
+                trade_count,
+                source,
+            } => {
+                write!(
+                    f,
+                    "match aborted: taker {order_id} stopped by a price level failure after executing {executed_quantity} in {trade_count} trades; remainder cancelled: {source}"
+                )
+            }
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { message } => {
                 write!(f, "nats publish error: {message}")
@@ -465,7 +509,14 @@ impl fmt::Display for OrderBookError {
     }
 }
 
-impl std::error::Error for OrderBookError {}
+impl std::error::Error for OrderBookError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OrderBookError::MatchAborted { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<PriceLevelError> for OrderBookError {
     fn from(err: PriceLevelError) -> Self {
