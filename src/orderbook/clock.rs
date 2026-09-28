@@ -41,7 +41,10 @@ pub trait Clock: Send + Sync + fmt::Debug {
 
 /// Production clock wrapping [`crate::utils::current_time_millis`].
 ///
-/// Returns wall-clock milliseconds since the Unix epoch. This is the
+/// Returns wall-clock milliseconds since the Unix epoch. [`Clock::now_millis`]
+/// is infallible, so a clock that cannot be represented as `u64` ms maps to
+/// the documented fallback of [`crate::utils::current_time_millis`] (`0`
+/// before the epoch, `u64::MAX` on overflow, logged once). This is the
 /// default clock installed on every [`crate::orderbook::book::OrderBook`]
 /// constructed via [`crate::orderbook::book::OrderBook::new`] and its
 /// friends.

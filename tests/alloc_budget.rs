@@ -109,7 +109,9 @@ fn measure_window() -> f64 {
     run_workload(&book, MEASURED_OPS, WARMUP_OPS + 1);
     let after = GLOBAL.snapshot();
 
-    let delta = after.since(before);
+    let delta = after
+        .since(before)
+        .expect("allocation counters are monotonic");
     delta.allocs as f64 / MEASURED_OPS as f64
 }
 

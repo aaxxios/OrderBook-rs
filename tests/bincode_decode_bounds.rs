@@ -71,7 +71,10 @@ fn measure_trade(payload: &[u8]) -> (u64, Result<(), SerializationError>) {
     let serializer = BincodeEventSerializer::new();
     let before = GLOBAL.snapshot();
     let result = serializer.deserialize_trade(payload).map(|_| ());
-    let delta = GLOBAL.snapshot().since(before);
+    let delta = GLOBAL
+        .snapshot()
+        .since(before)
+        .expect("allocation counters are monotonic");
     (delta.bytes_allocated, result)
 }
 
@@ -250,7 +253,11 @@ fn hostile_length_prefixes_allocate_a_bounded_amount() {
     let serializer = BincodeEventSerializer::new();
     let before = GLOBAL.snapshot();
     let result = serializer.deserialize_book_change(&huge_len());
-    let bytes = GLOBAL.snapshot().since(before).bytes_allocated;
+    let bytes = GLOBAL
+        .snapshot()
+        .since(before)
+        .expect("allocation counters are monotonic")
+        .bytes_allocated;
     assert!(result.is_err());
     assert!(
         bytes <= STRING_ATTACK_CEILING,

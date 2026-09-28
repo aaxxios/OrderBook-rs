@@ -50,6 +50,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Checked time and allocation-counter helpers (#257).**
+  `current_time_millis()` narrowed the `u128` millisecond count to `u64`
+  with `as` and silently returned `0` for a clock set before the UNIX
+  epoch. The new `try_current_time_millis() -> Result<u64, TimeError>`
+  converts with `u64::try_from` and reports `TimeError::ClockBeforeEpoch`
+  or `TimeError::MillisOverflow`. `current_time_millis()` stays infallible
+  (its production callers, `MonotonicClock::now_millis`, the book-manager
+  trade listeners and the NATS book-change batch timestamp, have no error
+  channel) and now documents its fallback: `0` before the epoch, `u64::MAX`
+  on overflow (instead of a truncated value), each logged once per process
+  with `tracing::warn!`. Matching still takes time only from the injected
+  `Clock`; no wall-clock read was added. `AllocSnapshot::since` (feature
+  `alloc-counters`) uses `checked_sub` and returns `Option<AllocSnapshot>`,
+  `None` when the snapshots are out of order, instead of clamping to zero.
+  `src/utils/mod.rs` gates its test module with `#[cfg(test)]`. The utils
+  entries leave `scripts/clippy_ratchet.txt` and
+  `scripts/panic_policy_allowlist.txt`.
+  Compatibility: `current_time_millis()` keeps its signature and returns
+  the same value on any sane clock; `try_current_time_millis` and
+  `TimeError` are additive (re-exported from the crate root and the
+  prelude). `AllocSnapshot::since` is source-breaking for
+  `alloc-counters` users: add `.expect(..)` or handle `None`. No wire,
+  journal or snapshot format change.
+
 - **Pre-trade risk uses checked notional arithmetic (#243).** The
   per-account `resting_notional` counter was updated with a wrapping
   `fetch_add` and the notional check used `saturating_*`, so two orders

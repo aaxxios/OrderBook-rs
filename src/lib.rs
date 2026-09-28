@@ -106,6 +106,13 @@
 //!   jitter; `shutdown()` returns `Result<(), NatsPublisherError>` so a
 //!   panicked or cancelled background task is reported.
 //!
+//! - **Checked time helpers (#257).** `try_current_time_millis()` returns
+//!   `Result<u64, TimeError>` for a pre-epoch clock or a `u64` overflow;
+//!   `current_time_millis()` stays infallible with a documented, logged
+//!   fallback instead of a silent `0` / truncating cast.
+//!   `AllocSnapshot::since` (feature `alloc-counters`) returns `Option` and
+//!   rejects out-of-order snapshots instead of clamping.
+//!
 //! ### Migration from 0.13
 //!
 //! | 0.13 | 0.14 |
@@ -118,6 +125,7 @@
 //! | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<Vec<..>, OrderBookError>>` |
 //! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
+//! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 //! | `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
 //! | `BlackScholes::{price, vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
 //! | `BlackScholes::d1(spot, strike, rate, time, vol) -> f64` | `-> Result<f64, IVError>` |
@@ -1240,7 +1248,8 @@ pub mod prelude;
 
 /// Shared internal helpers exposed at the crate root.
 ///
-/// Currently re-exports `current_time_millis`. When the optional
+/// Currently re-exports `current_time_millis`, `try_current_time_millis`
+/// and `TimeError`. When the optional
 /// `alloc-counters` feature is enabled, also exposes `CountingAllocator`
 /// and `AllocSnapshot` for opt-in allocation instrumentation in bench /
 /// test binaries.
@@ -1302,6 +1311,7 @@ pub use orderbook::{NatsPublisherError, NatsTradePublisher};
 pub use utils::current_time_millis;
 #[cfg(feature = "alloc-counters")]
 pub use utils::{AllocSnapshot, CountingAllocator};
+pub use utils::{TimeError, current_time_millis, try_current_time_millis};
 
 /// Legacy type alias for `OrderBook<()>` to maintain backward compatibility.
 ///
