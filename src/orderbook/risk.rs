@@ -1426,6 +1426,8 @@ impl RiskState {
     /// which empties the entire book in bulk — the per-order [`Self::on_cancel`]
     /// accounting collapses to a single clear, and leaving the maps populated would
     /// strand phantom open-order / notional counters that reject new flow (#99).
+    /// The caller must hold the exclusive submit gate (#248): the clear also
+    /// drops the reservations of in-flight submits.
     /// No-op semantics when no `RiskConfig` is installed (the maps are already empty).
     pub(super) fn clear(&self) {
         self.orders.clear();

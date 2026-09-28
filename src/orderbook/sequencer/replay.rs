@@ -1039,27 +1039,40 @@ where
 
     /// Whether the journal recorded this mass cancel as refused.
     ///
-    /// A refusal ([`MassCancelResult::has_failures`]) cancelled nothing on
-    /// the live book, so replay must not re-execute it.
+    /// A refusal ([`MassCancelResult::is_refused`]) cancelled nothing on
+    /// the live book, so replay must not re-execute it. A result carrying
+    /// only per-order failures (#248) is partial, not refused: its listed
+    /// ids were cancelled live, so replay re-executes it (see
+    /// [`Self::ensure_mass_cancel_complete`]).
     fn recorded_mass_cancel_refused(event: &SequencerEvent<T>) -> bool {
         matches!(
             &event.result,
-            SequencerResult::MassCancelled { result } if result.has_failures()
+            SequencerResult::MassCancelled { result } if result.is_refused()
         )
     }
 
-    /// Fails replay when a re-executed mass cancel recorded a failure.
+    /// Fails replay when a re-executed mass cancel recorded a failure, or
+    /// when the journal recorded one for it.
     ///
-    /// A refused mass cancel cancels nothing (see
+    /// A refused mass cancel cancels nothing and a partial one leaves orders
+    /// resting (see
     /// [`MassCancelFailure`](crate::orderbook::mass_cancel::MassCancelFailure)),
     /// so continuing would leave the replayed book diverged from the live one
-    /// without any signal. The first failure is reported as
+    /// without any signal. Likewise, a live mass cancel journaled with
+    /// per-order failures left those orders resting, and a replay that
+    /// cancels them diverges; until replay reconciles mass cancels by
+    /// identity (#252) such an event is always reported. The first failure
+    /// (the replay's own, else the journal's) is reported as
     /// [`ReplayError::OrderBookError`] at the event's sequence number.
     fn ensure_mass_cancel_complete(
         event: &SequencerEvent<T>,
         result: &MassCancelResult,
     ) -> Result<(), ReplayError> {
-        match result.failures().first() {
+        let recorded = match &event.result {
+            SequencerResult::MassCancelled { result } => result.failures().first(),
+            _ => None,
+        };
+        match result.failures().first().or(recorded) {
             None => Ok(()),
             Some(failure) => Err(ReplayError::OrderBookError {
                 sequence_num: event.sequence_num,
@@ -2214,6 +2227,54 @@ mod tests {
             1,
             "the refused cancel kept the order"
         );
+    }
+
+    /// #248: a mass cancel journaled with per-order failures is partial,
+    /// not refused. Replay must not skip it (its listed ids were cancelled
+    /// live) and, until #252 reconciles by identity, must not accept it
+    /// silently either: replay reports the recorded failure.
+    #[test]
+    fn test_replay_reports_mass_cancel_recorded_as_partial() {
+        use crate::orderbook::mass_cancel::MassCancelFailure;
+
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let symbol = "PARTIAL";
+        for (seq, id) in [(0u64, 1u64), (1, 2)] {
+            assert!(
+                journal
+                    .append(&make_add_event(seq, Id::from_u64(id), 100, 5, Side::Buy))
+                    .is_ok()
+            );
+        }
+        let partial = MassCancelResult::with_failures(
+            vec![Id::from_u64(1)],
+            vec![MassCancelFailure::OrderCancelFailed {
+                order_id: Id::from_u64(2),
+                error: pricelevel::PriceLevelError::InvalidOperation {
+                    message: "refused".to_string(),
+                },
+            }],
+        );
+        assert!(partial.has_failures() && !partial.is_refused());
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 2,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::CancelBySide { side: Side::Buy },
+                    result: SequencerResult::MassCancelled { result: partial },
+                })
+                .is_ok()
+        );
+
+        match ReplayEngine::<()>::replay_from(&journal, 0, symbol) {
+            Err(ReplayError::OrderBookError {
+                sequence_num,
+                source: OrderBookError::PriceLevelError(_),
+            }) => assert_eq!(sequence_num, 2),
+            Err(other) => panic!("expected the recorded failure, got {other:?}"),
+            Ok(_) => panic!("a partial mass cancel must not replay silently"),
+        }
     }
 
     // --- trade-ID namespace through replay (#200) ---------------------------

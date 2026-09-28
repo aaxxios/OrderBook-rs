@@ -5,9 +5,12 @@
 //! These are critical exchange operations for risk management, market maker
 //! position unwinding, and administrative actions.
 //!
-//! All mass cancel methods reuse the single-order `cancel_order` path,
-//! ensuring consistent listener notifications, special-order tracker cleanup,
-//! and empty price-level removal.
+//! The scoped mass cancels and expiry eviction reuse the single-order
+//! `cancel_order` path, ensuring consistent listener notifications, risk
+//! release, special-order tracker cleanup, and empty price-level removal;
+//! `cancel_all_orders` empties the book in bulk. Every mass cancel holds the
+//! exclusive side of the submit gate, and none of them swallows a failure:
+//! see [`MassCancelFailure`] (#248).
 
 use super::book::OrderBook;
 use super::book_change_event::PriceLevelChangedEvent;
@@ -20,17 +23,29 @@ use tracing::trace;
 
 /// A failure recorded by a mass cancel operation instead of being swallowed.
 ///
-/// Every mass cancel that walks price levels (`cancel_all_orders`,
-/// `cancel_orders_by_side`, `cancel_orders_by_price_range`) reads each level's
-/// resting orders through the fallible `PriceLevel::snapshot_by_seq_into`
-/// (pricelevel 0.10). The read phase runs before any order is cancelled, and
-/// a level that cannot be read makes the whole call cancel **nothing**: a
-/// partial bulk cancel whose skipped orders are invisible in the journaled
-/// payload would be worse than a refused one. The unreadable level is
-/// reported here so the caller can observe the refusal and retry.
+/// Two kinds of failure exist, and they mean different things for the book:
 ///
-/// The enum is `#[non_exhaustive]`: later releases add variants (for example
-/// per-order cancel failures), so match it with a wildcard arm.
+/// - [`Self::LevelUnreadable`] is a **refusal**. Every mass cancel that
+///   walks price levels (`cancel_all_orders`, `cancel_orders_by_side`,
+///   `cancel_orders_by_price_range`) reads each level's resting orders
+///   through the fallible `PriceLevel::snapshot_by_seq_into` (pricelevel
+///   0.10). The read phase runs before any order is cancelled, and a level
+///   that cannot be read makes the whole call cancel **nothing**: a partial
+///   bulk cancel whose skipped orders are invisible in the journaled payload
+///   would be worse than a refused one. See [`MassCancelResult::is_refused`].
+/// - [`Self::OrderCancelFailed`] is a **per-order** failure (#248). The
+///   scoped mass cancels remove orders one at a time through the
+///   single-order cancel path; an order whose price level refuses the
+///   removal stays resting and fully tracked (location, user index, risk,
+///   order state), the failure is recorded here, and the call carries on
+///   with the next order. Such a result can therefore carry cancelled ids
+///   **and** failures.
+///
+/// Failures are recorded in the call's deterministic traversal order, the
+/// same order as [`MassCancelResult::cancelled_order_ids`].
+///
+/// The enum is `#[non_exhaustive]`: later releases may add variants, so
+/// match it with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -45,6 +60,16 @@ pub enum MassCancelFailure {
         /// The error pricelevel returned for the read.
         error: PriceLevelError,
     },
+    /// The order `order_id` was in the mass cancel's scope but its price
+    /// level refused the removal (#248). The order is still resting and
+    /// tracked; no cancel event, order-state transition or risk release was
+    /// emitted for it.
+    OrderCancelFailed {
+        /// The order that could not be cancelled.
+        order_id: Id,
+        /// The error the single-order cancel path returned.
+        error: PriceLevelError,
+    },
 }
 
 impl MassCancelFailure {
@@ -52,9 +77,32 @@ impl MassCancelFailure {
     #[must_use]
     pub fn to_order_book_error(&self) -> OrderBookError {
         match self {
-            MassCancelFailure::LevelUnreadable { error, .. } => {
+            MassCancelFailure::LevelUnreadable { error, .. }
+            | MassCancelFailure::OrderCancelFailed { error, .. } => {
                 OrderBookError::PriceLevelError(error.clone())
             }
+        }
+    }
+
+    /// Returns `true` for a failure that refused the whole call
+    /// ([`Self::LevelUnreadable`]): nothing was cancelled.
+    #[must_use]
+    #[inline]
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, MassCancelFailure::LevelUnreadable { .. })
+    }
+
+    /// Builds the per-order failure for an `order_id` the single-order
+    /// cancel path could not remove. The cancel path only fails with
+    /// [`OrderBookError::PriceLevelError`]; any other variant is folded into
+    /// [`PriceLevelError::InvalidOperation`] carrying its message, so the
+    /// failure is still recorded rather than dropped.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn order_cancel_failed(order_id: Id, error: OrderBookError) -> Self {
+        MassCancelFailure::OrderCancelFailed {
+            order_id,
+            error: cancel_error_source(error),
         }
     }
 }
@@ -65,6 +113,9 @@ impl std::fmt::Display for MassCancelFailure {
             MassCancelFailure::LevelUnreadable { side, price, error } => {
                 write!(f, "price level {side} {price} unreadable: {error}")
             }
+            MassCancelFailure::OrderCancelFailed { order_id, error } => {
+                write!(f, "order {order_id} not cancelled: {error}")
+            }
         }
     }
 }
@@ -72,17 +123,20 @@ impl std::fmt::Display for MassCancelFailure {
 /// Result of a mass cancel operation.
 ///
 /// Contains the count and identifiers of all orders that were successfully
-/// cancelled, plus any [`MassCancelFailure`] that made the call refuse part or
-/// all of its work. This struct is returned by every mass cancel method and
-/// should always be inspected by the caller: check [`Self::has_failures`]
-/// before treating an empty result as "nothing to cancel".
+/// cancelled, plus every [`MassCancelFailure`] the call recorded. This struct
+/// is returned by every mass cancel method and should always be inspected by
+/// the caller: check [`Self::has_failures`] before treating the result as
+/// complete, and [`Self::is_refused`] to tell a refused call (nothing
+/// cancelled) from a partial one.
 ///
 /// # Serialization
 ///
 /// `failures` was added in 0.14.0 with `#[serde(default)]`: JSON written by
 /// earlier releases (for example a journaled `MassCancelled` entry) decodes
-/// with an empty failure list. Positional encodings (bincode) written by
-/// earlier releases do not decode.
+/// with an empty failure list. The `order_cancel_failed` failure variant is
+/// also new in 0.14.0; a 0.14.0 reader decodes JSON carrying only
+/// `level_unreadable` failures unchanged. Positional encodings (bincode)
+/// written by earlier releases do not decode.
 ///
 /// Fields are intentionally private to prevent external mutation of what
 /// should be an immutable result type. Use the accessor methods instead.
@@ -103,7 +157,7 @@ pub struct MassCancelResult {
     cancelled_count: usize,
     /// IDs of all cancelled orders, in the order they were processed.
     cancelled_order_ids: Vec<Id>,
-    /// Failures that made the call refuse work, in traversal order.
+    /// Failures recorded by the call, in traversal order.
     #[serde(default)]
     failures: Vec<MassCancelFailure>,
 }
@@ -115,6 +169,19 @@ impl MassCancelResult {
             cancelled_count,
             cancelled_order_ids,
             failures: Vec::new(),
+        }
+    }
+
+    /// Creates a result from the cancelled ids and the per-order failures of
+    /// a call, both in traversal order.
+    pub(crate) fn with_failures(
+        cancelled_order_ids: Vec<Id>,
+        failures: Vec<MassCancelFailure>,
+    ) -> Self {
+        Self {
+            cancelled_count: cancelled_order_ids.len(),
+            cancelled_order_ids,
+            failures,
         }
     }
 
@@ -144,6 +211,18 @@ impl MassCancelResult {
     #[inline]
     pub fn has_failures(&self) -> bool {
         !self.failures.is_empty()
+    }
+
+    /// Returns `true` if the operation was **refused** as a whole
+    /// ([`MassCancelFailure::LevelUnreadable`]): nothing was cancelled.
+    ///
+    /// A result with only [`MassCancelFailure::OrderCancelFailed`] failures
+    /// is partial, not refused: the listed ids were cancelled and the failed
+    /// orders are still resting.
+    #[must_use]
+    #[inline]
+    pub fn is_refused(&self) -> bool {
+        self.failures.iter().any(MassCancelFailure::is_refusal)
     }
 
     /// Returns the number of orders successfully cancelled.
@@ -197,12 +276,28 @@ where
     ///
     /// This is an optimised bulk operation that clears the entire book in one
     /// pass instead of cancelling orders individually. It:
-    /// 1. Collects all resting order IDs.
-    /// 2. Emits a [`PriceLevelChangedEvent`] (quantity → 0) for every
-    ///    affected price level so that external listeners can update.
-    /// 3. Clears all internal tracking maps (`order_locations`, `user_orders`)
-    ///    and drains both bid/ask SkipMaps.
-    /// 4. Cleans up the special-order tracker (pegged / trailing stop).
+    /// 1. Collects all resting order IDs and the affected price levels.
+    /// 2. Clears all internal tracking maps (`order_locations`, `user_orders`),
+    ///    drains both bid/ask SkipMaps, cleans up the special-order tracker
+    ///    (pegged / trailing stop) and releases every order's pre-trade risk
+    ///    contribution.
+    /// 3. Only then emits a [`PriceLevelChangedEvent`] (quantity → 0) for every
+    ///    affected price level and a `Cancelled { MassCancelAll }` order-state
+    ///    transition for every cancelled order, so a listener never observes
+    ///    an event for a mutation that has not happened yet.
+    ///
+    /// # Concurrency (#248)
+    ///
+    /// The whole call holds the **exclusive** side of the submit gate. The
+    /// bulk clear removes everything the tracking maps hold, not just what
+    /// step 1 collected, so under the shared side an order admitted between
+    /// the collection and the clear was dropped with no cancel event, no
+    /// order-state transition and no risk release, and the risk reset wiped
+    /// the reservations of in-flight submits. Under the exclusive side the
+    /// book is quiescent: every order is either cancelled and reported here,
+    /// or admitted after the call and still resting and tracked. The cost is
+    /// that submits, cancels and modifies on this book wait for the bulk
+    /// clear to finish.
     ///
     /// # Performance
     ///
@@ -254,9 +349,10 @@ where
     /// # }
     /// ```
     pub fn cancel_all_orders(&self) -> MassCancelResult {
-        // #209: shared submit gate — the bulk walk must not interleave
-        // with a concurrent FOK's exclusive feasibility + sweep window.
-        let _gate = self.submit_gate_read();
+        // #248: exclusive submit gate. The bulk clear below empties the
+        // tracking maps wholesale, so no admission, cancel or modify may run
+        // between the collection and the clear (see "Concurrency" above).
+        let _gate = self.submit_gate_write();
         self.cache.invalidate();
         trace!("Order book {}: Mass cancel ALL orders (bulk)", self.symbol);
 
@@ -267,13 +363,16 @@ where
         // order the matching engine consumes resting orders — the `order_locations`
         // `DashMap` iteration order must NOT be used here or replay would diverge
         // across processes (its hasher is seeded per-instance). One scratch buffer
-        // is reused across levels to avoid a per-level allocation.
+        // is reused across levels to avoid a per-level allocation. The affected
+        // levels are recorded in the same order for the post-clear events.
         //
         // The collection runs before any mutation: a level whose orders
         // cannot be read refuses the whole call (nothing is cancelled and the
         // level is reported in `failures`), because the bulk clear below would
         // otherwise remove orders that neither the result nor the journal names.
-        let mut cancelled_order_ids: Vec<Id> = Vec::new();
+        let mut cancelled_order_ids: Vec<Id> = Vec::with_capacity(self.order_locations.len());
+        let mut cleared_levels: Vec<(Side, u128)> =
+            Vec::with_capacity(self.bids.len().checked_add(self.asks.len()).unwrap_or(0));
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
         let sides = self
             .bids
@@ -281,11 +380,11 @@ where
             .map(|entry| (entry, Side::Buy))
             .chain(self.asks.iter().map(|entry| (entry, Side::Sell)));
         for (entry, side) in sides {
-            if let Err(failure) =
-                read_level_orders(entry.value(), side, *entry.key(), &mut level_orders)
-            {
+            let price = *entry.key();
+            if let Err(failure) = read_level_orders(entry.value(), side, price, &mut level_orders) {
                 return self.refuse_mass_cancel(failure);
             }
+            cleared_levels.push((side, price));
             for order in &level_orders {
                 cancelled_order_ids.push(order.id());
             }
@@ -296,29 +395,57 @@ where
             return MassCancelResult::default();
         }
 
-        // 2. Emit PriceLevelChangedEvent (qty → 0) for every affected level
+        // 2. Mutate. Everything below is infallible, so the book goes from
+        // "every collected order resting" to "empty" with nothing in between
+        // observable by a listener.
+        //
+        // 2a. Clear tracking maps. Exclusive gate: the maps hold exactly the
+        // collected orders.
+        self.order_locations.clear();
+        self.user_orders.clear();
+        // #230: `cancel_all_orders` is the one removal path that does not go
+        // through `cancel_order_with_reason` — it empties the whole book in
+        // bulk — so the strandable-maker tally collapses to a single reset
+        // here, the same way the risk state does below. Nothing rests
+        // afterwards, so the exact count is zero.
+        self.reset_strandable_makers();
+
+        // 2b. Drain both SkipMaps
+        while self.bids.pop_front().is_some() {}
+        while self.asks.pop_front().is_some() {}
+
+        // 2c. Clear special order tracker
+        #[cfg(feature = "special_orders")]
+        self.special_order_tracker.clear();
+
+        // 2d. Release the pre-trade risk state. cancel_all empties the whole
+        // book, so the per-order on_cancel accounting collapses to a single
+        // clear — otherwise every account's open_orders / notional counters
+        // would stay at pre-cancel values and permanently reject new flow
+        // (#99). Exact only because the exclusive gate excludes in-flight
+        // submits, whose risk reservations the clear would otherwise wipe
+        // (#248). No-op without a RiskConfig.
+        self.risk_state.clear();
+
+        self.cache.invalidate();
+        // Refresh the depth gauges; both sides are now empty.
+        self.record_depth_metric();
+
+        // 3. Emit, after the mutation: one PriceLevelChangedEvent (qty → 0)
+        // per cleared level, then one Cancelled transition per order, both in
+        // the collection order (the same level-then-state order the
+        // single-order cancel path emits).
         if let Some(ref listener) = self.price_level_changed_listener {
-            for entry in self.bids.iter() {
+            for &(side, price) in &cleared_levels {
                 let engine_seq = self.next_engine_seq();
                 listener(PriceLevelChangedEvent {
-                    side: Side::Buy,
-                    price: *entry.key(),
-                    quantity: 0,
-                    engine_seq,
-                });
-            }
-            for entry in self.asks.iter() {
-                let engine_seq = self.next_engine_seq();
-                listener(PriceLevelChangedEvent {
-                    side: Side::Sell,
-                    price: *entry.key(),
+                    side,
+                    price,
                     quantity: 0,
                     engine_seq,
                 });
             }
         }
-
-        // 2b. Track cancellation state for each order
         for &order_id in &cancelled_order_ids {
             let prev_filled = self
                 .order_state_tracker
@@ -334,34 +461,6 @@ where
                 },
             );
         }
-
-        // 3. Clear tracking maps
-        self.order_locations.clear();
-        self.user_orders.clear();
-        // #230: `cancel_all_orders` is the one removal path that does not go
-        // through `cancel_order_with_reason` — it empties the whole book in
-        // bulk — so the strandable-maker tally collapses to a single reset
-        // here, the same way the risk state does below. Nothing rests
-        // afterwards, so the exact count is zero.
-        self.reset_strandable_makers();
-
-        // 4. Drain both SkipMaps
-        while self.bids.pop_front().is_some() {}
-        while self.asks.pop_front().is_some() {}
-
-        // 5. Clear special order tracker
-        #[cfg(feature = "special_orders")]
-        self.special_order_tracker.clear();
-
-        // 6. Reset the pre-trade risk state. cancel_all empties the whole book, so
-        // the per-order on_cancel accounting collapses to a single clear — otherwise
-        // every account's open_orders / notional counters would stay at pre-cancel
-        // values and permanently reject new flow (#99). No-op without a RiskConfig.
-        self.risk_state.clear();
-
-        self.cache.invalidate();
-        // Refresh the depth gauges; both sides are now empty.
-        self.record_depth_metric();
 
         MassCancelResult::new(cancelled_count, cancelled_order_ids)
     }
@@ -379,6 +478,15 @@ where
     /// # Returns
     ///
     /// A [`MassCancelResult`] with the count and IDs of cancelled orders.
+    /// An order whose price level refuses the removal is recorded as
+    /// [`MassCancelFailure::OrderCancelFailed`] and stays resting and
+    /// tracked; the call carries on with the rest of its scope (#248).
+    ///
+    /// # Concurrency
+    ///
+    /// Holds the **exclusive** side of the submit gate (#248): the scope is
+    /// collected before it is cancelled, and an id re-admitted out of scope
+    /// in between must not be cancelled by this call.
     ///
     /// # Determinism
     ///
@@ -417,9 +525,13 @@ where
     /// # }
     /// ```
     pub fn cancel_orders_by_side(&self, side: Side) -> MassCancelResult {
-        // #209: shared submit gate — the bulk walk must not interleave
-        // with a concurrent FOK's exclusive feasibility + sweep window.
-        let _gate = self.submit_gate_read();
+        // #248: exclusive submit gate. The scope is collected first and
+        // cancelled id by id afterwards; under the shared side an id could be
+        // cancelled and re-admitted out of scope in between (other side,
+        // other price, other user, not expired) and would then be cancelled
+        // by this call. Exclusive also keeps a concurrent FOK / STP window
+        // (#209 / #225) out of the walk, as the shared side did.
+        let _gate = self.submit_gate_write();
         trace!(
             "Order book {}: Mass cancel orders on side {}",
             self.symbol, side
@@ -446,13 +558,22 @@ where
     /// # Returns
     ///
     /// A [`MassCancelResult`] with the count and IDs of cancelled orders.
+    /// An order whose price level refuses the removal is recorded as
+    /// [`MassCancelFailure::OrderCancelFailed`] and stays resting and
+    /// tracked; the call carries on with the rest of its scope (#248).
+    ///
+    /// # Concurrency
+    ///
+    /// Holds the **exclusive** side of the submit gate (#248): the scope is
+    /// collected before it is cancelled, and an id re-admitted out of scope
+    /// in between must not be cancelled by this call.
     ///
     /// # Determinism
     ///
     /// [`MassCancelResult::cancelled_order_ids`] follows the user's
     /// **admission-history order**: the `user_orders` index is a `Vec<Id>`
     /// appended to (never reordered) as each of the user's orders is admitted
-    /// (`track_user_order`), and this method drains that `Vec` in place. Under a
+    /// (`track_user_order`), and this method walks a copy of that `Vec`. Under a
     /// serialized command stream — as replayed from the journal — that ordering
     /// is fixed and byte-identical across processes, so the emitted
     /// `SequencerResult::MassCancelled` payload is replay-stable without any
@@ -499,22 +620,37 @@ where
     /// # }
     /// ```
     pub fn cancel_orders_by_user(&self, user_id: Hash32) -> MassCancelResult {
-        // #209: shared submit gate — the bulk walk must not interleave
-        // with a concurrent FOK's exclusive feasibility + sweep window.
-        let _gate = self.submit_gate_read();
+        // #248: exclusive submit gate. The scope is collected first and
+        // cancelled id by id afterwards; under the shared side an id could be
+        // cancelled and re-admitted out of scope in between (other side,
+        // other price, other user, not expired) and would then be cancelled
+        // by this call. Exclusive also keeps a concurrent FOK / STP window
+        // (#209 / #225) out of the walk, as the shared side did.
+        let _gate = self.submit_gate_write();
         trace!(
             "Order book {}: Mass cancel orders for user {}",
             self.symbol, user_id
         );
 
         // O(1) lookup via the user_orders index — no full book scan needed.
-        let order_ids = self
+        // #248: copy the ids, do not remove the entry. Each successful cancel
+        // untracks its own id through the single-order cancel path, so an
+        // order whose cancel fails stays in the index (and resting) instead
+        // of becoming unreachable by a later by-user cancel. The shard guard
+        // is released at the end of this statement, before any cancel takes
+        // the same shard's write side.
+        let Some(order_ids) = self
             .user_orders
-            .remove(&user_id)
-            .map(|(_, ids)| ids)
-            .unwrap_or_default();
+            .get(&user_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return MassCancelResult::default();
+        };
 
-        self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelByUser)
+        let result =
+            self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelByUser);
+        self.purge_stale_user_ids(user_id);
+        result
     }
 
     /// Cancel all resting orders on a given side within a price range
@@ -534,6 +670,15 @@ where
     /// # Returns
     ///
     /// A [`MassCancelResult`] with the count and IDs of cancelled orders.
+    /// An order whose price level refuses the removal is recorded as
+    /// [`MassCancelFailure::OrderCancelFailed`] and stays resting and
+    /// tracked; the call carries on with the rest of its scope (#248).
+    ///
+    /// # Concurrency
+    ///
+    /// Holds the **exclusive** side of the submit gate (#248): the scope is
+    /// collected before it is cancelled, and an id re-admitted out of scope
+    /// in between must not be cancelled by this call.
     ///
     /// # Determinism
     ///
@@ -577,8 +722,13 @@ where
         min_price: u128,
         max_price: u128,
     ) -> MassCancelResult {
-        // #209: shared submit gate (see `cancel_all_orders`).
-        let _gate = self.submit_gate_read();
+        // #248: exclusive submit gate. The scope is collected first and
+        // cancelled id by id afterwards; under the shared side an id could be
+        // cancelled and re-admitted out of scope in between (other side,
+        // other price, other user, not expired) and would then be cancelled
+        // by this call. Exclusive also keeps a concurrent FOK / STP window
+        // (#209 / #225) out of the walk, as the shared side did.
+        let _gate = self.submit_gate_write();
         trace!(
             "Order book {}: Mass cancel orders on side {} in price range [{}, {}]",
             self.symbol, side, min_price, max_price
@@ -674,7 +824,23 @@ where
     /// Returns [`OrderBookError::PriceLevelError`] when a price level's
     /// resting orders cannot be read (`PriceLevel::snapshot_by_seq_into` is
     /// fallible since pricelevel 0.10). The read phase runs before any
-    /// eviction, so on `Err` nothing was evicted and the book is unchanged.
+    /// eviction, so on this `Err` nothing was evicted and the book is
+    /// unchanged.
+    ///
+    /// Returns [`OrderBookError::EvictionIncomplete`] when at least one
+    /// expired order's price level refused its removal (#248). The sweep
+    /// does not stop at the failure: every other expired order is still
+    /// evicted, with its usual events, and every failed order stays resting
+    /// and fully tracked. The error names the first failed order in sweep
+    /// order and counts the evicted and failed orders; the evicted orders
+    /// themselves were reported through the price-level and order-state
+    /// listeners. A later sweep retries the failed orders.
+    ///
+    /// # Concurrency
+    ///
+    /// Holds the **exclusive** side of the submit gate (#248), like every
+    /// mass cancel: the expired ids are collected before they are removed,
+    /// and an id re-admitted in between as a live order must not be evicted.
     ///
     /// # Examples
     ///
@@ -710,8 +876,13 @@ where
         &self,
         now_ms: TimestampMs,
     ) -> Result<Vec<Arc<OrderType<T>>>, OrderBookError> {
-        // #209: shared submit gate (see `cancel_all_orders`).
-        let _gate = self.submit_gate_read();
+        // #248: exclusive submit gate. The scope is collected first and
+        // cancelled id by id afterwards; under the shared side an id could be
+        // cancelled and re-admitted out of scope in between (other side,
+        // other price, other user, not expired) and would then be cancelled
+        // by this call. Exclusive also keeps a concurrent FOK / STP window
+        // (#209 / #225) out of the walk, as the shared side did.
+        let _gate = self.submit_gate_write();
         let now = now_ms.as_u64();
         trace!(
             "Order book {}: Evicting expired orders as of {} ms",
@@ -765,12 +936,27 @@ where
         // Phase 2: cancel each expired order through the shared single-order
         // path, preserving the collection order. This is what keeps the caches,
         // trackers, and emitted events consistent and in the documented order.
+        //
+        // #248: a per-order failure is not swallowed. The failed order stays
+        // resting and tracked, the sweep carries on with the next expired
+        // order (each removal is independent), and the call ends in
+        // `EvictionIncomplete` naming the first failure.
         let mut evicted = Vec::with_capacity(expired_ids.len());
+        // Ids only (no arithmetic): the count is the length.
+        let mut failed_ids: Vec<Id> = Vec::new();
+        let mut first_failure: Option<(Id, OrderBookError)> = None;
         for order_id in expired_ids {
-            if let Ok(Some(order)) =
-                self.cancel_order_with_reason(order_id, CancelReason::TimeInForceExpired)
-            {
-                evicted.push(order);
+            match self.cancel_order_with_reason(order_id, CancelReason::TimeInForceExpired) {
+                Ok(Some(order)) => evicted.push(order),
+                // Absent: under the exclusive gate only an index
+                // inconsistency gets here; nothing to evict.
+                Ok(None) => self.note_order_not_in_book(order_id),
+                Err(error) => {
+                    failed_ids.push(order_id);
+                    if first_failure.is_none() {
+                        first_failure = Some((order_id, error));
+                    }
+                }
             }
         }
 
@@ -778,33 +964,123 @@ where
             symbol = %self.symbol,
             now_ms = now,
             evicted = evicted.len(),
+            failed = failed_ids.len(),
             "expired orders evicted"
         );
 
-        Ok(evicted)
+        match first_failure {
+            None => Ok(evicted),
+            Some((order_id, error)) => {
+                Err(self.eviction_incomplete(now, evicted.len(), failed_ids.len(), order_id, error))
+            }
+        }
     }
 
     /// Internal helper: cancel a batch of orders by their IDs with a reason.
     ///
-    /// Calls [`Self::cancel_order_with_reason`] for each ID. Orders that no
-    /// longer exist (e.g. concurrently cancelled) are silently skipped.
+    /// Calls [`Self::cancel_order_with_reason`] for each ID, in the given
+    /// order. A successful cancel is reported in the result's ids; a failed
+    /// one is recorded as [`MassCancelFailure::OrderCancelFailed`] (the order
+    /// stays resting and tracked) and the batch carries on. An id that is no
+    /// longer resting is skipped and logged: callers hold the exclusive
+    /// submit gate, so only an index inconsistency gets there.
     fn cancel_order_batch_with_reason(
         &self,
         order_ids: &[Id],
         reason: CancelReason,
     ) -> MassCancelResult {
         let mut cancelled_ids = Vec::with_capacity(order_ids.len());
+        let mut failures = Vec::new();
 
         for &order_id in order_ids {
-            // cancel_order_with_reason handles: listener notification, special order cleanup,
-            // empty level removal, order_locations cleanup, and state tracking.
-            if let Ok(Some(_)) = self.cancel_order_with_reason(order_id, reason) {
-                cancelled_ids.push(order_id);
+            // cancel_order_with_reason handles: listener notification, special
+            // order cleanup, empty level removal, order_locations / user_orders
+            // cleanup, risk release and state tracking.
+            match self.cancel_order_with_reason(order_id, reason) {
+                Ok(Some(_)) => cancelled_ids.push(order_id),
+                Ok(None) => self.note_order_not_in_book(order_id),
+                Err(error) => {
+                    let failure = MassCancelFailure::order_cancel_failed(order_id, error);
+                    tracing::warn!(
+                        symbol = %self.symbol,
+                        %reason,
+                        %failure,
+                        "mass cancel could not cancel an order; it stays resting"
+                    );
+                    failures.push(failure);
+                }
             }
         }
 
-        let count = cancelled_ids.len();
-        MassCancelResult::new(count, cancelled_ids)
+        MassCancelResult::with_failures(cancelled_ids, failures)
+    }
+
+    /// Drops the ids of `user_id`'s index entry that no longer name a
+    /// resting order, after a by-user cancel (#248).
+    ///
+    /// A successful cancel already untracked its own id, and a failed one is
+    /// still resting, so only stale ids — an index inconsistency, logged by
+    /// [`Self::note_order_not_in_book`] — are dropped here. The pre-#248
+    /// code removed the whole entry up front, which also purged them; this
+    /// keeps that repair without dropping failed orders. Runs under the
+    /// exclusive submit gate, so no admission can race the check.
+    fn purge_stale_user_ids(&self, user_id: Hash32) {
+        let now_empty = match self.user_orders.get_mut(&user_id) {
+            None => return,
+            Some(mut entry) => {
+                // Different map from `user_orders`, so reading it under this
+                // shard guard cannot deadlock.
+                entry
+                    .value_mut()
+                    .retain(|id| self.order_locations.contains_key(id));
+                entry.value().is_empty()
+            }
+        };
+        if now_empty {
+            self.user_orders.remove(&user_id);
+        }
+    }
+
+    /// Logs a scoped mass cancel or eviction that found a collected id no
+    /// longer resting. Under the exclusive submit gate this means the
+    /// `order_locations` / `user_orders` indices disagree with the levels.
+    #[cold]
+    #[inline(never)]
+    fn note_order_not_in_book(&self, order_id: Id) {
+        tracing::warn!(
+            symbol = %self.symbol,
+            %order_id,
+            "mass cancel: order in scope is not resting at its indexed location; index inconsistency, skipped"
+        );
+    }
+
+    /// Logs an incomplete eviction and builds its error.
+    #[cold]
+    #[inline(never)]
+    fn eviction_incomplete(
+        &self,
+        now_ms: u64,
+        evicted_count: usize,
+        failed_count: usize,
+        order_id: Id,
+        error: OrderBookError,
+    ) -> OrderBookError {
+        let source = cancel_error_source(error);
+        tracing::warn!(
+            symbol = %self.symbol,
+            now_ms,
+            evicted_count,
+            failed_count,
+            %order_id,
+            %source,
+            "expired-order eviction incomplete: orders could not be removed and stay resting"
+        );
+        OrderBookError::EvictionIncomplete {
+            evicted_count,
+            failed_count,
+            order_id,
+            source: Box::new(source),
+        }
     }
 
     /// Collect all order IDs on a given side by iterating price levels in the
@@ -848,6 +1124,22 @@ where
             "mass cancel refused: price level unreadable, nothing cancelled"
         );
         MassCancelResult::refused(failure)
+    }
+}
+
+/// The price-level error behind a failed single-order cancel.
+/// `cancel_order_with_reason` only fails with
+/// [`OrderBookError::PriceLevelError`]; any other variant is folded into
+/// [`PriceLevelError::InvalidOperation`] carrying its message, so the failure
+/// is still recorded rather than dropped.
+#[cold]
+#[inline(never)]
+fn cancel_error_source(error: OrderBookError) -> PriceLevelError {
+    match error {
+        OrderBookError::PriceLevelError(error) => error,
+        other => PriceLevelError::InvalidOperation {
+            message: other.to_string(),
+        },
     }
 }
 
@@ -936,6 +1228,84 @@ mod tests {
         assert!(json.contains("\"level_unreadable\""), "{json}");
         let decoded: MassCancelResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.failures(), result.failures());
+    }
+
+    /// JSON in the pre-#248 0.14.0 shape — a `failures` list holding only
+    /// `level_unreadable` entries — still decodes unchanged: #248 only adds
+    /// a variant (#248 serde back-compat).
+    #[test]
+    fn test_mass_cancel_result_json_without_order_cancel_failed_decodes() {
+        let pre_248 = r#"{"cancelled_count":0,"cancelled_order_ids":[],"failures":[{"level_unreadable":{"side":"SELL","price":101,"error":{"CapacityExceeded":{"resource":"order_snapshot","additional":3}}}}]}"#;
+        let decoded: MassCancelResult = serde_json::from_str(pre_248).expect("pre-#248 json");
+        assert_eq!(decoded.failures(), &[unreadable_level()]);
+        assert!(decoded.is_refused());
+        assert!(decoded.is_empty());
+    }
+
+    fn order_cancel_failed(order: u64) -> MassCancelFailure {
+        MassCancelFailure::OrderCancelFailed {
+            order_id: Id::from_u64(order),
+            error: PriceLevelError::InvalidOperation {
+                message: "refused".to_string(),
+            },
+        }
+    }
+
+    /// A partial result (cancelled ids plus per-order failures) round-trips
+    /// through JSON, is not a refusal, and renders its failures.
+    #[test]
+    fn test_mass_cancel_result_partial_round_trip_json() {
+        let result = MassCancelResult::with_failures(
+            vec![Id::from_u64(1), Id::from_u64(3)],
+            vec![order_cancel_failed(2)],
+        );
+        assert_eq!(result.cancelled_count(), 2);
+        assert!(result.has_failures());
+        assert!(!result.is_refused());
+        assert_eq!(
+            result.to_string(),
+            "MassCancelResult { cancelled: 2, failures: 1 }"
+        );
+        let failure = &result.failures()[0];
+        assert!(!failure.is_refusal());
+        assert!(
+            failure
+                .to_string()
+                .starts_with(&format!("order {} not cancelled", Id::from_u64(2)))
+        );
+        assert!(matches!(
+            failure.to_order_book_error(),
+            OrderBookError::PriceLevelError(PriceLevelError::InvalidOperation { .. })
+        ));
+
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"order_cancel_failed\""), "{json}");
+        let decoded: MassCancelResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.cancelled_order_ids(), result.cancelled_order_ids());
+        assert_eq!(decoded.cancelled_count(), 2);
+        assert_eq!(decoded.failures(), result.failures());
+    }
+
+    /// A non-price-level cancel error is folded into
+    /// `PriceLevelError::InvalidOperation` rather than dropped.
+    #[test]
+    fn test_order_cancel_failed_folds_other_errors() {
+        let failure = MassCancelFailure::order_cancel_failed(
+            Id::from_u64(9),
+            OrderBookError::InvalidOperation {
+                message: "boom".to_string(),
+            },
+        );
+        match failure {
+            MassCancelFailure::OrderCancelFailed {
+                order_id,
+                error: PriceLevelError::InvalidOperation { message },
+            } => {
+                assert_eq!(order_id, Id::from_u64(9));
+                assert!(message.contains("boom"), "{message}");
+            }
+            other => panic!("unexpected failure {other:?}"),
+        }
     }
 
     /// JSON written before 0.14 (no `failures` key) decodes with an empty

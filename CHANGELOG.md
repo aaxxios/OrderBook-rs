@@ -206,6 +206,60 @@ change.
   Replay applies a mass cancel journaled as refused as a no-op instead of
   re-executing it, so a replay book that happens to be readable cannot
   cancel orders the live book kept.
+- **Mass cancels are failure-aware and gate-safe (#248).**
+  - `cancel_all_orders` now holds the **exclusive** submit gate. Under the
+    shared gate it collected the resting ids, then cleared
+    `order_locations` / `user_orders` and drained the levels wholesale, so
+    an order admitted in between was dropped with no cancel event, no
+    order-state transition and no risk release, and the risk reset wiped
+    the reservations of in-flight submits. Its price-level and order-state
+    events are now emitted **after** the book is cleared (same events, same
+    order: levels bids then asks ascending, then one `Cancelled
+    { MassCancelAll }` per order), so a listener never sees an event ahead
+    of the mutation.
+  - `cancel_orders_by_side`, `cancel_orders_by_user`,
+    `cancel_orders_by_price_range` and `evict_expired_orders` also take the
+    exclusive gate: they collect their scope before cancelling it id by id,
+    and under the shared gate an id cancelled and re-admitted out of scope
+    in between (other side, price, user, or not expired) was cancelled by
+    the bulk call. Cost: submits, cancels and modifies on that book wait
+    for the bulk operation. Single-order `cancel_order` keeps the shared
+    gate.
+  - `cancel_orders_by_user` no longer removes the user's `user_orders`
+    entry up front: each successful cancel untracks its own id, a failed
+    order stays indexed, and stale ids (no longer resting) are still
+    purged.
+  - Per-order failures are recorded instead of swallowed:
+    `MassCancelFailure` gains `OrderCancelFailed { order_id, error }`. A
+    scoped mass cancel carries on past a failed order, so a result can
+    hold cancelled ids **and** failures, both in the deterministic
+    traversal order; the failed order stays resting and fully tracked
+    (location, user index, risk, order state). New
+    `MassCancelResult::is_refused()` / `MassCancelFailure::is_refusal()`
+    tell a refused call (`LevelUnreadable`, nothing cancelled) from a
+    partial one.
+  - `OrderBook::cancel_order` (and every internal cancel) returns
+    `Err(OrderBookError::PriceLevelError(_))` when the price level refuses
+    the removal; before, that case returned `Ok(None)`, indistinguishable
+    from an absent order. The order is untouched on `Err`.
+  - `evict_expired_orders` carries on past a failed order and returns the
+    new `OrderBookError::EvictionIncomplete { evicted_count, failed_count,
+    order_id, source }` (reject code `Other(0)`), after evicting everything
+    else; a later sweep retries the failed orders. The sequencer classifies
+    it as possibly mutating.
+  - Replay skips only a **refused** journaled mass cancel
+    (`is_refused()`), not every result with failures; a mass cancel
+    journaled with per-order failures is re-executed and reported as
+    `ReplayError::OrderBookError` until #252 reconciles mass cancels by
+    identity.
+  - Compatibility: no signature changes. `MassCancelFailure` and
+    `OrderBookError` are `#[non_exhaustive]`, so downstream matches already
+    carry a wildcard arm. JSON `MassCancelResult`s written by 0.13 (no
+    `failures`) and by 0.14 builds before #248 (`level_unreadable` only)
+    decode unchanged; a JSON result carrying `order_cancel_failed` does
+    not decode on those older readers. No snapshot or journal format
+    change. Callers that treated `cancel_order`'s `Ok(None)` as "gone"
+    should also handle `Err`.
 - **Snapshot package format v4.** `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` goes
   from 3 to 4 because a level's `value_executed` statistic is a `u128` in
   pricelevel 0.10 and may exceed `u64::MAX`. Migration: none needed on read;

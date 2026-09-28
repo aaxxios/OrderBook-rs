@@ -429,7 +429,9 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::InsufficientLiquidityNotional { .. }
         | OrderBookError::SelfTradePrevented { .. }
         | OrderBookError::PriceLevelError(_)
-        | OrderBookError::MatchAborted { .. } => true,
+        | OrderBookError::MatchAborted { .. }
+        // A sweep that evicted part of its scope before reporting (#248).
+        | OrderBookError::EvictionIncomplete { .. } => true,
         // Admission and shape checks (all evaluated before the sweep), the
         // operational gates, and the non-reject internal errors. The
         // post-sweep post-only rejection is here too: `pricelevel`

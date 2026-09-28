@@ -348,7 +348,10 @@ pub struct OrderBook<T = ()> {
     /// sweep, and an STP-relevant submit or matching-capable modify takes it
     /// across its per-level scan and the fill that scan authorises, so no
     /// concurrent add / cancel / update can invalidate either decision
-    /// between the two steps. Everything else takes the **read** side and
+    /// between the two steps. Every mass cancel and expiry eviction takes
+    /// the **write** side too (#248): each collects its scope before it
+    /// removes it, and `cancel_all_orders` clears the tracking maps
+    /// wholesale. Everything else takes the **read** side and
     /// stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
     /// single place that picks the mode, and it documents the scope
     /// limitation.
@@ -356,15 +359,16 @@ pub struct OrderBook<T = ()> {
     /// # Cost of enabling STP
     ///
     /// On an `STPMode::None` book the exclusive side is taken only by
-    /// fill-or-kill submits, which are rare. **Enabling any other
+    /// fill-or-kill submits, mass cancels and expiry eviction, which are
+    /// rare. **Enabling any other
     /// [`STPMode`] serializes the book**: `validate_order_shape` rejects a
     /// zero `user_id` with [`OrderBookError::MissingUserId`], so every
     /// admissible `add_order` carries an identity, and every one of them
     /// that can take liquidity — plus every `UpdatePrice` /
     /// `UpdatePriceAndQuantity` / `Replace` and every market sweep that
     /// names a user — runs one at a time on that book. Only post-only
-    /// submits (which never reach the STP scan), `UpdateQuantity`, cancels,
-    /// mass cancels and anonymous match-only sweeps keep the shared side.
+    /// submits (which never reach the STP scan), `UpdateQuantity`, cancels
+    /// and anonymous match-only sweeps keep the shared side.
     /// This is the price of the #225 guarantee and it should be weighed
     /// before turning STP on for a hot symbol.
     ///
@@ -399,6 +403,19 @@ pub struct OrderBook<T = ()> {
     /// nor its `Option` check reaches a release binary.
     #[cfg(test)]
     pub(super) level_interleave_hook: Option<std::sync::Arc<dyn Fn(u128) + Send + Sync>>,
+
+    /// Test-only fault injection for the single-order cancel path (#248).
+    ///
+    /// Consulted by `cancel_order_with_reason` right before it asks the
+    /// order's price level to remove the order; returning `Some(err)` makes
+    /// that removal fail with `err` exactly as a refusing level would, with
+    /// nothing mutated. pricelevel 0.10 has no public way to make a level
+    /// refuse a cancel on demand, so this is what lets the mass-cancel
+    /// failure paths be tested. Like its siblings it exists only in
+    /// `cfg(test)` builds.
+    #[cfg(test)]
+    pub(super) cancel_fault_hook:
+        Option<std::sync::Arc<dyn Fn(Id) -> Option<pricelevel::PriceLevelError> + Send + Sync>>,
 
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
@@ -765,6 +782,8 @@ where
             stp_interleave_hook: None,
             #[cfg(test)]
             level_interleave_hook: None,
+            #[cfg(test)]
+            cancel_fault_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1143,8 +1162,9 @@ where
 
     /// Acquire the exclusive (write) side of the submit gate for a
     /// fill-or-kill submit (#209), an STP-relevant submit or
-    /// matching-capable modify, and the live snapshot restore commit
-    /// (#225). See [`Self::submit_gate_read`] for the poisoning policy.
+    /// matching-capable modify, the live snapshot restore commit (#225),
+    /// and every mass cancel and expiry eviction (#248). See
+    /// [`Self::submit_gate_read`] for the poisoning policy.
     pub(super) fn submit_gate_write(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.submit_gate.write().unwrap_or_else(|poisoned| {
             tracing::error!("submit gate poisoned by a prior panic; recovering write guard");
@@ -1185,10 +1205,11 @@ where
     /// > land inside its capture window.
     ///
     /// Note the direction: the rule is enforced on the *sweep*, not on the
-    /// cancels. Cancels, mass cancels and `UpdateQuantity` keep the shared
-    /// side and never read the count; they are excluded from a sweep's
-    /// window by that sweep holding the exclusive side, not by taking it
-    /// themselves. Every sweep entry point acquires through this helper —
+    /// cancels. Cancels and `UpdateQuantity` keep the shared side and never
+    /// read the count; they are excluded from a sweep's window by that sweep
+    /// holding the exclusive side, not by taking it themselves. Mass cancels
+    /// and expiry eviction take the exclusive side for their own reasons
+    /// (#248), which excludes them from any sweep as well. Every sweep entry point acquires through this helper —
     /// the submits, the modifies' re-add, and the match-only paths
     /// (`match_order`, `match_order_with_user`,
     /// `match_market_order_by_amount*`) — so an anonymous market sweep is
@@ -1202,9 +1223,8 @@ where
     ///
     /// Cost: a book holding strandable makers serializes its
     /// matching-capable submits and re-prices, exactly as an STP book has
-    /// since #225. Cancels, mass cancels and `UpdateQuantity` keep the
-    /// shared side — they simply cannot overlap an exclusive sweep in such
-    /// a book. Books that hold none are unaffected: one relaxed load.
+    /// since #225. Cancels and `UpdateQuantity` keep the shared side — they
+    /// simply cannot overlap an exclusive sweep in such a book. Books that hold none are unaffected: one relaxed load.
     /// # Why exclusive
     ///
     /// Both cases make a decision by reading book state and then act on
@@ -1531,6 +1551,8 @@ where
             stp_interleave_hook: None,
             #[cfg(test)]
             level_interleave_hook: None,
+            #[cfg(test)]
+            cancel_fault_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1588,6 +1610,8 @@ where
             stp_interleave_hook: None,
             #[cfg(test)]
             level_interleave_hook: None,
+            #[cfg(test)]
+            cancel_fault_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -5258,8 +5282,9 @@ struct PreparedSnapshotLevels {
 pub(super) enum SubmitGateGuard<'a> {
     /// Shared mode: everything whose decision does not span two operations
     /// — ordinary and post-only submits, `UpdateQuantity`, `Cancel`, every
-    /// modify on an `STPMode::None` book, cancels, mass cancels, expiry
-    /// eviction and anonymous match-only sweeps.
+    /// modify on an `STPMode::None` book, cancels and anonymous match-only
+    /// sweeps. Mass cancels and expiry eviction take the write side
+    /// directly (#248), not through this guard.
     Read(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>),
     /// Exclusive mode: a fill-or-kill submit's feasibility + sweep window
     /// (#209); an STP-relevant submit's per-level scan + fill window and

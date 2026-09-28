@@ -1088,6 +1088,17 @@ where
     ///
     /// Tracks the cancellation as `CancelReason::UserRequested` in the
     /// order state tracker (if configured).
+    ///
+    /// Returns `Ok(None)` when `order_id` is not resting in this book.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::PriceLevelError`] when the order's price level
+    /// refuses the removal (for example a level poisoned by an earlier
+    /// failure, or a level counter with no headroom left). The order is then
+    /// still resting and tracked, and no event was emitted. Before 0.14.0
+    /// this case returned `Ok(None)`, indistinguishable from an absent order
+    /// (#248).
     pub fn cancel_order(&self, order_id: Id) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         // #209: shared gate — a concurrent FOK's exclusive window must not
         // interleave with this cancel.
@@ -1100,6 +1111,9 @@ where
     /// This is the internal implementation used by both `cancel_order`
     /// and mass cancel operations to track the correct
     /// [`CancelReason`] in the order state tracker.
+    ///
+    /// Fails with [`OrderBookError::PriceLevelError`] when the level refuses
+    /// the removal, before any book-side mutation or event (#248).
     pub(super) fn cancel_order_with_reason(
         &self,
         order_id: Id,
@@ -1125,26 +1139,40 @@ where
 
             if let Some(entry) = price_levels.get(&price) {
                 let price_level = entry.value();
-                // Try to cancel the order
-                if let Ok(cancelled) = price_level.update_order(update) {
-                    result = cancelled;
+                // Try to cancel the order. #248: a level that refuses the
+                // removal is an error, not "order absent": returning
+                // `Ok(None)` made every mass cancel under-report silently.
+                // Nothing below has run yet, so the order is still indexed
+                // exactly as before (location, user index, risk, state).
+                #[cfg(test)]
+                let outcome = match self
+                    .cancel_fault_hook
+                    .as_ref()
+                    .and_then(|hook| hook(order_id))
+                {
+                    Some(injected) => Err(injected),
+                    None => price_level.update_order(update),
+                };
+                #[cfg(not(test))]
+                let outcome = price_level.update_order(update);
+                let cancelled = outcome.map_err(OrderBookError::PriceLevelError)?;
+                result = cancelled;
 
-                    // notify price level changes
-                    if result.is_some()
-                        && let Some(ref listener) = self.price_level_changed_listener
-                    {
-                        let engine_seq = self.next_engine_seq();
-                        listener(PriceLevelChangedEvent {
-                            side,
-                            price: price_level.price(),
-                            quantity: price_level.visible_quantity(),
-                            engine_seq,
-                        })
-                    }
-
-                    // Check if the level became empty
-                    empty_level = price_level.order_count() == 0;
+                // notify price level changes
+                if result.is_some()
+                    && let Some(ref listener) = self.price_level_changed_listener
+                {
+                    let engine_seq = self.next_engine_seq();
+                    listener(PriceLevelChangedEvent {
+                        side,
+                        price: price_level.price(),
+                        quantity: price_level.visible_quantity(),
+                        engine_seq,
+                    })
                 }
+
+                // Check if the level became empty
+                empty_level = price_level.order_count() == 0;
             }
 
             self.cache.invalidate();

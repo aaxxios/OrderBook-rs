@@ -147,6 +147,15 @@
 //!   or awaits the processor after it handles queued events; a panic is
 //!   `ProcessorPanicked`) and `dropped_trade_events()`, plus the
 //!   `orderbook_manager_trade_events_dropped_total` metric.
+//! - **Gate-safe, failure-aware mass cancels (#248).** Every mass cancel
+//!   and `evict_expired_orders` holds the exclusive submit gate, so no
+//!   order admitted concurrently is dropped without an event;
+//!   `cancel_all_orders` emits its events after the book is cleared.
+//!   Per-order failures are recorded as `MassCancelFailure::OrderCancelFailed`
+//!   (the order stays resting and tracked; see `MassCancelResult::is_refused`),
+//!   `cancel_order` returns `Err` when a level refuses the removal, and an
+//!   eviction that could not remove every expired order ends in
+//!   `OrderBookError::EvictionIncomplete`.
 //!
 //! ### Migration from 0.13
 //!
@@ -159,6 +168,9 @@
 //! | `BookManager{Std,Tokio}::evict_expired_orders(symbol, now_ms) -> Option<Vec<..>>` | `-> Option<Result<Vec<..>, OrderBookError>>` |
 //! | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<Vec<..>, OrderBookError>>` |
 //! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
+//! | `OrderBook::cancel_order`: level refusal → `Ok(None)` | `Err(OrderBookError::PriceLevelError(_))`, order untouched |
+//! | `evict_expired_orders`: per-order failure silently skipped | `Err(OrderBookError::EvictionIncomplete { .. })` after evicting the rest |
+//! | mass cancels on the shared submit gate | exclusive gate; `cancel_all_orders` emits after clearing |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 //! | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |
