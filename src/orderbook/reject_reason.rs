@@ -650,9 +650,9 @@ mod tests {
             order_id: Id::from_u64(9),
             executed_quantity: 5,
             trade_count: 1,
-            source: PriceLevelError::CounterExhausted {
+            source: Box::new(PriceLevelError::CounterExhausted {
                 counter: ExhaustedCounter::MutationEpoch,
-            },
+            }),
         };
         assert_eq!(RejectReason::from(&aborted), RejectReason::MatchAborted);
 

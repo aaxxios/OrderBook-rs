@@ -105,7 +105,7 @@ mod tests {
                 assert_eq!(*trade_count, trades);
                 assert!(
                     matches!(
-                        source,
+                        source.as_ref(),
                         PriceLevelError::CapacityExceeded {
                             resource: CapacityResource::IdSequence,
                             ..

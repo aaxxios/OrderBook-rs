@@ -114,6 +114,59 @@ table PriceLevel's document has for each row above (which lock, if any, is
 held across the call; what state is already committed if the callback
 unwinds).
 
+## Matching sweep failures (#240)
+
+pricelevel 0.10 reports a failure inside `PriceLevel::match_order` through
+`MatchResult::error()` while keeping the prefix the level committed. The
+book stops the sweep at that level, never trades at a worse price, publishes
+the committed prefix exactly like a partial fill (trade listener, price-level
+listener, risk `on_fill`, maker states, location cleanup), never rests the
+remainder, and returns `OrderBookError::MatchAborted` (taker state
+`Cancelled { MatchAborted }`).
+
+Before each level is matched, the aggregate result and the pooled
+filled-maker buffer are reserved for that level's worst case,
+`min(resting makers, quantity cap)`; a refused reservation aborts the sweep
+**before** the level is touched, with the prefix of the earlier levels.
+Fill-or-kill takers additionally reserve for their whole predicted sweep and
+check trade-id headroom before any mutation.
+
+Residuals, stated precisely:
+
+- **Fold beyond the reserved bound.** A replenishing iceberg / reserve maker
+  can trade again at the same level, and a maker admitted to the level by a
+  concurrent submit on the shared submit gate while it is being swept can be
+  consumed too. Those trades exceed `min(resting makers, quantity cap)`, so
+  their slots grow during the fold. Only if the allocator refuses that growth
+  are the level's committed trades left out of the aggregate `MatchResult`
+  (and so out of the `TradeResult` / journal), while the level, the makers'
+  risk counters and order states reflect them. The sweep then aborts and the
+  gap is logged at `ERROR` ("committed trades of a price level could not be
+  folded into the taker's result").
+- **Fill-or-kill preflight.** The preflight covers what the book can
+  observe: the trade-id generator's `remaining()` against a conservative
+  upper bound on the sweep's trades, and the result buffers. pricelevel's
+  internal counters (queue insertion sequence, topology / mutation epochs,
+  statistics sequence) have no public headroom query, and replenishment
+  trades beyond the reserved maker steps grow the buffers. Either can still
+  stop a FOK mid-sweep; it then follows the abort rules above (a partial
+  fill reported as `MatchAborted`, never rested). The id bound is
+  conservative, so a FOK within that many ids of the sequence's exhaustion
+  can be refused although it would fit.
+- **Poisoned levels.** A pricelevel level poisoned by an earlier panic
+  refuses to match by returning an empty result **without** an error, so the
+  book cannot tell it from an empty level and the sweep walks on to the next
+  price. This is an upstream limitation, tracked in pricelevel.
+- **Replay of recorded aborts.** Replay re-executes a journaled
+  `SequencerResult::MatchAborted` and requires the same committed prefix.
+  An abort caused by trade-id generator exhaustion or by an allocator
+  refusal depends on state the journal does not carry (the generator's
+  counter is not part of the snapshot package or `ReplayBookConfig`, and
+  allocation outcomes are not deterministic), so it usually does not
+  reproduce on a fresh replay book: the replayed submit fills further and
+  replay stops with `ReplayError::OutcomeMismatch`. That is by design —
+  loud, never a silent divergence.
+
 ## Ratchet
 
 Three ledgers, all mechanically enforced (`make lint`), all shrink-only:

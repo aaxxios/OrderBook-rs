@@ -398,11 +398,13 @@ where
     ///   the same executed quantity. A replay that succeeds, fails
     ///   differently or commits different fills is
     ///   [`ReplayError::OutcomeMismatch`]. Aborts come from exhausted
-    ///   resources (trade-id sequence, level counters, allocation) that a
-    ///   fresh replay book does not normally reproduce, so in practice a
-    ///   journaled abort stops replay loudly rather than letting the
-    ///   reconstructed book trade past the point where the live one
-    ///   stopped. An `UpdateOrder` journaled as `RejectedWithCode` under
+    ///   resources — the trade-id generator's sequence (its counter is not
+    ///   in the snapshot package or [`ReplayBookConfig`]), level counters,
+    ///   an allocator refusal — that a fresh replay book usually does not
+    ///   reproduce, so a journaled abort normally stops replay with
+    ///   `OutcomeMismatch` **by design**: loud, never a silent divergence
+    ///   in which the reconstructed book trades past the point where the
+    ///   live one stopped. See `doc/panic-boundaries.md`. An `UpdateOrder` journaled as `RejectedWithCode` under
     ///   [`RejectReason::MatchAborted`] (its re-add aborted after the
     ///   original was cancelled) is likewise re-executed and reconciled by
     ///   code.

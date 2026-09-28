@@ -310,8 +310,9 @@ pub enum OrderBookError {
         executed_quantity: u64,
         /// Number of trades in the committed prefix.
         trade_count: usize,
-        /// The price-level failure that stopped the sweep.
-        source: PriceLevelError,
+        /// The price-level failure that stopped the sweep. Boxed so the
+        /// variant does not widen every `Result<_, OrderBookError>`.
+        source: Box<PriceLevelError>,
     },
 
     /// Failed to publish a trade event to NATS JetStream.
@@ -511,7 +512,7 @@ impl fmt::Display for OrderBookError {
 impl std::error::Error for OrderBookError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            OrderBookError::MatchAborted { source, .. } => Some(source),
+            OrderBookError::MatchAborted { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

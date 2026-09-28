@@ -3251,10 +3251,6 @@ where
     /// the trades (including an aborted sweep's committed prefix, #240).
     /// `want_committed` builds the committed `TradeResult` for the caller
     /// even when no trade listener is installed.
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     pub(crate) fn match_market_order_committed(
         &self,
         order_id: Id,
@@ -3299,10 +3295,6 @@ where
     ///
     /// [`SubmitFailure`] carrying [`OrderBookError::MatchAborted`] when the
     /// outcome was aborted.
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     pub(crate) fn publish_match_outcome(
         &self,
         outcome: MatchOutcome,
@@ -3433,10 +3425,6 @@ where
 
     /// Shared body of the quote-notional market sweep; see
     /// [`Self::match_market_order_committed`].
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     pub(crate) fn match_market_order_by_amount_committed(
         &self,
         order_id: Id,

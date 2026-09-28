@@ -2034,7 +2034,8 @@ where
     /// `PriceLevelError(CapacityExceeded)`. Residual: pricelevel's per-level
     /// counters are not observable and replenishment trades beyond the
     /// reserved maker steps still grow the buffers, so a FOK can still abort
-    /// mid-sweep in those cases, following the rules above.
+    /// mid-sweep in those cases, following the rules above. See
+    /// `doc/panic-boundaries.md` for every residual.
     ///
     /// # Errors
     /// Returns [`OrderBookError::KillSwitchActive`] when the kill switch
@@ -2135,10 +2136,6 @@ where
     /// A [`SubmitFailure`] whose `error` is exactly what
     /// [`Self::add_order_with_result`] returns for the same call, and whose
     /// `committed` is `Some` when trades executed before the failure.
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     pub fn add_order_with_committed(
         &self,
         order: OrderType<T>,
@@ -2157,10 +2154,6 @@ where
     /// [`Self::add_order_with_result`]. `want_result` gates `TradeResult`
     /// construction so the plain `add_order` path only pays for it when an
     /// installed trade listener needs it anyway.
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     fn add_order_inner(
         &self,
         mut order: OrderType<T>,

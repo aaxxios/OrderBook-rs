@@ -407,10 +407,6 @@ where
     /// [`Self::submit_market_order`] returns for the same call; `committed`
     /// is `Some` when trades executed before the failure (an aborted
     /// sweep).
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     pub fn submit_market_order_with_committed(
         &self,
         id: Id,
@@ -501,10 +497,6 @@ where
     /// A [`SubmitFailure`] whose `error` is what
     /// [`Self::submit_market_order_by_amount`] returns for the same call;
     /// `committed` is `Some` when trades executed before the failure.
-    #[allow(
-        clippy::result_large_err,
-        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
-    )]
     pub fn submit_market_order_by_amount_with_committed(
         &self,
         id: Id,

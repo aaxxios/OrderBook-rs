@@ -192,7 +192,10 @@ change.
   `add_limit_order*`, `submit_market_order*`, `match_market_order*`,
   `match_limit_order*`, the raw `match_order*`, modify re-adds) returns
   `Err(OrderBookError::MatchAborted { order_id, executed_quantity,
-  trade_count, source })`. The taker's terminal state is
+  trade_count, source: Box<PriceLevelError> })` (boxed, so
+  `OrderBookError` stays 96 bytes). Each level's worst case
+  (`min(resting makers, quantity cap)`) is reserved in the result before the
+  level is touched; a refused reservation aborts before that level. The taker's terminal state is
   `OrderStatus::Cancelled { filled_quantity: executed_quantity, reason:
   CancelReason::MatchAborted }`. A failed post-only probe and a failed STP
   queue view abort the same way (with an empty prefix) instead of
@@ -242,6 +245,9 @@ change.
   sequence, epochs) are not observable, and replenishment trades beyond the
   reserved maker steps grow the buffers during the sweep; either can still
   abort a FOK mid-sweep, which then follows the `MatchAborted` rules above.
+  The residuals, including poisoned pricelevel levels (empty result without
+  an error) and why a journaled abort usually stops replay with
+  `OutcomeMismatch`, are documented in `doc/panic-boundaries.md`.
 - **Implied-volatility inputs are validated; Black-Scholes and Greeks
   return `Result` (#256).** `f64::clamp(min_iv, max_iv)` in the solver
   panicked when `min_iv > max_iv` or a bound was NaN, reachable through the

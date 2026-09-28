@@ -809,6 +809,17 @@ where
                         if safe_quantity > 0 {
                             let match_qty = qty_cap.min(safe_quantity);
                             if match_qty > 0 {
+                                // #240: room for the level's worst case
+                                // BEFORE it is touched.
+                                if let Err(err) = Self::reserve_level_worst_case(
+                                    &mut match_result,
+                                    &mut filled_orders,
+                                    price_level,
+                                    match_qty,
+                                ) {
+                                    sweep_error = Some(err);
+                                    break;
+                                }
                                 if let Some(strandable) = strandable_makers.as_mut() {
                                     self.capture_strandable_makers(price_level, strandable);
                                 }
@@ -915,6 +926,17 @@ where
                         if safe_quantity > 0 {
                             let match_qty = qty_cap.min(safe_quantity);
                             if match_qty > 0 {
+                                // #240: room for the level's worst case
+                                // BEFORE it is touched.
+                                if let Err(err) = Self::reserve_level_worst_case(
+                                    &mut match_result,
+                                    &mut filled_orders,
+                                    price_level,
+                                    match_qty,
+                                ) {
+                                    sweep_error = Some(err);
+                                    break;
+                                }
                                 if let Some(strandable) = strandable_makers.as_mut() {
                                     self.capture_strandable_makers(price_level, strandable);
                                 }
@@ -984,6 +1006,20 @@ where
             }
 
             // --- Normal matching (no STP conflict or after CancelMaker cleanup) ---
+            // #240: reserve the aggregate result (and the pooled filled-maker
+            // buffer) for the most trades this level can emit BEFORE it is
+            // touched, so folding its committed trades cannot fail after the
+            // makers were mutated. A refused reservation aborts the sweep
+            // here with the prefix of the earlier levels, this level intact.
+            if let Err(err) = Self::reserve_level_worst_case(
+                &mut match_result,
+                &mut filled_orders,
+                price_level,
+                qty_cap,
+            ) {
+                sweep_error = Some(err);
+                break;
+            }
             if let Some(strandable) = strandable_makers.as_mut() {
                 self.capture_strandable_makers(price_level, strandable);
             }
@@ -1480,16 +1516,44 @@ where
         }
     }
 
+    /// Reserve the aggregate result and the pooled filled-maker buffer for
+    /// the most trades one level can emit for a taker capped at `qty_cap`
+    /// (#240): `min(resting makers, qty_cap)`. Each maker trades at most
+    /// once unless a replenishing iceberg / reserve comes back with a fresh
+    /// tranche, and every trade takes at least one unit.
+    ///
+    /// Residual (documented in `doc/panic-boundaries.md`): replenishment
+    /// trades, and makers admitted to the level by a concurrent submit on
+    /// the shared gate while it is being swept, can exceed this bound; the
+    /// extra slots then grow during the fold, and only an allocator refusal
+    /// at that point leaves the level's trades out of the aggregate.
+    ///
+    /// # Errors
+    ///
+    /// [`PriceLevelError::CapacityExceeded`] when a buffer cannot grow; the
+    /// level has not been touched.
+    #[inline]
+    fn reserve_level_worst_case(
+        match_result: &mut MatchResult,
+        filled_orders: &mut Vec<(Id, u64)>,
+        price_level: &pricelevel::PriceLevel,
+        qty_cap: u64,
+    ) -> Result<(), PriceLevelError> {
+        let makers = u64::try_from(price_level.order_count()).unwrap_or(u64::MAX);
+        Self::reserve_sweep_steps(match_result, filled_orders, makers.min(qty_cap))
+    }
+
     /// Reserve room for `steps` maker steps in the aggregate result (trades
     /// and filled ids) and the pooled filled-maker buffer: the fill-or-kill
-    /// preflight (#240). Amortized growth on reused buffers, so a warm pool
-    /// usually allocates nothing.
+    /// preflight and the per-level worst case (#240). Amortized growth: a
+    /// no-op when the room is already there, and the pooled buffer is
+    /// reused across sweeps.
     ///
     /// # Errors
     ///
     /// [`PriceLevelError::CapacityExceeded`] when a buffer cannot grow (or
     /// `steps` does not fit `usize`); nothing observable has changed.
-    #[cold]
+    #[inline]
     fn reserve_sweep_steps(
         match_result: &mut MatchResult,
         filled_orders: &mut Vec<(Id, u64)>,
@@ -1582,7 +1646,7 @@ where
                 order_id,
                 executed_quantity,
                 trade_count,
-                source,
+                source: Box::new(source),
             }),
         })
     }
