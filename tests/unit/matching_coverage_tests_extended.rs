@@ -128,11 +128,13 @@ mod tests {
             .unwrap();
 
         // Peek match with price limit
-        let matched_quantity = book.peek_match(Side::Buy, 30, Some(1010));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 30, Some(1010))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 25); // Only first two orders (10 + 15)
 
         // Peek match without price limit
-        let matched_quantity_all = book.peek_match(Side::Buy, 50, None);
+        let matched_quantity_all = book.peek_match(Side::Buy, 50, None).expect("peek_match");
         assert_eq!(matched_quantity_all, 45); // All orders (10 + 15 + 20)
     }
 
@@ -141,10 +143,12 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Peek match on empty order book
-        let matched_quantity = book.peek_match(Side::Buy, 100, None);
+        let matched_quantity = book.peek_match(Side::Buy, 100, None).expect("peek_match");
         assert_eq!(matched_quantity, 0);
 
-        let matched_quantity_with_limit = book.peek_match(Side::Sell, 50, Some(1000));
+        let matched_quantity_with_limit = book
+            .peek_match(Side::Sell, 50, Some(1000))
+            .expect("peek_match");
         assert_eq!(matched_quantity_with_limit, 0);
     }
 
@@ -158,7 +162,7 @@ mod tests {
             .unwrap();
 
         // Peek match for more than available
-        let matched_quantity = book.peek_match(Side::Buy, 100, None);
+        let matched_quantity = book.peek_match(Side::Buy, 100, None).expect("peek_match");
         assert_eq!(matched_quantity, 20); // Only what's available
     }
 
@@ -243,7 +247,9 @@ mod tests {
             .unwrap();
 
         // Peek sell with price limit - behavior depends on implementation
-        let matched_quantity = book.peek_match(Side::Sell, 50, Some(1025));
+        let matched_quantity = book
+            .peek_match(Side::Sell, 50, Some(1025))
+            .expect("peek_match");
         // The actual matched quantity depends on how price limits are implemented
         assert!(
             matched_quantity <= 50,
@@ -251,7 +257,9 @@ mod tests {
         );
 
         // Peek sell with lower price limit
-        let matched_quantity_lower = book.peek_match(Side::Sell, 50, Some(1015));
+        let matched_quantity_lower = book
+            .peek_match(Side::Sell, 50, Some(1015))
+            .expect("peek_match");
         // Price limit behavior may vary by implementation
         assert!(
             matched_quantity_lower <= 50,

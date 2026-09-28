@@ -212,6 +212,7 @@ pub(crate) enum STPAction {
     CancelTaker {
         /// Maximum quantity that can be safely matched before hitting
         /// a same-user order. Zero means the first order is same-user.
+        /// `min(Σ visible, u64::MAX)`, see [`check_stp_at_level`].
         safe_quantity: u64,
     },
 
@@ -225,11 +226,30 @@ pub(crate) enum STPAction {
     /// the maker and stop.
     CancelBoth {
         /// Maximum quantity that can be safely matched before hitting
-        /// a same-user order.
+        /// a same-user order. `min(Σ visible, u64::MAX)`, see
+        /// [`check_stp_at_level`].
         safe_quantity: u64,
         /// The first same-user maker order ID to cancel.
         maker_order_id: Id,
     },
+}
+
+/// `min(cap, acc + quantity)`, in quantity units, without overflow (#246).
+///
+/// The depth accumulator shared by the STP scan (`safe_quantity`) and the
+/// `CancelMaker` fill-or-kill walk. Precondition: `acc <= cap`, which every
+/// caller keeps by starting at `0` and only ever storing this function's
+/// result. Under it the result is **exact**, not a clamp: when
+/// `acc + quantity` overflows `u64` the true sum exceeds `u64::MAX >= cap`,
+/// so `min(cap, sum)` is `cap`. The accumulated depth is only ever consumed
+/// as `min(cap, depth)`, so nothing is lost by stopping at `cap`.
+#[inline]
+#[must_use]
+pub(crate) fn capped_depth_add(acc: u64, quantity: u64, cap: u64) -> u64 {
+    match acc.checked_add(quantity) {
+        Some(sum) => sum.min(cap),
+        None => cap,
+    }
 }
 
 /// Scans orders at a price level and determines the STP action.
@@ -241,6 +261,17 @@ pub(crate) enum STPAction {
 ///
 /// # Returns
 /// The appropriate [`STPAction`] for the matching engine to take.
+///
+/// # `safe_quantity` bound (#246)
+///
+/// `safe_quantity` is the non-self visible depth ahead of the first
+/// same-user order, **bounded by `u64::MAX`**: `min(Σ visible, u64::MAX)`,
+/// accumulated with [`capped_depth_add`]. Two resting orders can legitimately
+/// hold more than `u64::MAX` between them, so the bound is reachable with
+/// valid state and is not an invariant breach. It is exact for every
+/// consumer: the sweep, the fill-or-kill walk and the modify dry run all
+/// use `min(cap, safe_quantity)` with a `u64` cap, which is the same value
+/// whether the sum is carried exactly or bounded at `u64::MAX`.
 #[inline]
 pub(crate) fn check_stp_at_level(
     orders: &[std::sync::Arc<pricelevel::OrderType<()>>],
@@ -263,7 +294,8 @@ pub(crate) fn check_stp_at_level(
                     return STPAction::CancelTaker { safe_quantity };
                 }
                 // Sum visible quantity of non-same-user orders
-                safe_quantity = safe_quantity.saturating_add(order.visible_quantity().as_u64());
+                safe_quantity =
+                    capped_depth_add(safe_quantity, order.visible_quantity().as_u64(), u64::MAX);
             }
             STPAction::NoConflict
         }
@@ -289,7 +321,8 @@ pub(crate) fn check_stp_at_level(
                         maker_order_id: order.id(),
                     };
                 }
-                safe_quantity = safe_quantity.saturating_add(order.visible_quantity().as_u64());
+                safe_quantity =
+                    capped_depth_add(safe_quantity, order.visible_quantity().as_u64(), u64::MAX);
             }
             STPAction::NoConflict
         }
@@ -517,5 +550,50 @@ mod tests {
             check_stp_at_level(&orders, taker_user, STPMode::CancelBoth),
             STPAction::NoConflict
         ));
+    }
+
+    #[test]
+    fn test_capped_depth_add_is_exact_min() {
+        assert_eq!(capped_depth_add(0, 5, 10), 5);
+        assert_eq!(capped_depth_add(8, 5, 10), 10);
+        assert_eq!(capped_depth_add(u64::MAX - 1, 1, u64::MAX), u64::MAX);
+        // Overflow: the true sum exceeds u64::MAX >= cap, so the result is cap.
+        assert_eq!(capped_depth_add(u64::MAX, u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(capped_depth_add(7, u64::MAX, 9), 9);
+    }
+
+    /// #246: two foreign makers whose visible depth sums past `u64::MAX`
+    /// ahead of a same-user maker give `safe_quantity == u64::MAX` (the
+    /// exact `min(cap, Σ)` for any `u64` cap) instead of panicking in debug
+    /// or wrapping in release.
+    #[test]
+    fn test_check_stp_safe_quantity_bounded_at_u64_extremes() {
+        let taker_user = Hash32::new([1u8; 32]);
+        let other_user = Hash32::new([2u8; 32]);
+        let order = |quantity: u64, user_id: Hash32| {
+            std::sync::Arc::new(pricelevel::OrderType::Standard {
+                id: new_id(),
+                price: pricelevel::Price::new(100),
+                quantity: pricelevel::Quantity::new(quantity),
+                side: pricelevel::Side::Sell,
+                user_id,
+                timestamp: pricelevel::TimestampMs::new(0),
+                time_in_force: pricelevel::TimeInForce::Gtc,
+                extra_fields: (),
+            })
+        };
+        let orders = vec![
+            order(u64::MAX - 1, other_user),
+            order(u64::MAX - 1, other_user),
+            order(1, taker_user),
+        ];
+        match check_stp_at_level(&orders, taker_user, STPMode::CancelTaker) {
+            STPAction::CancelTaker { safe_quantity } => assert_eq!(safe_quantity, u64::MAX),
+            other => panic!("expected CancelTaker, got {other:?}"),
+        }
+        match check_stp_at_level(&orders, taker_user, STPMode::CancelBoth) {
+            STPAction::CancelBoth { safe_quantity, .. } => assert_eq!(safe_quantity, u64::MAX),
+            other => panic!("expected CancelBoth, got {other:?}"),
+        }
     }
 }

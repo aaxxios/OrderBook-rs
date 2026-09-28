@@ -50,6 +50,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Panic-free matching, STP and matching pool (#246).** The last
+  panicking forms in `matching.rs`, `stp.rs` and `pool.rs` are gone and
+  the three files leave both panic-policy ledgers:
+  - The `STPMode::CancelMaker` fill-or-kill walk summed the non-self depth
+    with `.sum()`: resting depth past `u64::MAX` (legal with a large
+    visible tranche plus an iceberg's hidden tranche) panicked in debug
+    and, in release, wrapped into a false kill. It now accumulates
+    `min(cap, depth)` with checked adds, so such a level reads as exactly
+    the taker's cap and the FOK fills. The STP `safe_quantity` scan uses
+    the same bounded accumulator (`min(Σ visible, u64::MAX)`), exact for
+    every consumer.
+  - The thread-local matching pool is reached with `LocalKey::try_with`
+    and `RefCell::try_borrow_mut`: a sweep run from a thread-local
+    destructor after the pool was torn down, or a reentrant pool access,
+    uses fresh buffers instead of panicking.
+  - The three `debug_assert!`s on the #225 STP snapshot invariant are now
+    a debug-build check that logs at `ERROR` (maker id, price, site)
+    instead of panicking; release builds still skip it.
+  - The per-level budget (`remaining - executed`, the quote-notional
+    `price × executed` deduction, lot rounding, the `u128` to `u64` level
+    cap) uses checked forms and `u64::try_from`. These invariants cannot
+    fail on a valid book (the level cap is derived from the same budget
+    the deduction checks against), so valid traffic and existing journals
+    replay unchanged; a breach, which can only come from already corrupt
+    state, aborts the sweep with its committed prefix
+    (`OrderBookError::MatchAborted`) instead of being clamped.
+  - Quote-notional normalization no longer returns the un-normalized
+    result, with its `u64::MAX` working bound in `remaining_quantity()`,
+    as a success when the rebuild fails: the committed trades are
+    reported as `MatchAborted` and the failure is logged.
+
+  Compatibility: identical trades, fees, events and order states for
+  every valid input; no snapshot, journal or wire format change
+  (`ORDERBOOK_SNAPSHOT_FORMAT_VERSION` stays 4) and no replay impact. The
+  only behaviour changes are on the overflow and invariant-breach paths
+  above, which used to panic, wrap or clamp. `peek_match` changes
+  signature (see "Changed (breaking)").
+
 - **Default trade-id namespace no longer reads panicking OS entropy
   (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
   `with_trade_and_price_level_listener` (and every constructor built on
@@ -202,6 +240,15 @@ change.
   CI now runs it (#262). Test-only change.
 
 ### Changed (breaking)
+
+- **`OrderBook::peek_match` returns `Result` (#246).** Compatibility:
+  `peek_match(side, quantity, price_limit)`: `u64` →
+  `Result<u64, OrderBookError>`. A level whose `visible + hidden` overflows
+  `u64` used to be read as empty (`total_quantity().unwrap_or(0)`) and the
+  running total was saturated; the overflowing level is now
+  `OrderBookError::PriceLevelError`, and the accounting is checked. Values
+  are unchanged for every book whose levels fit `u64`; add `?` or handle
+  the error.
 
 - **Checked fee / trade arithmetic API (#244).** Compatibility:
   - `FeeSchedule::calculate_fee(notional, is_maker)`: `i128` →

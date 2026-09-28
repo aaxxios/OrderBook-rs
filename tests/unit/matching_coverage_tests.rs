@@ -305,10 +305,12 @@ mod tests {
         let book = OrderBook::<TestExtraFields>::new("TEST");
 
         // Test peek match when there are no orders
-        let matched_quantity = book.peek_match(Side::Buy, 10, Some(100));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 10, Some(100))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 0);
 
-        let matched_quantity = book.peek_match(Side::Sell, 10, None);
+        let matched_quantity = book.peek_match(Side::Sell, 10, None).expect("peek_match");
         assert_eq!(matched_quantity, 0);
     }
 
@@ -324,11 +326,15 @@ mod tests {
         let _ = book.add_limit_order(sell_id2, 110, 20, Side::Sell, TimeInForce::Gtc, None);
 
         // Peek match for less than first level
-        let matched_quantity = book.peek_match(Side::Buy, 5, Some(120));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 5, Some(120))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 5); // Should match from first level only
 
         // Peek match for exactly first level
-        let matched_quantity = book.peek_match(Side::Buy, 10, Some(120));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 10, Some(120))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 10); // Should match exactly first level
     }
 
@@ -344,7 +350,9 @@ mod tests {
         let _ = book.add_limit_order(sell_id2, 100, 10, Side::Sell, TimeInForce::Gtc, None);
 
         // Peek match with price limit that excludes higher price
-        let matched_quantity = book.peek_match(Side::Buy, 15, Some(120));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 15, Some(120))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 10); // Should only match the 100-price level
     }
 
@@ -360,7 +368,9 @@ mod tests {
         let _ = book.add_limit_order(buy_id2, 100, 10, Side::Buy, TimeInForce::Gtc, None);
 
         // Peek match with price limit that excludes lower price
-        let matched_quantity = book.peek_match(Side::Sell, 15, Some(80));
+        let matched_quantity = book
+            .peek_match(Side::Sell, 15, Some(80))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 10); // Should only match the 100-price level
     }
 
@@ -378,16 +388,24 @@ mod tests {
         let _ = book.add_limit_order(sell_id3, 102, 15, Side::Sell, TimeInForce::Gtc, None);
 
         // Test various peek quantities
-        let matched_quantity = book.peek_match(Side::Buy, 2, Some(105));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 2, Some(105))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 2); // Partial from first level
 
-        let matched_quantity = book.peek_match(Side::Buy, 5, Some(105));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 5, Some(105))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 5); // Full first level + partial second
 
-        let matched_quantity = book.peek_match(Side::Buy, 12, Some(105));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 12, Some(105))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 12); // First two levels + partial third
 
-        let matched_quantity = book.peek_match(Side::Buy, 30, Some(105));
+        let matched_quantity = book
+            .peek_match(Side::Buy, 30, Some(105))
+            .expect("peek_match");
         assert_eq!(matched_quantity, 25); // All available (3+7+15)
     }
 }
