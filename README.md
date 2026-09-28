@@ -200,6 +200,15 @@ This order book engine is built with the following design principles:
   Pegged orders referencing the mid price use the exact integer midpoint
   (rounded down) instead of an `f64` round trip. The matching path is
   unchanged.
+- **Panic-free matching loop (#246).** A `CancelMaker` fill-or-kill whose
+  non-self depth sums past `u64::MAX` is judged fillable instead of
+  panicking (debug) or being killed on a wrapped sum (release); the
+  thread-local matching pool degrades to fresh buffers during thread
+  teardown or reentrancy; the #225 STP snapshot check logs instead of
+  asserting; per-level budget arithmetic is checked and a breach aborts
+  the sweep with its committed prefix. `OrderBook::peek_match` returns
+  `Result<u64, OrderBookError>` and reports a level whose depth overflows
+  `u64` instead of reading it as empty. Valid inputs trade identically.
 - **Hardened journals and identity replay of mass cancels (#252).**
   `FileJournal` never truncates an existing segment on rotation
   (`create_new`, `JournalError::SegmentExists`), both journals refuse
@@ -274,6 +283,7 @@ This order book engine is built with the following design principles:
 | `OrderSimulation::total_cost() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
 | `DistributionBin::width() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
 | `OrderBookError` (no analytics overflow variant) | adds `ArithmeticOverflow { operation }`, `AllocationFailed { operation, requested }` (wire code `Other(0)`) |
+| `OrderBook::peek_match(side, qty, limit) -> u64` (overflowing level read as empty) | `-> Result<u64, OrderBookError>` (`PriceLevelError` for an overflowing level) |
 | `Journal::last_sequence() -> Option<u64>` | `-> Result<Option<u64>, JournalError>` |
 | `InMemoryJournal::with_capacity(n) -> Self`; `len() -> usize`; `is_empty() -> bool` | `-> Result<Self, JournalError>`; `-> Result<usize, JournalError>`; `-> Result<bool, JournalError>` |
 | `Journal::append` accepts any sequence; rotation truncates an existing segment | non-increasing sequence → `JournalError::NonMonotonicSequence`; existing segment → `SegmentExists` |
