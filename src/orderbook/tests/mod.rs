@@ -12,6 +12,7 @@ mod market_metrics;
 mod mass_cancel_failures;
 mod match_abort;
 mod matching;
+mod modification_failures;
 mod modifications;
 mod operations;
 mod order;

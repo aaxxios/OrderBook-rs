@@ -134,7 +134,7 @@ mod tests {
             timestamp: TimestampMs::new(0),
             extra_fields: TestExtraFields::default(),
         };
-        assert_eq!(iceberg_order.total_quantity(), 200); // visible + hidden
+        assert_eq!(iceberg_order.total_quantity().ok(), Some(200)); // visible + hidden
 
         let reserve_order = OrderType::ReserveOrder {
             id: new_id(),
@@ -150,7 +150,7 @@ mod tests {
             timestamp: TimestampMs::new(0),
             extra_fields: TestExtraFields::default(),
         };
-        assert_eq!(reserve_order.total_quantity(), 100); // visible + hidden
+        assert_eq!(reserve_order.total_quantity().ok(), Some(100)); // visible + hidden
 
         let standard_order = OrderType::Standard {
             id: new_id(),
@@ -162,7 +162,7 @@ mod tests {
             timestamp: TimestampMs::new(0),
             extra_fields: TestExtraFields::default(),
         };
-        assert_eq!(standard_order.total_quantity(), 100);
+        assert_eq!(standard_order.total_quantity().ok(), Some(100));
     }
 
     #[test]
@@ -211,7 +211,7 @@ mod tests {
         };
         reserve_order.set_quantity(80); // Set the visible tranche to 80
         assert_eq!(reserve_order.quantity(), 80); // visible quantity updated
-        assert_eq!(reserve_order.total_quantity(), 150); // hidden 70 untouched
+        assert_eq!(reserve_order.total_quantity().ok(), Some(150)); // hidden 70 untouched
     }
 
     #[test]

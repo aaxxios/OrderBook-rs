@@ -419,7 +419,7 @@ mod test_modifications_remaining {
         let Some(reserve) = order4.as_deref() else {
             panic!("expected a reserve order after the update");
         };
-        assert_eq!(reserve.total_quantity(), 20);
+        assert_eq!(reserve.total_quantity().ok(), Some(20));
         let OrderType::ReserveOrder {
             visible_quantity,
             hidden_quantity,
@@ -823,7 +823,7 @@ mod tests {
 
         // After the fill, the visible part is consumed and then immediately replenished.
         assert_eq!(order.quantity(), 10); // The visible quantity is replenished to 10.
-        assert_eq!(order.total_quantity(), 85); // The total remaining quantity is correct.
+        assert_eq!(order.total_quantity().ok(), Some(85)); // The total remaining quantity is correct.
 
         // Verify the internal state of the order
         if let OrderType::ReserveOrder {
@@ -875,7 +875,7 @@ mod tests {
         let mut increased = reserve_order(5, 5);
         increased.set_quantity(15);
         assert_reserve_split(&increased, 15, 5);
-        assert_eq!(increased.total_quantity(), 20);
+        assert_eq!(increased.total_quantity().ok(), Some(20));
 
         // A decrease sets the visible tranche; hidden is untouched.
         let mut decreased = reserve_order(30, 70);
@@ -887,7 +887,7 @@ mod tests {
         let mut amplified = reserve_order(30, 70);
         amplified.set_quantity(80);
         assert_reserve_split(&amplified, 80, 70);
-        assert_eq!(amplified.total_quantity(), 150);
+        assert_eq!(amplified.total_quantity().ok(), Some(150));
     }
 
     #[test]
@@ -916,7 +916,7 @@ mod tests {
         };
         assert_eq!(visible_quantity.as_u64(), 15);
         assert_eq!(hidden_quantity.as_u64(), 5);
-        assert_eq!(order.total_quantity(), 20);
+        assert_eq!(order.total_quantity().ok(), Some(20));
     }
 }
 

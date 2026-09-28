@@ -28,11 +28,25 @@ mod tests {
         let err = OrderBookError::PriceCrossing {
             price: 1000,
             side: Side::Buy,
-            opposite_price: 999,
+            opposite_price: Some(999),
         };
         assert_eq!(
             format!("{err}"),
             "Price crossing: BUY 1000 would cross opposite at 999"
+        );
+    }
+
+    /// #247: an opposite side that emptied is `None`, not a fake `0`.
+    #[test]
+    fn test_display_price_crossing_without_opposite_price() {
+        let err = OrderBookError::PriceCrossing {
+            price: 1000,
+            side: Side::Buy,
+            opposite_price: None,
+        };
+        assert_eq!(
+            format!("{err}"),
+            "Price crossing: BUY 1000 would cross the opposite side"
         );
     }
 

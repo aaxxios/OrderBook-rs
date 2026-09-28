@@ -630,22 +630,43 @@ mod tests {
         assert_eq!(verified(Side::Buy, 10, None), 100);
     }
 
-    /// Copilot review on #280: the re-add of a validate-first modify takes
-    /// the arithmetic preflight as done (it ran before the cancel), so it
-    /// cannot fail with `FeeOverflow` after the original is gone; a worse
-    /// maker admitted concurrently is left to the sweep's backstop.
+    /// Copilot review on #280, extended by #247: the re-add of a
+    /// validate-first modify takes the whole pre-cancel verdict as its
+    /// admission (the arithmetic preflight included), so it cannot fail with
+    /// `FeeOverflow` after the original is gone; a worse maker admitted
+    /// concurrently is left to the sweep's backstop, which aborts before
+    /// touching the level.
     #[test]
     fn test_modify_re_add_does_not_rerun_the_arithmetic_preflight() {
+        use crate::orderbook::matching::ShapeVerdict;
+        use crate::orderbook::modifications::Admission;
+
         let (book, _trades) = book(Some(FeeSchedule::new(-2, 5)), false);
         let crossing = limit(TAKER, ASK_PRICE, ASK_QTY, Side::Buy);
         assert!(matches!(
             book.validate_order_shape(&crossing),
             Err(OrderBookError::FeeOverflow { .. })
         ));
-        let verdict = book
-            .validate_order_shape_with(&crossing, Some(42))
-            .expect("preverified: the arithmetic check is skipped");
-        assert_eq!(verdict.arithmetic_verified_price, 42);
-        assert_eq!(verdict.fok, None);
+        let verdict = ShapeVerdict {
+            fok: None,
+            arithmetic_verified_price: 42,
+        };
+        let failure = book
+            .add_order_inner(crossing, false, false, Admission::ReAdd(verdict))
+            .expect_err("the backstop refuses the unpriceable level");
+        assert!(
+            matches!(
+                failure.into_submit().error,
+                OrderBookError::MatchAborted {
+                    executed_quantity: 0,
+                    ..
+                }
+            ),
+            "not FeeOverflow: the preflight is not re-run"
+        );
+        assert!(
+            book.get_order(Id::from_u64(ASK_ID)).is_some(),
+            "ask untouched"
+        );
     }
 }

@@ -825,6 +825,23 @@ fn may_have_mutated_is_set_for_exactly_the_post_mutation_errors() {
             user_id: user(1),
         },
         OrderBookError::PriceLevelError(PriceLevelError::InvalidFormat),
+        // #247: a modify re-add that failed after the original was
+        // cancelled, rolled back (the original moved to the back of its
+        // level) or lost.
+        OrderBookError::ModifyRolledBack {
+            order_id: Id::from_u64(1),
+            source: Box::new(OrderBookError::DuplicateOrderId {
+                order_id: Id::from_u64(1),
+            }),
+        },
+        OrderBookError::ModifyOrderLost {
+            order_id: Id::from_u64(1),
+            executed_quantity: 5,
+            source: Box::new(OrderBookError::PriceLevelError(
+                PriceLevelError::InvalidFormat,
+            )),
+            restore_error: None,
+        },
     ];
     let pre_mutation = [
         OrderBookError::KillSwitchActive,
@@ -836,7 +853,7 @@ fn may_have_mutated_is_set_for_exactly_the_post_mutation_errors() {
         OrderBookError::PriceCrossing {
             price: 100,
             side: Side::Buy,
-            opposite_price: 99,
+            opposite_price: Some(99),
         },
         OrderBookError::InvalidTickSize {
             price: 105,

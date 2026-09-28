@@ -69,7 +69,7 @@ mod tests_update_price_and_quantity_two_tranche {
             panic!("the reserve order is no longer on the book");
         };
         assert_eq!(order.price().as_u128(), price);
-        assert_eq!(order.total_quantity(), visible + hidden);
+        assert_eq!(order.total_quantity().ok(), Some(visible + hidden));
         let OrderType::ReserveOrder {
             visible_quantity,
             hidden_quantity,
@@ -150,7 +150,7 @@ mod tests_update_price_and_quantity_two_tranche {
             panic!("the iceberg order is no longer on the book");
         };
         assert_eq!(order.price().as_u128(), NEW_PRICE);
-        assert_eq!(order.total_quantity(), 20);
+        assert_eq!(order.total_quantity().ok(), Some(20));
         let OrderType::IcebergOrder {
             visible_quantity,
             hidden_quantity,

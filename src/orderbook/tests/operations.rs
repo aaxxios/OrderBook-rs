@@ -152,7 +152,7 @@ mod tests {
             }) => {
                 assert_eq!(price, 1000, "Price should match");
                 assert_eq!(side, Side::Buy, "Side should be buy");
-                assert_eq!(opposite_price, 1000, "Opposite price should match");
+                assert_eq!(opposite_price, Some(1000), "Opposite price should match");
             }
             _ => panic!("Expected PriceCrossing error"),
         }

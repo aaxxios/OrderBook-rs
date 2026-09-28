@@ -285,7 +285,7 @@ mod tests {
         assert!(result.is_ok());
         let order = result.unwrap();
         assert_eq!(order.quantity(), 25); // Visible quantity
-        assert_eq!(order.total_quantity(), 100); // Total quantity
+        assert_eq!(order.total_quantity().ok(), Some(100)); // Total quantity
 
         // Verify default extra fields
         let stored_order = book.get_order(order_id).unwrap();
@@ -345,7 +345,7 @@ mod tests {
         // This might be valid - iceberg with no hidden part
         if let Ok(order) = result {
             assert_eq!(order.quantity(), 50);
-            assert_eq!(order.total_quantity(), 50);
+            assert_eq!(order.total_quantity().ok(), Some(50));
         } else {
             // Or it might be invalid - check error message
             if let Err(e) = result {
@@ -383,6 +383,6 @@ mod tests {
             extra_fields: TestExtraFields::default(),
         };
         assert_eq!(iceberg_order.quantity(), 20);
-        assert_eq!(iceberg_order.total_quantity(), 100);
+        assert_eq!(iceberg_order.total_quantity().ok(), Some(100));
     }
 }

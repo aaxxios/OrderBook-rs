@@ -435,6 +435,19 @@ pub struct OrderBook<T = ()> {
     pub(super) cancel_fault_hook:
         Option<std::sync::Arc<dyn Fn(Id) -> Option<CancelFault> + Send + Sync>>,
 
+    /// Test-only fault injection for resting an order on its price level
+    /// (#247).
+    ///
+    /// Consulted right before the book asks a level to admit an order that
+    /// is about to rest (a submit's remainder, a modify's re-add, or the
+    /// restore of a modify's original); returning an error makes that
+    /// admission fail with nothing mutated. pricelevel 0.10 has no public
+    /// way to make a level refuse an admission on demand. Like its siblings
+    /// it exists only in `cfg(test)` builds.
+    #[cfg(test)]
+    pub(super) rest_fault_hook:
+        Option<std::sync::Arc<dyn Fn(Id) -> Option<pricelevel::PriceLevelError> + Send + Sync>>,
+
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
 
@@ -803,6 +816,8 @@ where
             level_interleave_hook: None,
             #[cfg(test)]
             cancel_fault_hook: None,
+            #[cfg(test)]
+            rest_fault_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1678,6 +1693,8 @@ where
             level_interleave_hook: None,
             #[cfg(test)]
             cancel_fault_hook: None,
+            #[cfg(test)]
+            rest_fault_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1738,6 +1755,8 @@ where
             level_interleave_hook: None,
             #[cfg(test)]
             cancel_fault_hook: None,
+            #[cfg(test)]
+            rest_fault_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
