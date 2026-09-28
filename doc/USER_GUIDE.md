@@ -663,17 +663,19 @@ while let Ok((seq, fills)) = rx.try_recv() {
 }
 ```
 
-**Re-entrancy contract.** `TradeListener`, `PriceLevelChangedListener` and
-`OrderStateListener` all fire from inside the book operation that produced
-the event, and may fire while that operation still holds the book-level
-gate described in [Concurrent Access](#4-concurrent-access). A listener
-must therefore never call back into the same `OrderBook`'s mutating API on
-the invoking thread: `add_order` / `submit_*`, `cancel_order`,
-`update_order`, the mass cancels and the market sweeps all re-enter the
-gate, which is not reentrant, so the nested acquisition can deadlock. Push
-the event onto a channel or queue and mutate from another context.
-Read-only queries (`best_bid`, `best_ask`, snapshots, statistics) are not
-gated and are safe from a listener.
+**Delivery and re-entrancy (0.14.0, #249).** `TradeListener`,
+`PriceLevelChangedListener` and `OrderStateListener` run **after** the book
+operation that produced the event has committed and released the
+book-level gate described in [Concurrent Access](#4-concurrent-access),
+never mid-mutation. Per book, events are delivered in one total order
+consistent with commit order (`engine_seq` strictly increases across the
+trade and price-level streams, also with concurrent submitters), by
+whichever thread is dispatching: usually the submitter before its call
+returns, but under concurrency possibly another thread after the submit
+returned. A listener may call back into the same `OrderBook` (the nested
+call's events are delivered after the current batch). Listeners must not
+panic and must return quickly: a slow listener delays every later event
+of the book, so pushing onto a channel is still the recommended shape.
 
 ### 3. State Management
 
@@ -1008,18 +1010,15 @@ let snapshot = book.create_snapshot(10);  // Only top 10 levels
 let snapshot = book.create_snapshot(0);  // All levels (high memory)
 ```
 
-**Issue: A thread hangs inside a listener callback**
+**Issue: A listener callback is slow or blocks**
 
-A listener that mutates the same book on the invoking thread re-enters the
-book-level gate, which is not reentrant, so the thread can block forever.
+Since 0.14.0 listeners run after the gate is released, so a listener that
+mutates the same book no longer deadlocks. A listener that blocks still
+delays every later event of the book (one dispatcher per book delivers them
+in order), so hand the event off and do the work elsewhere.
 
 ```rust
-// Wrong: the cancel re-enters the gate the submit may still hold.
-book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
-    let _ = book_handle.cancel_order(some_id);
-}));
-
-// Correct: hand the event off and mutate from another context.
+// Preferred: hand the event off and work from another context.
 book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
     let _ = tx.send(trade.engine_seq);
 }));

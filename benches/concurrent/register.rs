@@ -1,6 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group};
 use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
+use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,6 +9,22 @@ use std::time::{Duration, Instant};
 /// Fresh random order id (UUID v4).
 fn new_id() -> Id {
     Id::from_uuid(uuid::Uuid::new_v4())
+}
+
+/// A book with no-op trade and price-level listeners installed (#249):
+/// measures the deferred, ordered emission path (buffer, stamp, dispatch)
+/// against the listener-free fast path.
+fn book_with_listeners() -> OrderBook {
+    let trade: orderbook_rs::orderbook::trade::TradeListener =
+        Arc::new(|result: &orderbook_rs::orderbook::trade::TradeResult| {
+            black_box(result.engine_seq);
+        });
+    let level: orderbook_rs::orderbook::book_change_event::PriceLevelChangedListener = Arc::new(
+        |event: orderbook_rs::orderbook::book_change_event::PriceLevelChangedEvent| {
+            black_box(event.engine_seq);
+        },
+    );
+    OrderBook::with_trade_and_price_level_listener("TEST-SYMBOL", trade, level)
 }
 
 pub fn register_benchmarks(c: &mut Criterion) {
@@ -36,10 +53,50 @@ pub fn register_benchmarks(c: &mut Criterion) {
         );
 
         group.bench_with_input(
+            BenchmarkId::new("concurrent_add_limit_orders_with_listeners", thread_count),
+            thread_count,
+            |b, &thread_count| {
+                b.iter_custom(|iters| {
+                    measure_concurrent_operation_on(
+                        book_with_listeners(),
+                        thread_count,
+                        iters,
+                        |order_book, _thread_id, _iteration| {
+                            let id = new_id();
+                            order_book
+                                .add_limit_order(id, 1000, 10, Side::Buy, TimeInForce::Gtc, None)
+                                .unwrap();
+                        },
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
             BenchmarkId::new("concurrent_mixed_operations", thread_count),
             thread_count,
             |b, &thread_count| {
-                b.iter_custom(|iters| measure_concurrent_mixed_operations(thread_count, iters));
+                b.iter_custom(|iters| {
+                    measure_concurrent_mixed_operations_on(
+                        OrderBook::new("TEST-SYMBOL"),
+                        thread_count,
+                        iters,
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("concurrent_mixed_operations_with_listeners", thread_count),
+            thread_count,
+            |b, &thread_count| {
+                b.iter_custom(|iters| {
+                    measure_concurrent_mixed_operations_on(
+                        book_with_listeners(),
+                        thread_count,
+                        iters,
+                    )
+                });
             },
         );
     }
@@ -52,7 +109,25 @@ fn measure_concurrent_operation<F>(thread_count: usize, iterations: u64, operati
 where
     F: Fn(&Arc<OrderBook>, usize, u64) + Send + Sync + 'static,
 {
-    let order_book = Arc::new(OrderBook::new("TEST-SYMBOL"));
+    measure_concurrent_operation_on(
+        OrderBook::new("TEST-SYMBOL"),
+        thread_count,
+        iterations,
+        operation,
+    )
+}
+
+/// [`measure_concurrent_operation`] on a caller-built book.
+fn measure_concurrent_operation_on<F>(
+    order_book: OrderBook,
+    thread_count: usize,
+    iterations: u64,
+    operation: F,
+) -> Duration
+where
+    F: Fn(&Arc<OrderBook>, usize, u64) + Send + Sync + 'static,
+{
+    let order_book = Arc::new(order_book);
     let operation = Arc::new(operation);
     let barrier = Arc::new(Barrier::new(thread_count + 1)); // +1 for main thread
 
@@ -93,8 +168,12 @@ where
 }
 
 /// Measures time for mixed concurrent operations (add, match, cancel) on an order book
-fn measure_concurrent_mixed_operations(thread_count: usize, iterations: u64) -> Duration {
-    let order_book: Arc<OrderBook> = Arc::new(OrderBook::new("TEST-SYMBOL"));
+fn measure_concurrent_mixed_operations_on(
+    order_book: OrderBook,
+    thread_count: usize,
+    iterations: u64,
+) -> Duration {
+    let order_book: Arc<OrderBook> = Arc::new(order_book);
     let barrier = Arc::new(Barrier::new(thread_count + 1)); // +1 for main thread
 
     // Pre-populate with some orders

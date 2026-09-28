@@ -522,6 +522,51 @@ change.
 
 ### Changed (breaking)
 
+- **Listeners run after commit and outside the submit gate (#249,
+  decision D3).** Behaviour change, no signature change. Compatibility:
+  - `TradeListener`, `PriceLevelChangedListener` and the book's
+    `OrderStateListener` used to run inline, often while the submit gate
+    was held and in several places before the mutation finished. Events
+    are now buffered during the mutation, stamped with `engine_seq` under
+    the gate at commit, and delivered after the gate is released by one
+    active dispatcher per book.
+  - Ordering guarantee: per book, one total order consistent with commit
+    order; `engine_seq` strictly increases across the delivered trade and
+    price-level stream, now also with concurrent submitters (previously
+    two shared-gate submitters could interleave their mints and deliver out
+    of sequence). A single submitting thread sees exactly the same events
+    in exactly the same order as before (pinned by a recorded-stream test).
+  - Timing: delivery happens on whichever thread is dispatching. Single
+    threaded, a call's events are still delivered before it returns; under
+    concurrency a submit can return before another thread's dispatcher has
+    delivered its events. A listener may observe a book state newer than
+    its event.
+  - Re-entrant calls are now allowed: a listener may submit, cancel,
+    modify or mass-cancel on the same book (previously a deadlock under
+    the exclusive gate). The nested call's events are delivered after the
+    current batch.
+  - Panicking listener: book state is consistent (the mutation committed
+    first) and the gate is not poisoned; the rest of the batch being
+    delivered is dropped and counted. New diagnostics:
+    `OrderBook::dropped_listener_events()`, `OrderBook::listener_panics()`,
+    and `OrderBook::flush_listener_events()` to deliver batches left
+    queued after such a panic.
+  - Submit-gate poisoning is no longer recovered silently. It can now only
+    follow an engine (or `T::default()` / `T::clone()`) panic under the
+    exclusive gate; the acquisition that detects it engages the kill switch
+    (new flow and modifies return `KillSwitchActive`, cancels still run),
+    logs once at `ERROR` and latches `OrderBook::submit_gate_poisoned()`.
+  - `OrderStateTracker::transition` on a standalone tracker still calls its
+    listener inline; only a tracker owned by a book defers it.
+  - `match_market_order*` / `match_limit_order*` now publish their trades
+    before releasing the gate (they used to publish after it), so the
+    trade's `engine_seq` is stamped at commit with the sweep's level events;
+    the listener itself still runs after the gate is released.
+  - `add_order_with_result` / `*_with_committed` with a trade listener
+    installed clone the `TradeResult` once (caller copy + deferred listener
+    copy; same fills, fees and `engine_seq`). Journal and replay do not go
+    through listeners and are unaffected.
+
 - **`OrderBook::peek_match` returns `Result` (#246).** Compatibility:
   `peek_match(side, quantity, price_limit)`: `u64` →
   `Result<u64, OrderBookError>`. A level whose `visible + hidden` overflows

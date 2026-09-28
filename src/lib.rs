@@ -254,6 +254,17 @@
 //!   replay re-runs the sweep and refuses the residual, reproducing the
 //!   live trades without a `RiskConfig`. The repricers keep a reused id's
 //!   special-order registration.
+//! - **Listeners run after commit, outside the submit gate (#249).** Trade,
+//!   price-level and order-state listener events are buffered during the
+//!   mutation, stamped with `engine_seq` under the gate at commit and
+//!   delivered after the gate is released by one active dispatcher per book:
+//!   one total order consistent with commit order, with `engine_seq` strictly
+//!   increasing also under concurrent submitters, and the same single-thread
+//!   order as before. A listener may re-enter the book; a panicking listener
+//!   leaves the book consistent and the gate unpoisoned
+//!   (`dropped_listener_events()`, `listener_panics()`,
+//!   `flush_listener_events()`). A poisoned submit gate now engages the kill
+//!   switch (`submit_gate_poisoned()`) instead of being recovered silently.
 //!
 //! ### Migration from 0.13
 //!
@@ -272,6 +283,8 @@
 //! | journaled eviction replayed by re-running the sweep | replay evicts exactly the journaled ids (`MassCancelled` result) |
 //! | `SequencerResult::from(&err)` is always a rejection | `OrderRemovedWithLevelFault` records `OrderCancelled { order_id }` |
 //! | mass cancels on the shared submit gate | exclusive gate; `cancel_all_orders` emits after clearing |
+//! | listeners run inline, often under the submit gate; re-entering the book can deadlock | run after commit and gate release, ordered by commit; re-entry allowed; may run on another submitter's thread |
+//! | submit-gate poison recovered silently | kill switch engaged, `submit_gate_poisoned()` latched |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 //! | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |

@@ -209,6 +209,34 @@ pub const UNSTAMPED_ENGINE_SEQ: u64 = u64::MAX;
 /// field. The book-derived analytics ([`depth_statistics`](Self::depth_statistics),
 /// the enriched snapshot metrics, market-impact simulation) read prices and
 /// quantities only and are unaffected.
+///
+/// # Listener delivery (#249)
+///
+/// The trade, price-level and order-state listeners run **after** the
+/// mutation that produced their events has committed and the submit gate
+/// has been released, never mid-mutation or under a book lock. Per book,
+/// deliveries form one total order consistent with commit order: the
+/// `engine_seq` of trade and price-level events strictly increases across
+/// the delivered stream, also with concurrent submitters, and a single
+/// submitting thread sees exactly the order it saw before 0.14.0. Events
+/// are delivered by whichever thread is dispatching: usually the submitter
+/// before its call returns, but under concurrency possibly another thread,
+/// after the submit returned. A listener may observe a book state newer
+/// than its event, and may re-enter the book (its nested call's events are
+/// delivered after the current batch). See [`TradeListener`] for the
+/// details and [`Self::dropped_listener_events`] /
+/// [`Self::listener_panics`] for the panicking-listener accounting.
+///
+/// # Caller-supplied code
+///
+/// `T` (`Clone`, `Default`, and whatever else the caller's type carries)
+/// and every listener are caller code the crate cannot certify. They must
+/// not panic. `T::default()` / `T::clone()` run at the book's boundary
+/// (order conversion, snapshots), not inside pricelevel's matcher; a panic
+/// there unwinds out of the calling entry point, and if that entry point
+/// held the exclusive side of the submit gate the book engages its kill
+/// switch on the next acquisition (see [`Self::submit_gate_poisoned`]).
+/// See `doc/panic-boundaries.md`.
 pub struct OrderBook<T = ()> {
     /// The symbol or identifier for this order book
     pub(super) symbol: String,
@@ -396,6 +424,20 @@ pub struct OrderBook<T = ()> {
     /// synchronous).
     pub(super) submit_gate: std::sync::RwLock<()>,
 
+    /// Latched the first time a submit-gate acquisition finds the gate
+    /// poisoned (#249). Since listeners run after the gate is released, a
+    /// poisoned gate can only mean engine code panicked mid-mutation while
+    /// holding the exclusive side; the book then engages the kill switch
+    /// (see [`Self::submit_gate_poisoned`]). Not part of the snapshot
+    /// format (the kill switch it engages is).
+    pub(super) submit_gate_poisoned: AtomicBool,
+
+    /// Sequenced outbox and dispatcher state for the trade, price-level and
+    /// order-state listeners (#249): events produced under the submit gate
+    /// are stamped into it at commit and delivered after the gate is
+    /// released, in commit order. See `emission.rs`. Runtime-only.
+    pub(super) outbox: super::emission::EventOutbox,
+
     /// Striped per-price reader-writer lock ordering the two operations
     /// that can race on a price level's **existence** under the shared
     /// submit gate (#247, Copilot on #285): admitting an order into a level
@@ -423,7 +465,7 @@ pub struct OrderBook<T = ()> {
     /// that must clean up drops its shared guard before taking the
     /// exclusive one), so it cannot deadlock. `std::sync::RwLock<()>`
     /// because no lock-free structure expresses "exclude admissions while
-    /// unlinking"; poisoning is recovered as for the submit gate (see
+    /// unlinking"; poisoning is logged and recovered (see
     /// [`Self::lock_level`]).
     pub(super) level_locks: [std::sync::RwLock<()>; LEVEL_LOCK_STRIPES],
 
@@ -663,6 +705,94 @@ where
     }
 }
 
+/// Engine-sequence minting, free of `T` bounds so the listener outbox
+/// (`emission.rs`, #249) can stamp events from the submit-gate guard.
+impl<T> OrderBook<T> {
+    /// Mint the next monotonic outbound sequence number.
+    ///
+    /// Called exactly once per outbound event (trade emission, price-level
+    /// change emission). Internally a checked
+    /// `AtomicU64::fetch_update(checked_add(1))` — strict total order across
+    /// all events of this `OrderBook<T>` instance. Single source of truth
+    /// for the minting contract; every emission path in the matching engine
+    /// routes through this method so the counter cannot drift between
+    /// sites.
+    ///
+    /// The contract is **per-instance**, not per-journal-stream: replay into
+    /// a fresh book produces fresh seqs, not the original ones. Consumers
+    /// that need to replay the exact original outbound stream should use
+    /// the journal's `sequence_num` + `timestamp_ns` instead.
+    ///
+    /// # Exhaustion (#250)
+    ///
+    /// The counter holds the next value to mint and never wraps: the last
+    /// mintable value is `u64::MAX - 1`, after which the counter rests at
+    /// `u64::MAX` and every call fails. The engine's own emission paths
+    /// then stop publishing `TradeResult` / `PriceLevelChangedEvent`
+    /// events to the listeners (logged once at `ERROR`) rather than
+    /// stamping a wrapped or repeated sequence; the book itself keeps
+    /// working. Event stamping never affects a caller-owned result: an
+    /// `add_order_with_result` / `*_with_committed` caller still receives
+    /// its committed fills, with `engine_seq` set to
+    /// [`UNSTAMPED_ENGINE_SEQ`]. Snapshot restore rejects a package whose
+    /// `engine_seq` is already `u64::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::EngineSeqExhausted`] when the counter is at
+    /// `u64::MAX` and cannot advance.
+    #[inline]
+    pub fn next_engine_seq(&self) -> Result<u64, OrderBookError> {
+        self.engine_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+                seq.checked_add(1)
+            })
+            .map_err(engine_seq_exhausted)
+    }
+
+    /// Mint an `engine_seq` for an outbound event the engine is about to
+    /// emit after a committed mutation (#250).
+    ///
+    /// Emission happens after the book has already changed, so an
+    /// exhausted counter cannot be reported to the caller as a failure of
+    /// the operation. Instead the event is suppressed: `None` is returned,
+    /// the first exhaustion is logged at `ERROR` (latched, so a hot
+    /// emission loop does not flood the log), and no event carrying a
+    /// wrapped or repeated sequence is ever published.
+    #[inline]
+    pub(super) fn mint_event_seq(&self) -> Option<u64> {
+        match self.next_engine_seq() {
+            Ok(seq) => Some(seq),
+            Err(_) => {
+                self.latch_engine_seq_exhausted();
+                None
+            }
+        }
+    }
+
+    /// Latch `engine_seq` exhaustion (#250): the first caller logs at
+    /// `ERROR`; later calls are no-ops.
+    #[cold]
+    #[inline(never)]
+    fn latch_engine_seq_exhausted(&self) {
+        if !self.engine_seq_exhausted.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                symbol = %self.symbol,
+                "engine_seq exhausted at u64::MAX: outbound trade and price-level events are no longer published"
+            );
+        }
+    }
+
+    /// Current value of the engine sequence counter without advancing.
+    ///
+    /// Used by snapshotting to capture the counter for later restore.
+    #[inline]
+    #[must_use]
+    pub fn engine_seq(&self) -> u64 {
+        self.engine_seq.load(Ordering::Acquire)
+    }
+}
+
 impl<T> OrderBook<T>
 where
     T: Default + Clone + Send + Sync + 'static,
@@ -874,6 +1004,8 @@ where
             trade_ids_exhausted: AtomicBool::new(false),
             engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            submit_gate_poisoned: AtomicBool::new(false),
+            outbox: super::emission::EventOutbox::default(),
             level_locks: std::array::from_fn(|_| std::sync::RwLock::new(())),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1052,86 +1184,27 @@ where
         &self.clock
     }
 
-    /// Mint the next monotonic outbound sequence number.
+    /// Emit a [`PriceLevelChangedEvent`] to the installed listener, if any
+    /// (#250, #249).
     ///
-    /// Called exactly once per outbound event (trade emission, price-level
-    /// change emission). Internally a checked
-    /// `AtomicU64::fetch_update(checked_add(1))` — strict total order across
-    /// all events of this `OrderBook<T>` instance. Single source of truth
-    /// for the minting contract; every emission path in the matching engine
-    /// routes through this method so the counter cannot drift between
-    /// sites.
-    ///
-    /// The contract is **per-instance**, not per-journal-stream: replay into
-    /// a fresh book produces fresh seqs, not the original ones. Consumers
-    /// that need to replay the exact original outbound stream should use
-    /// the journal's `sequence_num` + `timestamp_ns` instead.
-    ///
-    /// # Exhaustion (#250)
-    ///
-    /// The counter holds the next value to mint and never wraps: the last
-    /// mintable value is `u64::MAX - 1`, after which the counter rests at
-    /// `u64::MAX` and every call fails. The engine's own emission paths
-    /// then stop publishing `TradeResult` / `PriceLevelChangedEvent`
-    /// events to the listeners (logged once at `ERROR`) rather than
-    /// stamping a wrapped or repeated sequence; the book itself keeps
-    /// working. Event stamping never affects a caller-owned result: an
-    /// `add_order_with_result` / `*_with_committed` caller still receives
-    /// its committed fills, with `engine_seq` set to
-    /// [`UNSTAMPED_ENGINE_SEQ`]. Snapshot restore rejects a package whose
-    /// `engine_seq` is already `u64::MAX`.
-    ///
-    /// # Errors
-    ///
-    /// [`OrderBookError::EngineSeqExhausted`] when the counter is at
-    /// `u64::MAX` and cannot advance.
-    #[inline]
-    pub fn next_engine_seq(&self) -> Result<u64, OrderBookError> {
-        self.engine_seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
-                seq.checked_add(1)
-            })
-            .map_err(engine_seq_exhausted)
-    }
-
-    /// Mint an `engine_seq` for an outbound event the engine is about to
-    /// emit after a committed mutation (#250).
-    ///
-    /// Emission happens after the book has already changed, so an
-    /// exhausted counter cannot be reported to the caller as a failure of
-    /// the operation. Instead the event is suppressed: `None` is returned,
-    /// the first exhaustion is logged at `ERROR` (latched, so a hot
-    /// emission loop does not flood the log), and no event carrying a
-    /// wrapped or repeated sequence is ever published.
-    #[inline]
-    pub(super) fn mint_event_seq(&self) -> Option<u64> {
-        match self.next_engine_seq() {
-            Ok(seq) => Some(seq),
-            Err(_) => {
-                self.latch_engine_seq_exhausted();
-                None
-            }
-        }
-    }
-
-    /// Emit a [`PriceLevelChangedEvent`] to the installed listener, if any,
-    /// stamped with a freshly minted `engine_seq` (#250).
-    ///
-    /// Single emission helper for every price-level-change site, so the
-    /// listener check, the sequence mint and the exhaustion handling of
-    /// [`Self::mint_event_seq`] cannot drift between them. The sequence is
-    /// minted only when a listener is installed, exactly as before.
+    /// Single emission helper for every price-level-change site. The event
+    /// is buffered in the caller's emission scope and stamped with a fresh
+    /// `engine_seq` when the mutation commits (under the submit gate, with
+    /// [`Self::mint_event_seq`]'s exhaustion handling), then delivered after
+    /// the gate is released (see `emission.rs`). Nothing is buffered or
+    /// minted when no listener is installed, exactly as before.
     #[inline]
     pub(super) fn emit_price_level_changed(&self, side: Side, price: u128, quantity: u64) {
-        if let Some(listener) = self.price_level_changed_listener.as_ref()
-            && let Some(engine_seq) = self.mint_event_seq()
-        {
-            listener(PriceLevelChangedEvent {
-                side,
-                price,
-                quantity,
-                engine_seq,
-            });
+        if self.price_level_changed_listener.is_some() {
+            self.defer_event(super::emission::PendingEvent::Level(
+                PriceLevelChangedEvent {
+                    side,
+                    price,
+                    quantity,
+                    // Stamped at commit.
+                    engine_seq: 0,
+                },
+            ));
         }
     }
 
@@ -1143,28 +1216,6 @@ where
         if self.price_level_changed_listener.is_some() {
             self.emit_price_level_changed(side, level.price(), level.visible_quantity());
         }
-    }
-
-    /// Latch `engine_seq` exhaustion (#250): the first caller logs at
-    /// `ERROR`; later calls are no-ops.
-    #[cold]
-    #[inline(never)]
-    fn latch_engine_seq_exhausted(&self) {
-        if !self.engine_seq_exhausted.swap(true, Ordering::Relaxed) {
-            tracing::error!(
-                symbol = %self.symbol,
-                "engine_seq exhausted at u64::MAX: outbound trade and price-level events are no longer published"
-            );
-        }
-    }
-
-    /// Current value of the engine sequence counter without advancing.
-    ///
-    /// Used by snapshotting to capture the counter for later restore.
-    #[inline]
-    #[must_use]
-    pub fn engine_seq(&self) -> u64 {
-        self.engine_seq.load(Ordering::Acquire)
     }
 
     /// Refresh the operational depth gauges with the current count
@@ -1366,8 +1417,10 @@ where
     ///
     /// Poisoning can only follow a panic that unwound while a stripe guard
     /// was held; the protected data is `()`, so recovery is always safe:
-    /// the poison is logged at `ERROR` and the guard recovered, as for the
-    /// submit gate. `None` is unreachable: the stripe index is
+    /// the poison is logged at `ERROR` and the guard recovered. (The
+    /// submit gate no longer recovers silently: since #249 its poisoning
+    /// engages the kill switch, see [`Self::submit_gate_read`].) `None` is
+    /// unreachable: the stripe index is
     /// `price % LEVEL_LOCK_STRIPES`, always in range.
     pub(super) fn lock_level(&self, price: u128) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
         let lock = self.level_stripe(price)?;
@@ -1439,27 +1492,78 @@ where
         entry.remove()
     }
 
-    /// Acquire the shared (read) side of the submit gate (#209). Poisoning
-    /// can only occur if a panic unwound while a guard was held; the
-    /// protected data is `()` so recovery is always safe — log and
-    /// continue rather than propagating the poison.
-    pub(super) fn submit_gate_read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
-        self.submit_gate.read().unwrap_or_else(|poisoned| {
-            tracing::error!("submit gate poisoned by a prior panic; recovering read guard");
+    /// Acquire the shared (read) side of the submit gate (#209).
+    ///
+    /// The returned guard also opens the call's listener emission scope
+    /// when a listener is installed (#249): events the call produces are
+    /// buffered, stamped when the guard is dropped (still under the gate),
+    /// and delivered after the gate is released. See
+    /// [`SubmitGateGuard`].
+    ///
+    /// # Poisoning (#249)
+    ///
+    /// Listeners no longer run under the gate, so a poisoned gate can only
+    /// mean engine code panicked mid-mutation while holding the exclusive
+    /// side, and the book may be inconsistent. The acquisition that finds
+    /// it poisoned engages the kill switch (every later new-flow call and
+    /// modify returns [`OrderBookError::KillSwitchActive`]), latches
+    /// [`Self::submit_gate_poisoned`], logs once at `ERROR`, clears the
+    /// poison and continues, so cancels and mass cancels can still drain
+    /// the book, exactly as under an operator-engaged kill switch.
+    pub(super) fn submit_gate_read(&self) -> SubmitGateGuard<'_, T> {
+        let lock = self.submit_gate.read().unwrap_or_else(|poisoned| {
+            self.on_submit_gate_poisoned();
             poisoned.into_inner()
-        })
+        });
+        SubmitGateGuard::new(self, GateLock::Read(lock))
     }
 
     /// Acquire the exclusive (write) side of the submit gate for a
     /// fill-or-kill submit (#209), an STP-relevant submit or
     /// matching-capable modify, the live snapshot restore commit (#225),
     /// and every mass cancel and expiry eviction (#248). See
-    /// [`Self::submit_gate_read`] for the poisoning policy.
-    pub(super) fn submit_gate_write(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+    /// [`Self::submit_gate_read`] for the emission scope and the poisoning
+    /// policy.
+    pub(super) fn submit_gate_write(&self) -> SubmitGateGuard<'_, T> {
+        SubmitGateGuard::new(self, GateLock::Write(self.submit_gate_write_raw()))
+    }
+
+    /// The bare exclusive lock, poison handled (see
+    /// [`Self::submit_gate_read`]).
+    fn submit_gate_write_raw(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.submit_gate.write().unwrap_or_else(|poisoned| {
-            tracing::error!("submit gate poisoned by a prior panic; recovering write guard");
+            self.on_submit_gate_poisoned();
             poisoned.into_inner()
         })
+    }
+
+    /// A submit-gate acquisition found the gate poisoned (#249): engage the
+    /// kill switch, latch the flag, log once, clear the poison.
+    #[cold]
+    #[inline(never)]
+    fn on_submit_gate_poisoned(&self) {
+        self.engage_kill_switch();
+        self.submit_gate.clear_poison();
+        if !self.submit_gate_poisoned.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                symbol = %self.symbol,
+                "submit gate poisoned: engine code panicked mid-mutation; kill switch engaged, new flow and modifies are rejected until an operator releases it (cancels still run)"
+            );
+        }
+    }
+
+    /// `true` once a submit-gate acquisition has found the gate poisoned
+    /// (#249): engine code panicked mid-mutation while holding the
+    /// exclusive side. The book engaged its kill switch at that point, so
+    /// new flow and modifies return [`OrderBookError::KillSwitchActive`]
+    /// while cancels keep working. Latched for the life of the book (also
+    /// after an operator releases the kill switch, which is the operator's
+    /// statement that the book state is acceptable). Not part of the
+    /// snapshot format; the kill switch it engaged is.
+    #[must_use]
+    #[inline]
+    pub fn submit_gate_poisoned(&self) -> bool {
+        self.submit_gate_poisoned.load(Ordering::Relaxed)
     }
 
     /// Acquire the submit gate in a mode that is **coherent with the
@@ -1553,25 +1657,29 @@ where
     /// deadlock. Gate acquisition therefore lives ONLY in the public
     /// mutating entry points, which call ungated inner variants for any
     /// internal composition (`add_order_inner`,
-    /// `cancel_order_with_reason`, `match_order_with_user_outcome`). The
-    /// same rule extends to user callbacks: see the re-entrancy contract
-    /// on [`TradeListener`], [`PriceLevelChangedListener`] and
-    /// [`OrderStateListener`](super::order_state::OrderStateListener).
+    /// `cancel_order_with_reason`, `match_order_with_user_outcome`). User
+    /// callbacks are not affected (#249): [`TradeListener`],
+    /// [`PriceLevelChangedListener`] and
+    /// [`OrderStateListener`](super::order_state::OrderStateListener) run
+    /// after the guard released the gate, so they may re-enter the book.
     pub(super) fn acquire_coherent_submit_gate(
         &self,
         wants_exclusive: bool,
-    ) -> SubmitGateGuard<'_> {
+    ) -> SubmitGateGuard<'_, T> {
         if wants_exclusive {
-            return SubmitGateGuard::Write(self.submit_gate_write());
+            return self.submit_gate_write();
         }
-        let shared = self.submit_gate_read();
+        let shared = self.submit_gate.read().unwrap_or_else(|poisoned| {
+            self.on_submit_gate_poisoned();
+            poisoned.into_inner()
+        });
         if self.strandable_makers_resting.load(Ordering::Relaxed) == 0 {
-            return SubmitGateGuard::Read(shared);
+            return SubmitGateGuard::new(self, GateLock::Read(shared));
         }
         // A strandable maker was admitted between the caller's decision and
         // this acquisition. Release and start over on the exclusive side.
         drop(shared);
-        SubmitGateGuard::Write(self.submit_gate_write())
+        self.submit_gate_write()
     }
 
     /// Decide the submit gate mode for an incoming order (#209 / #225 / #230).
@@ -1838,6 +1946,8 @@ where
             trade_ids_exhausted: AtomicBool::new(false),
             engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            submit_gate_poisoned: AtomicBool::new(false),
+            outbox: super::emission::EventOutbox::default(),
             level_locks: std::array::from_fn(|_| std::sync::RwLock::new(())),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1909,6 +2019,8 @@ where
             trade_ids_exhausted: AtomicBool::new(false),
             engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            submit_gate_poisoned: AtomicBool::new(false),
+            outbox: super::emission::EventOutbox::default(),
             level_locks: std::array::from_fn(|_| std::sync::RwLock::new(())),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -3977,27 +4089,27 @@ where
             "Order book {}: Matching market order {} for {} at side {:?}",
             self.symbol, order_id, quantity, side
         );
-        let outcome = {
-            // #209 / #225: same gate as `match_order_with_user`, released
-            // before the trades are published, as before.
-            let _gate = self.acquire_coherent_submit_gate(
-                self.submit_needs_exclusive_gate(false, user_id, false, false),
-            );
-            // #240: under the same gate the sweep holds, before any mutation.
-            self.check_trade_id_headroom(order_id, side, None)?;
-            // #244: worst-case notional / fee representability, same place.
-            let verified = self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
-            self.match_order_with_user_outcome(
-                order_id,
-                side,
-                quantity,
-                None,
-                user_id,
-                TakerKind::Standard,
-                0,
-                verified,
-            )?
-        };
+        // #209 / #225: same gate as `match_order_with_user`. #249: the
+        // trades are published under it too, so their `engine_seq` is
+        // stamped at commit with the sweep's level events; the listeners
+        // still run only after the gate is released.
+        let _gate = self.acquire_coherent_submit_gate(
+            self.submit_needs_exclusive_gate(false, user_id, false, false),
+        );
+        // #240: under the same gate the sweep holds, before any mutation.
+        self.check_trade_id_headroom(order_id, side, None)?;
+        // #244: worst-case notional / fee representability, same place.
+        let verified = self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
+        let outcome = self.match_order_with_user_outcome(
+            order_id,
+            side,
+            quantity,
+            None,
+            user_id,
+            TakerKind::Standard,
+            0,
+            verified,
+        )?;
         self.publish_match_outcome(outcome, want_committed)
     }
 
@@ -4329,9 +4441,16 @@ where
     }
 
     /// Emit the trade-count metric and the trade listener for
-    /// `match_result`'s trades. Returns the emitted `TradeResult` when
-    /// `want_result` is set or a listener consumed it; `None` when there
-    /// were no trades. Every emission consumes one `engine_seq` tick.
+    /// `match_result`'s trades. Returns the `TradeResult` when
+    /// `want_result` is set; `None` when there were no trades or the caller
+    /// did not ask for it. Every emission consumes one `engine_seq` tick.
+    ///
+    /// #249: the listener does not run here. Its copy is buffered in the
+    /// caller's emission scope and delivered after the mutation commits and
+    /// the submit gate is released. A caller that wants the result needs
+    /// its `engine_seq` now, so the scope's pending events are committed at
+    /// this point, followed by the trade: the sequence is the one the
+    /// listener receives, minted in the same position as before.
     pub(crate) fn publish_trades(
         &self,
         match_result: &MatchResult,
@@ -4348,8 +4467,8 @@ where
         if let Ok(trades_emitted) = u64::try_from(trade_count) {
             super::metrics::record_trades(trades_emitted);
         }
-        let listener = self.trade_listener.as_ref();
-        if !want_result && listener.is_none() {
+        let has_trade_listener = self.trade_listener.is_some();
+        if !want_result && !has_trade_listener {
             return None;
         }
         // #244: checked notional / fee arithmetic. The preflight
@@ -4371,25 +4490,25 @@ where
                 return None;
             }
         };
+        if !want_result {
+            // Listener only: buffered, stamped at commit (#249).
+            self.defer_trade(trade_result);
+            return None;
+        }
         // #250: event stamping never affects the caller-owned result. With
         // `engine_seq` exhausted only the listener emission is suppressed
         // (logged once); the committed fills are still returned to an
         // `add_order_with_result` / `*_with_committed` caller, stamped with
         // the never-minted sentinel `u64::MAX`.
-        match self.mint_event_seq() {
-            Some(engine_seq) => {
-                trade_result.engine_seq = engine_seq;
-                if let Some(listener) = listener {
-                    listener(&trade_result);
-                }
-            }
-            None => {
-                trade_result.engine_seq = UNSTAMPED_ENGINE_SEQ;
-                if !want_result {
-                    return None;
-                }
-            }
-        }
+        let engine_seq = if self.has_event_listeners() {
+            // Order the caller's sequence after the events this call
+            // already produced (#249); the listener gets its own copy.
+            let listener_copy = has_trade_listener.then(|| trade_result.clone());
+            self.commit_with_trade_seq(listener_copy)
+        } else {
+            self.mint_event_seq()
+        };
+        trade_result.engine_seq = engine_seq.unwrap_or(UNSTAMPED_ENGINE_SEQ);
         Some(trade_result)
     }
 
@@ -4565,29 +4684,27 @@ where
             "Order book {}: Matching limit order {} for {} at side {:?} with limit price {}",
             self.symbol, order_id, quantity, side, limit_price
         );
-        let outcome = {
-            // #209 / #225: same gate as `match_order_with_user`, released
-            // before the trades are published, as before.
-            let _gate = self.acquire_coherent_submit_gate(
-                self.submit_needs_exclusive_gate(false, user_id, false, false),
-            );
-            // #240: under the same gate the sweep holds, before any
-            // mutation; only a limit that actually crosses is refused.
-            self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
-            // #244: worst-case notional / fee representability.
-            let verified =
-                self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
-            self.match_order_with_user_outcome(
-                order_id,
-                side,
-                quantity,
-                Some(limit_price),
-                user_id,
-                TakerKind::Standard,
-                0,
-                verified,
-            )?
-        };
+        // #209 / #225: same gate as `match_order_with_user`. #249: trades
+        // are published under it (see `match_market_order_committed`).
+        let _gate = self.acquire_coherent_submit_gate(
+            self.submit_needs_exclusive_gate(false, user_id, false, false),
+        );
+        // #240: under the same gate the sweep holds, before any
+        // mutation; only a limit that actually crosses is refused.
+        self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
+        // #244: worst-case notional / fee representability.
+        let verified =
+            self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
+        let outcome = self.match_order_with_user_outcome(
+            order_id,
+            side,
+            quantity,
+            Some(limit_price),
+            user_id,
+            TakerKind::Standard,
+            0,
+            verified,
+        )?;
         self.publish_match_outcome(outcome, false)
             .map_err(SubmitFailure::into_error)
     }
@@ -4865,11 +4982,8 @@ where
     ///
     /// The commit phase holds the **exclusive** side of the submit gate, so
     /// it never interleaves with an in-flight submit, cancel or modify.
-    /// Like every gated entry point it must not be called from a
-    /// [`TradeListener`], [`PriceLevelChangedListener`] or
-    /// [`OrderStateListener`](super::order_state::OrderStateListener)
-    /// on the invoking thread: the gate is not reentrant and the nested
-    /// acquisition deadlocks.
+    /// Listeners run after the gate is released (#249), so calling this
+    /// from a listener is safe.
     pub fn restore_from_snapshot(&self, snapshot: OrderBookSnapshot) -> Result<(), OrderBookError> {
         self.ensure_snapshot_symbol(&snapshot)?;
         let prepared = Self::prepare_snapshot_levels(snapshot, false)?;
@@ -6313,21 +6427,90 @@ pub(super) enum CancelFault {
 }
 
 /// Guard over the submit gate (#209 / #225) in either mode — held for the
-/// length of one mutating entry-point call. Only the drop timing matters,
-/// hence the unused-field allowances.
+/// length of one mutating entry-point call.
 /// [`OrderBook::acquire_coherent_submit_gate`] is the single place that picks the
 /// mode and carries the full rationale.
-pub(super) enum SubmitGateGuard<'a> {
+///
+/// # Listener emission (#249)
+///
+/// On a book with any listener installed the guard also owns the call's
+/// emission scope: every trade, price-level and order-state event the call
+/// produces is buffered instead of being delivered inline. Dropping the
+/// guard, in this order:
+///
+/// 1. commits the buffered events to the book's outbox while the gate is
+///    **still held**, stamping `engine_seq` there, so outbox order is both
+///    sequence order and commit order;
+/// 2. releases the gate;
+/// 3. marks the batch ready and dispatches (or leaves it to the thread
+///    already dispatching).
+///
+/// Listeners therefore never run under the gate or mid-mutation, and a
+/// listener may re-enter the book. On a book with no listener the guard
+/// opens no scope and dropping it only releases the gate. When the thread
+/// is unwinding (engine panic) nothing is dispatched; the gate's own
+/// poisoning then drives the kill-switch policy on the next acquisition
+/// (see [`OrderBook::submit_gate_read`]).
+pub(super) struct SubmitGateGuard<'a, T> {
+    /// The book whose gate is held.
+    book: &'a OrderBook<T>,
+    /// The held side of the gate; `Released` once dropped.
+    lock: GateLock<'a>,
+    /// The call's emission scope, when a listener is installed.
+    emission: Option<super::emission::GateEmission>,
+}
+
+/// The held side of the submit gate. Only the drop timing matters, hence
+/// the unused-field allowances.
+pub(super) enum GateLock<'a> {
     /// Shared mode: everything whose decision does not span two operations
     /// — ordinary and post-only submits, `UpdateQuantity`, `Cancel`, every
     /// modify on an `STPMode::None` book, cancels and anonymous match-only
-    /// sweeps. Mass cancels and expiry eviction take the write side
-    /// directly (#248), not through this guard.
+    /// sweeps.
     Read(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>),
     /// Exclusive mode: a fill-or-kill submit's feasibility + sweep window
     /// (#209); an STP-relevant submit's per-level scan + fill window and
     /// the matching-capable modifies (`UpdatePrice`,
     /// `UpdatePriceAndQuantity`, `Replace`) that carry the same window
-    /// under STP; and the live snapshot restore commit (#225).
+    /// under STP; every mass cancel and expiry eviction (#248); and the
+    /// live snapshot restore commit (#225).
     Write(#[allow(dead_code)] std::sync::RwLockWriteGuard<'a, ()>),
+    /// The gate has been released.
+    Released,
+}
+
+impl<'a, T> SubmitGateGuard<'a, T> {
+    /// Wrap a held gate side, opening the emission scope when the book has
+    /// a listener installed.
+    #[inline]
+    fn new(book: &'a OrderBook<T>, lock: GateLock<'a>) -> Self {
+        let emission = super::emission::GateEmission::open(book);
+        Self {
+            book,
+            lock,
+            emission,
+        }
+    }
+}
+
+impl<T> Drop for SubmitGateGuard<'_, T> {
+    fn drop(&mut self) {
+        let Some(emission) = self.emission.take() else {
+            // No listener: the gate is released by the field drop.
+            return;
+        };
+        // 1. Commit under the gate (no-op while unwinding, see
+        //    `GateEmission::commit`).
+        let committed = emission.commit(self.book);
+        // 2. Release the gate before any listener runs.
+        self.lock = GateLock::Released;
+        // 3. Deliver.
+        match committed {
+            super::emission::Committed::Nothing => {}
+            super::emission::Committed::Queued(ticket) => {
+                self.book.release_and_dispatch(ticket);
+            }
+            super::emission::Committed::Direct(events) => self.book.deliver_direct(events),
+        }
+    }
 }

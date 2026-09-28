@@ -205,8 +205,7 @@ impl std::fmt::Display for OrderStatus {
 /// Callback invoked on every order state transition.
 ///
 /// The listener receives the order ID, the previous status, and the new
-/// status. Listeners are called synchronously from the thread performing
-/// the book operation and must not block.
+/// status. It must not block.
 ///
 /// # Arguments
 ///
@@ -215,25 +214,22 @@ impl std::fmt::Display for OrderStatus {
 ///   first transition, i.e., `Open` or `Rejected`)
 /// * `new_status` — the status after the transition
 ///
-/// # Re-entrancy contract (#209, #225)
+/// # When it runs (#249)
 ///
-/// Transitions are recorded from inside the book operation that caused
-/// them, so the listener may fire while the book's submit gate is held —
-/// and usually does. (The exception is the kill-switch rejection recorded
-/// by `check_kill_switch_or_reject`, which the `submit_market_order`
-/// family runs before taking the gate at all.) Since #225 that hold is
-/// exclusive for fill-or-kill submits and for self-trade-prevention
-/// relevant submits and matching-capable modifies. Like
-/// [`TradeListener`](crate::orderbook::trade::TradeListener), it must
-/// never call back into the same `OrderBook`'s mutating API (add / submit
-/// / cancel / update / mass cancel / market sweeps) on the invoking
-/// thread: the gate is not reentrant, so the nested acquisition **may**
-/// deadlock — a nested shared acquisition of `std::sync::RwLock` is
-/// unspecified and may succeed, panic or block — and it **always**
-/// deadlocks when the gate is held exclusively. The prohibition is
-/// absolute: a listener that happens to work today on an `STPMode::None`
-/// book will hang the moment STP is enabled. Hand the transition off to a
-/// queue or channel instead.
+/// For a tracker installed on an [`OrderBook`](crate::OrderBook), the
+/// transition is **recorded** in the tracker during the book operation but
+/// the listener runs only after that operation has committed and released
+/// the submit gate, in the same ordered stream as the trade and
+/// price-level listeners (events of one call keep the order the engine
+/// produced them in). Called directly through
+/// [`OrderStateTracker::transition`] on a standalone tracker, the listener
+/// runs inline on the calling thread.
+///
+/// # Re-entrancy and obligations
+///
+/// Same as [`TradeListener`](crate::orderbook::trade::TradeListener):
+/// re-entering the book is allowed; the listener must not panic and must
+/// return quickly.
 pub type OrderStateListener = Arc<dyn Fn(Id, &OrderStatus, &OrderStatus) + Send + Sync>;
 
 /// Default number of terminal-state entries to retain before eviction.
@@ -413,12 +409,72 @@ impl OrderStateTracker {
     /// lock, so the old status handed to the listener is exactly the one
     /// this transition replaced. The clock is read, and the listener
     /// invoked, outside that lock.
+    ///
+    /// This standalone entry point calls the listener inline, on the
+    /// calling thread. An [`OrderBook`](crate::OrderBook) that owns the
+    /// tracker does not use it: the book records the transition and defers
+    /// the listener until its mutation has committed and its submit gate is
+    /// released (#249).
     pub fn transition(&self, order_id: Id, new_status: OrderStatus) {
+        let old_status = self.record(order_id, &new_status);
+
+        // Notify listener
+        if let Some(ref listener) = self.listener {
+            let old = old_status.as_ref().unwrap_or(&new_status);
+            listener(order_id, old, &new_status);
+        }
+
+        // Track terminal states for eviction
+        if new_status.is_terminal() {
+            self.enqueue_terminal(order_id);
+        }
+    }
+
+    /// Record a transition exactly like [`Self::transition`] but **without**
+    /// invoking the listener (#249).
+    ///
+    /// Returns the `(old, new)` pair the listener must receive when one is
+    /// installed (`old == new` for an order's first transition), `None`
+    /// otherwise. The owning [`OrderBook`](crate::OrderBook) buffers the
+    /// pair and delivers it after its mutation commits, outside the submit
+    /// gate.
+    pub(crate) fn record_transition(
+        &self,
+        order_id: Id,
+        new_status: OrderStatus,
+    ) -> Option<(OrderStatus, OrderStatus)> {
+        let old_status = self.record(order_id, &new_status);
+        if new_status.is_terminal() {
+            self.enqueue_terminal(order_id);
+        }
+        self.listener.as_ref()?;
+        let old = old_status.unwrap_or_else(|| new_status.clone());
+        Some((old, new_status))
+    }
+
+    /// The installed listener, if any (#249: the owning book invokes it
+    /// from its deferred dispatcher).
+    #[inline]
+    #[must_use]
+    pub(crate) fn listener(&self) -> Option<&OrderStateListener> {
+        self.listener.as_ref()
+    }
+
+    /// `true` when a listener is installed.
+    #[inline]
+    #[must_use]
+    pub(crate) fn has_listener(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Store `new_status` and its history entry under one map entry lock
+    /// and return the status it replaced (`None` for a first transition).
+    fn record(&self, order_id: Id, new_status: &OrderStatus) -> Option<OrderStatus> {
         // Timestamp in milliseconds from the installed [`Clock`]
         // (wall-clock in production, logical counter under replay / tests),
         // read before the entry lock is taken.
         let ts = self.clock.now_millis().as_u64();
-        let old_status = match self.entries.entry(order_id) {
+        match self.entries.entry(order_id) {
             dashmap::Entry::Occupied(mut occupied) => {
                 let tracked = occupied.get_mut();
                 tracked.history.push((ts, new_status.clone()));
@@ -431,17 +487,6 @@ impl OrderStateTracker {
                 });
                 None
             }
-        };
-
-        // Notify listener
-        if let Some(ref listener) = self.listener {
-            let old = old_status.as_ref().unwrap_or(&new_status);
-            listener(order_id, old, &new_status);
-        }
-
-        // Track terminal states for eviction
-        if new_status.is_terminal() {
-            self.enqueue_terminal(order_id);
         }
     }
 

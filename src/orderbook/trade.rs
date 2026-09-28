@@ -30,8 +30,10 @@ pub struct TradeResult {
     /// callback, the `PriceLevelChangedListener` callback, and the NATS
     /// publishers. Use it for cross-stream gap detection and temporal
     /// ordering. Always strictly increasing within a single book; replay
-    /// into a fresh book yields fresh seqs, not the originals. Stamped at
-    /// emission time by `OrderBook::next_engine_seq`.
+    /// into a fresh book yields fresh seqs, not the originals. Minted by
+    /// `OrderBook::next_engine_seq` when the producing mutation commits,
+    /// under the submit gate, and delivered to the listeners in that order
+    /// (#249), also across concurrent submitters.
     ///
     /// Defaults to `0` when deserializing payloads from format versions
     /// that pre-date `engine_seq` so existing consumers keep parsing.
@@ -212,22 +214,38 @@ impl TradeResult {
 /// Trade listener specification using Arc for shared ownership
 /// Callback invoked with every emitted [`TradeResult`].
 ///
-/// # Re-entrancy contract (#209, #225)
+/// # When it runs (#249)
 ///
-/// The listener may fire while the book's submit gate is held (the
-/// trade-emitting entry points hold it across the sweep). Since #225 that
-/// hold is **exclusive** for a fill-or-kill submit and for every
-/// self-trade-prevention relevant submit or matching-capable modify. A
-/// listener must **never call back into the same `OrderBook`'s mutating
-/// API** (add / submit / cancel / update / mass cancel / market sweeps) on
-/// the invoking thread: the gate is not reentrant, so the nested
-/// acquisition **may** deadlock — a nested shared acquisition of
-/// `std::sync::RwLock` is unspecified and may succeed, panic or block —
-/// and it **always** deadlocks when the gate is held exclusively. The
-/// prohibition is absolute: a listener that happens to work today on an
-/// `STPMode::None` book will hang the moment STP is enabled. Hand the
-/// event off to a queue or channel instead and mutate from another
-/// context.
+/// After the mutation that produced the trade has **committed** and the
+/// book's submit gate has been **released**, never mid-mutation and never
+/// while a book lock is held. Events are delivered by the book's single
+/// active dispatcher, in one total order per book that is consistent with
+/// commit order: `engine_seq` strictly increases across the trade and
+/// price-level streams, also under concurrent submitters, and a single
+/// thread sees exactly the order it saw before #249. Usually the submitting
+/// thread delivers its own events before its call returns; under
+/// concurrency another thread's dispatcher may deliver them, after the
+/// submit returned. The listener may observe a book state newer than the
+/// event.
+///
+/// # Re-entrancy
+///
+/// Allowed. The listener may call back into the same `OrderBook` (add /
+/// submit / cancel / update / mass cancel / market sweeps): the nested call
+/// commits its own events and returns without dispatching them; they are
+/// delivered after the current batch, by the same dispatcher. A listener
+/// that blocks, however, delays every later event of the book.
+///
+/// # Obligations
+///
+/// Must not panic and must return quickly (push into a channel; no
+/// blocking I/O). A panic is not caught (`catch_unwind` is not used): it
+/// unwinds out of the book call that happened to be dispatching. Book state
+/// is unaffected (the mutation already committed) and the submit gate is
+/// not poisoned, but the rest of that batch is dropped
+/// ([`OrderBook::dropped_listener_events`](crate::OrderBook::dropped_listener_events),
+/// [`OrderBook::listener_panics`](crate::OrderBook::listener_panics)); see
+/// `doc/panic-boundaries.md`.
 pub type TradeListener = Arc<dyn Fn(&TradeResult) + Send + Sync>;
 
 /// A submit that failed, together with the trades it committed first.
