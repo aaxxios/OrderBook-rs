@@ -1,18 +1,16 @@
 //! Core OrderBook implementation for managing price levels and orders
 
 // panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::indexing_slicing
-)]
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 
 use super::cache::PriceLevelCache;
 use super::clock::{Clock, MonotonicClock};
 use super::error::OrderBookError;
 use super::fees::FeeSchedule;
-use super::iterators::{LevelInfo, LevelsInRange, LevelsUntilDepth, LevelsWithCumulativeDepth};
+use super::iterators::{
+    LevelInfo, LevelsInRange, LevelsUntilDepth, LevelsWithCumulativeDepth, analytics_overflow,
+    checked_depth_add, checked_notional_add, level_total,
+};
 use super::market_impact::{MarketImpact, OrderSimulation};
 use super::risk::{ReferencePriceSource, RiskConfig, RiskRebuild, RiskState};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
@@ -135,6 +133,11 @@ pub(crate) fn default_trade_id_namespace(symbol: &str) -> Uuid {
     let symbol_ns = Uuid::new_v5(&root, symbol.as_bytes());
     Uuid::new_v5(&symbol_ns, &name)
 }
+/// Upper bound on the number of bins [`OrderBook::depth_distribution`]
+/// builds (#245). A larger `bins` request is capped to this value, so the
+/// histogram's allocation is bounded by a constant rather than by caller
+/// input.
+pub const MAX_DEPTH_DISTRIBUTION_BINS: usize = 4_096;
 
 /// The OrderBook manages a collection of price levels for both bid and ask sides.
 /// It supports adding, cancelling, and matching orders with lock-free operations where possible.
@@ -1118,12 +1121,9 @@ where
     pub(super) fn resolve_reference_price(&self, source: ReferencePriceSource) -> Option<u128> {
         match source {
             ReferencePriceSource::LastTrade => self.last_trade_price(),
-            ReferencePriceSource::Mid => match (self.best_bid(), self.best_ask()) {
-                // `midpoint` computes (bid + ask) / 2 without the intermediate
-                // `bid + ask` overflowing u128 at extreme prices.
-                (Some(bid), Some(ask)) => Some(bid.midpoint(ask)),
-                _ => self.last_trade_price(),
-            },
+            ReferencePriceSource::Mid => {
+                self.integer_mid_price().or_else(|| self.last_trade_price())
+            }
             ReferencePriceSource::FixedPrice(p) => Some(p),
         }
     }
@@ -2017,6 +2017,23 @@ where
         best_price
     }
 
+    /// Integer midpoint of the best bid and best ask, in price units,
+    /// rounded down; `None` when either side is empty.
+    ///
+    /// Exact for every `u128` pair: `u128::midpoint` computes
+    /// `(bid + ask) / 2` without the intermediate sum overflowing and
+    /// without the `f64` round trip of [`Self::mid_price`] (which loses
+    /// precision above 2^53 and whose `as u128` cast truncates). Used for
+    /// pegged repricing and the `Mid` risk reference price (#245).
+    #[inline]
+    #[must_use]
+    pub(crate) fn integer_mid_price(&self) -> Option<u128> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => Some(bid.midpoint(ask)),
+            _ => None,
+        }
+    }
+
     /// Get the mid price (average of best bid and best ask)
     pub fn mid_price(&self) -> Option<f64> {
         match (
@@ -2055,8 +2072,15 @@ where
     /// - `side`: The side of the order book (Buy for bids, Sell for asks)
     ///
     /// # Returns
-    /// The price at which the cumulative depth reaches or exceeds the target,
-    /// or `None` if the target depth cannot be reached with available liquidity.
+    /// `Ok(Some(price))` at which the cumulative depth reaches or exceeds the
+    /// target, or `Ok(None)` if the target depth cannot be reached with
+    /// available liquidity.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a walked level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the cumulative depth
+    ///   overflows `u64` before the target is reached.
     ///
     /// # Performance
     /// O(M log N) where M is the number of levels needed to reach the target depth.
@@ -2069,19 +2093,35 @@ where
     ///
     /// let orderbook = OrderBook::<()>::new("BTC/USD");
     /// // Find where 50 units of cumulative depth is reached
-    /// if let Some(price) = orderbook.price_at_depth(50, Side::Buy) {
+    /// if let Some(price) = orderbook.price_at_depth(50, Side::Buy)? {
     ///     println!("50 units cumulative depth reached at price: {}", price);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn price_at_depth(&self, target_depth: u64, side: Side) -> Option<u128> {
+    pub fn price_at_depth(
+        &self,
+        target_depth: u64,
+        side: Side,
+    ) -> Result<Option<u128>, OrderBookError> {
+        Ok(self
+            .cumulative_depth_to_target(target_depth, side)?
+            .map(|(price, _)| price))
+    }
+
+    /// Shared walk behind [`Self::price_at_depth`] and
+    /// [`Self::cumulative_depth_to_target`].
+    fn depth_to_target_walk(
+        &self,
+        target_depth: u64,
+        side: Side,
+    ) -> Result<Option<(u128, u64)>, OrderBookError> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
 
         if price_levels.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut cumulative = 0u64;
@@ -2094,15 +2134,15 @@ where
 
         for entry in iter {
             let price = *entry.key();
-            let price_level = entry.value();
-            cumulative = cumulative.saturating_add(price_level.total_quantity().unwrap_or(0));
+            let quantity = level_total(entry.value())?;
+            cumulative = checked_depth_add(cumulative, quantity, "cumulative depth")?;
 
             if cumulative >= target_depth {
-                return Some(price);
+                return Ok(Some((price, cumulative)));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Returns both the price and actual cumulative depth when target is reached
@@ -2112,8 +2152,15 @@ where
     /// - `side`: The side of the order book (Buy for bids, Sell for asks)
     ///
     /// # Returns
-    /// A tuple of `(price, cumulative_depth)` where the cumulative depth reaches
-    /// or exceeds the target, or `None` if the target depth cannot be reached.
+    /// `Ok(Some((price, cumulative_depth)))` where the cumulative depth
+    /// reaches or exceeds the target, or `Ok(None)` if the target depth
+    /// cannot be reached.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a walked level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the cumulative depth
+    ///   overflows `u64` before the target is reached.
     ///
     /// # Performance
     /// O(M log N) where M is the number of levels needed to reach the target depth.
@@ -2125,40 +2172,17 @@ where
     ///
     /// let orderbook = OrderBook::<()>::new("BTC/USD");
     /// // Get both price and actual depth
-    /// if let Some((price, depth)) = orderbook.cumulative_depth_to_target(50, Side::Buy) {
+    /// if let Some((price, depth)) = orderbook.cumulative_depth_to_target(50, Side::Buy)? {
     ///     println!("Target depth 50 reached at {} (actual: {})", price, depth);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn cumulative_depth_to_target(&self, target_depth: u64, side: Side) -> Option<(u128, u64)> {
-        let price_levels = match side {
-            Side::Buy => &self.bids,
-            Side::Sell => &self.asks,
-        };
-
-        if price_levels.is_empty() {
-            return None;
-        }
-
-        let mut cumulative = 0u64;
-
-        // Iterate in price-priority order
-        let iter = match side {
-            Side::Buy => Either::Left(price_levels.iter().rev()), // Highest to lowest
-            Side::Sell => Either::Right(price_levels.iter()),     // Lowest to highest
-        };
-
-        for entry in iter {
-            let price = *entry.key();
-            let price_level = entry.value();
-            cumulative = cumulative.saturating_add(price_level.total_quantity().unwrap_or(0));
-
-            if cumulative >= target_depth {
-                return Some((price, cumulative));
-            }
-        }
-
-        None
+    pub fn cumulative_depth_to_target(
+        &self,
+        target_depth: u64,
+        side: Side,
+    ) -> Result<Option<(u128, u64)>, OrderBookError> {
+        self.depth_to_target_walk(target_depth, side)
     }
 
     /// Calculates total depth available in the first N price levels
@@ -2169,7 +2193,12 @@ where
     ///
     /// # Returns
     /// The total cumulative quantity across the specified number of levels.
-    /// Returns 0 if the side is empty or if levels is 0.
+    /// Returns `Ok(0)` if the side is empty or if levels is 0.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a summed level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the sum overflows `u64`.
     ///
     /// # Performance
     /// O(min(levels, N) * log N) where N is the total number of price levels.
@@ -2181,13 +2210,13 @@ where
     ///
     /// let orderbook = OrderBook::<()>::new("BTC/USD");
     /// // Total depth in top 10 bid levels
-    /// let top_10_depth = orderbook.total_depth_at_levels(10, Side::Buy);
+    /// let top_10_depth = orderbook.total_depth_at_levels(10, Side::Buy)?;
     /// println!("Total depth in top 10 bid levels: {}", top_10_depth);
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn total_depth_at_levels(&self, levels: usize, side: Side) -> u64 {
+    pub fn total_depth_at_levels(&self, levels: usize, side: Side) -> Result<u64, OrderBookError> {
         if levels == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let price_levels = match side {
@@ -2196,7 +2225,7 @@ where
         };
 
         if price_levels.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let mut total = 0u64;
@@ -2207,16 +2236,11 @@ where
             Side::Sell => Either::Right(price_levels.iter()),     // Lowest to highest
         };
 
-        for (count, entry) in iter.enumerate() {
-            if count >= levels {
-                break;
-            }
-
-            let price_level = entry.value();
-            total = total.saturating_add(price_level.total_quantity().unwrap_or(0));
+        for entry in iter.take(levels) {
+            total = checked_depth_add(total, level_total(entry.value())?, "total depth")?;
         }
 
-        total
+        Ok(total)
     }
 
     /// Returns the absolute spread (ask - bid) in price units
@@ -2303,8 +2327,15 @@ where
     /// - `side`: The side to calculate VWAP for (Buy = execute against asks, Sell = execute against bids)
     ///
     /// # Returns
-    /// - `Some(vwap)` if sufficient liquidity exists to fill the quantity
-    /// - `None` if insufficient liquidity or quantity is zero
+    /// - `Ok(Some(vwap))` if sufficient liquidity exists to fill the quantity
+    /// - `Ok(None)` if insufficient liquidity or quantity is zero
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a walked level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the checked `u128`
+    ///   notional (`price * quantity`, summed over the walked levels)
+    ///   overflows.
     ///
     /// # Performance
     /// O(M log N) where M is the number of levels needed to reach the target quantity.
@@ -2320,14 +2351,14 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 105, 15, Side::Sell, TimeInForce::Gtc, None);
     ///
     /// // Calculate VWAP for buying 20 units
-    /// if let Some(vwap) = book.vwap(20, Side::Buy) {
+    /// if let Some(vwap) = book.vwap(20, Side::Buy)? {
     ///     println!("VWAP for buying 20 units: {:.2}", vwap);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn vwap(&self, quantity: u64, side: Side) -> Option<f64> {
+    pub fn vwap(&self, quantity: u64, side: Side) -> Result<Option<f64>, OrderBookError> {
         if quantity == 0 {
-            return None;
+            return Ok(None);
         }
 
         // For Buy orders, we execute against asks (in ascending order)
@@ -2338,11 +2369,11 @@ where
         };
 
         if price_levels.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut remaining = quantity;
-        let mut total_cost = 0u128; // Use u128 to avoid overflow
+        let mut total_cost = 0u128; // Checked u128 notional (#245)
         let mut total_filled = 0u64;
 
         // Iterate in price-priority order
@@ -2357,23 +2388,27 @@ where
             }
 
             let price = *entry.key();
-            let price_level = entry.value();
-            let available = price_level.total_quantity().unwrap_or(0);
+            let available = level_total(entry.value())?;
 
             if available == 0 {
                 continue;
             }
 
+            // `fill_qty <= remaining <= quantity`, and `total_filled +
+            // remaining == quantity` is kept invariant, so the quantity
+            // updates below cannot fail; they stay checked regardless.
             let fill_qty = remaining.min(available);
-            total_cost = total_cost.saturating_add(price * (fill_qty as u128));
-            total_filled = total_filled.saturating_add(fill_qty);
-            remaining = remaining.saturating_sub(fill_qty);
+            total_cost = checked_notional_add(total_cost, price, fill_qty, "vwap notional")?;
+            total_filled = checked_depth_add(total_filled, fill_qty, "vwap filled quantity")?;
+            remaining = remaining
+                .checked_sub(fill_qty)
+                .ok_or_else(|| analytics_overflow("vwap remaining quantity"))?;
         }
 
         if total_filled == quantity {
-            Some(total_cost as f64 / total_filled as f64)
+            Ok(Some(total_cost as f64 / total_filled as f64))
         } else {
-            None // Insufficient liquidity
+            Ok(None) // Insufficient liquidity
         }
     }
 
@@ -2386,8 +2421,14 @@ where
     /// a better estimate of the "true" price than the simple mid price.
     ///
     /// # Returns
-    /// - `Some(micro_price)` if both best bid and best ask exist with non-zero volumes
-    /// - `None` if either side is empty or both volumes are zero
+    /// - `Ok(Some(micro_price))` if both best bid and best ask exist with non-zero volumes
+    /// - `Ok(None)` if either side is empty or both volumes are zero
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a best level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the two best-level
+    ///   volumes overflow `u64` together.
     ///
     /// # Examples
     /// ```
@@ -2399,33 +2440,32 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 50, Side::Buy, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 105, 30, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// if let Some(micro) = book.micro_price() {
+    /// if let Some(micro) = book.micro_price()? {
     ///     println!("Micro price: {:.2}", micro);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn micro_price(&self) -> Option<f64> {
-        let best_bid_price = self.best_bid()?;
-        let best_ask_price = self.best_ask()?;
+    pub fn micro_price(&self) -> Result<Option<f64>, OrderBookError> {
+        let (Some(best_bid_price), Some(best_ask_price)) = (self.best_bid(), self.best_ask())
+        else {
+            return Ok(None);
+        };
 
-        // Get volumes at best levels
-        let bid_volume = self
-            .bids
-            .get(&best_bid_price)?
-            .value()
-            .total_quantity()
-            .unwrap_or(0);
-        let ask_volume = self
-            .asks
-            .get(&best_ask_price)?
-            .value()
-            .total_quantity()
-            .unwrap_or(0);
+        // Get volumes at best levels (a level removed concurrently between
+        // the cache read and this lookup reads as "no quote").
+        let (Some(bid_entry), Some(ask_entry)) = (
+            self.bids.get(&best_bid_price),
+            self.asks.get(&best_ask_price),
+        ) else {
+            return Ok(None);
+        };
+        let bid_volume = level_total(bid_entry.value())?;
+        let ask_volume = level_total(ask_entry.value())?;
 
-        let total_volume = bid_volume.saturating_add(ask_volume);
+        let total_volume = checked_depth_add(bid_volume, ask_volume, "micro price volume")?;
 
         if total_volume == 0 {
-            return None;
+            return Ok(None);
         }
 
         // micro_price = (ask_price * bid_volume + bid_price * ask_volume) / (bid_volume + ask_volume)
@@ -2433,7 +2473,7 @@ where
             + (best_bid_price as f64 * ask_volume as f64);
         let denominator = total_volume as f64;
 
-        Some(numerator / denominator)
+        Ok(Some(numerator / denominator))
     }
 
     /// Calculates the order book imbalance ratio for the top N levels
@@ -2449,7 +2489,13 @@ where
     ///   - `> 0`: More buy pressure (bids dominate)
     ///   - `< 0`: More sell pressure (asks dominate)
     ///   - `≈ 0`: Balanced order book
-    ///   - Returns `0.0` if both sides are empty or `levels` is 0
+    ///   - Returns `Ok(0.0)` if both sides are empty or `levels` is 0
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a summed level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when either side's depth or
+    ///   their sum overflows `u64`.
     ///
     /// # Performance
     /// O(M log N) where M is the number of levels requested.
@@ -2464,30 +2510,30 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 60, Side::Buy, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 105, 40, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// let imbalance = book.order_book_imbalance(5);
+    /// let imbalance = book.order_book_imbalance(5)?;
     /// if imbalance > 0.0 {
     ///     println!("More buy pressure: {:.2}", imbalance);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn order_book_imbalance(&self, levels: usize) -> f64 {
+    pub fn order_book_imbalance(&self, levels: usize) -> Result<f64, OrderBookError> {
         if levels == 0 {
-            return 0.0;
+            return Ok(0.0);
         }
 
-        let bid_volume = self.total_depth_at_levels(levels, Side::Buy);
-        let ask_volume = self.total_depth_at_levels(levels, Side::Sell);
+        let bid_volume = self.total_depth_at_levels(levels, Side::Buy)?;
+        let ask_volume = self.total_depth_at_levels(levels, Side::Sell)?;
 
-        let total_volume = bid_volume.saturating_add(ask_volume);
+        let total_volume = checked_depth_add(bid_volume, ask_volume, "imbalance volume")?;
 
         if total_volume == 0 {
-            return 0.0;
+            return Ok(0.0);
         }
 
         let bid_f64 = bid_volume as f64;
         let ask_f64 = ask_volume as f64;
 
-        (bid_f64 - ask_f64) / (bid_f64 + ask_f64)
+        Ok((bid_f64 - ask_f64) / (bid_f64 + ask_f64))
     }
 
     /// Calculates the market impact of a hypothetical order
@@ -2518,6 +2564,13 @@ where
     /// all-zero [`MarketImpact`] (including `total_quantity_available == 0`),
     /// so read depth with a positive `quantity`.
     ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a scanned level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the checked `u128`
+    ///   notional of the consumed portion, or the side's total resting
+    ///   depth (`u64`), overflows.
+    ///
     /// # Performance
     /// O(N) over the resting price levels on the side being hit: the impact
     /// metrics only need the consumed prefix, but `total_quantity_available`
@@ -2534,15 +2587,15 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 10, Side::Sell, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 105, 15, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// let impact = book.market_impact(20, Side::Buy);
+    /// let impact = book.market_impact(20, Side::Buy)?;
     /// println!("Average price: {}", impact.avg_price);
     /// println!("Slippage: {} bps", impact.slippage_bps);
     /// println!("Levels consumed: {}", impact.levels_consumed);
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn market_impact(&self, quantity: u64, side: Side) -> MarketImpact {
+    pub fn market_impact(&self, quantity: u64, side: Side) -> Result<MarketImpact, OrderBookError> {
         if quantity == 0 {
-            return MarketImpact::empty();
+            return Ok(MarketImpact::empty());
         }
 
         // For Buy orders, we execute against asks (in ascending order)
@@ -2553,7 +2606,7 @@ where
         };
 
         if price_levels.is_empty() {
-            return MarketImpact::empty();
+            return Ok(MarketImpact::empty());
         }
 
         let best_price = match side {
@@ -2563,7 +2616,7 @@ where
 
         let best_price = match best_price {
             Some(price) => price,
-            None => return MarketImpact::empty(),
+            None => return Ok(MarketImpact::empty()),
         };
 
         let mut remaining = quantity;
@@ -2571,7 +2624,7 @@ where
         let mut total_filled = 0u64;
         let mut total_available = 0u64;
         let mut worst_price = best_price;
-        let mut levels_consumed = 0;
+        let mut levels_consumed = 0usize;
 
         // Iterate in price-priority order. The loop scans the whole side
         // (not just the levels this order would consume) so
@@ -2587,24 +2640,30 @@ where
 
         for entry in iter {
             let price = *entry.key();
-            let price_level = entry.value();
-            let available = price_level.total_quantity().unwrap_or(0);
+            let available = level_total(entry.value())?;
 
             if available == 0 {
                 continue;
             }
 
             // Accumulate full available depth across every non-empty level.
-            total_available = total_available.saturating_add(available);
+            total_available =
+                checked_depth_add(total_available, available, "market impact available depth")?;
 
             // Cost / slippage only reflect the portion this order consumes.
             if remaining > 0 {
-                levels_consumed += 1;
+                levels_consumed = levels_consumed
+                    .checked_add(1)
+                    .ok_or_else(|| analytics_overflow("market impact levels consumed"))?;
                 let fill_qty = remaining.min(available);
-                total_cost = total_cost.saturating_add(price * (fill_qty as u128));
-                total_filled = total_filled.saturating_add(fill_qty);
+                total_cost =
+                    checked_notional_add(total_cost, price, fill_qty, "market impact notional")?;
+                total_filled =
+                    checked_depth_add(total_filled, fill_qty, "market impact filled quantity")?;
                 worst_price = price;
-                remaining = remaining.saturating_sub(fill_qty);
+                remaining = remaining
+                    .checked_sub(fill_qty)
+                    .ok_or_else(|| analytics_overflow("market impact remaining quantity"))?;
             }
         }
 
@@ -2614,10 +2673,13 @@ where
             0.0
         };
 
-        let slippage = match side {
-            Side::Buy => worst_price.saturating_sub(best_price),
-            Side::Sell => best_price.saturating_sub(worst_price),
-        };
+        // Levels are walked away from the best price, so on a settled book
+        // `worst_price` is never better than `best_price` and this is the
+        // signed-free distance `worst - best` (Buy) / `best - worst` (Sell).
+        // `abs_diff` is exact and cannot overflow; under a concurrent
+        // best-price move between the cache read and the walk it reports
+        // the true distance instead of collapsing to zero.
+        let slippage = worst_price.abs_diff(best_price);
 
         let slippage_bps = if best_price > 0 {
             (slippage as f64 / best_price as f64) * DEFAULT_BASIS_POINTS_MULTIPLIER
@@ -2625,14 +2687,14 @@ where
             0.0
         };
 
-        MarketImpact {
+        Ok(MarketImpact {
             avg_price,
             worst_price,
             slippage,
             slippage_bps,
             levels_consumed,
             total_quantity_available: total_available,
-        }
+        })
     }
 
     /// Simulates the execution of a market order
@@ -2651,6 +2713,12 @@ where
     /// - `total_filled`: Total quantity that would be filled
     /// - `remaining_quantity`: Quantity that could not be filled
     ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a walked level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the checked `u128`
+    ///   notional of the simulated fills overflows.
+    ///
     /// # Performance
     /// O(M log N) where M is the number of levels needed.
     ///
@@ -2664,16 +2732,20 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 10, Side::Sell, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 105, 15, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// let simulation = book.simulate_market_order(20, Side::Buy);
+    /// let simulation = book.simulate_market_order(20, Side::Buy)?;
     /// for (price, qty) in &simulation.fills {
     ///     println!("Fill: {} @ {}", qty, price);
     /// }
     /// println!("Average price: {}", simulation.avg_price);
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn simulate_market_order(&self, quantity: u64, side: Side) -> OrderSimulation {
+    pub fn simulate_market_order(
+        &self,
+        quantity: u64,
+        side: Side,
+    ) -> Result<OrderSimulation, OrderBookError> {
         if quantity == 0 {
-            return OrderSimulation::empty();
+            return Ok(OrderSimulation::empty());
         }
 
         // For Buy orders, we execute against asks (in ascending order)
@@ -2686,7 +2758,7 @@ where
         if price_levels.is_empty() {
             let mut sim = OrderSimulation::empty();
             sim.remaining_quantity = quantity;
-            return sim;
+            return Ok(sim);
         }
 
         let mut remaining = quantity;
@@ -2706,18 +2778,19 @@ where
             }
 
             let price = *entry.key();
-            let price_level = entry.value();
-            let available = price_level.total_quantity().unwrap_or(0);
+            let available = level_total(entry.value())?;
 
             if available == 0 {
                 continue;
             }
 
             let fill_qty = remaining.min(available);
-            total_cost = total_cost.saturating_add(price * (fill_qty as u128));
-            total_filled = total_filled.saturating_add(fill_qty);
+            total_cost = checked_notional_add(total_cost, price, fill_qty, "simulation notional")?;
+            total_filled = checked_depth_add(total_filled, fill_qty, "simulation filled quantity")?;
             fills.push((price, fill_qty));
-            remaining = remaining.saturating_sub(fill_qty);
+            remaining = remaining
+                .checked_sub(fill_qty)
+                .ok_or_else(|| analytics_overflow("simulation remaining quantity"))?;
         }
 
         let avg_price = if total_filled > 0 {
@@ -2726,12 +2799,12 @@ where
             0.0
         };
 
-        OrderSimulation {
+        Ok(OrderSimulation {
             fills,
             avg_price,
             total_filled,
             remaining_quantity: remaining,
-        }
+        })
     }
 
     /// Calculates available liquidity within a specific price range
@@ -2745,10 +2818,16 @@ where
     /// - `side`: The side to analyze (Buy for bids, Sell for asks)
     ///
     /// # Returns
-    /// Total quantity available in the specified price range (in units)
+    /// Total quantity available in the specified price range (in units);
+    /// `Ok(0)` for an empty side or an inverted range.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when an in-range level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the sum overflows `u64`.
     ///
     /// # Performance
-    /// O(M log N) where M is the number of levels in the range.
+    /// O(log N + M) where M is the number of levels in the range.
     ///
     /// # Examples
     /// ```
@@ -2762,13 +2841,18 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 110, 20, Side::Buy, TimeInForce::Gtc, None);
     ///
     /// // Get liquidity between 100 and 105 (inclusive)
-    /// let liquidity = book.liquidity_in_range(100, 105, Side::Buy);
+    /// let liquidity = book.liquidity_in_range(100, 105, Side::Buy)?;
     /// assert_eq!(liquidity, 25); // 10 + 15
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn liquidity_in_range(&self, min_price: u128, max_price: u128, side: Side) -> u64 {
+    pub fn liquidity_in_range(
+        &self,
+        min_price: u128,
+        max_price: u128,
+        side: Side,
+    ) -> Result<u64, OrderBookError> {
         if min_price > max_price {
-            return 0;
+            return Ok(0);
         }
 
         let price_levels = match side {
@@ -2776,29 +2860,17 @@ where
             Side::Sell => &self.asks,
         };
 
-        if price_levels.is_empty() {
-            return 0;
-        }
-
         let mut total_liquidity = 0u64;
 
-        for entry in price_levels.iter() {
-            let price = *entry.key();
-
-            if price < min_price {
-                continue;
-            }
-
-            if price > max_price {
-                break;
-            }
-
-            let price_level = entry.value();
-            let quantity = price_level.total_quantity().unwrap_or(0);
-            total_liquidity = total_liquidity.saturating_add(quantity);
+        for entry in price_levels.range(min_price..=max_price) {
+            total_liquidity = checked_depth_add(
+                total_liquidity,
+                level_total(entry.value())?,
+                "liquidity in range",
+            )?;
         }
 
-        total_liquidity
+        Ok(total_liquidity)
     }
 
     /// Returns the number of orders ahead in queue at a specific price level
@@ -2981,8 +3053,16 @@ where
     /// - `side`: The side to calculate for (Buy or Sell)
     ///
     /// # Returns
-    /// - `Some(price)` adjusted by one tick inside the depth level
-    /// - `None` if insufficient depth exists or calculation fails
+    /// - `Ok(Some(price))` adjusted by one tick inside the depth level
+    /// - `Ok(Some(deepest_price))` when the side cannot reach `target_depth`
+    /// - `Ok(None)` for a zero target / tick, an empty side, or a one-tick
+    ///   adjustment that leaves the `u128` price domain
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a walked level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the cumulative depth
+    ///   overflows `u64` before the target is reached.
     ///
     /// # Performance
     /// O(M log N) where M is the number of levels to reach target depth.
@@ -3000,19 +3080,19 @@ where
     ///
     /// // Want to be just inside 100 units of depth
     /// // Depth at 100: 50, at 99: 110, so we want to be at 100 (just inside 110)
-    /// if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Buy) {
+    /// if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Buy)? {
     ///     assert_eq!(price, 100); // One tick better than the level that reaches depth
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
     pub fn price_at_depth_adjusted(
         &self,
         target_depth: u64,
         tick_size: u128,
         side: Side,
-    ) -> Option<u128> {
+    ) -> Result<Option<u128>, OrderBookError> {
         if target_depth == 0 || tick_size == 0 {
-            return None;
+            return Ok(None);
         }
 
         let price_levels = match side {
@@ -3021,7 +3101,7 @@ where
         };
 
         if price_levels.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut cumulative_depth = 0u64;
@@ -3036,16 +3116,16 @@ where
 
         for entry in iter {
             let price = *entry.key();
-            let quantity = entry.value().total_quantity().unwrap_or(0);
-            cumulative_depth = cumulative_depth.saturating_add(quantity);
+            let quantity = level_total(entry.value())?;
+            cumulative_depth = checked_depth_add(cumulative_depth, quantity, "cumulative depth")?;
 
             if cumulative_depth >= target_depth {
                 // Found the level where we exceed target depth
                 // Return one tick better than this price
-                return match side {
+                return Ok(match side {
                     Side::Buy => price.checked_add(tick_size),
                     Side::Sell => price.checked_sub(tick_size),
-                };
+                });
             }
 
             last_price = Some(price);
@@ -3053,7 +3133,7 @@ where
 
         // If we didn't reach target depth, return the last price seen
         // (deepest level available)
-        last_price
+        Ok(last_price)
     }
 
     /// Returns an iterator over price levels with cumulative depth tracking
@@ -3066,7 +3146,12 @@ where
     /// - `side`: The side to iterate (Buy for bids from highest to lowest, Sell for asks from lowest to highest)
     ///
     /// # Returns
-    /// An iterator yielding `LevelInfo` containing price, quantity, and cumulative depth
+    /// An iterator yielding `Result<LevelInfo, OrderBookError>` containing
+    /// price, quantity, and cumulative depth. A level whose
+    /// `visible + hidden` total overflows `u64`
+    /// ([`OrderBookError::PriceLevelError`]) or a cumulative depth that
+    /// overflows `u64` ([`OrderBookError::ArithmeticOverflow`]) is yielded
+    /// once as `Err`, after which the iterator is exhausted.
     ///
     /// # Performance
     /// Lazy evaluation with O(1) memory overhead. Each iteration is O(log N) for skipmap traversal.
@@ -3084,6 +3169,7 @@ where
     ///
     /// // Functional-style analysis
     /// for level in book.levels_with_cumulative_depth(Side::Buy).take(5) {
+    ///     let level = level?;
     ///     println!("Price: {}, Qty: {}, Cumulative: {}",
     ///              level.price, level.quantity, level.cumulative_depth);
     ///     
@@ -3092,6 +3178,7 @@ where
     ///         break;
     ///     }
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
     #[must_use]
     pub fn levels_with_cumulative_depth(&self, side: Side) -> LevelsWithCumulativeDepth<'_> {
@@ -3114,7 +3201,10 @@ where
     /// - `side`: The side to iterate (Buy for bids, Sell for asks)
     ///
     /// # Returns
-    /// An iterator that stops when target depth is reached
+    /// An iterator of `Result<LevelInfo, OrderBookError>` that stops when
+    /// target depth is reached. A level-total or cumulative-depth overflow
+    /// is yielded once as `Err` and ends the iteration (see
+    /// [`Self::levels_with_cumulative_depth`]).
     ///
     /// # Performance
     /// Short-circuits early, processing only the minimum levels needed. O(M log N) where M is levels to reach target.
@@ -3131,8 +3221,11 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 98, 20, Side::Buy, TimeInForce::Gtc, None);
     ///
     /// // Collect levels needed for 30 units
-    /// let levels: Vec<_> = book.levels_until_depth(30, Side::Buy).collect();
+    /// let levels = book
+    ///     .levels_until_depth(30, Side::Buy)
+    ///     .collect::<Result<Vec<_>, _>>()?;
     /// println!("Levels needed: {}", levels.len());
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
     #[must_use]
     pub fn levels_until_depth(&self, target_depth: u64, side: Side) -> LevelsUntilDepth<'_> {
@@ -3156,7 +3249,10 @@ where
     /// - `side`: The side to iterate (Buy for bids, Sell for asks)
     ///
     /// # Returns
-    /// An iterator yielding only levels within the price range
+    /// An iterator yielding `Result<LevelInfo, OrderBookError>` only for
+    /// levels within the price range (`cumulative_depth` is not tracked and
+    /// is always `0`). A level whose `visible + hidden` total overflows
+    /// `u64` is yielded once as `Err` and ends the iteration.
     ///
     /// # Performance
     /// Skips levels outside range, O(M log N) where M is levels in range.
@@ -3173,11 +3269,11 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 90, 20, Side::Buy, TimeInForce::Gtc, None);
     ///
     /// // Analyze levels between 90 and 100
-    /// let total_qty: u64 = book
-    ///     .levels_in_range(90, 100, Side::Buy)
-    ///     .map(|level| level.quantity)
-    ///     .sum();
-    /// println!("Total quantity in range: {}", total_qty);
+    /// for level in book.levels_in_range(90, 100, Side::Buy) {
+    ///     let level = level?;
+    ///     println!("{} units at {}", level.quantity, level.price);
+    /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
     #[must_use]
     pub fn levels_in_range(
@@ -3205,8 +3301,14 @@ where
     /// - `predicate`: Function that takes `LevelInfo` and returns `true` if the level matches
     ///
     /// # Returns
-    /// - `Some(LevelInfo)` if a matching level is found
-    /// - `None` if no level matches or the book is empty
+    /// - `Ok(Some(LevelInfo))` if a matching level is found
+    /// - `Ok(None)` if no level matches or the book is empty
+    ///
+    /// # Errors
+    /// Propagates the first level error of
+    /// [`Self::levels_with_cumulative_depth`] reached before a match
+    /// ([`OrderBookError::PriceLevelError`] or
+    /// [`OrderBookError::ArithmeticOverflow`]).
     ///
     /// # Performance
     /// Short-circuits on first match, O(M log N) where M is position of match.
@@ -3223,21 +3325,31 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 98, 25, Side::Buy, TimeInForce::Gtc, None);
     ///
     /// // Find first level with quantity > 10
-    /// if let Some(level) = book.find_level(Side::Buy, |info| info.quantity > 10) {
+    /// if let Some(level) = book.find_level(Side::Buy, |info| info.quantity > 10)? {
     ///     println!("First large level at price: {}", level.price);
     /// }
     ///
     /// // Find first level where cumulative depth exceeds 20
-    /// if let Some(level) = book.find_level(Side::Buy, |info| info.cumulative_depth > 20) {
+    /// if let Some(level) = book.find_level(Side::Buy, |info| info.cumulative_depth > 20)? {
     ///     println!("Depth threshold at: {}", level.price);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    pub fn find_level<F>(&self, side: Side, predicate: F) -> Option<LevelInfo>
+    pub fn find_level<F>(
+        &self,
+        side: Side,
+        predicate: F,
+    ) -> Result<Option<LevelInfo>, OrderBookError>
     where
         F: Fn(&LevelInfo) -> bool,
     {
-        self.levels_with_cumulative_depth(side)
-            .find(|level| predicate(level))
+        for level in self.levels_with_cumulative_depth(side) {
+            let level = level?;
+            if predicate(&level) {
+                return Ok(Some(level));
+            }
+        }
+        Ok(None)
     }
 
     /// Returns the visible (displayed) resting quantity at a price level, in
@@ -3318,23 +3430,25 @@ where
     ///
     /// O(log N) `SkipMap` point lookup plus two relaxed atomic loads summed by
     /// `pricelevel`'s `PriceLevel::total_quantity`. That sum returns a
-    /// `Result` that only errors on a `u64` overflow of `visible + hidden`,
-    /// which is unreachable for any real book; on that overflow this method
-    /// **saturates to `u64::MAX`** rather than collapsing to `0`, so an
-    /// overflow signals "enormous", never "empty" (a `0` would be the exact
-    /// inversion of an overflowed level).
+    /// `Result` that errors on a `u64` overflow of `visible + hidden` (for
+    /// example a limit order and an iceberg at one price whose combined
+    /// depth exceeds `u64::MAX`); since 0.14.0 (#245) that overflow is
+    /// surfaced as an error instead of being read as `u64::MAX`.
     ///
     /// # Arguments
     /// - `price`: The price level to read (in price units).
     /// - `side`: The side to read (`Buy` for bids, `Sell` for asks).
     ///
     /// # Returns
-    /// - `Some(qty)` when a level exists at `price`. A `Some(0)` here is only a
-    ///   brief concurrency transient during level removal — an empty level is
-    ///   eagerly removed from the `SkipMap` on every removal path, so a settled
-    ///   level always has positive total quantity. `Some(u64::MAX)` denotes a
-    ///   (practically unreachable) counter overflow, never an empty level.
-    /// - `None` when no level exists at `price` on that side.
+    /// - `Ok(Some(qty))` when a level exists at `price`. A `Some(0)` here is
+    ///   only a brief concurrency transient during level removal — an empty
+    ///   level is eagerly removed from the `SkipMap` on every removal path, so
+    ///   a settled level always has positive total quantity.
+    /// - `Ok(None)` when no level exists at `price` on that side.
+    ///
+    /// # Errors
+    /// Returns [`OrderBookError::PriceLevelError`] when the level's
+    /// `visible + hidden` total overflows `u64`.
     ///
     /// # Consistency
     /// **Advisory, eventually-consistent** read — it sums two independent
@@ -3343,18 +3457,19 @@ where
     /// is not guaranteed mutually consistent with the per-side visible / hidden
     /// / count read separately. For a mutually-consistent view, take
     /// [`Self::create_snapshot`].
-    #[must_use]
-    pub fn total_quantity_at_price(&self, price: u128, side: Side) -> Option<u64> {
+    pub fn total_quantity_at_price(
+        &self,
+        price: u128,
+        side: Side,
+    ) -> Result<Option<u64>, OrderBookError> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
         price_levels
             .get(&price)
-            // Saturate an (unreachable) `visible + hidden` overflow to
-            // `u64::MAX`: a `0` would read as "empty level" — the exact
-            // inversion — so signal "enormous" instead.
-            .map(|entry| entry.value().total_quantity().unwrap_or(u64::MAX))
+            .map(|entry| level_total(entry.value()))
+            .transpose()
     }
 
     /// Returns the number of resting orders at a price level, or `None` when no
@@ -4795,7 +4910,10 @@ where
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
     /// produce a coherent snapshot (`PriceLevel::snapshot` is fallible since
-    /// pricelevel 0.10). No partial snapshot is returned.
+    /// pricelevel 0.10) or when a level's `visible + hidden` total overflows
+    /// `u64`, and [`OrderBookError::ArithmeticOverflow`] when a selected
+    /// metric's depth (`u64`) or VWAP notional (`u128`) aggregate overflows
+    /// (#245). No partial snapshot is returned.
     pub fn enriched_snapshot(&self, depth: usize) -> Result<EnrichedSnapshot, OrderBookError> {
         self.enriched_snapshot_with_metrics(depth, MetricFlags::ALL)
     }
@@ -4818,7 +4936,10 @@ where
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
     /// produce a coherent snapshot (`PriceLevel::snapshot` is fallible since
-    /// pricelevel 0.10). No partial snapshot is returned.
+    /// pricelevel 0.10) or when a level's `visible + hidden` total overflows
+    /// `u64`, and [`OrderBookError::ArithmeticOverflow`] when a selected
+    /// metric's depth (`u64`) or VWAP notional (`u128`) aggregate overflows
+    /// (#245). No partial snapshot is returned.
     ///
     /// # Performance
     /// O(N) where N is depth, but faster than `enriched_snapshot()` if fewer metrics selected.
@@ -4868,7 +4989,7 @@ where
             .collect::<Result<_, PriceLevelError>>()?;
 
         // Create enriched snapshot with pre-calculated metrics
-        Ok(EnrichedSnapshot::with_metrics(
+        EnrichedSnapshot::with_metrics(
             self.symbol.clone(),
             self.clock().now_millis().as_u64(),
             bid_levels,
@@ -4876,29 +4997,33 @@ where
             depth, // Use depth for VWAP calculation
             depth, // Use depth for imbalance calculation
             flags,
-        ))
+        )
     }
 
-    /// Get the total volume at each price level
-    pub fn get_volume_by_price(&self) -> (HashMap<u128, u64>, HashMap<u128, u64>) {
+    /// Get the total volume (`visible + hidden`, in quantity units) at each
+    /// price level, as `(bid_volumes, ask_volumes)` keyed by price.
+    ///
+    /// # Errors
+    /// Returns [`OrderBookError::PriceLevelError`] when a level's
+    /// `visible + hidden` total overflows `u64` (previously read as `0`).
+    #[allow(clippy::type_complexity)]
+    pub fn get_volume_by_price(
+        &self,
+    ) -> Result<(HashMap<u128, u64>, HashMap<u128, u64>), OrderBookError> {
         let mut bid_volumes = HashMap::new();
         let mut ask_volumes = HashMap::new();
 
         // Calculate bid volumes
         for item in self.bids.iter() {
-            let price = *item.key();
-            let price_level = item.value();
-            bid_volumes.insert(price, price_level.total_quantity().unwrap_or(0));
+            bid_volumes.insert(*item.key(), level_total(item.value())?);
         }
 
         // Calculate ask volumes
         for item in self.asks.iter() {
-            let price = *item.key();
-            let price_level = item.value();
-            ask_volumes.insert(price, price_level.total_quantity().unwrap_or(0));
+            ask_volumes.insert(*item.key(), level_total(item.value())?);
         }
 
-        (bid_volumes, ask_volumes)
+        Ok((bid_volumes, ask_volumes))
     }
 
     /// Get a BTreeMap of bids with price as key and PriceLevel as value
@@ -4966,6 +5091,12 @@ where
     /// # Returns
     /// `DepthStats` containing comprehensive statistics. Returns zero stats if no levels exist.
     ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when an analyzed level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the total volume
+    ///   (`u64`) or the price-weighted volume (`u128`) overflows.
+    ///
     /// # Performance
     /// O(N) where N is the number of levels analyzed.
     ///
@@ -4980,20 +5111,24 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 99, 20, Side::Buy, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 98, 30, Side::Buy, TimeInForce::Gtc, None);
     ///
-    /// let stats = book.depth_statistics(Side::Buy, 10);
+    /// let stats = book.depth_statistics(Side::Buy, 10)?;
     /// println!("Total volume: {}", stats.total_volume);
     /// println!("Average level size: {:.2}", stats.avg_level_size);
     /// println!("Weighted avg price: {:.2}", stats.weighted_avg_price);
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn depth_statistics(&self, side: Side, levels: usize) -> DepthStats {
+    pub fn depth_statistics(
+        &self,
+        side: Side,
+        levels: usize,
+    ) -> Result<DepthStats, OrderBookError> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
 
         if price_levels.is_empty() {
-            return DepthStats::zero();
+            return Ok(DepthStats::zero());
         }
 
         let iter = match side {
@@ -5014,23 +5149,29 @@ where
             }
 
             let price = *entry.key();
-            let quantity = entry.value().total_quantity().unwrap_or(0);
+            let quantity = level_total(entry.value())?;
 
             if quantity == 0 {
                 continue;
             }
 
-            total_volume = total_volume.saturating_add(quantity);
-            weighted_price_sum =
-                weighted_price_sum.saturating_add(price.saturating_mul(quantity as u128));
+            total_volume = checked_depth_add(total_volume, quantity, "depth statistics volume")?;
+            weighted_price_sum = checked_notional_add(
+                weighted_price_sum,
+                price,
+                quantity,
+                "depth statistics weighted price",
+            )?;
             sizes.push(quantity);
             min_size = min_size.min(quantity);
             max_size = max_size.max(quantity);
-            count += 1;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| analytics_overflow("depth statistics level count"))?;
         }
 
         if count == 0 || total_volume == 0 {
-            return DepthStats::zero();
+            return Ok(DepthStats::zero());
         }
 
         let avg_level_size = total_volume as f64 / count as f64;
@@ -5047,7 +5188,7 @@ where
             / count as f64;
         let std_dev = variance.sqrt();
 
-        DepthStats {
+        Ok(DepthStats {
             total_volume,
             levels_count: count,
             avg_level_size,
@@ -5055,7 +5196,7 @@ where
             min_level_size: if min_size == u64::MAX { 0 } else { min_size },
             max_level_size: max_size,
             std_dev_level_size: std_dev,
-        }
+        })
     }
 
     /// Calculates buy and sell pressure based on total volume on each side
@@ -5066,6 +5207,12 @@ where
     /// # Returns
     /// Tuple of `(buy_pressure, sell_pressure)` where each value is the total
     /// quantity available on that side (in units).
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when a side's total overflows
+    ///   `u64`.
     ///
     /// # Performance
     /// O(N + M) where N is bid levels and M is ask levels.
@@ -5080,28 +5227,24 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 50, Side::Buy, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 101, 30, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+    /// let (buy_pressure, sell_pressure) = book.buy_sell_pressure()?;
     /// println!("Buy: {}, Sell: {}", buy_pressure, sell_pressure);
     ///
     /// if buy_pressure > sell_pressure {
     ///     println!("More buying interest");
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn buy_sell_pressure(&self) -> (u64, u64) {
-        let buy_pressure: u64 = self
-            .bids
-            .iter()
-            .map(|entry| entry.value().total_quantity().unwrap_or(0))
-            .sum();
+    pub fn buy_sell_pressure(&self) -> Result<(u64, u64), OrderBookError> {
+        let buy_pressure = self.bids.iter().try_fold(0u64, |acc, entry| {
+            checked_depth_add(acc, level_total(entry.value())?, "buy pressure")
+        })?;
 
-        let sell_pressure: u64 = self
-            .asks
-            .iter()
-            .map(|entry| entry.value().total_quantity().unwrap_or(0))
-            .sum();
+        let sell_pressure = self.asks.iter().try_fold(0u64, |acc, entry| {
+            checked_depth_add(acc, level_total(entry.value())?, "sell pressure")
+        })?;
 
-        (buy_pressure, sell_pressure)
+        Ok((buy_pressure, sell_pressure))
     }
 
     /// Detects if the order book is thin (has low liquidity)
@@ -5117,6 +5260,11 @@ where
     /// # Returns
     /// `true` if either side has insufficient liquidity, `false` otherwise
     ///
+    /// # Errors
+    /// Propagates [`Self::depth_statistics`] errors
+    /// ([`OrderBookError::PriceLevelError`],
+    /// [`OrderBookError::ArithmeticOverflow`]).
+    ///
     /// # Performance
     /// O(N) where N is levels to check.
     ///
@@ -5130,16 +5278,16 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 5, Side::Buy, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 101, 5, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// if book.is_thin_book(100, 5) {
+    /// if book.is_thin_book(100, 5)? {
     ///     println!("Warning: Thin book detected - high slippage risk!");
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn is_thin_book(&self, threshold: u64, levels: usize) -> bool {
-        let bid_stats = self.depth_statistics(Side::Buy, levels);
-        let ask_stats = self.depth_statistics(Side::Sell, levels);
+    pub fn is_thin_book(&self, threshold: u64, levels: usize) -> Result<bool, OrderBookError> {
+        let bid_stats = self.depth_statistics(Side::Buy, levels)?;
+        let ask_stats = self.depth_statistics(Side::Sell, levels)?;
 
-        bid_stats.total_volume < threshold || ask_stats.total_volume < threshold
+        Ok(bid_stats.total_volume < threshold || ask_stats.total_volume < threshold)
     }
 
     /// Calculates depth distribution histogram for a side
@@ -5150,14 +5298,28 @@ where
     ///
     /// # Arguments
     /// - `side`: The side to analyze (Buy for bids, Sell for asks)
-    /// - `bins`: Number of bins to divide the depth into (must be > 0)
+    /// - `bins`: Number of bins to divide the depth into (must be > 0).
+    ///   Capped at [`MAX_DEPTH_DISTRIBUTION_BINS`]: a larger request builds
+    ///   exactly `MAX_DEPTH_DISTRIBUTION_BINS` bins, so the result length is
+    ///   `min(bins, MAX_DEPTH_DISTRIBUTION_BINS)`.
     ///
     /// # Returns
     /// Vector of `DistributionBin` containing price ranges and volumes.
-    /// Returns empty vector if bins is 0 or no levels exist.
+    /// Returns an empty vector if bins is 0 or no levels exist. Each bin's
+    /// `max_price` is exclusive; the last bin ends at `max_level_price + 1`.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when a bin bound leaves the
+    ///   `u128` price domain (for example a level at `u128::MAX`, whose
+    ///   exclusive upper bound `u128::MAX + 1` is not representable) or a
+    ///   bin's volume / level count overflows.
+    /// - [`OrderBookError::AllocationFailed`] when the (capped) bin vector
+    ///   cannot be reserved.
     ///
     /// # Performance
-    /// O(N) where N is total number of levels.
+    /// O(N + B) where N is the total number of levels and B the bin count.
     ///
     /// # Examples
     /// ```
@@ -5171,16 +5333,21 @@ where
     ///     let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), price, 10, Side::Buy, TimeInForce::Gtc, None);
     /// }
     ///
-    /// let distribution = book.depth_distribution(Side::Buy, 5);
+    /// let distribution = book.depth_distribution(Side::Buy, 5)?;
     /// for bin in distribution {
     ///     println!("Price {}-{}: {} units in {} levels",
     ///              bin.min_price, bin.max_price, bin.volume, bin.level_count);
     /// }
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn depth_distribution(&self, side: Side, bins: usize) -> Vec<DistributionBin> {
+    pub fn depth_distribution(
+        &self,
+        side: Side,
+        bins: usize,
+    ) -> Result<Vec<DistributionBin>, OrderBookError> {
+        let bins = bins.min(MAX_DEPTH_DISTRIBUTION_BINS);
         if bins == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let price_levels = match side {
@@ -5188,41 +5355,47 @@ where
             Side::Sell => &self.asks,
         };
 
-        if price_levels.is_empty() {
-            return Vec::new();
-        }
+        // The SkipMap is price-ordered: the extremes are its two ends.
+        let (Some(front), Some(back)) = (price_levels.front(), price_levels.back()) else {
+            return Ok(Vec::new());
+        };
+        let min_price = *front.key();
+        let max_price = *back.key();
 
-        // Find min and max prices
-        let mut min_price = u128::MAX;
-        let mut max_price = 0u128;
-
-        for entry in price_levels.iter() {
-            let price = *entry.key();
-            min_price = min_price.min(price);
-            max_price = max_price.max(price);
-        }
-
-        if min_price == u128::MAX || max_price < min_price {
-            return Vec::new();
-        }
-
-        // Calculate bin width
-        let price_range = max_price - min_price;
+        // Calculate bin width (ceiling division). A concurrent insert between
+        // the two end reads can only widen the observed range, never invert
+        // it; an inverted read is reported rather than clamped.
+        let price_range = max_price
+            .checked_sub(min_price)
+            .ok_or_else(|| analytics_overflow("depth distribution price range"))?;
+        // `bins >= 1` and `usize` fits `u128` on every supported target.
+        let bins_u128 = bins as u128;
         let bin_width = if price_range == 0 {
             1
         } else {
-            price_range.div_ceil(bins as u128) // Ceiling division
+            price_range.div_ceil(bins_u128)
         };
+        let last_index = bins
+            .checked_sub(1)
+            .ok_or_else(|| analytics_overflow("depth distribution last bin"))?;
 
         // Initialize bins
-        let mut distribution = Vec::with_capacity(bins);
+        let mut distribution: Vec<DistributionBin> = Vec::new();
+        distribution
+            .try_reserve_exact(bins)
+            .map_err(|_| OrderBookError::AllocationFailed {
+                operation: "depth distribution bins",
+                requested: bins,
+            })?;
+        let mut bin_min = min_price;
         for i in 0..bins {
-            let bin_min = min_price + (i as u128 * bin_width);
-            let bin_max = if i == bins - 1 {
-                max_price + 1 // Make last bin inclusive
+            let bin_max = if i == last_index {
+                // Make last bin inclusive of the highest level.
+                max_price.checked_add(1)
             } else {
-                bin_min + bin_width
-            };
+                bin_min.checked_add(bin_width)
+            }
+            .ok_or_else(|| analytics_overflow("depth distribution bin bound"))?;
 
             distribution.push(DistributionBin {
                 min_price: bin_min,
@@ -5230,30 +5403,43 @@ where
                 volume: 0,
                 level_count: 0,
             });
+
+            if i != last_index {
+                // `bin_min + bin_width` was just checked as this bin's max.
+                bin_min = bin_max;
+            }
         }
 
-        // Fill bins with data
-        for entry in price_levels.iter() {
+        // Fill bins with data. Only the observed `[min_price, max_price]`
+        // band is binned: a level inserted concurrently outside it after the
+        // two end reads is not part of this histogram.
+        for entry in price_levels.range(min_price..=max_price) {
             let price = *entry.key();
-            let quantity = entry.value().total_quantity().unwrap_or(0);
+            let quantity = level_total(entry.value())?;
 
             if quantity == 0 {
                 continue;
             }
 
-            // Find which bin this price belongs to
-            let bin_index = if price >= max_price {
-                bins - 1
-            } else {
-                ((price - min_price) / bin_width).min((bins - 1) as u128) as usize
-            };
+            // Find which bin this price belongs to (`bin_width >= 1`).
+            let raw_index = price
+                .checked_sub(min_price)
+                .and_then(|offset| offset.checked_div(bin_width))
+                .ok_or_else(|| analytics_overflow("depth distribution bin index"))?;
+            let bin_index =
+                usize::try_from(raw_index).map_or(last_index, |index| index.min(last_index));
 
-            distribution[bin_index].volume =
-                distribution[bin_index].volume.saturating_add(quantity);
-            distribution[bin_index].level_count += 1;
+            let bin = distribution
+                .get_mut(bin_index)
+                .ok_or_else(|| analytics_overflow("depth distribution bin index"))?;
+            bin.volume = checked_depth_add(bin.volume, quantity, "depth distribution bin volume")?;
+            bin.level_count = bin
+                .level_count
+                .checked_add(1)
+                .ok_or_else(|| analytics_overflow("depth distribution bin level count"))?;
         }
 
-        distribution
+        Ok(distribution)
     }
 }
 
@@ -5290,7 +5476,8 @@ where
 
         let best_bid = self.best_bid();
         let best_ask = self.best_ask();
-        let mid_price = self.mid_price().map(|p| p as u128);
+        // Exact integer midpoint (#245): no `f64` round trip / truncating cast.
+        let mid_price = self.integer_mid_price();
         let last_trade = if self.has_traded.load(Ordering::Relaxed) {
             Some(self.last_trade_price.load())
         } else {

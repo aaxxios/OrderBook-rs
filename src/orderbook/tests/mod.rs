@@ -1,3 +1,4 @@
+mod analytics_overflow;
 mod book;
 mod depth_analysis;
 mod enriched_snapshot_tests;

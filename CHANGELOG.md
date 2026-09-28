@@ -640,6 +640,74 @@ change.
   a wildcard arm for `CapacityOverflow`. Metrics names, labels and values are
   unchanged.
 
+- **Book analytics return `Result` with checked aggregates (#245).**
+  The read-only analytics used raw `price * qty` (`vwap`, `market_impact`,
+  `simulate_market_order`), `.sum()` (`buy_sell_pressure`, the snapshot
+  totals, the enriched-snapshot depth) and saturating folds, so type-valid
+  extreme inputs panicked in debug and wrapped or clamped in release; about
+  30 sites also read a level whose `visible + hidden` total overflows as
+  `0` (`total_quantity().unwrap_or(0)`), or as `u64::MAX` in
+  `total_quantity_at_price`. Every level read now goes through one helper
+  that returns the level's `PriceLevelError`, `u128` notionals and `u64`
+  depth sums use checked arithmetic, and the analytics return
+  `Result<_, OrderBookError>`:
+  - `OrderBook`: `vwap`, `micro_price`, `order_book_imbalance`,
+    `market_impact`, `simulate_market_order`, `price_at_depth`,
+    `price_at_depth_adjusted`, `cumulative_depth_to_target`,
+    `total_depth_at_levels`, `liquidity_in_range`, `total_quantity_at_price`,
+    `get_volume_by_price`, `depth_statistics`, `buy_sell_pressure`,
+    `is_thin_book`, `depth_distribution`, `find_level`.
+  - `levels_with_cumulative_depth`, `levels_until_depth` and
+    `levels_in_range` yield `Result<LevelInfo, OrderBookError>`; the first
+    `Err` (level overflow or cumulative-depth overflow) is yielded once and
+    the iterator is then exhausted (`FusedIterator`), so no depth is
+    reported past a failed level.
+  - `OrderBookSnapshot::{total_bid_volume, total_ask_volume,
+    total_bid_value, total_ask_value}`, `EnrichedSnapshot::{new,
+    with_metrics}`, `OrderSimulation::total_cost` and
+    `DistributionBin::width`.
+  - New `OrderBookError::ArithmeticOverflow { operation: &'static str }`
+    and `OrderBookError::AllocationFailed { operation, requested }`, both
+    mapped to wire code `RejectReason::Other(0)` and classified as
+    non-mutating by the sequencer (they are never raised by a submit).
+    `OrderBookError` stays within its 96-byte size budget.
+  - `depth_distribution` caps `bins` at the new
+    `MAX_DEPTH_DISTRIBUTION_BINS` (4096), reserves with
+    `Vec::try_reserve_exact`, computes bin bounds with checked arithmetic,
+    reads the price range from the two ends of the level map and bins only
+    that observed band, and indexes with `get_mut`. A level at `u128::MAX`
+    (whose exclusive last-bin bound `u128::MAX + 1` is not representable)
+    returns `ArithmeticOverflow`.
+  - Pegged orders referencing `MidPrice` (feature `special_orders`) use the
+    exact integer midpoint (`u128::midpoint`, rounded down) instead of
+    `mid_price() as u128`, which lost precision above 2^53. The `Mid` risk
+    reference price shares the same helper (unchanged result).
+  - `market_impact` reports `slippage` as `worst.abs_diff(best)`: equal to
+    the previous value on a settled book, the true distance (instead of `0`)
+    if the best price moves between the cache read and the walk.
+
+  Removed ledger entries: `scripts/panic_policy_allowlist.txt` drops
+  `iterators.rs`, `market_impact.rs` and `statistics.rs` and lowers
+  `book.rs` `saturating_wrapping` 26 to 3 and `snapshot.rs` 7 to 1 (the
+  remaining `spread` / counter forms belong to #250);
+  `scripts/clippy_ratchet.txt` drops `book.rs` `cast_possible_truncation`
+  and `cast_sign_loss`, lowers `book.rs` `arithmetic_side_effects` 32 to 4
+  and `indexing_slicing` 12 to 6, and drops `snapshot.rs` entirely (its
+  ratchet marker is gone).
+
+  **Compatibility:** source-breaking for callers of the listed functions:
+  add `?` (or handle the error) and handle each iterator item (`level?`,
+  or `collect::<Result<Vec<_>, _>>()?`). Values are unchanged for every
+  book whose aggregates fit their types; the only visible differences are
+  that an overflow is now an `Err` instead of a panic / wrapped / clamped
+  value, `total_quantity_at_price` no longer returns `Some(u64::MAX)` for an
+  overflowed level, a `depth_distribution` request above 4096 bins returns
+  4096 bins, and a pegged mid-price order above 2^53 reprices to the exact
+  midpoint. The matching path (`peek_match`, sweeps, fill-or-kill
+  feasibility) is untouched: no trade, event, journal or snapshot format
+  changes. `OrderBookError` is `#[non_exhaustive]`, so downstream matches
+  already carry a wildcard arm for the two new variants.
+
 ### Changed
 
 - **Behaviour from pricelevel 0.10.** `PriceLevel::new` starts

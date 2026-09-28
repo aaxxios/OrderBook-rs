@@ -3,7 +3,19 @@
 //! This module provides efficient, lazy iterators for analyzing order book depth
 //! and structure without unnecessary allocations. All iterators support standard
 //! iterator combinators and can short-circuit early.
+//!
+//! # Error surfacing (0.14.0, #245)
+//!
+//! Every iterator yields `Result<LevelInfo, OrderBookError>`. A level whose
+//! `visible + hidden` total does not fit `u64` (a
+//! [`PriceLevelError`](pricelevel::PriceLevelError) from
+//! `PriceLevel::total_quantity`) or a cumulative depth that overflows `u64`
+//! is yielded **once** as `Err(..)`; the iterator is then exhausted (every
+//! later `next()` returns `None`), so a failed level is never silently read
+//! as an empty one and no depth is ever reported past it. Collect with
+//! `collect::<Result<Vec<_>, _>>()` or use `?` per item.
 
+use super::error::OrderBookError;
 use crossbeam_skiplist::SkipMap;
 use crossbeam_skiplist::map::Iter;
 use either::Either;
@@ -18,6 +30,73 @@ use std::sync::Arc;
 /// iterate in ascending price order.
 type PriceLevelIter<'a> =
     Either<Rev<Iter<'a, u128, Arc<PriceLevel>>>, Iter<'a, u128, Arc<PriceLevel>>>;
+
+/// Total resting quantity (`visible + hidden`) of a price level, in quantity
+/// units, with the level's own overflow surfaced as a typed error.
+///
+/// The single analytics entry point for a level's depth (#245): every
+/// book analytic and depth iterator reads a level through this helper
+/// instead of `total_quantity().unwrap_or(0)`, which used to read an
+/// overflowed level as an empty one.
+///
+/// Advisory read: it sums two independent atomic counters (see
+/// `pricelevel`'s `PriceLevel::total_quantity`).
+///
+/// # Errors
+///
+/// Returns [`OrderBookError::PriceLevelError`] when the level's
+/// `visible + hidden` total overflows `u64` (for example a limit order and
+/// an iceberg at one price whose combined depth exceeds `u64::MAX`).
+#[inline]
+pub(crate) fn level_total(level: &PriceLevel) -> Result<u64, OrderBookError> {
+    Ok(level.total_quantity()?)
+}
+
+/// Checked `u64` running-depth accumulation shared by the depth iterators
+/// and the book's depth analytics (#245).
+///
+/// # Errors
+///
+/// Returns [`OrderBookError::ArithmeticOverflow`] naming `operation` when
+/// `acc + quantity` does not fit `u64`.
+#[inline]
+pub(crate) fn checked_depth_add(
+    acc: u64,
+    quantity: u64,
+    operation: &'static str,
+) -> Result<u64, OrderBookError> {
+    acc.checked_add(quantity)
+        .ok_or_else(|| analytics_overflow(operation))
+}
+
+/// Checked `acc + price * quantity` in `u128` for the notional aggregates
+/// (VWAP, market impact, simulated fills, weighted depth) (#245).
+///
+/// # Errors
+///
+/// Returns [`OrderBookError::ArithmeticOverflow`] naming `operation` when
+/// the product or the sum does not fit `u128`.
+#[inline]
+pub(crate) fn checked_notional_add(
+    acc: u128,
+    price: u128,
+    quantity: u64,
+    operation: &'static str,
+) -> Result<u128, OrderBookError> {
+    price
+        .checked_mul(u128::from(quantity))
+        .and_then(|notional| acc.checked_add(notional))
+        .ok_or_else(|| analytics_overflow(operation))
+}
+
+/// Cold constructor for [`OrderBookError::ArithmeticOverflow`], kept off the
+/// analytics loops' fast path.
+#[cold]
+#[inline(never)]
+#[must_use]
+pub(crate) fn analytics_overflow(operation: &'static str) -> OrderBookError {
+    OrderBookError::ArithmeticOverflow { operation }
+}
 
 /// Information about a price level including price, quantity, and cumulative depth
 #[derive(Debug, Clone)]
@@ -37,9 +116,13 @@ pub struct LevelInfo {
 /// Iterates through price levels in price-priority order (best to worst),
 /// maintaining cumulative depth as it goes. This is useful for analyzing
 /// market depth distribution and finding liquidity thresholds.
+///
+/// Yields `Result<LevelInfo, OrderBookError>`; the first error ends the
+/// iteration (see the [module docs](self)).
 pub struct LevelsWithCumulativeDepth<'a> {
     iter: PriceLevelIter<'a>,
     cumulative_depth: u64,
+    finished: bool,
 }
 
 impl<'a> LevelsWithCumulativeDepth<'a> {
@@ -62,32 +145,50 @@ impl<'a> LevelsWithCumulativeDepth<'a> {
         Self {
             iter,
             cumulative_depth: 0,
+            finished: false,
         }
     }
 }
 
 impl<'a> Iterator for LevelsWithCumulativeDepth<'a> {
-    type Item = LevelInfo;
+    type Item = Result<LevelInfo, OrderBookError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|entry| {
-            let price = *entry.key();
-            let quantity = entry.value().total_quantity().unwrap_or(0);
-            self.cumulative_depth = self.cumulative_depth.saturating_add(quantity);
-
-            LevelInfo {
-                price,
-                quantity,
-                cumulative_depth: self.cumulative_depth,
+        if self.finished {
+            return None;
+        }
+        let entry = self.iter.next()?;
+        let price = *entry.key();
+        let step = level_total(entry.value()).and_then(|quantity| {
+            checked_depth_add(self.cumulative_depth, quantity, "cumulative depth")
+                .map(|cumulative| (quantity, cumulative))
+        });
+        match step {
+            Ok((quantity, cumulative_depth)) => {
+                self.cumulative_depth = cumulative_depth;
+                Some(Ok(LevelInfo {
+                    price,
+                    quantity,
+                    cumulative_depth,
+                }))
             }
-        })
+            Err(err) => {
+                self.finished = true;
+                Some(Err(err))
+            }
+        }
     }
 }
+
+impl std::iter::FusedIterator for LevelsWithCumulativeDepth<'_> {}
 
 /// Iterator over price levels until a target depth is reached
 ///
 /// Stops automatically when the cumulative depth reaches or exceeds the target.
 /// Useful for analyzing how many levels are needed to fill a specific quantity.
+///
+/// Yields `Result<LevelInfo, OrderBookError>`; the first error ends the
+/// iteration (see the [module docs](self)).
 pub struct LevelsUntilDepth<'a> {
     iter: PriceLevelIter<'a>,
     target_depth: u64,
@@ -127,38 +228,49 @@ impl<'a> LevelsUntilDepth<'a> {
 }
 
 impl<'a> Iterator for LevelsUntilDepth<'a> {
-    type Item = LevelInfo;
+    type Item = Result<LevelInfo, OrderBookError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
         }
 
-        self.iter.next().map(|entry| {
-            let price = *entry.key();
-            let quantity = entry.value().total_quantity().unwrap_or(0);
-            self.cumulative_depth = self.cumulative_depth.saturating_add(quantity);
-
-            let level_info = LevelInfo {
-                price,
-                quantity,
-                cumulative_depth: self.cumulative_depth,
-            };
-
-            // Check if we've reached target depth
-            if self.cumulative_depth >= self.target_depth {
-                self.finished = true;
+        let entry = self.iter.next()?;
+        let price = *entry.key();
+        let step = level_total(entry.value()).and_then(|quantity| {
+            checked_depth_add(self.cumulative_depth, quantity, "cumulative depth")
+                .map(|cumulative| (quantity, cumulative))
+        });
+        match step {
+            Ok((quantity, cumulative_depth)) => {
+                self.cumulative_depth = cumulative_depth;
+                // Check if we've reached target depth
+                if cumulative_depth >= self.target_depth {
+                    self.finished = true;
+                }
+                Some(Ok(LevelInfo {
+                    price,
+                    quantity,
+                    cumulative_depth,
+                }))
             }
-
-            level_info
-        })
+            Err(err) => {
+                self.finished = true;
+                Some(Err(err))
+            }
+        }
     }
 }
+
+impl std::iter::FusedIterator for LevelsUntilDepth<'_> {}
 
 /// Iterator over price levels within a specific price range
 ///
 /// Only yields levels where the price falls within [min_price, max_price] inclusive.
 /// Useful for analyzing liquidity in specific price bands.
+///
+/// Yields `Result<LevelInfo, OrderBookError>`; the first error ends the
+/// iteration (see the [module docs](self)).
 pub struct LevelsInRange<'a> {
     iter: PriceLevelIter<'a>,
     side: Side,
@@ -202,7 +314,7 @@ impl<'a> LevelsInRange<'a> {
 }
 
 impl<'a> Iterator for LevelsInRange<'a> {
-    type Item = LevelInfo;
+    type Item = Result<LevelInfo, OrderBookError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -228,13 +340,17 @@ impl<'a> Iterator for LevelsInRange<'a> {
 
             // Check if price is within range.
             if price >= self.min_price && price <= self.max_price {
-                let quantity = entry.value().total_quantity().unwrap_or(0);
-
-                return Some(LevelInfo {
-                    price,
-                    quantity,
-                    cumulative_depth: 0, // Not tracked in range iterator
-                });
+                return match level_total(entry.value()) {
+                    Ok(quantity) => Some(Ok(LevelInfo {
+                        price,
+                        quantity,
+                        cumulative_depth: 0, // Not tracked in range iterator
+                    })),
+                    Err(err) => {
+                        self.finished = true;
+                        Some(Err(err))
+                    }
+                };
             }
             // Otherwise we are still on the NEAR side of the band (Buy: above
             // max; Sell: below min) — keep scanning toward it.
@@ -244,6 +360,8 @@ impl<'a> Iterator for LevelsInRange<'a> {
         None
     }
 }
+
+impl std::iter::FusedIterator for LevelsInRange<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -262,7 +380,7 @@ mod tests {
         // Wide ascending book 1..=1000, narrow band [10, 12] near the low end.
         let map = make_map(1..=1000u128);
         let mut it = LevelsInRange::new(&map, Side::Sell, 10, 12);
-        let prices: Vec<u128> = (&mut it).map(|l| l.price).collect();
+        let prices: Vec<u128> = (&mut it).map(|l| l.expect("level").price).collect();
         assert_eq!(prices, vec![10, 11, 12], "only in-band levels are yielded");
         assert!(
             it.finished,
@@ -282,7 +400,7 @@ mod tests {
         // Buy iterates descending; narrow band [988, 990] near the high end.
         let map = make_map(1..=1000u128);
         let mut it = LevelsInRange::new(&map, Side::Buy, 988, 990);
-        let prices: Vec<u128> = (&mut it).map(|l| l.price).collect();
+        let prices: Vec<u128> = (&mut it).map(|l| l.expect("level").price).collect();
         assert_eq!(prices, vec![990, 989, 988], "descending in-band yield");
         assert!(it.finished);
         assert!(
@@ -295,7 +413,7 @@ mod tests {
     fn test_levels_in_range_empty_when_band_outside_book() {
         let map = make_map(1..=10u128);
         let got: Vec<u128> = LevelsInRange::new(&map, Side::Sell, 100, 200)
-            .map(|l| l.price)
+            .map(|l| l.expect("level").price)
             .collect();
         assert!(got.is_empty());
     }

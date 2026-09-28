@@ -33,7 +33,10 @@ mod tests {
     fn test_levels_with_cumulative_depth_buy() {
         let book = setup_test_book();
 
-        let levels: Vec<_> = book.levels_with_cumulative_depth(Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 5);
 
@@ -57,7 +60,10 @@ mod tests {
     fn test_levels_with_cumulative_depth_sell() {
         let book = setup_test_book();
 
-        let levels: Vec<_> = book.levels_with_cumulative_depth(Side::Sell).collect();
+        let levels: Vec<_> = book
+            .levels_with_cumulative_depth(Side::Sell)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 4);
 
@@ -79,6 +85,7 @@ mod tests {
         // Take only first 3 levels
         let levels: Vec<_> = book
             .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
             .take(3)
             .collect();
 
@@ -90,7 +97,10 @@ mod tests {
     fn test_levels_with_cumulative_depth_empty_book() {
         let book: OrderBook = OrderBook::new("TEST");
 
-        let levels: Vec<_> = book.levels_with_cumulative_depth(Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 0);
     }
@@ -100,7 +110,10 @@ mod tests {
         let book = setup_test_book();
 
         // Target depth of 25 should give us 2 levels (10 + 15)
-        let levels: Vec<_> = book.levels_until_depth(25, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_until_depth(25, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[0].price, 100);
@@ -113,7 +126,10 @@ mod tests {
         let book = setup_test_book();
 
         // Target depth of 30 should give us 3 levels (10 + 15 + 20 = 45)
-        let levels: Vec<_> = book.levels_until_depth(30, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_until_depth(30, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[2].cumulative_depth, 45);
@@ -124,7 +140,10 @@ mod tests {
         let book = setup_test_book();
 
         // Target depth of 1000 should give us all levels
-        let levels: Vec<_> = book.levels_until_depth(1000, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_until_depth(1000, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 5);
     }
@@ -134,7 +153,10 @@ mod tests {
         let book = setup_test_book();
 
         // Zero target should still return first level if it has any quantity
-        let levels: Vec<_> = book.levels_until_depth(0, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_until_depth(0, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 1);
     }
@@ -144,7 +166,10 @@ mod tests {
         let book = setup_test_book();
 
         // Range 85-95 should include 3 levels
-        let levels: Vec<_> = book.levels_in_range(85, 95, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_in_range(85, 95, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[0].price, 95);
@@ -157,7 +182,10 @@ mod tests {
         let book = setup_test_book();
 
         // Exact match for one level
-        let levels: Vec<_> = book.levels_in_range(100, 100, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_in_range(100, 100, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].price, 100);
@@ -168,7 +196,10 @@ mod tests {
         let book = setup_test_book();
 
         // Range with no levels
-        let levels: Vec<_> = book.levels_in_range(101, 104, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_in_range(101, 104, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 0);
     }
@@ -178,7 +209,10 @@ mod tests {
         let book = setup_test_book();
 
         // Range that partially overlaps
-        let levels: Vec<_> = book.levels_in_range(92, 102, Side::Buy).collect();
+        let levels: Vec<_> = book
+            .levels_in_range(92, 102, Side::Buy)
+            .map(Result::unwrap)
+            .collect();
 
         assert_eq!(levels.len(), 2); // 100 and 95
         assert_eq!(levels[0].price, 100);
@@ -190,7 +224,9 @@ mod tests {
         let book = setup_test_book();
 
         // Find first level with quantity > 15
-        let level = book.find_level(Side::Buy, |info| info.quantity > 15);
+        let level = book
+            .find_level(Side::Buy, |info| info.quantity > 15)
+            .unwrap();
 
         assert!(level.is_some());
         let level = level.unwrap();
@@ -202,7 +238,9 @@ mod tests {
         let book = setup_test_book();
 
         // Find first level where cumulative depth exceeds 30
-        let level = book.find_level(Side::Buy, |info| info.cumulative_depth > 30);
+        let level = book
+            .find_level(Side::Buy, |info| info.cumulative_depth > 30)
+            .unwrap();
 
         assert!(level.is_some());
         let level = level.unwrap();
@@ -215,7 +253,9 @@ mod tests {
         let book = setup_test_book();
 
         // Find level with impossible condition
-        let level = book.find_level(Side::Buy, |info| info.quantity > 1000);
+        let level = book
+            .find_level(Side::Buy, |info| info.quantity > 1000)
+            .unwrap();
 
         assert!(level.is_none());
     }
@@ -224,7 +264,7 @@ mod tests {
     fn test_find_level_empty_book() {
         let book: OrderBook = OrderBook::new("TEST");
 
-        let level = book.find_level(Side::Buy, |_| true);
+        let level = book.find_level(Side::Buy, |_| true).unwrap();
 
         assert!(level.is_none());
     }
@@ -236,6 +276,7 @@ mod tests {
         // Complex functional pipeline
         let total_qty: u64 = book
             .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
             .take(3) // Only first 3 levels
             .filter(|level| level.quantity >= 15) // Only levels with 15+ units
             .map(|level| level.quantity)
@@ -250,7 +291,10 @@ mod tests {
         let book = setup_test_book();
 
         // Find first level and stop
-        let first = book.levels_with_cumulative_depth(Side::Buy).next();
+        let first = book
+            .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
+            .next();
 
         assert!(first.is_some());
         assert_eq!(first.unwrap().price, 100);
@@ -263,6 +307,7 @@ mod tests {
         // Calculate total quantity in range
         let total: u64 = book
             .levels_in_range(85, 95, Side::Buy)
+            .map(Result::unwrap)
             .map(|level| level.quantity)
             .sum();
 
@@ -277,6 +322,7 @@ mod tests {
         // Get levels until depth 50, but only those with even prices
         let levels: Vec<_> = book
             .levels_until_depth(50, Side::Buy)
+            .map(Result::unwrap)
             .filter(|level| level.price % 2 == 0)
             .collect();
 
@@ -295,6 +341,7 @@ mod tests {
         // Real-world scenario: Find average order size in top 3 levels
         let levels: Vec<_> = book
             .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
             .take(3)
             .collect();
 
@@ -310,7 +357,9 @@ mod tests {
         let book = setup_test_book();
 
         // Find price level where we have at least 40 units cumulative
-        let level = book.find_level(Side::Buy, |info| info.cumulative_depth >= 40);
+        let level = book
+            .find_level(Side::Buy, |info| info.cumulative_depth >= 40)
+            .unwrap();
 
         assert!(level.is_some());
         let level = level.unwrap();
@@ -323,7 +372,10 @@ mod tests {
         let book = setup_test_book();
 
         // Test sell side with levels_until_depth
-        let levels: Vec<_> = book.levels_until_depth(30, Side::Sell).collect();
+        let levels: Vec<_> = book
+            .levels_until_depth(30, Side::Sell)
+            .map(Result::unwrap)
+            .collect();
 
         // Should get 105 (12) + 110 (18) = 30 cumulative
         assert_eq!(levels.len(), 2);
@@ -339,6 +391,7 @@ mod tests {
         // Count levels with quantity > 20
         let count = book
             .levels_with_cumulative_depth(Side::Buy)
+            .map(Result::unwrap)
             .filter(|level| level.quantity > 20)
             .count();
 

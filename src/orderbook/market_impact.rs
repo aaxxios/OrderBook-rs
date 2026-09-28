@@ -7,6 +7,8 @@
 //! - Number of price levels consumed
 //! - Available liquidity in price ranges
 
+use super::error::OrderBookError;
+use super::iterators::checked_notional_add;
 use serde::{Deserialize, Serialize};
 
 /// Represents the market impact analysis of an order
@@ -151,14 +153,16 @@ impl OrderSimulation {
     /// Calculates the total cost of the simulated order
     ///
     /// # Returns
-    /// The total cost (price × quantity summed across all fills)
-    #[must_use]
-    pub fn total_cost(&self) -> u128 {
-        // Saturating fold (matching the simulate path) so an extreme
-        // price × quantity product or running total caps at u128::MAX rather
-        // than panicking in debug / wrapping in release.
-        self.fills.iter().fold(0u128, |acc, (price, qty)| {
-            acc.saturating_add(price.saturating_mul(u128::from(*qty)))
+    /// The total cost (price × quantity summed across all fills, in price
+    /// units times quantity units)
+    ///
+    /// # Errors
+    /// Returns [`OrderBookError::ArithmeticOverflow`] when a fill's
+    /// `price * quantity` product or the running total overflows `u128`
+    /// (checked, matching the simulate path; #245).
+    pub fn total_cost(&self) -> Result<u128, OrderBookError> {
+        self.fills.iter().try_fold(0u128, |acc, (price, qty)| {
+            checked_notional_add(acc, *price, *qty, "simulation total cost")
         })
     }
 }
@@ -176,16 +180,45 @@ mod tests {
     }
 
     #[test]
-    fn test_total_cost_saturates_on_extreme_fills() {
-        // A price × quantity product and running total beyond u128::MAX must
-        // saturate, not panic in debug / wrap in release.
+    fn test_total_cost_extreme_product_returns_overflow_error() {
+        // A price × quantity product beyond u128::MAX is reported (#245),
+        // not saturated, panicked on in debug or wrapped in release.
         let sim = OrderSimulation {
             fills: vec![(u128::MAX, 2), (u128::MAX, 3)],
             avg_price: 0.0,
             total_filled: 5,
             remaining_quantity: 0,
         };
-        assert_eq!(sim.total_cost(), u128::MAX);
+        assert!(matches!(
+            sim.total_cost(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_total_cost_extreme_sum_returns_overflow_error() {
+        // Each product fits; the running total does not.
+        let sim = OrderSimulation {
+            fills: vec![(u128::MAX, 1), (1, 1)],
+            avg_price: 0.0,
+            total_filled: 2,
+            remaining_quantity: 0,
+        };
+        assert!(matches!(
+            sim.total_cost(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_total_cost_at_u128_max_boundary_is_exact() {
+        let sim = OrderSimulation {
+            fills: vec![(u128::MAX, 1)],
+            avg_price: 0.0,
+            total_filled: 1,
+            remaining_quantity: 0,
+        };
+        assert_eq!(sim.total_cost().expect("fits"), u128::MAX);
     }
 
     #[test]
@@ -196,7 +229,7 @@ mod tests {
             total_filled: 8,
             remaining_quantity: 0,
         };
-        assert_eq!(sim.total_cost(), 100 * 5 + 101 * 3);
+        assert_eq!(sim.total_cost().expect("fits"), 100 * 5 + 101 * 3);
     }
 
     #[test]
@@ -278,6 +311,6 @@ mod tests {
             remaining_quantity: 0,
         };
         // (100 * 10) + (105 * 10) = 1000 + 1050 = 2050
-        assert_eq!(sim.total_cost(), 2050);
+        assert_eq!(sim.total_cost().expect("fits"), 2050);
     }
 }

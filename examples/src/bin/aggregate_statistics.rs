@@ -15,12 +15,18 @@
 //   cargo run --bin aggregate_statistics
 //   (from the examples directory)
 
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "aggregate statistics example failed");
+    }
+}
+
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Aggregate Statistics Example");
@@ -29,25 +35,26 @@ fn main() {
     let book = create_orderbook_with_depth("BTC/USD");
 
     // Display current state
-    display_book_state(&book);
+    display_book_state(&book)?;
 
     // Demonstrate depth statistics
-    demo_depth_statistics(&book);
+    demo_depth_statistics(&book)?;
 
     // Demonstrate market pressure analysis
-    demo_market_pressure(&book);
+    demo_market_pressure(&book)?;
 
     // Demonstrate liquidity checks
-    demo_liquidity_health(&book);
+    demo_liquidity_health(&book)?;
 
     // Demonstrate distribution analysis
-    demo_depth_distribution(&book);
+    demo_depth_distribution(&book)?;
 
     // Demonstrate imbalance detection
-    demo_imbalance_detection(&book);
+    demo_imbalance_detection(&book)?;
 
     // Practical trading scenarios
-    demo_trading_scenarios(&book);
+    demo_trading_scenarios(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
@@ -113,7 +120,7 @@ fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
     book
 }
 
-fn display_book_state(book: &OrderBook) {
+fn display_book_state(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== OrderBook State ===");
 
     if let (Some(best_bid), Some(best_ask)) = (book.best_bid(), book.best_ask()) {
@@ -123,18 +130,19 @@ fn display_book_state(book: &OrderBook) {
         info!("Mid Price: {}", (best_bid + best_ask) / 2);
     }
 
-    let (buy_volume, sell_volume) = book.buy_sell_pressure();
+    let (buy_volume, sell_volume) = book.buy_sell_pressure()?;
     info!("Total Buy Volume: {}", buy_volume);
     info!("Total Sell Volume: {}", sell_volume);
+    Ok(())
 }
 
-fn demo_depth_statistics(book: &OrderBook) {
+fn demo_depth_statistics(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Depth Statistics ===");
     info!("Analyzing top 5 levels on each side");
 
     // Analyze bid side
     info!("\n📊 Bid Side Statistics:");
-    let bid_stats = book.depth_statistics(Side::Buy, 5);
+    let bid_stats = book.depth_statistics(Side::Buy, 5)?;
 
     info!("  Total Volume: {}", bid_stats.total_volume);
     info!("  Levels Analyzed: {}", bid_stats.levels_count);
@@ -146,7 +154,7 @@ fn demo_depth_statistics(book: &OrderBook) {
 
     // Analyze ask side
     info!("\n📊 Ask Side Statistics:");
-    let ask_stats = book.depth_statistics(Side::Sell, 5);
+    let ask_stats = book.depth_statistics(Side::Sell, 5)?;
 
     info!("  Total Volume: {}", ask_stats.total_volume);
     info!("  Levels Analyzed: {}", ask_stats.levels_count);
@@ -174,12 +182,13 @@ fn demo_depth_statistics(book: &OrderBook) {
     } else {
         info!("  ✓ Balanced level sizes (ratio: {:.1}x)", size_ratio);
     }
+    Ok(())
 }
 
-fn demo_market_pressure(book: &OrderBook) {
+fn demo_market_pressure(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Market Pressure Analysis ===");
 
-    let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+    let (buy_pressure, sell_pressure) = book.buy_sell_pressure()?;
 
     info!("Buy Pressure: {} units", buy_pressure);
     info!("Sell Pressure: {} units", sell_pressure);
@@ -206,9 +215,10 @@ fn demo_market_pressure(book: &OrderBook) {
         info!("  → Sell-heavy market ({:.1}% more sell volume)", diff_pct);
         info!("  → Potential downward pressure");
     }
+    Ok(())
 }
 
-fn demo_liquidity_health(book: &OrderBook) {
+fn demo_liquidity_health(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Liquidity Health Check ===");
 
     // Check different thresholds
@@ -221,14 +231,14 @@ fn demo_liquidity_health(book: &OrderBook) {
 
     info!("\nLiquidity checks (top 5 levels):");
     for (threshold, label) in thresholds {
-        let is_thin = book.is_thin_book(threshold, 5);
+        let is_thin = book.is_thin_book(threshold, 5)?;
         let status = if is_thin { "❌ THIN" } else { "✓ OK" };
         info!("  {} threshold ({} units): {}", label, threshold, status);
     }
 
     // Detailed analysis
-    let bid_stats = book.depth_statistics(Side::Buy, 5);
-    let ask_stats = book.depth_statistics(Side::Sell, 5);
+    let bid_stats = book.depth_statistics(Side::Buy, 5)?;
+    let ask_stats = book.depth_statistics(Side::Sell, 5)?;
 
     info!("\n💡 Liquidity Assessment:");
 
@@ -258,14 +268,15 @@ fn demo_liquidity_health(book: &OrderBook) {
             info!("  → More liquidity on ask side");
         }
     }
+    Ok(())
 }
 
-fn demo_depth_distribution(book: &OrderBook) {
+fn demo_depth_distribution(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Depth Distribution Analysis ===");
 
     // Analyze bid distribution
     info!("\n📊 Bid Side Distribution (5 bins):");
-    let bid_distribution = book.depth_distribution(Side::Buy, 5);
+    let bid_distribution = book.depth_distribution(Side::Buy, 5)?;
 
     for (i, bin) in bid_distribution.iter().enumerate() {
         let bar_len = (bin.volume / 5).min(20) as usize;
@@ -283,7 +294,7 @@ fn demo_depth_distribution(book: &OrderBook) {
 
     // Analyze ask distribution
     info!("\n📊 Ask Side Distribution (5 bins):");
-    let ask_distribution = book.depth_distribution(Side::Sell, 5);
+    let ask_distribution = book.depth_distribution(Side::Sell, 5)?;
 
     for (i, bin) in ask_distribution.iter().enumerate() {
         let bar_len = (bin.volume / 5).min(20) as usize;
@@ -316,9 +327,10 @@ fn demo_depth_distribution(book: &OrderBook) {
             info!("  ✓ Well-distributed liquidity");
         }
     }
+    Ok(())
 }
 
-fn demo_imbalance_detection(book: &OrderBook) {
+fn demo_imbalance_detection(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Order Book Imbalance Detection ===");
 
     // Check imbalance at different depths
@@ -326,7 +338,7 @@ fn demo_imbalance_detection(book: &OrderBook) {
 
     info!("\nImbalance at different depths:");
     for depth in depths {
-        let imbalance = book.order_book_imbalance(depth);
+        let imbalance = book.order_book_imbalance(depth)?;
         let direction = if imbalance > 0.0 { "BUY" } else { "SELL" };
         let strength = imbalance.abs();
 
@@ -345,7 +357,7 @@ fn demo_imbalance_detection(book: &OrderBook) {
     }
 
     // Detailed analysis
-    let imbalance = book.order_book_imbalance(5);
+    let imbalance = book.order_book_imbalance(5)?;
 
     info!("\n💡 Imbalance Interpretation:");
     if imbalance.abs() < 0.1 {
@@ -365,16 +377,17 @@ fn demo_imbalance_detection(book: &OrderBook) {
         info!("  → Monitor for trend development");
         info!("  → Wait for confirmation");
     }
+    Ok(())
 }
 
-fn demo_trading_scenarios(book: &OrderBook) {
+fn demo_trading_scenarios(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Practical Trading Scenarios ===");
 
     // Scenario 1: Order size decision
     info!("\n📈 Scenario 1: Determining Safe Order Size");
 
-    let bid_stats = book.depth_statistics(Side::Buy, 5);
-    let ask_stats = book.depth_statistics(Side::Sell, 5);
+    let bid_stats = book.depth_statistics(Side::Buy, 5)?;
+    let ask_stats = book.depth_statistics(Side::Sell, 5)?;
 
     let safe_buy_size = bid_stats.total_volume / 4; // 25% of depth
     let safe_sell_size = ask_stats.total_volume / 4;
@@ -389,9 +402,9 @@ fn demo_trading_scenarios(book: &OrderBook) {
     // Scenario 2: Market condition assessment
     info!("\n📊 Scenario 2: Market Condition Assessment");
 
-    let is_thin = book.is_thin_book(150, 5);
-    let imbalance = book.order_book_imbalance(5);
-    let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+    let is_thin = book.is_thin_book(150, 5)?;
+    let imbalance = book.order_book_imbalance(5)?;
+    let (buy_pressure, sell_pressure) = book.buy_sell_pressure()?;
 
     info!(
         "  Liquidity: {}",
@@ -463,4 +476,5 @@ fn demo_trading_scenarios(book: &OrderBook) {
     info!("  3. Adjust order size based on depth statistics");
     info!("  4. Use distribution analysis for risk assessment");
     info!("  5. Combine multiple indicators for better decisions");
+    Ok(())
 }

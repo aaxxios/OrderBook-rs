@@ -168,6 +168,48 @@ mod tests {
         assert_eq!(order.price().as_u128(), 105);
     }
 
+    /// #245: the mid-price peg reference is the exact integer midpoint, not
+    /// an `f64` round trip truncated back to `u128`. Above 2^53 the `f64`
+    /// mid of `2^60 + 1` and `2^60 + 3` collapses to `2^60` (below the
+    /// bid); the integer midpoint is `2^60 + 2`.
+    #[test]
+    fn test_reprice_pegged_order_mid_price_is_exact_integer_midpoint() {
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        let base = 1u128 << 60;
+        for (price, side) in [(base + 1, Side::Buy), (base + 3, Side::Sell)] {
+            book.add_order(OrderType::Standard {
+                id: create_order_id(),
+                price: Price::new(price),
+                quantity: Quantity::new(100),
+                side,
+                user_id: Hash32::zero(),
+                timestamp: TimestampMs::new(current_time_millis()),
+                time_in_force: TimeInForce::Gtc,
+                extra_fields: (),
+            })
+            .unwrap();
+        }
+
+        let pegged_id = create_order_id();
+        book.add_order(OrderType::PeggedOrder {
+            id: pegged_id,
+            price: Price::new(base - 10),
+            quantity: Quantity::new(10),
+            side: Side::Buy,
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(current_time_millis()),
+            time_in_force: TimeInForce::Gtc,
+            reference_price_offset: 0,
+            reference_price_type: PegReferenceType::MidPrice,
+            extra_fields: (),
+        })
+        .unwrap();
+
+        assert_eq!(book.reprice_pegged_orders().unwrap(), 1);
+        let order = book.get_order(pegged_id).unwrap();
+        assert_eq!(order.price().as_u128(), base + 2);
+    }
+
     #[test]
     fn test_reprice_pegged_order_best_ask() {
         let book: OrderBook<()> = OrderBook::new("TEST");

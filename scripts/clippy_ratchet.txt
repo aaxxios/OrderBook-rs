@@ -18,4 +18,3 @@ src/orderbook/modifications.rs:arithmetic_side_effects:6
 src/orderbook/sequencer/file_journal.rs:arithmetic_side_effects:20
 src/orderbook/sequencer/file_journal.rs:cast_possible_truncation:4
 src/orderbook/sequencer/file_journal.rs:indexing_slicing:126
-src/orderbook/snapshot.rs:arithmetic_side_effects:2

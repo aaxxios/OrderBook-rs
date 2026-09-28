@@ -285,7 +285,13 @@ fn print_orderbook_state(book: &OrderBook) {
     }
 
     // Volume by price
-    let (bid_volumes, ask_volumes) = book.get_volume_by_price();
+    let (bid_volumes, ask_volumes) = match book.get_volume_by_price() {
+        Ok(volumes) => volumes,
+        Err(err) => {
+            tracing::error!(%err, "volume by price failed");
+            return;
+        }
+    };
     info!("Number of bid price levels: {}", bid_volumes.len());
     info!("Number of ask price levels: {}", ask_volumes.len());
 

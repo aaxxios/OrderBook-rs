@@ -613,7 +613,7 @@ mod tests {
         // Test get_volume_by_price with empty book
         let book = OrderBook::<()>::new("TEST");
 
-        let (bid_volumes, ask_volumes) = book.get_volume_by_price();
+        let (bid_volumes, ask_volumes) = book.get_volume_by_price().unwrap();
         assert!(bid_volumes.is_empty());
         assert!(ask_volumes.is_empty());
     }

@@ -69,19 +69,19 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 110, 20, Side::Sell, TimeInForce::Gtc, None);
 
         // VWAP for buying 10 units should be 100.0
-        let vwap = book.vwap(10, Side::Buy).unwrap();
+        let vwap = book.vwap(10, Side::Buy).unwrap().unwrap();
         assert_eq!(vwap, 100.0);
 
         // VWAP for buying 20 units (10@100 + 10@105) = (1000 + 1050) / 20 = 102.5
-        let vwap = book.vwap(20, Side::Buy).unwrap();
+        let vwap = book.vwap(20, Side::Buy).unwrap().unwrap();
         assert_eq!(vwap, 102.5);
 
         // VWAP for buying 25 units (10@100 + 15@105) = (1000 + 1575) / 25 = 103.0
-        let vwap = book.vwap(25, Side::Buy).unwrap();
+        let vwap = book.vwap(25, Side::Buy).unwrap().unwrap();
         assert_eq!(vwap, 103.0);
 
         // Insufficient liquidity
-        assert_eq!(book.vwap(50, Side::Buy), None);
+        assert_eq!(book.vwap(50, Side::Buy).unwrap(), None);
     }
 
     #[test]
@@ -94,27 +94,27 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 90, 20, Side::Buy, TimeInForce::Gtc, None);
 
         // VWAP for selling 10 units should be 100.0
-        let vwap = book.vwap(10, Side::Sell).unwrap();
+        let vwap = book.vwap(10, Side::Sell).unwrap().unwrap();
         assert_eq!(vwap, 100.0);
 
         // VWAP for selling 20 units (10@100 + 10@95) = (1000 + 950) / 20 = 97.5
-        let vwap = book.vwap(20, Side::Sell).unwrap();
+        let vwap = book.vwap(20, Side::Sell).unwrap().unwrap();
         assert_eq!(vwap, 97.5);
 
         // VWAP for selling 25 units (10@100 + 15@95) = (1000 + 1425) / 25 = 97.0
-        let vwap = book.vwap(25, Side::Sell).unwrap();
+        let vwap = book.vwap(25, Side::Sell).unwrap().unwrap();
         assert_eq!(vwap, 97.0);
 
         // Insufficient liquidity
-        assert_eq!(book.vwap(50, Side::Sell), None);
+        assert_eq!(book.vwap(50, Side::Sell).unwrap(), None);
     }
 
     #[test]
     fn test_vwap_empty_book() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        assert_eq!(book.vwap(10, Side::Buy), None);
-        assert_eq!(book.vwap(10, Side::Sell), None);
+        assert_eq!(book.vwap(10, Side::Buy).unwrap(), None);
+        assert_eq!(book.vwap(10, Side::Sell).unwrap(), None);
     }
 
     #[test]
@@ -123,7 +123,7 @@ mod tests {
 
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
 
-        assert_eq!(book.vwap(0, Side::Buy), None);
+        assert_eq!(book.vwap(0, Side::Buy).unwrap(), None);
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Empty book
-        assert_eq!(book.micro_price(), None);
+        assert_eq!(book.micro_price().unwrap(), None);
 
         // Add orders with equal volumes
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
@@ -139,7 +139,7 @@ mod tests {
 
         // With equal volumes, micro price equals mid price
         // micro = (105 * 50 + 100 * 50) / 100 = 10250 / 100 = 102.5
-        let micro = book.micro_price().unwrap();
+        let micro = book.micro_price().unwrap().unwrap();
         assert_eq!(micro, 102.5);
 
         // Mid price should also be 102.5
@@ -156,7 +156,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 30, Side::Sell, TimeInForce::Gtc, None);
 
         // micro = (105 * 70 + 100 * 30) / 100 = (7350 + 3000) / 100 = 103.5
-        let micro = book.micro_price().unwrap();
+        let micro = book.micro_price().unwrap().unwrap();
         assert_eq!(micro, 103.5);
 
         // Mid price is 102.5, but micro price is higher due to more bid volume
@@ -172,7 +172,7 @@ mod tests {
         // This scenario shouldn't happen in practice, but test for robustness
         // If there are price levels but no volumes, micro_price should return None
         // Since we can't create this state easily, we just test empty book
-        assert_eq!(book.micro_price(), None);
+        assert_eq!(book.micro_price().unwrap(), None);
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 50, Side::Sell, TimeInForce::Gtc, None);
 
         // Imbalance should be 0 for balanced book
-        let imbalance = book.order_book_imbalance(5);
+        let imbalance = book.order_book_imbalance(5).unwrap();
         assert_eq!(imbalance, 0.0);
     }
 
@@ -197,7 +197,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 40, Side::Sell, TimeInForce::Gtc, None);
 
         // Imbalance = (60 - 40) / (60 + 40) = 20 / 100 = 0.2
-        let imbalance = book.order_book_imbalance(5);
+        let imbalance = book.order_book_imbalance(5).unwrap();
         assert_eq!(imbalance, 0.2);
     }
 
@@ -210,7 +210,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 70, Side::Sell, TimeInForce::Gtc, None);
 
         // Imbalance = (30 - 70) / (30 + 70) = -40 / 100 = -0.4
-        let imbalance = book.order_book_imbalance(5);
+        let imbalance = book.order_book_imbalance(5).unwrap();
         assert_eq!(imbalance, -0.4);
     }
 
@@ -228,12 +228,12 @@ mod tests {
 
         // Top 2 levels: bid=10+20=30, ask=15+25=40
         // Imbalance = (30 - 40) / (30 + 40) = -10 / 70 = -0.142857...
-        let imbalance = book.order_book_imbalance(2);
+        let imbalance = book.order_book_imbalance(2).unwrap();
         assert!((imbalance - (-10.0 / 70.0)).abs() < 0.0001);
 
         // Top 3 levels: bid=10+20+30=60, ask=15+25=40
         // Imbalance = (60 - 40) / (60 + 40) = 20 / 100 = 0.2
-        let imbalance = book.order_book_imbalance(3);
+        let imbalance = book.order_book_imbalance(3).unwrap();
         assert_eq!(imbalance, 0.2);
     }
 
@@ -241,7 +241,7 @@ mod tests {
     fn test_order_book_imbalance_empty_book() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        assert_eq!(book.order_book_imbalance(5), 0.0);
+        assert_eq!(book.order_book_imbalance(5).unwrap(), 0.0);
     }
 
     #[test]
@@ -250,7 +250,7 @@ mod tests {
 
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
-        assert_eq!(book.order_book_imbalance(0), 0.0);
+        assert_eq!(book.order_book_imbalance(0).unwrap(), 0.0);
     }
 
     #[test]
@@ -267,11 +267,11 @@ mod tests {
         assert_eq!(book.mid_price(), Some(100.5));
         assert_eq!(book.spread_absolute(), Some(1));
         assert!(book.spread_bps(None).is_some());
-        assert!(book.vwap(50, Side::Buy).is_some());
-        assert!(book.micro_price().is_some());
+        assert!(book.vwap(50, Side::Buy).unwrap().is_some());
+        assert!(book.micro_price().unwrap().is_some());
 
         // Top 1 level: bid=50, ask=30, imbalance = (50-30)/(50+30) = 20/80 = 0.25
-        let imbalance = book.order_book_imbalance(1);
+        let imbalance = book.order_book_imbalance(1).unwrap();
         assert_eq!(imbalance, 0.25);
     }
 }

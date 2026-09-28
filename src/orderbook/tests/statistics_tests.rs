@@ -33,7 +33,7 @@ mod tests {
     fn test_depth_statistics_buy_basic() {
         let book = setup_test_book();
 
-        let stats = book.depth_statistics(Side::Buy, 5);
+        let stats = book.depth_statistics(Side::Buy, 5).unwrap();
 
         assert_eq!(stats.total_volume, 150); // 10 + 20 + 30 + 40 + 50
         assert_eq!(stats.levels_count, 5);
@@ -46,7 +46,7 @@ mod tests {
     fn test_depth_statistics_sell_basic() {
         let book = setup_test_book();
 
-        let stats = book.depth_statistics(Side::Sell, 4);
+        let stats = book.depth_statistics(Side::Sell, 4).unwrap();
 
         assert_eq!(stats.total_volume, 120); // 15 + 25 + 35 + 45
         assert_eq!(stats.levels_count, 4);
@@ -59,7 +59,7 @@ mod tests {
     fn test_depth_statistics_limited_levels() {
         let book = setup_test_book();
 
-        let stats = book.depth_statistics(Side::Buy, 3);
+        let stats = book.depth_statistics(Side::Buy, 3).unwrap();
 
         assert_eq!(stats.total_volume, 60); // 10 + 20 + 30
         assert_eq!(stats.levels_count, 3);
@@ -70,7 +70,7 @@ mod tests {
     fn test_depth_statistics_all_levels() {
         let book = setup_test_book();
 
-        let stats = book.depth_statistics(Side::Buy, 0);
+        let stats = book.depth_statistics(Side::Buy, 0).unwrap();
 
         assert_eq!(stats.total_volume, 150);
         assert_eq!(stats.levels_count, 5);
@@ -80,7 +80,7 @@ mod tests {
     fn test_depth_statistics_empty_book() {
         let book = OrderBook::<()>::new("TEST");
 
-        let stats = book.depth_statistics(Side::Buy, 10);
+        let stats = book.depth_statistics(Side::Buy, 10).unwrap();
 
         assert!(stats.is_empty());
         assert_eq!(stats.total_volume, 0);
@@ -91,7 +91,7 @@ mod tests {
     fn test_depth_statistics_weighted_avg_price() {
         let book = setup_test_book();
 
-        let stats = book.depth_statistics(Side::Buy, 3);
+        let stats = book.depth_statistics(Side::Buy, 3).unwrap();
 
         // Weighted avg = (100*10 + 99*20 + 98*30) / (10 + 20 + 30)
         // = (1000 + 1980 + 2940) / 60 = 5920 / 60 = 98.666...
@@ -102,7 +102,7 @@ mod tests {
     fn test_buy_sell_pressure() {
         let book = setup_test_book();
 
-        let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+        let (buy_pressure, sell_pressure) = book.buy_sell_pressure().unwrap();
 
         assert_eq!(buy_pressure, 150); // 10 + 20 + 30 + 40 + 50
         assert_eq!(sell_pressure, 120); // 15 + 25 + 35 + 45
@@ -112,7 +112,7 @@ mod tests {
     fn test_buy_sell_pressure_empty_book() {
         let book = OrderBook::<()>::new("TEST");
 
-        let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+        let (buy_pressure, sell_pressure) = book.buy_sell_pressure().unwrap();
 
         assert_eq!(buy_pressure, 0);
         assert_eq!(sell_pressure, 0);
@@ -123,7 +123,7 @@ mod tests {
         let book = OrderBook::<()>::new("TEST");
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
-        let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+        let (buy_pressure, sell_pressure) = book.buy_sell_pressure().unwrap();
 
         assert_eq!(buy_pressure, 50);
         assert_eq!(sell_pressure, 0);
@@ -135,14 +135,14 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 5, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 5, Side::Sell, TimeInForce::Gtc, None);
 
-        assert!(book.is_thin_book(100, 10));
+        assert!(book.is_thin_book(100, 10).unwrap());
     }
 
     #[test]
     fn test_is_thin_book_false() {
         let book = setup_test_book();
 
-        assert!(!book.is_thin_book(100, 10));
+        assert!(!book.is_thin_book(100, 10).unwrap());
     }
 
     #[test]
@@ -152,21 +152,21 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 101, 5, Side::Sell, TimeInForce::Gtc, None);
 
         // Sell side is thin
-        assert!(book.is_thin_book(100, 10));
+        assert!(book.is_thin_book(100, 10).unwrap());
     }
 
     #[test]
     fn test_is_thin_book_empty() {
         let book = OrderBook::<()>::new("TEST");
 
-        assert!(book.is_thin_book(1, 10));
+        assert!(book.is_thin_book(1, 10).unwrap());
     }
 
     #[test]
     fn test_depth_distribution_basic() {
         let book = setup_test_book();
 
-        let distribution = book.depth_distribution(Side::Buy, 5);
+        let distribution = book.depth_distribution(Side::Buy, 5).unwrap();
 
         assert_eq!(distribution.len(), 5);
 
@@ -185,7 +185,7 @@ mod tests {
             let _ = book.add_limit_order(new_id(), price, 10, Side::Buy, TimeInForce::Gtc, None);
         }
 
-        let distribution = book.depth_distribution(Side::Buy, 3);
+        let distribution = book.depth_distribution(Side::Buy, 3).unwrap();
 
         assert_eq!(distribution.len(), 3);
 
@@ -198,7 +198,7 @@ mod tests {
     fn test_depth_distribution_zero_bins() {
         let book = setup_test_book();
 
-        let distribution = book.depth_distribution(Side::Buy, 0);
+        let distribution = book.depth_distribution(Side::Buy, 0).unwrap();
 
         assert!(distribution.is_empty());
     }
@@ -207,7 +207,7 @@ mod tests {
     fn test_depth_distribution_empty_book() {
         let book = OrderBook::<()>::new("TEST");
 
-        let distribution = book.depth_distribution(Side::Buy, 5);
+        let distribution = book.depth_distribution(Side::Buy, 5).unwrap();
 
         assert!(distribution.is_empty());
     }
@@ -217,7 +217,7 @@ mod tests {
         let book = OrderBook::<()>::new("TEST");
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
-        let distribution = book.depth_distribution(Side::Buy, 3);
+        let distribution = book.depth_distribution(Side::Buy, 3).unwrap();
 
         assert_eq!(distribution.len(), 3);
 
@@ -235,7 +235,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 99, 10, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 98, 10, Side::Buy, TimeInForce::Gtc, None);
 
-        let distribution = book.depth_distribution(Side::Buy, 2);
+        let distribution = book.depth_distribution(Side::Buy, 2).unwrap();
 
         // Verify level counts
         let total_levels: usize = distribution.iter().map(|bin| bin.level_count).sum();
@@ -251,7 +251,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
 
-        let stats = book.depth_statistics(Side::Buy, 3);
+        let stats = book.depth_statistics(Side::Buy, 3).unwrap();
 
         // Mean = 20, variance = ((10-20)^2 + (20-20)^2 + (30-20)^2) / 3 = 200/3
         // Std dev = sqrt(200/3) ≈ 8.165
@@ -264,7 +264,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
 
-        let imbalance = book.order_book_imbalance(5);
+        let imbalance = book.order_book_imbalance(5).unwrap();
 
         assert!((imbalance - 0.0).abs() < 0.01);
     }
@@ -275,7 +275,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 100, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
 
-        let imbalance = book.order_book_imbalance(5);
+        let imbalance = book.order_book_imbalance(5).unwrap();
 
         // More buy volume, expect positive imbalance
         assert!(imbalance > 0.0);
@@ -287,7 +287,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 30, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 100, Side::Sell, TimeInForce::Gtc, None);
 
-        let imbalance = book.order_book_imbalance(5);
+        let imbalance = book.order_book_imbalance(5).unwrap();
 
         // More sell volume, expect negative imbalance
         assert!(imbalance < 0.0);
@@ -298,19 +298,19 @@ mod tests {
         let book = setup_test_book();
 
         // Get statistics
-        let bid_stats = book.depth_statistics(Side::Buy, 10);
-        let ask_stats = book.depth_statistics(Side::Sell, 10);
+        let bid_stats = book.depth_statistics(Side::Buy, 10).unwrap();
+        let ask_stats = book.depth_statistics(Side::Sell, 10).unwrap();
 
         // Check market conditions
-        let _imbalance = book.order_book_imbalance(5);
-        let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
+        let _imbalance = book.order_book_imbalance(5).unwrap();
+        let (buy_pressure, sell_pressure) = book.buy_sell_pressure().unwrap();
 
         // Verify consistency
         assert_eq!(buy_pressure, bid_stats.total_volume);
         assert_eq!(sell_pressure, ask_stats.total_volume);
 
         // Check thin book
-        let is_thin = book.is_thin_book(1000, 5);
+        let is_thin = book.is_thin_book(1000, 5).unwrap();
         assert!(is_thin); // Total volume is 270, less than 1000
     }
 
@@ -322,7 +322,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 90, 10, Side::Buy, TimeInForce::Gtc, None);
 
-        let distribution = book.depth_distribution(Side::Buy, 2);
+        let distribution = book.depth_distribution(Side::Buy, 2).unwrap();
 
         assert_eq!(distribution.len(), 2);
 

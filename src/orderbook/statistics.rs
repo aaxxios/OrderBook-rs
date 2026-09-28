@@ -9,6 +9,7 @@
 //! their single-writer contract (see `OrderBook`'s "Level statistics are
 //! advisory under concurrent takers").
 
+use super::error::OrderBookError;
 use serde::{Deserialize, Serialize};
 
 /// Depth statistics for one side of the order book
@@ -90,10 +91,19 @@ impl DistributionBin {
         self.min_price.midpoint(self.max_price)
     }
 
-    /// Returns the width of this bin in price units
-    #[must_use]
-    pub fn width(&self) -> u128 {
-        self.max_price.saturating_sub(self.min_price)
+    /// Returns the width of this bin in price units (`max_price - min_price`).
+    ///
+    /// # Errors
+    /// Returns [`OrderBookError::ArithmeticOverflow`] when `max_price <
+    /// min_price` (an inverted bin, only constructible by hand since the
+    /// fields are public; [`OrderBook::depth_distribution`](crate::OrderBook::depth_distribution)
+    /// never builds one). Previously such a bin read as width `0` (#245).
+    pub fn width(&self) -> Result<u128, OrderBookError> {
+        self.max_price
+            .checked_sub(self.min_price)
+            .ok_or(OrderBookError::ArithmeticOverflow {
+                operation: "distribution bin width",
+            })
     }
 }
 
@@ -136,7 +146,21 @@ mod tests {
         };
 
         assert_eq!(bin.midpoint(), 150);
-        assert_eq!(bin.width(), 100);
+        assert_eq!(bin.width().expect("ordered bin"), 100);
+    }
+
+    #[test]
+    fn test_distribution_bin_width_inverted_returns_error() {
+        let bin = DistributionBin {
+            min_price: 200,
+            max_price: 100,
+            volume: 0,
+            level_count: 0,
+        };
+        assert!(matches!(
+            bin.width(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
     }
 
     #[test]

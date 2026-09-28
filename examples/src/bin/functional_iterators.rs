@@ -14,12 +14,22 @@
 //   cargo run --bin functional_iterators
 //   (from the examples directory)
 
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "functional iterators example failed");
+    }
+}
+
+// Since 0.14.0 (#245) every level iterator yields
+// `Result<LevelInfo, OrderBookError>`: a level whose depth overflows is
+// surfaced once as `Err` (and ends the iteration) instead of reading as an
+// empty level. The demos below propagate it with `?`.
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Functional Iterators Example");
@@ -31,22 +41,23 @@ fn main() {
     display_orderbook_state(&book);
 
     // Demonstrate basic iteration
-    demo_basic_iteration(&book);
+    demo_basic_iteration(&book)?;
 
     // Demonstrate lazy evaluation benefits
-    demo_lazy_evaluation(&book);
+    demo_lazy_evaluation(&book)?;
 
     // Demonstrate iterator composition
-    demo_iterator_composition(&book);
+    demo_iterator_composition(&book)?;
 
     // Demonstrate range-based analysis
-    demo_range_analysis(&book);
+    demo_range_analysis(&book)?;
 
     // Demonstrate find operations
-    demo_find_operations(&book);
+    demo_find_operations(&book)?;
 
     // Practical use cases
-    demo_practical_use_cases(&book);
+    demo_practical_use_cases(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
@@ -129,7 +140,7 @@ fn display_orderbook_state(book: &OrderBook) {
     }
 }
 
-fn demo_basic_iteration(book: &OrderBook) {
+fn demo_basic_iteration(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Basic Iteration ===");
     info!("Iterate through levels with cumulative depth tracking");
 
@@ -139,6 +150,7 @@ fn demo_basic_iteration(book: &OrderBook) {
         .take(5)
         .enumerate()
     {
+        let level = level?;
         info!(
             "  Level {}: Price={}, Qty={}, Cumulative={}",
             i + 1,
@@ -154,6 +166,7 @@ fn demo_basic_iteration(book: &OrderBook) {
         .take(5)
         .enumerate()
     {
+        let level = level?;
         info!(
             "  Level {}: Price={}, Qty={}, Cumulative={}",
             i + 1,
@@ -162,15 +175,17 @@ fn demo_basic_iteration(book: &OrderBook) {
             level.cumulative_depth
         );
     }
+    Ok(())
 }
 
-fn demo_lazy_evaluation(book: &OrderBook) {
+fn demo_lazy_evaluation(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Lazy Evaluation Benefits ===");
     info!("Iterators don't allocate memory upfront");
 
     // Example 1: Early termination
     info!("\n1. Find first level with >20 units (short-circuits early):");
     for level in book.levels_with_cumulative_depth(Side::Buy) {
+        let level = level?;
         if level.quantity > 20 {
             info!("  Found: {} units @ {}", level.quantity, level.price);
             info!("  Stopped early without processing remaining levels");
@@ -180,42 +195,54 @@ fn demo_lazy_evaluation(book: &OrderBook) {
 
     // Example 2: Automatic depth limit
     info!("\n2. Process only until 100 units accumulated:");
-    let count = book.levels_until_depth(100, Side::Buy).count();
+    let mut count = 0usize;
+    for level in book.levels_until_depth(100, Side::Buy) {
+        level?;
+        count += 1;
+    }
     info!("  Processed {} levels to reach 100 units", count);
     info!("  Remaining levels were never touched (efficient!)");
 
     // Example 3: No vector allocation
     info!("\n3. Calculate total without allocating vectors:");
-    let total: u64 = book
-        .levels_with_cumulative_depth(Side::Buy)
-        .take(5)
-        .map(|level| level.quantity)
-        .sum();
+    // The cumulative depth of the 5th level is the top-5 total, already
+    // checked by the iterator.
+    let mut total = 0u64;
+    for level in book.levels_with_cumulative_depth(Side::Buy).take(5) {
+        total = level?.cumulative_depth;
+    }
     info!(
         "  Total quantity in top 5 levels: {} (no intermediate allocations)",
         total
     );
+    Ok(())
 }
 
-fn demo_iterator_composition(book: &OrderBook) {
+fn demo_iterator_composition(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Iterator Composition ===");
     info!("Chain multiple operations elegantly");
 
     // Example 1: Filter and map
     info!("\n1. Filter levels with >15 units, sum their quantities:");
-    let total: u64 = book
-        .levels_with_cumulative_depth(Side::Buy)
-        .filter(|level| level.quantity > 15)
-        .map(|level| level.quantity)
-        .sum();
+    let mut total = 0u64;
+    for level in book.levels_with_cumulative_depth(Side::Buy) {
+        let level = level?;
+        if level.quantity > 15 {
+            total += level.quantity;
+        }
+    }
     info!("  Total of large orders: {}", total);
 
     // Example 2: Take while condition
     info!("\n2. Take levels while cumulative depth < 50:");
-    let levels: Vec<_> = book
-        .levels_with_cumulative_depth(Side::Buy)
-        .take_while(|level| level.cumulative_depth < 50)
-        .collect();
+    let mut levels = Vec::new();
+    for level in book.levels_with_cumulative_depth(Side::Buy) {
+        let level = level?;
+        if level.cumulative_depth >= 50 {
+            break;
+        }
+        levels.push(level);
+    }
     info!(
         "  Collected {} levels before reaching 50 units",
         levels.len()
@@ -223,9 +250,12 @@ fn demo_iterator_composition(book: &OrderBook) {
 
     // Example 3: Complex pipeline
     info!("\n3. Complex analysis pipeline:");
-    let avg = book
+    let top5 = book
         .levels_with_cumulative_depth(Side::Buy)
         .take(5)
+        .collect::<Result<Vec<_>, _>>()?;
+    let avg = top5
+        .iter()
         .filter(|level| level.quantity >= 10)
         .map(|level| level.quantity as f64)
         .sum::<f64>()
@@ -234,19 +264,20 @@ fn demo_iterator_composition(book: &OrderBook) {
 
     // Example 4: Find and enumerate
     info!("\n4. Enumerate and find specific condition:");
-    if let Some((idx, level)) = book
-        .levels_with_cumulative_depth(Side::Sell)
-        .enumerate()
-        .find(|(_, level)| level.cumulative_depth > 30)
-    {
-        info!(
-            "  First level with cumulative >30: index={}, price={}",
-            idx, level.price
-        );
+    for (idx, level) in book.levels_with_cumulative_depth(Side::Sell).enumerate() {
+        let level = level?;
+        if level.cumulative_depth > 30 {
+            info!(
+                "  First level with cumulative >30: index={}, price={}",
+                idx, level.price
+            );
+            break;
+        }
     }
+    Ok(())
 }
 
-fn demo_range_analysis(book: &OrderBook) {
+fn demo_range_analysis(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Range-Based Analysis ===");
     info!("Analyze specific price bands efficiently");
 
@@ -259,43 +290,52 @@ fn demo_range_analysis(book: &OrderBook) {
     ];
 
     for (min, max, desc) in ranges {
-        let total: u64 = book
-            .levels_in_range(min, max, Side::Buy)
-            .map(|level| level.quantity)
-            .sum();
+        let mut total = 0u64;
+        for level in book.levels_in_range(min, max, Side::Buy) {
+            total += level?.quantity;
+        }
         info!("  {}: {} units ({}-{})", desc, total, min, max);
     }
 
     // Example 2: Level count in range
     info!("\n2. Count levels in ranges:");
-    let count_near = book.levels_in_range(49900, 50000, Side::Buy).count();
-    let count_mid = book.levels_in_range(49700, 49900, Side::Buy).count();
+    let count_near = book
+        .levels_in_range(49900, 50000, Side::Buy)
+        .collect::<Result<Vec<_>, _>>()?
+        .len();
+    let count_mid = book
+        .levels_in_range(49700, 49900, Side::Buy)
+        .collect::<Result<Vec<_>, _>>()?
+        .len();
     info!("  Near touch (49900-50000): {} levels", count_near);
     info!("  Mid depth (49700-49900): {} levels", count_mid);
 
     // Example 3: Average size in range
     info!("\n3. Average order size in range:");
-    let levels: Vec<_> = book.levels_in_range(49700, 50000, Side::Buy).collect();
+    let levels = book
+        .levels_in_range(49700, 50000, Side::Buy)
+        .collect::<Result<Vec<_>, _>>()?;
     if !levels.is_empty() {
         let total: u64 = levels.iter().map(|l| l.quantity).sum();
         let avg = total as f64 / levels.len() as f64;
         info!("  Range 49700-50000: {:.2} units avg", avg);
     }
+    Ok(())
 }
 
-fn demo_find_operations(book: &OrderBook) {
+fn demo_find_operations(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Find Operations ===");
     info!("Search with custom predicates");
 
     // Example 1: Find by quantity threshold
     info!("\n1. Find first level with quantity > 25:");
-    if let Some(level) = book.find_level(Side::Buy, |info| info.quantity > 25) {
+    if let Some(level) = book.find_level(Side::Buy, |info| info.quantity > 25)? {
         info!("  Found: {} units @ {}", level.quantity, level.price);
     }
 
     // Example 2: Find by cumulative depth
     info!("\n2. Find where cumulative depth reaches 100:");
-    if let Some(level) = book.find_level(Side::Buy, |info| info.cumulative_depth >= 100) {
+    if let Some(level) = book.find_level(Side::Buy, |info| info.cumulative_depth >= 100)? {
         info!(
             "  Reached @ price={}, cumulative={}",
             level.price, level.cumulative_depth
@@ -304,7 +344,7 @@ fn demo_find_operations(book: &OrderBook) {
 
     // Example 3: Find by price condition
     info!("\n3. Find first level below 49800:");
-    if let Some(level) = book.find_level(Side::Buy, |info| info.price < 49800) {
+    if let Some(level) = book.find_level(Side::Buy, |info| info.price < 49800)? {
         info!(
             "  Found: price={}, quantity={}",
             level.price, level.quantity
@@ -315,21 +355,24 @@ fn demo_find_operations(book: &OrderBook) {
     info!("\n4. Find level with quantity >20 AND cumulative >50:");
     if let Some(level) = book.find_level(Side::Buy, |info| {
         info.quantity > 20 && info.cumulative_depth > 50
-    }) {
+    })? {
         info!(
             "  Found: qty={}, cumulative={}, @ {}",
             level.quantity, level.cumulative_depth, level.price
         );
     }
+    Ok(())
 }
 
-fn demo_practical_use_cases(book: &OrderBook) {
+fn demo_practical_use_cases(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Practical Use Cases ===");
 
     // Use case 1: Execution planning
     info!("\n1. Execution Planning:");
     info!("   How many levels needed to fill 150 units?");
-    let levels: Vec<_> = book.levels_until_depth(150, Side::Buy).collect();
+    let levels = book
+        .levels_until_depth(150, Side::Buy)
+        .collect::<Result<Vec<_>, _>>()?;
     info!("   → Need to consume {} price levels", levels.len());
     if let Some(last) = levels.last() {
         info!("   → Worst execution price: {}", last.price);
@@ -344,9 +387,12 @@ fn demo_practical_use_cases(book: &OrderBook) {
         (50, 100, "Next 50 units"),
     ];
 
+    let all_bids = book
+        .levels_with_cumulative_depth(Side::Buy)
+        .collect::<Result<Vec<_>, _>>()?;
     for (start, end, desc) in ranges {
-        let levels: Vec<_> = book
-            .levels_with_cumulative_depth(Side::Buy)
+        let levels: Vec<_> = all_bids
+            .iter()
             .skip_while(|l| l.cumulative_depth <= start)
             .take_while(|l| l.cumulative_depth <= end)
             .collect();
@@ -369,8 +415,11 @@ fn demo_practical_use_cases(book: &OrderBook) {
     let sizes = vec![25, 50, 100, 200];
 
     for size in sizes {
-        if let Some(last_level) = book.levels_until_depth(size, Side::Buy).last() {
-            let best_bid = book.best_bid().unwrap();
+        let mut last_level = None;
+        for level in book.levels_until_depth(size, Side::Buy) {
+            last_level = Some(level?);
+        }
+        if let (Some(last_level), Some(best_bid)) = (last_level, book.best_bid()) {
             let slippage = best_bid - last_level.price;
             let slippage_pct = (slippage as f64 / best_bid as f64) * 100.0;
 
@@ -388,16 +437,17 @@ fn demo_practical_use_cases(book: &OrderBook) {
     let depth_at_5 = book
         .levels_with_cumulative_depth(Side::Buy)
         .nth(4)
+        .transpose()?
         .map(|l| l.cumulative_depth)
         .unwrap_or(0);
 
     info!("   Depth at 5th level: {} units", depth_at_5);
 
     // Average spread between levels
-    let levels: Vec<_> = book
+    let levels = book
         .levels_with_cumulative_depth(Side::Buy)
         .take(5)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     if levels.len() >= 2 {
         let spreads: Vec<u128> = levels.windows(2).map(|w| w[0].price - w[1].price).collect();
@@ -410,8 +460,11 @@ fn demo_practical_use_cases(book: &OrderBook) {
     let target_size = 75;
 
     // Check if we can fill without excessive slippage
-    if let Some(last_level) = book.levels_until_depth(target_size, Side::Buy).last() {
-        let best = book.best_bid().unwrap();
+    let mut last_level = None;
+    for level in book.levels_until_depth(target_size, Side::Buy) {
+        last_level = Some(level?);
+    }
+    if let (Some(last_level), Some(best)) = (last_level, book.best_bid()) {
         let slippage_bps = ((best - last_level.price) as f64 / best as f64) * 10000.0;
 
         info!("   Target order: {} units", target_size);
@@ -432,4 +485,6 @@ fn demo_practical_use_cases(book: &OrderBook) {
     info!("  • Composable - chain operations elegantly");
     info!("  • Short-circuit - stop early when condition met");
     info!("  • Expressive - readable functional style");
+    info!("  • Fail-fast - a level error surfaces once as `Err`");
+    Ok(())
 }

@@ -262,7 +262,13 @@ fn print_order_book_state(order_book: &OrderBook<OrderMetadata>) {
     let all_orders = order_book.get_all_orders();
     info!("Total Orders: {}", all_orders.len());
 
-    let (bid_volumes, ask_volumes) = order_book.get_volume_by_price();
+    let (bid_volumes, ask_volumes) = match order_book.get_volume_by_price() {
+        Ok(volumes) => volumes,
+        Err(err) => {
+            tracing::error!(%err, "volume by price failed");
+            return;
+        }
+    };
     info!("Bid Price Levels: {}", bid_volumes.len());
     info!("Ask Price Levels: {}", ask_volumes.len());
 
