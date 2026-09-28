@@ -7,9 +7,10 @@
 //! depth gauge updates as a side effect of every add / cancel).
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use orderbook_rs::orderbook::manager::{BookManager, BookManagerStd, BookManagerTokio};
 use orderbook_rs::orderbook::metrics::{
-    DEPTH_LEVELS_ASK, DEPTH_LEVELS_BID, REJECTS_TOTAL, RESERVE_DISCARDS_TOTAL,
-    RESERVE_HIDDEN_DISCARDED_TOTAL, TRADES_TOTAL,
+    DEPTH_LEVELS_ASK, DEPTH_LEVELS_BID, MANAGER_TRADE_EVENTS_DROPPED_TOTAL, REJECTS_TOTAL,
+    RESERVE_DISCARDS_TOTAL, RESERVE_HIDDEN_DISCARDED_TOTAL, TRADES_TOTAL,
 };
 use orderbook_rs::{OrderBook, StubClock};
 use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
@@ -453,5 +454,55 @@ fn reserve_discard_counters_ignore_a_replenishing_maker() {
         counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL),
         quantity_before,
         "a refreshed maker must not count discarded quantity"
+    );
+}
+
+/// Cross one resting sell with a market buy: exactly one trade event.
+fn cross_once(book: &OrderBook<()>) {
+    book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        .expect("rest maker");
+    book.submit_market_order(new_id(), 10, Side::Buy)
+        .expect("cross maker");
+}
+
+#[test]
+fn manager_dropped_trade_events_counter_tracks_both_managers() {
+    let _guard = serialized_test_lock().lock().expect("serialized lock");
+    install_recorder();
+    let before = counter_value(MANAGER_TRADE_EVENTS_DROPPED_TOTAL);
+
+    // Std: a trade after the processor stopped is dropped and counted.
+    let mut std_mgr: BookManagerStd<()> = BookManagerStd::new();
+    std_mgr.add_book("MGR-STD").expect("add book");
+    std_mgr.start_trade_processor().expect("start");
+    cross_once(std_mgr.get_book("MGR-STD").expect("book"));
+    std_mgr.stop_trade_processor().expect("stop");
+    assert_eq!(
+        counter_value(MANAGER_TRADE_EVENTS_DROPPED_TOTAL),
+        before,
+        "a delivered event is not a drop"
+    );
+    cross_once(std_mgr.get_book("MGR-STD").expect("book"));
+    assert_eq!(std_mgr.dropped_trade_events(), 1);
+    assert_eq!(
+        counter_value(MANAGER_TRADE_EVENTS_DROPPED_TOTAL),
+        before + 1
+    );
+
+    // Tokio: same contract.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut tokio_mgr: BookManagerTokio<()> = BookManagerTokio::new();
+    tokio_mgr.add_book("MGR-TOKIO").expect("add book");
+    runtime.block_on(async {
+        tokio_mgr.start_trade_processor().expect("start");
+        tokio_mgr.stop_trade_processor().await.expect("stop");
+    });
+    cross_once(tokio_mgr.get_book("MGR-TOKIO").expect("book"));
+    assert_eq!(tokio_mgr.dropped_trade_events(), 1);
+    assert_eq!(
+        counter_value(MANAGER_TRADE_EVENTS_DROPPED_TOTAL),
+        before + 2
     );
 }

@@ -541,7 +541,8 @@ impl From<crate::orderbook::serialization::SerializationError> for OrderBookErro
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ManagerError {
-    /// Trade processor has already been started
+    /// Trade processor has already been started. A processor that was
+    /// since stopped counts as started: it cannot be restarted.
     ProcessorAlreadyStarted,
 
     /// An order book already exists for the symbol; `add_book` refuses to
@@ -551,6 +552,42 @@ pub enum ManagerError {
         /// The symbol that already has a book.
         symbol: String,
     },
+
+    /// `BookManagerTokio` was asked to start its trade processor from a
+    /// thread that is not inside a Tokio runtime (#255). Nothing was
+    /// consumed: the manager can start the processor later from inside a
+    /// runtime, or through `start_trade_processor_on` with an explicit
+    /// runtime handle.
+    NoRuntime,
+
+    /// The operating system refused to spawn the `BookManagerStd` trade
+    /// processor thread (#255). Nothing was consumed: the manager can retry
+    /// the start.
+    ThreadSpawn {
+        /// Kind of the underlying `std::io::Error`.
+        kind: std::io::ErrorKind,
+        /// Display text of the underlying `std::io::Error`.
+        message: String,
+    },
+
+    /// `stop_trade_processor` was called while no trade processor is
+    /// running: it was never started, or it was already stopped (#255).
+    ProcessorNotRunning,
+
+    /// The trade processor panicked (#255). Reported by
+    /// `stop_trade_processor` when it joins the thread (`BookManagerStd`) or
+    /// awaits the task (`BookManagerTokio`). The panic can only come from caller-supplied
+    /// code: the handler given to `start_trade_processor_with`, or the
+    /// installed `tracing` subscriber.
+    ProcessorPanicked {
+        /// The panic payload when it is a string, otherwise a placeholder.
+        message: String,
+    },
+
+    /// The Tokio trade processor task was cancelled before it finished
+    /// (#255), for example because its runtime shut down. Reported by
+    /// `BookManagerTokio::stop_trade_processor`.
+    ProcessorCancelled,
 }
 
 impl fmt::Display for ManagerError {
@@ -561,6 +598,24 @@ impl fmt::Display for ManagerError {
             }
             ManagerError::BookAlreadyExists { symbol } => {
                 write!(f, "order book already exists for symbol: {symbol}")
+            }
+            ManagerError::NoRuntime => {
+                write!(f, "no Tokio runtime available to start the trade processor")
+            }
+            ManagerError::ThreadSpawn { kind, message } => {
+                write!(
+                    f,
+                    "failed to spawn trade processor thread ({kind:?}): {message}"
+                )
+            }
+            ManagerError::ProcessorNotRunning => {
+                write!(f, "trade processor is not running")
+            }
+            ManagerError::ProcessorPanicked { message } => {
+                write!(f, "trade processor panicked: {message}")
+            }
+            ManagerError::ProcessorCancelled => {
+                write!(f, "trade processor task was cancelled")
             }
         }
     }
@@ -825,5 +880,39 @@ mod tests {
                 ref actual
             }) if expected == "hash1" && actual == "hash2"
         ));
+    }
+
+    #[test]
+    fn test_manager_error_lifecycle_variants_display_issue_255() {
+        let cases = [
+            (
+                ManagerError::NoRuntime,
+                "no Tokio runtime available to start the trade processor",
+            ),
+            (
+                ManagerError::ThreadSpawn {
+                    kind: std::io::ErrorKind::WouldBlock,
+                    message: "resource temporarily unavailable".to_string(),
+                },
+                "failed to spawn trade processor thread (WouldBlock): resource temporarily unavailable",
+            ),
+            (
+                ManagerError::ProcessorNotRunning,
+                "trade processor is not running",
+            ),
+            (
+                ManagerError::ProcessorPanicked {
+                    message: "boom".to_string(),
+                },
+                "trade processor panicked: boom",
+            ),
+            (
+                ManagerError::ProcessorCancelled,
+                "trade processor task was cancelled",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.clone().to_string(), expected);
+        }
     }
 }

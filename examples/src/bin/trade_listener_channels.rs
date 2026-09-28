@@ -94,8 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager.add_book(symbol).expect("add book");
     }
 
-    // Start the trade processor
-    let _processor_handle = manager.start_trade_processor();
+    // Start the trade processor (typed error if the OS refuses the thread)
+    manager.start_trade_processor()?;
 
     // Add liquidity to all books
     for symbol in &symbols {
@@ -128,13 +128,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Wait a bit more for all events to be processed
-    thread::sleep(Duration::from_secs(1));
+    // Stop the trade processor: it handles every queued trade event, then
+    // the thread is joined. A panicked processor comes back as a typed error.
+    manager.stop_trade_processor()?;
+    info!(
+        dropped = manager.dropped_trade_events(),
+        "Trade processor stopped"
+    );
 
     info!("Example completed successfully");
-
-    // Note: In a real application, you'd want to gracefully shutdown
-    // the trade processor thread, but for this example we'll just let it finish
 
     Ok(())
 }

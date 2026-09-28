@@ -34,6 +34,11 @@
 //!   a fill larger than the maker's tracked remainder, or a post-trade
 //!   counter increment that would overflow. Each one is also logged and
 //!   counted in `RiskState::accounting_anomalies`.
+//! - `orderbook_manager_trade_events_dropped_total` — counter,
+//!   incremented whenever a `BookManagerStd` / `BookManagerTokio` trade
+//!   listener cannot hand a trade event to the manager's processor
+//!   because the processor is gone (shut down, or panicked) (#255). Each
+//!   one is also counted in the manager's `dropped_trade_events()`.
 //!
 //! # Determinism
 //!
@@ -134,6 +139,10 @@ pub fn record_trade_ids_exhausted() {
 #[inline]
 #[cfg(not(feature = "metrics"))]
 pub fn record_trade_ids_exhausted() {}
+
+/// Counter name: trade events a book manager could not deliver to its
+/// trade processor (#255).
+pub const MANAGER_TRADE_EVENTS_DROPPED_TOTAL: &str = "orderbook_manager_trade_events_dropped_total";
 
 /// Record an order rejection.
 ///
@@ -237,6 +246,23 @@ pub fn record_risk_accounting_anomaly() {
 #[cfg(not(feature = "metrics"))]
 pub fn record_risk_accounting_anomaly() {}
 
+/// Record one trade event a book manager could not deliver to its trade
+/// processor (#255).
+///
+/// Increments `orderbook_manager_trade_events_dropped_total` by 1. Called
+/// from the manager's trade listener only when the channel send fails.
+/// Compiles to a no-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(feature = "metrics")]
+pub fn record_manager_trade_event_dropped() {
+    metrics::counter!(MANAGER_TRADE_EVENTS_DROPPED_TOTAL).increment(1);
+}
+
+/// No-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(not(feature = "metrics"))]
+pub fn record_manager_trade_event_dropped() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +284,6 @@ mod tests {
         record_reserve_hidden_discarded(0);
         record_reserve_hidden_discarded(20);
         record_risk_accounting_anomaly();
+        record_manager_trade_event_dropped();
     }
 }

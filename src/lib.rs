@@ -138,6 +138,15 @@
 //!   replay (`snapshots_match`) stays exact. Capture with no sweep in flight
 //!   for exact statistics. No behaviour or API change. See
 //!   `doc/panic-boundaries.md`.
+//! - **Book managers are runtime-safe and stoppable (#255).**
+//!   `BookManagerTokio::start_trade_processor` returns
+//!   `ManagerError::NoRuntime` outside a Tokio runtime instead of panicking,
+//!   and `BookManagerStd` reports a refused thread as
+//!   `ManagerError::ThreadSpawn`. Both managers gain
+//!   `start_trade_processor_with(handler)`, `stop_trade_processor()` (joins
+//!   or awaits the processor after it handles queued events; a panic is
+//!   `ProcessorPanicked`) and `dropped_trade_events()`, plus the
+//!   `orderbook_manager_trade_events_dropped_total` metric.
 //!
 //! ### Migration from 0.13
 //!
@@ -153,6 +162,9 @@
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 //! | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |
+//! | `BookManagerStd::start_trade_processor() -> Result<std::thread::JoinHandle<()>, ManagerError>` | `-> Result<(), ManagerError>`; join with `stop_trade_processor()` |
+//! | `BookManagerTokio::start_trade_processor() -> Result<tokio::task::JoinHandle<()>, ManagerError>` (panics outside a runtime) | `-> Result<(), ManagerError>` (`NoRuntime` outside a runtime); await `stop_trade_processor()` |
+//! | `ManagerError { ProcessorAlreadyStarted, BookAlreadyExists }` | adds `NoRuntime`, `ThreadSpawn`, `ProcessorNotRunning`, `ProcessorPanicked`, `ProcessorCancelled` |
 //! | `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
 //! | `BlackScholes::{price, vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
 //! | `BlackScholes::d1(spot, strike, rate, time, vol) -> f64` | `-> Result<f64, IVError>` |
