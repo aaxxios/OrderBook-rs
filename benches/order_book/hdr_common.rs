@@ -26,6 +26,20 @@ pub fn new_histogram() -> Histogram<u64> {
 ///
 /// Uses `std::hint::black_box` on the closure result to prevent
 /// dead-code elimination of the observed work.
+///
+/// # When NOT to use this (issue #258)
+///
+/// `record` pays one `Instant::now()` pair per call. On this host class
+/// (Apple silicon) the monotonic clock's tick resolution is about
+/// 41.67 ns — measurably close to, or below, the cost of some of this
+/// suite's single operations (`cancel_only`, `aggressive_walk`,
+/// `notional_walk`, `thin_book_sweep`, the thin `reserve_sweep_*`
+/// scenarios). Below that floor `record` does not measure the
+/// operation, it measures the clock: the reported histogram is a
+/// quantization artifact (a p50 that lands exactly on `41` or `83` ns
+/// with zero jitter run to run is the tell). Use [`record_batch`]
+/// instead for any scenario whose per-op cost is at or near the host's
+/// tick resolution.
 #[inline(always)]
 pub fn record<F, R>(h: &mut Histogram<u64>, f: F) -> R
 where
@@ -38,6 +52,45 @@ where
     // operations that always exceed a few hundred ns.
     h.record(elapsed.max(1)).expect("record");
     r
+}
+
+/// Time a batch of `k` closure invocations with a *single* `Instant`
+/// pair and record the per-op average (`elapsed_ns / k`) into `h`
+/// (issue #258).
+///
+/// `f` is called `k` times, indexed `0..k`, so the caller can vary the
+/// op per call (e.g. cancel a different pre-loaded id each time). Use
+/// this instead of [`record`] whenever a single invocation of the
+/// operation under test is at or below the host's clock-tick
+/// resolution (about 42 ns on Apple silicon): a per-op `Instant::now()`
+/// pair at that scale reports the tick, not the operation. Batching
+/// amortizes the timer call over `k` ops so the reported value tracks
+/// the operation's real cost.
+///
+/// # Trade-off
+///
+/// The value recorded is a per-op *average over the batch*, not that
+/// batch's own per-op tail — a slow outlier among the `k` calls is
+/// smeared across the average rather than surfacing as its own sample.
+/// This is a deliberate, documented loss of single-op tail fidelity in
+/// exchange for a real (non-quantized) measurement; see `BENCH.md`
+/// "Methodology" for which scenarios this applies to and why. Prefer
+/// [`record`] whenever the op is comfortably above the tick (hundreds
+/// of ns or more) so the tail stays op-level.
+#[inline(always)]
+pub fn record_batch<F>(h: &mut Histogram<u64>, k: u64, mut f: F)
+where
+    F: FnMut(u64),
+{
+    debug_assert!(k > 0, "batch size must be positive");
+    let t0 = Instant::now();
+    for i in 0..k {
+        f(i);
+        std::hint::black_box(());
+    }
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    let per_op = elapsed.checked_div(k).unwrap_or(elapsed).max(1);
+    h.record(per_op).expect("record");
 }
 
 /// Print a fixed-format summary block to stdout. Matches what

@@ -1,43 +1,60 @@
-use criterion::{BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion};
 use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
 use uuid::Uuid;
 
 /// Register all benchmarks for updating orders in an order book
+///
+/// # Methodology (issue #258)
+///
+/// Every group here used to build a fresh 100-order book *inside*
+/// `b.iter`, collect the ids to touch, and drop the book at the end of
+/// the same closure — so the reported number was book construction +
+/// id collection + N cancels/updates + book teardown, not the N ops.
+/// `iter_batched_ref` builds the book and pre-collects the target ids in
+/// the unmeasured `setup` closure and takes `(book, ids)` by `&mut` in
+/// `routine`, so the book's drop also lands outside the measurement
+/// window — only the N `cancel_order` / `update_order` calls are timed.
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Update Orders");
 
     // Benchmark canceling orders
     group.bench_function("cancel_orders", |b| {
-        b.iter(|| {
-            let order_book = setup_order_book_with_orders(100);
-            let ids = collect_order_ids(&order_book, 50);
-
-            // Cancel half of the orders
-            for id in ids {
-                let _ = black_box(order_book.cancel_order(id));
-            }
-        })
+        b.iter_batched_ref(
+            || {
+                let order_book = setup_order_book_with_orders(100);
+                let ids = collect_order_ids(&order_book, 50);
+                (order_book, ids)
+            },
+            |(order_book, ids)| {
+                for id in ids.iter() {
+                    let _ = black_box(order_book.cancel_order(*id));
+                }
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // Benchmark updating order quantities
     group.bench_function("update_quantities", |b| {
-        b.iter(|| {
-            let order_book = setup_order_book_with_orders(100);
-            let ids = collect_order_ids(&order_book, 50);
-
-            // Update the quantities of half the orders
-            for id in ids {
-                // You would need to implement a proper way to update quantities
-                // This is just a placeholder based on the OrderBook API
-                let update = pricelevel::OrderUpdate::UpdateQuantity {
-                    order_id: id,
-                    new_quantity: pricelevel::Quantity::new(20),
-                };
-                let _ = black_box(order_book.update_order(update));
-            }
-        })
+        b.iter_batched_ref(
+            || {
+                let order_book = setup_order_book_with_orders(100);
+                let ids = collect_order_ids(&order_book, 50);
+                (order_book, ids)
+            },
+            |(order_book, ids)| {
+                for id in ids.iter() {
+                    let update = pricelevel::OrderUpdate::UpdateQuantity {
+                        order_id: *id,
+                        new_quantity: pricelevel::Quantity::new(20),
+                    };
+                    let _ = black_box(order_book.update_order(update));
+                }
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // Parametrized benchmark with different order counts for cancellation
@@ -46,15 +63,19 @@ pub fn register_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("cancel_order_count_scaling", order_count),
             order_count,
             |b, &order_count| {
-                b.iter(|| {
-                    let order_book = setup_order_book_with_orders(order_count);
-                    let ids = collect_order_ids(&order_book, order_count / 4);
-
-                    // Cancel 25% of orders
-                    for id in ids {
-                        let _ = black_box(order_book.cancel_order(id));
-                    }
-                })
+                b.iter_batched_ref(
+                    || {
+                        let order_book = setup_order_book_with_orders(order_count);
+                        let ids = collect_order_ids(&order_book, order_count / 4);
+                        (order_book, ids)
+                    },
+                    |(order_book, ids)| {
+                        for id in ids.iter() {
+                            let _ = black_box(order_book.cancel_order(*id));
+                        }
+                    },
+                    BatchSize::SmallInput,
+                )
             },
         );
     }

@@ -1,4 +1,4 @@
-use criterion::Criterion;
+use criterion::{BatchSize, Criterion};
 use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
@@ -9,133 +9,150 @@ fn new_id() -> Id {
 }
 
 /// Register benchmarks for mixed/realistic order book operations
+///
+/// # Methodology (issue #258)
+///
+/// Both scenarios below are intentionally a *composite* operation (a
+/// whole multi-phase trading session run against a fresh book) rather
+/// than a single call — that composite is "the operation under test"
+/// here. What was wrong was that `OrderBook::new` (setup) and the final
+/// drop of the book (teardown, `Phase 5`'s snapshot notwithstanding)
+/// were folded into the same `b.iter` closure as the scenario itself.
+/// `iter_batched_ref` moves the (cheap) book construction into the
+/// unmeasured `setup` closure and takes it by `&mut` in `routine`, so
+/// its drop also lands outside the measurement window — only the
+/// phases below are timed.
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Mixed Operations");
 
     // Benchmark a realistic trading scenario with mixed operations
     group.bench_function("realistic_trading_scenario", |b| {
-        b.iter(|| {
-            let order_book: OrderBook = OrderBook::new("TEST-SYMBOL");
-
-            // Phase 1: Add initial orders on both sides of the book
-            for i in 0..50 {
-                let bid_id = new_id();
-                let ask_id = new_id();
-                let _ = black_box(order_book.add_limit_order(
-                    bid_id,
-                    990 + i % 10,
-                    10,
-                    Side::Buy,
-                    TimeInForce::Gtc,
-                    None,
-                ));
-                let _ = black_box(order_book.add_limit_order(
-                    ask_id,
-                    1010 + i % 10,
-                    10,
-                    Side::Sell,
-                    TimeInForce::Gtc,
-                    None,
-                ));
-            }
-
-            // Phase 2: Add some iceberg orders
-            for _i in 0..10 {
-                let bid_id = new_id();
-                let ask_id = new_id();
-                let _ = black_box(order_book.add_iceberg_order(
-                    bid_id,
-                    985,
-                    5,
-                    15,
-                    Side::Buy,
-                    TimeInForce::Gtc,
-                    None,
-                ));
-                let _ = black_box(order_book.add_iceberg_order(
-                    ask_id,
-                    1015,
-                    5,
-                    15,
-                    Side::Sell,
-                    TimeInForce::Gtc,
-                    None,
-                ));
-            }
-
-            // Phase 3: Execute some market orders
-            for i in 0..5 {
-                let market_id = new_id();
-                let _ = black_box(order_book.submit_market_order(
-                    market_id,
-                    50,
-                    if i % 2 == 0 { Side::Buy } else { Side::Sell },
-                ));
-            }
-
-            // Phase 4: Cancel some orders
-            let all_orders = order_book.get_all_orders();
-            for (i, order) in all_orders.iter().enumerate() {
-                if i % 5 == 0 {
-                    let _ = black_box(order_book.cancel_order(order.id()));
+        b.iter_batched_ref(
+            || -> OrderBook { OrderBook::new("TEST-SYMBOL") },
+            |order_book| {
+                // Phase 1: Add initial orders on both sides of the book
+                for i in 0..50 {
+                    let bid_id = new_id();
+                    let ask_id = new_id();
+                    let _ = black_box(order_book.add_limit_order(
+                        bid_id,
+                        990 + i % 10,
+                        10,
+                        Side::Buy,
+                        TimeInForce::Gtc,
+                        None,
+                    ));
+                    let _ = black_box(order_book.add_limit_order(
+                        ask_id,
+                        1010 + i % 10,
+                        10,
+                        Side::Sell,
+                        TimeInForce::Gtc,
+                        None,
+                    ));
                 }
-            }
 
-            // Phase 5: Create a snapshot
-            black_box(order_book.create_snapshot(5).expect("snapshot"));
-        })
+                // Phase 2: Add some iceberg orders
+                for _i in 0..10 {
+                    let bid_id = new_id();
+                    let ask_id = new_id();
+                    let _ = black_box(order_book.add_iceberg_order(
+                        bid_id,
+                        985,
+                        5,
+                        15,
+                        Side::Buy,
+                        TimeInForce::Gtc,
+                        None,
+                    ));
+                    let _ = black_box(order_book.add_iceberg_order(
+                        ask_id,
+                        1015,
+                        5,
+                        15,
+                        Side::Sell,
+                        TimeInForce::Gtc,
+                        None,
+                    ));
+                }
+
+                // Phase 3: Execute some market orders
+                for i in 0..5 {
+                    let market_id = new_id();
+                    let _ = black_box(order_book.submit_market_order(
+                        market_id,
+                        50,
+                        if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    ));
+                }
+
+                // Phase 4: Cancel some orders
+                let all_orders = order_book.get_all_orders();
+                for (i, order) in all_orders.iter().enumerate() {
+                    if i % 5 == 0 {
+                        let _ = black_box(order_book.cancel_order(order.id()));
+                    }
+                }
+
+                // Phase 5: Create a snapshot
+                black_box(order_book.create_snapshot(5).expect("snapshot"));
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // Benchmark high-frequency trading scenario
     group.bench_function("high_frequency_scenario", |b| {
-        b.iter(|| {
-            let order_book: OrderBook = OrderBook::new("TEST-SYMBOL");
+        b.iter_batched_ref(
+            || -> OrderBook { OrderBook::new("TEST-SYMBOL") },
+            |order_book| {
+                // Set up initial orderbook
+                for i in 0..200 {
+                    let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+                    let price = if side == Side::Buy {
+                        1000 - (i / 2)
+                    } else {
+                        1001 + (i / 2)
+                    };
 
-            // Set up initial orderbook
-            for i in 0..200 {
-                let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
-                let price = if side == Side::Buy {
-                    1000 - (i / 2)
-                } else {
-                    1001 + (i / 2)
-                };
+                    let id = new_id();
+                    let _ = black_box(order_book.add_limit_order(
+                        id,
+                        price,
+                        5,
+                        side,
+                        TimeInForce::Gtc,
+                        None,
+                    ));
+                }
 
-                let id = new_id();
-                let _ = black_box(order_book.add_limit_order(
-                    id,
-                    price,
-                    5,
-                    side,
-                    TimeInForce::Gtc,
-                    None,
-                ));
-            }
+                // Execute many small orders and modifications
+                for i in 0..100 {
+                    let market_id = new_id();
+                    let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
 
-            // Execute many small orders and modifications
-            for i in 0..100 {
-                let market_id = new_id();
-                let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+                    // Submit small market order
+                    let _ = black_box(order_book.submit_market_order(market_id, 2, side));
 
-                // Submit small market order
-                let _ = black_box(order_book.submit_market_order(market_id, 2, side));
-
-                // Add new limit order
-                let limit_id = new_id();
-                let price = if side == Side::Buy {
-                    999 - (i % 10)
-                } else {
-                    1001 + (i % 10)
-                };
-                let _ = black_box(order_book.add_limit_order(
-                    limit_id,
-                    price,
-                    5,
-                    side.opposite(),
-                    TimeInForce::Gtc,
-                    None,
-                ));
-            }
-        })
+                    // Add new limit order
+                    let limit_id = new_id();
+                    let price = if side == Side::Buy {
+                        999 - (i % 10)
+                    } else {
+                        1001 + (i % 10)
+                    };
+                    let _ = black_box(order_book.add_limit_order(
+                        limit_id,
+                        price,
+                        5,
+                        side.opposite(),
+                        TimeInForce::Gtc,
+                        None,
+                    ));
+                }
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     group.finish();

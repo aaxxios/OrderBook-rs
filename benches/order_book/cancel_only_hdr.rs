@@ -17,15 +17,23 @@
 
 // cancel_only_hdr — pre-loaded book + cancel workload.
 // Measures `cancel_order` lookup + unlink cost.
+//
+// Methodology (issue #258): a single `cancel_order` here runs in the
+// tens of ns (BENCH.md quotes a `p50` of 41 ns pre-fix — i.e. one host
+// clock tick), so timing it with one `Instant` pair per call measures
+// the clock, not the cancel. `record_batch` times `BATCH` cancels per
+// `Instant` pair and records the per-op average instead; see
+// `hdr_common::record_batch` for the trade-off.
 
 #[path = "hdr_common.rs"]
 mod common;
 
-use common::{Rng, new_histogram, persist, record, report, submit_gtc};
+use common::{Rng, new_histogram, persist, record_batch, report, submit_gtc};
 use pricelevel::Id;
 
 const SCENARIO: &str = "cancel_only";
 const PRELOAD_OPS: u64 = 1_000_000;
+const BATCH: u64 = 32;
 const SEED: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 
 fn main() {
@@ -39,13 +47,18 @@ fn main() {
         submit_gtc(&book, &mut rng, i + 1);
     }
 
-    // Cancel each one, in order. No warmup phase needed — cancel cost is
-    // dominated by `DashMap::remove` which has a stable distribution.
-    for i in 0..PRELOAD_OPS {
-        let id = Id::from_u64(i + 1);
-        record(&mut hist, || {
+    // Cancel each one, in order, `BATCH` at a time. No warmup phase
+    // needed — cancel cost is dominated by `DashMap::remove` which has a
+    // stable distribution.
+    let mut next = 0u64;
+    while next < PRELOAD_OPS {
+        let base = next;
+        let k = BATCH.min(PRELOAD_OPS - next);
+        record_batch(&mut hist, k, |j| {
+            let id = Id::from_u64(base + j + 1);
             let _ = book.cancel_order(id);
         });
+        next += k;
     }
 
     report(SCENARIO, &hist);

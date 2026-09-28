@@ -11,6 +11,18 @@ Run benchmarks locally:
 cargo bench --all-features
 ```
 
+> **Methodology note (issue #258).** The tables below predate a
+> #258 audit that found several of these Criterion benches (`Snapshot &
+> Restore`, `Journal & Replay`, most of `Order Operations`) were timing
+> setup and/or teardown alongside the operation under test — see
+> `BENCH.md` § "Timing only the operation under test" for the fix and
+> `benches/order_book/*.rs`'s own `# Methodology (issue #258)` doc
+> comments for the specifics. The absolute numbers here are stale (they
+> predate that fix, several point releases, and the `pricelevel` 0.10
+> upgrade) and are kept as a historical illustration of the harness's
+> *shape*, not as a current baseline — #259 re-measures the corrected
+> harness against `v0.13.1` and publishes fresh numbers.
+
 ## Snapshot & Restore
 
 | Operation | 100 orders | 1,000 orders | 10,000 orders |

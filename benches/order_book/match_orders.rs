@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion};
 use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
@@ -9,26 +9,42 @@ fn new_id() -> Id {
 }
 
 /// Register all benchmarks for matching orders in an order book
+///
+/// # Methodology (issue #258)
+///
+/// `setup_limit_order_book` / `setup_iceberg_order_book` used to run
+/// *inside* `b.iter`, so every sample paid for building a fresh 50-100
+/// order book (and dropping it) in addition to the one market order this
+/// group claims to measure. `iter_batched_ref` moves the book
+/// construction into the unmeasured `setup` closure and takes the book
+/// by `&mut` in `routine`, so its drop also lands after the measurement
+/// window closes — only `submit_market_order` is timed.
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Match Orders");
     group.sample_size(100); // Adjust sample size for more consistent results
 
     // Benchmark market order against limit orders
     group.bench_function("match_market_against_limit", |b| {
-        b.iter(|| {
-            let order_book = setup_limit_order_book(100);
-            let id = new_id();
-            let _ = black_box(order_book.submit_market_order(id, 50, Side::Buy));
-        })
+        b.iter_batched_ref(
+            || setup_limit_order_book(100),
+            |order_book| {
+                let id = new_id();
+                let _ = black_box(order_book.submit_market_order(id, 50, Side::Buy));
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // Benchmark market order against iceberg orders
     group.bench_function("match_market_against_iceberg", |b| {
-        b.iter(|| {
-            let order_book = setup_iceberg_order_book(100);
-            let id = new_id();
-            let _ = black_box(order_book.submit_market_order(id, 75, Side::Buy));
-        })
+        b.iter_batched_ref(
+            || setup_iceberg_order_book(100),
+            |order_book| {
+                let id = new_id();
+                let _ = black_box(order_book.submit_market_order(id, 75, Side::Buy));
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // Benchmark with different match quantities against limit orders
@@ -37,12 +53,18 @@ pub fn register_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("match_quantity_scaling", match_quantity),
             match_quantity,
             |b, &match_quantity| {
-                b.iter(|| {
-                    let order_book = setup_limit_order_book(50);
-                    let id = new_id();
-                    let _ =
-                        black_box(order_book.submit_market_order(id, match_quantity, Side::Buy));
-                })
+                b.iter_batched_ref(
+                    || setup_limit_order_book(50),
+                    |order_book| {
+                        let id = new_id();
+                        let _ = black_box(order_book.submit_market_order(
+                            id,
+                            match_quantity,
+                            Side::Buy,
+                        ));
+                    },
+                    BatchSize::SmallInput,
+                )
             },
         );
     }

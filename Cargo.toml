@@ -141,6 +141,11 @@ path = "benches/order_book/add_only_hdr.rs"
 harness = false
 
 [[bench]]
+name = "add_only_risk_hdr"
+path = "benches/order_book/add_only_risk_hdr.rs"
+harness = false
+
+[[bench]]
 name = "cancel_only_hdr"
 path = "benches/order_book/cancel_only_hdr.rs"
 harness = false

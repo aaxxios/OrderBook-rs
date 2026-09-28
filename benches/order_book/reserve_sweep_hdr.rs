@@ -95,7 +95,7 @@
 #[path = "hdr_common.rs"]
 mod common;
 
-use common::{Rng, new_histogram, owner, persist, record, report};
+use common::{Rng, new_histogram, owner, persist, record, record_batch, report};
 use hdrhistogram::Histogram;
 use orderbook_rs::OrderBook;
 use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
@@ -106,6 +106,24 @@ use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, Time
 const RESTING_PER_REFILL: u64 = 3;
 const REFILL_EVERY: u64 = 5;
 const MEASURED_OPS: u64 = 200_000;
+// Methodology (issue #258): `reserve_sweep_nonauto` reads a `p50` of
+// 83 ns pre-fix (two host clock ticks) — `run_scenario` (which also
+// produces `reserve_sweep_auto`, sharing the same loop) batches `BATCH`
+// probes per `Instant` pair and records the per-op average instead; see
+// `hdr_common::record_batch` for the trade-off. `BATCH` must equal
+// `REFILL_EVERY` (not just divide it): a larger batch front-loads every
+// refill due within it into the unmeasured pre-pass, so the first
+// probes in the batch would sweep a book already topped up several
+// refills ahead of where the original, unbatched loop would have had it
+// — a deeper-than-intended book changes the workload, not just how it
+// is timed (this exact bug was caught in `thin_book_sweep_hdr`, which
+// shares this file's geometry — see that file's comment). At `BATCH ==
+// REFILL_EVERY` every batch contains at most one refill, always at its
+// first index, exactly reproducing the original per-probe book-depth
+// profile. `run_dense_nonauto` (tens of us/op) and `run_mixed`
+// (~1.2 us/op, both comfortably above the tick even per single op) are
+// deliberately left on single-op `record` — see their own comments.
+const BATCH: u64 = REFILL_EVERY;
 const SEED: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 
 const SCENARIOS: [(&str, bool); 2] = [
@@ -133,39 +151,45 @@ fn run_scenario(auto_replenish: bool) -> Histogram<u64> {
     let maker = owner(0xAA);
     let taker = owner(0xBB);
     let mut next_id: u64 = 1;
+    let mut op: u64 = 0;
 
-    for i in 0..MEASURED_OPS {
-        if i % REFILL_EVERY == 0 {
-            // Drop a few resting reserve asks. No measurement around the
-            // refill; only the IOC probe below is timed.
-            for _ in 0..RESTING_PER_REFILL {
-                let _ = book.add_order(OrderType::ReserveOrder {
-                    id: Id::from_u64(next_id),
-                    price: Price::new(rng.range(99, 101) as u128),
-                    visible_quantity: Quantity::new(rng.range(1, 5)),
-                    hidden_quantity: Quantity::new(rng.range(4, 12)),
-                    side: Side::Sell,
-                    user_id: maker,
-                    timestamp: TimestampMs::new(0),
-                    time_in_force: TimeInForce::Gtc,
-                    replenish_threshold: Quantity::new(0),
-                    replenish_amount: None,
-                    auto_replenish,
-                    extra_fields: (),
-                });
-                next_id += 1;
+    while op < MEASURED_OPS {
+        let k = BATCH.min(MEASURED_OPS - op);
+
+        // Unmeasured pre-pass: every refill due within this batch of
+        // `k` probes, before the batch's `Instant` pair starts.
+        for idx in 0..k {
+            if (op + idx).is_multiple_of(REFILL_EVERY) {
+                for _ in 0..RESTING_PER_REFILL {
+                    let _ = book.add_order(OrderType::ReserveOrder {
+                        id: Id::from_u64(next_id),
+                        price: Price::new(rng.range(99, 101) as u128),
+                        visible_quantity: Quantity::new(rng.range(1, 5)),
+                        hidden_quantity: Quantity::new(rng.range(4, 12)),
+                        side: Side::Sell,
+                        user_id: maker,
+                        timestamp: TimestampMs::new(0),
+                        time_in_force: TimeInForce::Gtc,
+                        replenish_threshold: Quantity::new(0),
+                        replenish_amount: None,
+                        auto_replenish,
+                        extra_fields: (),
+                    });
+                    next_id += 1;
+                }
             }
         }
 
-        // IOC buy probe, frequently larger than the resting visible
+        // IOC buy probes, frequently larger than the resting visible
         // tranche, so the engine partial-fills and, on the nonauto
         // scenario, strands (and reports) hidden depth.
-        let id = Id::from_u64(next_id);
-        next_id += 1;
-        let qty = rng.range(1, 20);
-        record(&mut hist, || {
+        record_batch(&mut hist, k, |_| {
+            let id = Id::from_u64(next_id);
+            next_id += 1;
+            let qty = rng.range(1, 20);
             let _ = book.submit_market_order_with_user(id, qty, Side::Buy, taker);
         });
+        op += k;
     }
 
     hist
@@ -209,10 +233,16 @@ fn run_dense_nonauto() -> Histogram<u64> {
 
     refill_dense_level(&book, &mut rng, maker, &mut next_id);
 
+    // Not batched (issue #258): this scenario's op cost is tens of us
+    // (see BENCH.md), several orders of magnitude above the host clock
+    // tick, so a single `Instant` pair per probe already measures the
+    // operation, not the clock. `record` (not `record_batch`) keeps
+    // this scenario's true per-op tail, including the reactive refill's
+    // contribution when a probe drains the level — that refill is
+    // itself part of what a real IOC probe here can trigger, so, unlike
+    // the fixed-cadence refills elsewhere in this file, it belongs
+    // inside the timed call, not in an unmeasured pre-pass.
     for _ in 0..MEASURED_OPS {
-        // Reactive refill: top the level back up only once it is fully
-        // consumed, rather than on a fixed cadence, since a single probe
-        // can drain anywhere from a few to all `DENSE_LEVEL_DEPTH` makers.
         if book.order_count_at_price(DENSE_PRICE, Side::Sell).is_none() {
             refill_dense_level(&book, &mut rng, maker, &mut next_id);
         }

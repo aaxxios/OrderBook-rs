@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion};
 use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
@@ -9,6 +9,17 @@ fn new_id() -> Id {
 }
 
 /// Register all benchmarks for mass cancel operations.
+///
+/// # Methodology (issue #258)
+///
+/// These groups pre-populate the book in an unmeasured `setup` closure
+/// already (good), but used `iter_with_setup` / `iter_batched` with a
+/// *consuming* `routine`, so the populated `OrderBook` (up to 50 000
+/// resting orders before the mass cancel) was dropped as the routine
+/// returned — still inside the timed window. `iter_batched_ref` takes
+/// the book by `&mut` instead, so that drop happens after the
+/// measurement window closes; only the mass-cancel call itself is
+/// timed.
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Mass Cancel");
 
@@ -18,7 +29,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("cancel_all_orders", order_count),
             &order_count,
             |b, &count| {
-                b.iter_with_setup(
+                b.iter_batched_ref(
                     || {
                         let book: OrderBook<()> = OrderBook::new("BENCH");
                         // Populate the book: half bids at low prices, half asks at high prices
@@ -38,6 +49,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         let result = black_box(book.cancel_all_orders());
                         assert_eq!(result.cancelled_count(), count);
                     },
+                    BatchSize::LargeInput,
                 );
             },
         );
@@ -49,7 +61,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("cancel_orders_by_side", order_count),
             &order_count,
             |b, &count| {
-                b.iter_with_setup(
+                b.iter_batched_ref(
                     || {
                         let book: OrderBook<()> = OrderBook::new("BENCH");
                         for i in 0..count {
@@ -70,6 +82,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         let result = black_box(book.cancel_orders_by_side(Side::Buy));
                         assert_eq!(result.cancelled_count(), count);
                     },
+                    BatchSize::LargeInput,
                 );
             },
         );
@@ -81,7 +94,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("cancel_orders_by_user", order_count),
             &order_count,
             |b, &count| {
-                b.iter_with_setup(
+                b.iter_batched_ref(
                     || {
                         let book: OrderBook<()> = OrderBook::new("BENCH");
                         let user = pricelevel::Hash32::new([1u8; 32]);
@@ -105,9 +118,10 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         (book, user)
                     },
                     |(book, user)| {
-                        let result = black_box(book.cancel_orders_by_user(user));
+                        let result = black_box(book.cancel_orders_by_user(*user));
                         assert_eq!(result.cancelled_count(), count);
                     },
+                    BatchSize::LargeInput,
                 );
             },
         );

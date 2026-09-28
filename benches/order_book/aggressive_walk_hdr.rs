@@ -17,11 +17,18 @@
 
 // aggressive_walk_hdr — taker market orders sweep multi-level book.
 // Measures the fill-loop tail under saturating liquidity.
+//
+// Methodology (issue #258): most sweeps here fill within a single level
+// (BENCH.md quotes a pre-fix `p50` of 42 ns — one host clock tick), so a
+// single `Instant` pair per call would measure the clock, not the fill
+// loop. `record_batch` times `BATCH` sweeps per `Instant` pair and
+// records the per-op average instead; see `hdr_common::record_batch`
+// for the trade-off.
 
 #[path = "hdr_common.rs"]
 mod common;
 
-use common::{Rng, new_histogram, owner, persist, record, report};
+use common::{Rng, new_histogram, owner, persist, record_batch, report};
 use pricelevel::{Id, Side, TimeInForce};
 
 const SCENARIO: &str = "aggressive_walk";
@@ -29,6 +36,7 @@ const SCENARIO: &str = "aggressive_walk";
 const RESTING_PER_LEVEL: u64 = 100;
 const NUM_LEVELS: u64 = 50;
 const MEASURED_OPS: u64 = 100_000;
+const BATCH: u64 = 32;
 const SEED: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 
 fn main() {
@@ -57,13 +65,17 @@ fn main() {
     }
 
     // Aggressive Buy sweeps. Each sweeps 5..=20 lots — usually clears
-    // a few orders within the same price level.
-    for i in 0..MEASURED_OPS {
-        let qty = rng.range(5, 20);
-        let id = Id::from_u64(next_id + i);
-        record(&mut hist, || {
+    // a few orders within the same price level. Batched `BATCH` at a
+    // time (see the methodology note above).
+    let mut done = 0u64;
+    while done < MEASURED_OPS {
+        let k = BATCH.min(MEASURED_OPS - done);
+        record_batch(&mut hist, k, |j| {
+            let qty = rng.range(5, 20);
+            let id = Id::from_u64(next_id + done + j);
             let _ = book.submit_market_order_with_user(id, qty, Side::Buy, taker);
         });
+        done += k;
     }
 
     report(SCENARIO, &hist);
