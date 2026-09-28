@@ -149,17 +149,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload whose `String` length prefix declared `u64::MAX` bytes made
   bincode 2.0.1 allocate that length before checking the input
   (capacity-overflow panic or OOM abort in the consumer). Decoding now
-  runs under `standard().with_limit::<N>()`, with `N` the smallest
-  power-of-four tier (4 KiB to 1 GiB) covering 16 bytes per input byte
-  (bincode's worst-case claim ratio on a well-formed payload), so a length
-  prefix the input cannot back is rejected before the allocation. The
-  same hostile payload now returns `SerializationError::DecodeLimitExceeded`
-  after allocating 0 bytes. Sequence length prefixes (`Vec<Trade>`,
-  `Vec<Id>`) stay bounded by serde's own 1 MiB reservation cap; each
-  element must then be backed by input bytes.
-- New typed `SerializationError` variants: `PayloadTooLarge { len, max }`,
-  `DecodeLimitExceeded { limit }` and `Truncated { additional }` (bincode
-  end-of-input, previously folded into `Bincode(String)`).
+  goes through bincode's borrowed serde path behind a private adapter that
+  routes `deserialize_string` / `deserialize_byte_buf` to the slicing
+  `deserialize_str` / `deserialize_bytes`: a length prefix is checked
+  against the remaining input before anything is allocated, and the copy
+  that follows is the real length, so string / byte allocations over one
+  payload never exceed its length. The same hostile payload now returns
+  `SerializationError::Truncated` after allocating 0 bytes; a 200 MiB
+  prefix inside an 8 MiB payload allocates nothing for the string. No
+  `with_limit` is used: bincode's limit charges the in-memory width of
+  every primitive (16 bytes for a one-byte `u128` varint), so it cannot be
+  set to the input length without rejecting valid payloads. Sequence /
+  map size hints are clamped to the payload length, so a hostile element
+  count (`Vec<Trade>`, `Vec<Id>`) reserves at most
+  `min(payload_len * size_of::<T>(), 1 MiB)` (1 MiB is serde's own cap)
+  before its first element runs out of input.
+- New typed `SerializationError` variants: `PayloadTooLarge { len, max }`
+  and `Truncated { additional }` (bincode end-of-input or a length prefix
+  longer than the remaining input, previously folded into
+  `Bincode(String)`).
 - New `DEFAULT_MAX_BINCODE_PAYLOAD_BYTES` (8 MiB, the largest NATS
   `max_payload` the NATS docs recommend; about 48 000 fills in one
   `TradeResult`) and `MAX_BINCODE_PAYLOAD_BYTES_CEILING` (64 MiB, the NATS
@@ -177,7 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit struct, so construct it with `BincodeEventSerializer::new()` or
   `Default::default()` instead of the bare `BincodeEventSerializer`
   expression. Code matching exhaustively on `SerializationError` must
-  handle the three new variants, and bincode end-of-input errors now
+  handle the two new variants, and bincode end-of-input errors now
   surface as `Truncated` rather than `Bincode(String)`. JSON is unaffected.
 
 ## [0.13.1] - 2026-09-18

@@ -56,16 +56,9 @@ pub enum SerializationError {
         max: usize,
     },
 
-    /// A length prefix inside the payload declared more data than the
-    /// decode budget allows (malformed or hostile input). Rejected before
-    /// allocating for it.
-    #[error("decoded length prefix exceeds the {limit}-byte decode budget")]
-    DecodeLimitExceeded {
-        /// Decode budget in bytes that the payload tried to exceed.
-        limit: usize,
-    },
-
-    /// The payload ended before the value was fully decoded.
+    /// The payload ended before the value was fully decoded, or a length
+    /// prefix inside it declared more bytes than remain (malformed or hostile
+    /// input). Rejected before allocating for the declared length.
     #[error("payload truncated: {additional} more bytes needed")]
     Truncated {
         /// Number of additional bytes the decoder needed.
@@ -205,17 +198,6 @@ pub const DEFAULT_MAX_BINCODE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "bincode")]
 pub const MAX_BINCODE_PAYLOAD_BYTES_CEILING: usize = 64 * 1024 * 1024;
 
-/// Upper bound on how many bytes bincode's limit accounting may claim per
-/// input byte on a legitimate payload.
-///
-/// bincode 2.0.1 claims the in-memory width of every primitive before it
-/// reads it (`u128` claims 16 even when its varint is a single byte), and
-/// claims a `String` / byte buffer's declared length before allocating it.
-/// Every claim is backed by at least one input byte, so a well-formed payload
-/// never claims more than `16 * data.len()`.
-#[cfg(feature = "bincode")]
-const BINCODE_CLAIM_BYTES_PER_INPUT_BYTE: usize = 16;
-
 /// Bincode event serializer for compact binary payloads.
 ///
 /// Produces significantly smaller payloads than JSON with much lower
@@ -224,24 +206,25 @@ const BINCODE_CLAIM_BYTES_PER_INPUT_BYTE: usize = 16;
 ///
 /// # Untrusted input
 ///
-/// Deserialization treats the bytes as untrusted. bincode reads a
-/// `String` / `Vec` length prefix from the payload and, unconfigured,
-/// allocates that many bytes before checking the input holds them, so a
-/// ten-byte payload could request an allocation of `u64::MAX` bytes. This
-/// serializer bounds that in two layers:
+/// Deserialization treats the bytes as untrusted. Unconfigured, bincode
+/// 2.0.1 decodes a `String` / `Vec<u8>` by allocating the length read from
+/// the payload before checking the input holds it, so a ten-byte payload
+/// could request an allocation of `u64::MAX` bytes. This serializer bounds
+/// every allocation by the input instead:
 ///
 /// 1. Payloads longer than [`max_payload_bytes`](Self::max_payload_bytes)
 ///    are rejected up front with [`SerializationError::PayloadTooLarge`].
-/// 2. The decoder runs under a bincode byte limit scaled to the input length
-///    (at most 16 bytes of claimed memory per input byte, rounded up to a
-///    power-of-four tier, minimum 4 KiB). A length prefix that declares more
-///    than the input can back is rejected with
-///    [`SerializationError::DecodeLimitExceeded`] before anything is
-///    allocated for it.
-///
-/// Sequences (`Vec<Trade>`, `Vec<Id>`) are decoded by serde's own visitor,
-/// which caps its up-front reservation at 1 MiB regardless of the declared
-/// length; each element must then be backed by input bytes.
+/// 2. Decoding runs through bincode's borrowed serde path with string and
+///    byte-buffer requests routed to the slicing `deserialize_str` /
+///    `deserialize_bytes`: a length prefix is checked against the remaining
+///    input (end-of-input is [`SerializationError::Truncated`]) before a
+///    single byte is allocated, and the copy that follows is the real
+///    length. Across one payload, string / byte allocations sum to at most
+///    the payload length.
+/// 3. Sequence / map size hints are clamped to the payload length, so a
+///    hostile element count reserves at most
+///    `min(payload_len * size_of::<T>(), 1 MiB)` before the first element
+///    runs out of input (1 MiB is serde's own reservation cap).
 ///
 /// Serialization enforces the same `max_payload_bytes`, so a producer never
 /// emits a payload its matching consumer would reject.
@@ -327,44 +310,26 @@ impl BincodeEventSerializer {
         Ok(bytes)
     }
 
-    /// Decode a `V` from untrusted `data` under a bounded bincode config and
-    /// reject trailing bytes.
+    /// Decode a `V` from untrusted `data` with every allocation backed by
+    /// the input (see the private `input_backed` module) and reject trailing
+    /// bytes.
     fn decode<V: serde::de::DeserializeOwned>(
         &self,
         data: &[u8],
         what: &'static str,
     ) -> Result<V, SerializationError> {
         self.check_len(data.len())?;
-        let budget = data
-            .len()
-            .checked_mul(BINCODE_CLAIM_BYTES_PER_INPUT_BYTE)
-            .ok_or_else(|| payload_too_large(data.len(), self.max_payload_bytes))?;
-        // `with_limit` takes a const generic, so pick the smallest
-        // power-of-four tier that covers the budget. The largest tier covers
-        // `16 * MAX_BINCODE_PAYLOAD_BYTES_CEILING` (1 GiB).
-        let (value, bytes_read) = if budget <= KIB4 {
-            decode_limited::<V, KIB4>(data)?
-        } else if budget <= KIB16 {
-            decode_limited::<V, KIB16>(data)?
-        } else if budget <= KIB64 {
-            decode_limited::<V, KIB64>(data)?
-        } else if budget <= KIB256 {
-            decode_limited::<V, KIB256>(data)?
-        } else if budget <= MIB1 {
-            decode_limited::<V, MIB1>(data)?
-        } else if budget <= MIB4 {
-            decode_limited::<V, MIB4>(data)?
-        } else if budget <= MIB16 {
-            decode_limited::<V, MIB16>(data)?
-        } else if budget <= MIB64 {
-            decode_limited::<V, MIB64>(data)?
-        } else if budget <= MIB256 {
-            decode_limited::<V, MIB256>(data)?
-        } else if budget <= GIB1 {
-            decode_limited::<V, GIB1>(data)?
-        } else {
-            return Err(payload_too_large(data.len(), self.max_payload_bytes));
+        // No `with_limit`: its accounting charges the in-memory width of
+        // every primitive (16 for a one-byte `u128` varint), so it cannot be
+        // set to the input length without rejecting valid payloads, and the
+        // input-backed adapter already bounds every allocation it guards.
+        let seed = input_backed::Seed {
+            seed: std::marker::PhantomData::<V>,
+            max_elems: data.len(),
         };
+        let (value, bytes_read) =
+            bincode::serde::seed_decode_from_slice(seed, data, bincode::config::standard())
+                .map_err(map_decode_error)?;
         if bytes_read != data.len() {
             return Err(SerializationError::TrailingBytes(format!(
                 "trailing bytes after {what} payload: consumed {bytes_read} of {}",
@@ -375,70 +340,402 @@ impl BincodeEventSerializer {
     }
 }
 
-#[cfg(feature = "bincode")]
-const KIB4: usize = 4 * 1024;
-#[cfg(feature = "bincode")]
-const KIB16: usize = 16 * 1024;
-#[cfg(feature = "bincode")]
-const KIB64: usize = 64 * 1024;
-#[cfg(feature = "bincode")]
-const KIB256: usize = 256 * 1024;
-#[cfg(feature = "bincode")]
-const MIB1: usize = 1024 * 1024;
-#[cfg(feature = "bincode")]
-const MIB4: usize = 4 * 1024 * 1024;
-#[cfg(feature = "bincode")]
-const MIB16: usize = 16 * 1024 * 1024;
-#[cfg(feature = "bincode")]
-const MIB64: usize = 64 * 1024 * 1024;
-#[cfg(feature = "bincode")]
-const MIB256: usize = 256 * 1024 * 1024;
-#[cfg(feature = "bincode")]
-const GIB1: usize = 1024 * 1024 * 1024;
-
-/// Whether the largest limit tier covers the claim budget of a payload at
-/// [`MAX_BINCODE_PAYLOAD_BYTES_CEILING`].
-#[cfg(feature = "bincode")]
-const fn tiers_cover_ceiling() -> bool {
-    match MAX_BINCODE_PAYLOAD_BYTES_CEILING.checked_mul(BINCODE_CLAIM_BYTES_PER_INPUT_BYTE) {
-        Some(budget) => budget <= GIB1,
-        None => false,
-    }
-}
-
-// Compile-time check: the build fails (array length mismatch) if the largest
-// tier stops covering the ceiling.
-#[cfg(feature = "bincode")]
-const _: [(); 1] = [(); tiers_cover_ceiling() as usize];
-
-/// Decode under `standard().with_limit::<LIMIT>()`.
-///
-/// With a limit configured, bincode's `claim_container_read` checks a
-/// `String` / byte-buffer length prefix against `LIMIT` before allocating.
-#[cfg(feature = "bincode")]
-#[inline]
-fn decode_limited<V: serde::de::DeserializeOwned, const LIMIT: usize>(
-    data: &[u8],
-) -> Result<(V, usize), SerializationError> {
-    bincode::serde::decode_from_slice::<V, _>(
-        data,
-        bincode::config::standard().with_limit::<LIMIT>(),
-    )
-    .map_err(|e| map_decode_error(e, LIMIT))
-}
-
 /// Map a bincode decode failure to a typed [`SerializationError`].
 #[cfg(feature = "bincode")]
 #[cold]
-fn map_decode_error(err: bincode::error::DecodeError, limit: usize) -> SerializationError {
+fn map_decode_error(err: bincode::error::DecodeError) -> SerializationError {
     match err {
-        bincode::error::DecodeError::LimitExceeded => {
-            SerializationError::DecodeLimitExceeded { limit }
-        }
         bincode::error::DecodeError::UnexpectedEnd { additional } => {
             SerializationError::Truncated { additional }
         }
         other => SerializationError::Bincode(other.to_string()),
+    }
+}
+
+/// Input-backed serde adapter for bincode's borrowed deserializer (#251).
+///
+/// bincode 2.0.1's borrowed serde deserializer
+/// (`bincode::serde::seed_decode_from_slice`) implements `deserialize_str` /
+/// `deserialize_bytes` by slicing the input: `<&[u8]>::borrow_decode` calls
+/// `SliceReader::take_bytes(len)`, which returns `UnexpectedEnd` when `len`
+/// exceeds the remaining bytes, before anything is allocated. Its
+/// `deserialize_string` / `deserialize_byte_buf`, however, go through the
+/// owned `Vec<u8>::decode`, which runs `vec![0u8; len]` on the declared
+/// length first, and serde's `String` / `Vec<u8>` impls ask for exactly
+/// those. [`InputBacked`] wraps the deserializer and, recursively through
+/// every nested seq / map / enum / option / newtype access:
+///
+/// - routes `deserialize_string` to `deserialize_str` and
+///   `deserialize_byte_buf` to `deserialize_bytes`, so a string or byte
+///   buffer is only allocated after it was sliced out of the input: its
+///   allocation equals its real length and the sum over one payload never
+///   exceeds the payload length;
+/// - clamps a sequence / map `size_hint` to the payload length, so a
+///   declared element count the input cannot back does not drive serde's
+///   up-front reservation. Every element of a non-zero-sized type consumes at
+///   least one input byte, so a legitimate count never exceeds the payload
+///   length and the clamp never shrinks a correct hint. The residual
+///   reservation for a hostile count is
+///   `min(payload_len * size_of::<T>(), 1 MiB)` (serde's own cap), released
+///   when the first element hits end-of-input.
+///
+/// No other deserializer method of bincode's borrowed path allocates
+/// (primitives decode in place; `deserialize_any` / `deserialize_identifier`
+/// / `deserialize_ignored_any` are unsupported by bincode and error out).
+#[cfg(feature = "bincode")]
+mod input_backed {
+    use serde::de::{
+        DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor,
+    };
+    use std::fmt;
+
+    /// Clamp a container `size_hint` to the payload length.
+    #[inline]
+    fn clamp_hint(hint: Option<usize>, max: usize) -> Option<usize> {
+        hint.map(|n| n.min(max))
+    }
+
+    /// Seed that deserializes `T` through [`InputBacked`].
+    pub(super) struct Seed<S> {
+        pub(super) seed: S,
+        pub(super) max_elems: usize,
+    }
+
+    impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<S> {
+        type Value = S::Value;
+
+        #[inline]
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<S::Value, D::Error> {
+            self.seed.deserialize(InputBacked {
+                inner: deserializer,
+                max_elems: self.max_elems,
+            })
+        }
+    }
+
+    /// Deserializer wrapper; see the module docs.
+    struct InputBacked<D> {
+        inner: D,
+        max_elems: usize,
+    }
+
+    /// Visitor wrapper that re-wraps every nested deserializer / access.
+    struct Wrap<V> {
+        visitor: V,
+        max_elems: usize,
+    }
+
+    impl<V> Wrap<V> {
+        #[inline]
+        fn new(visitor: V, max_elems: usize) -> Self {
+            Self { visitor, max_elems }
+        }
+    }
+
+    macro_rules! forward_leaf {
+        ($($method:ident),* $(,)?) => {
+            $(
+                #[inline]
+                fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+                    self.inner.$method(visitor)
+                }
+            )*
+        };
+    }
+
+    impl<'de, D: Deserializer<'de>> Deserializer<'de> for InputBacked<D> {
+        type Error = D::Error;
+
+        forward_leaf!(
+            deserialize_any,
+            deserialize_bool,
+            deserialize_i8,
+            deserialize_i16,
+            deserialize_i32,
+            deserialize_i64,
+            deserialize_i128,
+            deserialize_u8,
+            deserialize_u16,
+            deserialize_u32,
+            deserialize_u64,
+            deserialize_u128,
+            deserialize_f32,
+            deserialize_f64,
+            deserialize_char,
+            deserialize_str,
+            deserialize_bytes,
+            deserialize_unit,
+            deserialize_identifier,
+            deserialize_ignored_any,
+        );
+
+        /// Slice first, copy after: see the module docs.
+        #[inline]
+        fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+            self.inner.deserialize_str(visitor)
+        }
+
+        /// Slice first, copy after: see the module docs.
+        #[inline]
+        fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+            self.inner.deserialize_bytes(visitor)
+        }
+
+        fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_option(Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_unit_struct<V: Visitor<'de>>(
+            self,
+            name: &'static str,
+            visitor: V,
+        ) -> Result<V::Value, D::Error> {
+            self.inner.deserialize_unit_struct(name, visitor)
+        }
+
+        fn deserialize_newtype_struct<V: Visitor<'de>>(
+            self,
+            name: &'static str,
+            visitor: V,
+        ) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_newtype_struct(name, Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_seq(Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_tuple<V: Visitor<'de>>(
+            self,
+            len: usize,
+            visitor: V,
+        ) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_tuple(len, Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_tuple_struct<V: Visitor<'de>>(
+            self,
+            name: &'static str,
+            len: usize,
+            visitor: V,
+        ) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_tuple_struct(name, len, Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_map(Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            name: &'static str,
+            fields: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_struct(name, fields, Wrap::new(visitor, self.max_elems))
+        }
+
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            name: &'static str,
+            variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, D::Error> {
+            self.inner
+                .deserialize_enum(name, variants, Wrap::new(visitor, self.max_elems))
+        }
+
+        #[inline]
+        fn is_human_readable(&self) -> bool {
+            self.inner.is_human_readable()
+        }
+    }
+
+    macro_rules! forward_visit {
+        ($($method:ident($ty:ty)),* $(,)?) => {
+            $(
+                #[inline]
+                fn $method<E: serde::de::Error>(self, v: $ty) -> Result<V::Value, E> {
+                    self.visitor.$method(v)
+                }
+            )*
+        };
+    }
+
+    impl<'de, V: Visitor<'de>> Visitor<'de> for Wrap<V> {
+        type Value = V::Value;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.visitor.expecting(f)
+        }
+
+        forward_visit!(
+            visit_bool(bool),
+            visit_i8(i8),
+            visit_i16(i16),
+            visit_i32(i32),
+            visit_i64(i64),
+            visit_i128(i128),
+            visit_u8(u8),
+            visit_u16(u16),
+            visit_u32(u32),
+            visit_u64(u64),
+            visit_u128(u128),
+            visit_f32(f32),
+            visit_f64(f64),
+            visit_char(char),
+            visit_str(&str),
+            visit_borrowed_str(&'de str),
+            visit_string(String),
+            visit_bytes(&[u8]),
+            visit_borrowed_bytes(&'de [u8]),
+            visit_byte_buf(Vec<u8>),
+        );
+
+        #[inline]
+        fn visit_none<E: serde::de::Error>(self) -> Result<V::Value, E> {
+            self.visitor.visit_none()
+        }
+
+        #[inline]
+        fn visit_unit<E: serde::de::Error>(self) -> Result<V::Value, E> {
+            self.visitor.visit_unit()
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<V::Value, D::Error> {
+            self.visitor.visit_some(InputBacked {
+                inner: deserializer,
+                max_elems: self.max_elems,
+            })
+        }
+
+        fn visit_newtype_struct<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<V::Value, D::Error> {
+            self.visitor.visit_newtype_struct(InputBacked {
+                inner: deserializer,
+                max_elems: self.max_elems,
+            })
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<V::Value, A::Error> {
+            self.visitor.visit_seq(Wrap::new(seq, self.max_elems))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<V::Value, A::Error> {
+            self.visitor.visit_map(Wrap::new(map, self.max_elems))
+        }
+
+        fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<V::Value, A::Error> {
+            self.visitor.visit_enum(Wrap::new(data, self.max_elems))
+        }
+    }
+
+    impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Wrap<A> {
+        type Error = A::Error;
+
+        fn next_element_seed<T: DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> Result<Option<T::Value>, A::Error> {
+            self.visitor.next_element_seed(Seed {
+                seed,
+                max_elems: self.max_elems,
+            })
+        }
+
+        #[inline]
+        fn size_hint(&self) -> Option<usize> {
+            clamp_hint(self.visitor.size_hint(), self.max_elems)
+        }
+    }
+
+    impl<'de, A: MapAccess<'de>> MapAccess<'de> for Wrap<A> {
+        type Error = A::Error;
+
+        fn next_key_seed<K: DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> Result<Option<K::Value>, A::Error> {
+            self.visitor.next_key_seed(Seed {
+                seed,
+                max_elems: self.max_elems,
+            })
+        }
+
+        fn next_value_seed<T: DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> Result<T::Value, A::Error> {
+            self.visitor.next_value_seed(Seed {
+                seed,
+                max_elems: self.max_elems,
+            })
+        }
+
+        #[inline]
+        fn size_hint(&self) -> Option<usize> {
+            clamp_hint(self.visitor.size_hint(), self.max_elems)
+        }
+    }
+
+    impl<'de, A: EnumAccess<'de>> EnumAccess<'de> for Wrap<A> {
+        type Error = A::Error;
+        type Variant = Wrap<A::Variant>;
+
+        fn variant_seed<T: DeserializeSeed<'de>>(
+            self,
+            seed: T,
+        ) -> Result<(T::Value, Self::Variant), A::Error> {
+            let max_elems = self.max_elems;
+            let (value, variant) = self.visitor.variant_seed(Seed { seed, max_elems })?;
+            Ok((value, Wrap::new(variant, max_elems)))
+        }
+    }
+
+    impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Wrap<A> {
+        type Error = A::Error;
+
+        #[inline]
+        fn unit_variant(self) -> Result<(), A::Error> {
+            self.visitor.unit_variant()
+        }
+
+        fn newtype_variant_seed<T: DeserializeSeed<'de>>(
+            self,
+            seed: T,
+        ) -> Result<T::Value, A::Error> {
+            self.visitor.newtype_variant_seed(Seed {
+                seed,
+                max_elems: self.max_elems,
+            })
+        }
+
+        fn tuple_variant<V: Visitor<'de>>(
+            self,
+            len: usize,
+            visitor: V,
+        ) -> Result<V::Value, A::Error> {
+            self.visitor
+                .tuple_variant(len, Wrap::new(visitor, self.max_elems))
+        }
+
+        fn struct_variant<V: Visitor<'de>>(
+            self,
+            fields: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, A::Error> {
+            self.visitor
+                .struct_variant(fields, Wrap::new(visitor, self.max_elems))
+        }
     }
 }
 
@@ -783,10 +1080,12 @@ mod tests {
             let serializer = BincodeEventSerializer::new();
             let payload = huge_len_prefix();
             match serializer.deserialize_trade(&payload) {
-                Err(SerializationError::DecodeLimitExceeded { limit }) => {
-                    assert_eq!(limit, 4 * 1024, "tiny payload decodes in the 4 KiB tier");
+                Err(SerializationError::Truncated { additional }) => {
+                    // The declared length was checked against the remaining
+                    // input (none) instead of being allocated.
+                    assert_eq!(additional, usize::MAX);
                 }
-                other => panic!("expected DecodeLimitExceeded, got {other:?}"),
+                other => panic!("expected Truncated, got {other:?}"),
             }
         }
 
@@ -797,20 +1096,20 @@ mod tests {
             payload.extend_from_slice(&huge_len_prefix());
             assert!(matches!(
                 serializer.deserialize_trade(&payload),
-                Err(SerializationError::DecodeLimitExceeded { .. })
+                Err(SerializationError::Truncated { .. })
             ));
         }
 
         #[test]
-        fn test_bincode_deserialize_trade_len_just_past_budget_rejected() {
-            // A string length one byte over the tier budget is rejected by
-            // the limit, not by the (later) end-of-input check.
+        fn test_bincode_deserialize_trade_len_one_past_input_rejected() {
+            // A string length one byte longer than the remaining input is
+            // rejected, with the exact shortfall reported.
             let serializer = BincodeEventSerializer::new();
-            let mut payload = len_prefix(4 * 1024 + 1);
+            let mut payload = len_prefix(8);
             payload.extend_from_slice(b"BTC/USD");
             assert!(matches!(
                 serializer.deserialize_trade(&payload),
-                Err(SerializationError::DecodeLimitExceeded { .. })
+                Err(SerializationError::Truncated { additional: 1 })
             ));
         }
 
@@ -820,8 +1119,8 @@ mod tests {
             let order_id = Id::from_uuid(Uuid::new_v4());
             let mut payload = trade_prefix_before_trades("BTC/USD", order_id);
             payload.extend_from_slice(&huge_len_prefix());
-            // serde's sequence visitor caps its reservation at 1 MiB; the
-            // first element then runs out of input.
+            // The size hint is clamped to the payload length; the first
+            // element then runs out of input.
             assert!(matches!(
                 serializer.deserialize_trade(&payload),
                 Err(SerializationError::Truncated { .. })
@@ -837,7 +1136,7 @@ mod tests {
             payload.extend_from_slice(&huge_len_prefix()); // …whose trade_id is huge
             assert!(matches!(
                 serializer.deserialize_trade(&payload),
-                Err(SerializationError::DecodeLimitExceeded { .. })
+                Err(SerializationError::Truncated { .. })
             ));
         }
 
@@ -862,7 +1161,7 @@ mod tests {
             payload.extend_from_slice(&huge_len_prefix()); // …with a huge length
             assert!(matches!(
                 serializer.deserialize_trade(&payload),
-                Err(SerializationError::DecodeLimitExceeded { .. })
+                Err(SerializationError::Truncated { .. })
             ));
         }
 
@@ -978,12 +1277,11 @@ mod tests {
                 BincodeEventSerializer::default().max_payload_bytes(),
                 DEFAULT_MAX_BINCODE_PAYLOAD_BYTES
             );
-            assert!(tiers_cover_ceiling());
         }
 
         #[test]
         fn test_bincode_roundtrip_multi_mib_trade_result() {
-            // ~30 000 fills ≈ 5 MiB: exercises a large limit tier and must
+            // ~30 000 fills ≈ 5 MiB: a multi-MiB payload with many strings must
             // round-trip under the default limit.
             let serializer = BincodeEventSerializer::new();
             let trade = make_large_trade_result(30_000);
@@ -1012,8 +1310,6 @@ mod tests {
         fn test_bincode_serialization_error_display_new_variants() {
             let e = SerializationError::PayloadTooLarge { len: 10, max: 5 };
             assert!(e.to_string().contains("10"));
-            let e = SerializationError::DecodeLimitExceeded { limit: 4096 };
-            assert!(e.to_string().contains("4096"));
             let e = SerializationError::Truncated { additional: 3 };
             assert!(e.to_string().contains("3 more bytes"));
         }
