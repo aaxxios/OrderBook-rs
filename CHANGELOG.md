@@ -385,6 +385,38 @@ change.
     now documented (module docs, `doc/panic-boundaries.md`).
   - Wire format and subjects are unchanged.
 
+- **Wire encoders return `Result`; wire and metrics leave the panic
+  ratchet (#254).** `encode_exec_report`, `encode_trade_print` and
+  `encode_book_update` (feature `wire`) reserved their fixed payload with
+  `Vec::reserve`, which panics with "capacity overflow" when the caller's
+  buffer cannot grow. They now reserve with `Vec::try_reserve` and return
+  `Result<(), WireError>`; the new `WireError::CapacityOverflow` variant
+  reports the failure and leaves the buffer unchanged. Decoders (`decode_frame`,
+  `decode_exec_report`, `decode_trade_print`, `decode_book_update`) read
+  through a shared checked-offset helper (`checked_add` +
+  `slice::get` + `<[u8; N]>::try_from`) instead of `copy_from_slice` and
+  raw `offset + N`; the frame length prefix converts with
+  `usize::try_from`. `NewOrderWire` to `OrderType` converts the price with
+  `u64::try_from` instead of an `as` cast and fills the STP user bytes
+  without `copy_from_slice`. The inbound layout size guards are now a
+  compile-time type equality (`[(); N] = [(); size_of::<T>()]`) instead of
+  `const _: () = assert!(..)`: still rejected at compile time, no
+  `assert!` form. `src/orderbook/metrics.rs` documents the caller-installed
+  `metrics` recorder boundary (must not panic; owns its counter overflow
+  semantics); it needed no code change. Removed ledger entries: four from
+  `scripts/clippy_ratchet.txt` (`new_order.rs` `cast_sign_loss`,
+  `book_update.rs` / `exec_report.rs` / `trade_print.rs`
+  `arithmetic_side_effects`) and four `assert` entries from
+  `scripts/panic_policy_allowlist.txt`.
+
+  **Compatibility:** the wire format is unchanged: every frame and payload
+  encodes and decodes byte-for-byte as before, and malformed input returns
+  the same `WireError` variants (`Truncated` / `InvalidPayload`) as
+  before. Callers of the three encoders add `?` (or handle the error).
+  `WireError` is `#[non_exhaustive]`, so downstream matches already carry
+  a wildcard arm for `CapacityOverflow`. Metrics names, labels and values are
+  unchanged.
+
 ### Changed
 
 - **Behaviour from pricelevel 0.10.** `PriceLevel::new` starts

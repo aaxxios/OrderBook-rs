@@ -112,6 +112,12 @@
 //!   fallback instead of a silent `0` / truncating cast.
 //!   `AllocSnapshot::since` (feature `alloc-counters`) returns `Option` and
 //!   rejects out-of-order snapshots instead of clamping.
+//! - **Wire codec is panic-free on untrusted bytes (#254).** Decoders read
+//!   through checked offsets instead of `copy_from_slice` and raw offset
+//!   arithmetic. `encode_exec_report`, `encode_trade_print` and
+//!   `encode_book_update` reserve with `Vec::try_reserve` and return
+//!   `Result<(), WireError>` (new `WireError::CapacityOverflow`); the wire
+//!   format is unchanged.
 //!
 //! ### Migration from 0.13
 //!
@@ -126,6 +132,7 @@
 //! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
+//! | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |
 //! | `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
 //! | `BlackScholes::{price, vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
 //! | `BlackScholes::d1(spot, strike, rate, time, vol) -> f64` | `-> Result<f64, IVError>` |

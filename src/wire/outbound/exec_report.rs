@@ -7,10 +7,8 @@
 //!
 //! See `doc/wire-protocol.md` for the canonical layout.
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
 use crate::orderbook::order_state::OrderStatus;
+use crate::wire::bytes::{read_i64_le, read_u8, read_u16_le, read_u64_le, reserve_payload};
 use crate::wire::error::WireError;
 
 /// Wire code for `OrderStatus::Open`.
@@ -76,10 +74,19 @@ pub fn status_to_wire(status: &OrderStatus) -> u8 {
     }
 }
 
-/// Encodes an `ExecReport` payload (44 bytes) into `out`.
+/// Appends an `ExecReport` payload (44 bytes) to `out`.
+///
+/// Room for the whole payload is reserved up front with
+/// [`Vec::try_reserve`], so the appends that follow never reallocate and the
+/// encoder never hits `Vec`'s capacity-overflow panic.
+///
+/// # Errors
+///
+/// Returns [`WireError::CapacityOverflow`] when `out` cannot grow by
+/// [`EXEC_REPORT_SIZE`] bytes. `out` is left unchanged in that case.
 #[inline]
-pub fn encode_exec_report(report: &ExecReport, out: &mut Vec<u8>) {
-    out.reserve(EXEC_REPORT_SIZE);
+pub fn encode_exec_report(report: &ExecReport, out: &mut Vec<u8>) -> Result<(), WireError> {
+    reserve_payload(out, EXEC_REPORT_SIZE)?;
     out.extend_from_slice(&report.engine_seq.to_le_bytes());
     out.extend_from_slice(&report.order_id.to_le_bytes());
     out.push(report.status);
@@ -88,6 +95,7 @@ pub fn encode_exec_report(report: &ExecReport, out: &mut Vec<u8>) {
     out.extend_from_slice(&report.price.to_le_bytes());
     out.extend_from_slice(&report.reject_reason.to_le_bytes());
     out.push(report._pad);
+    Ok(())
 }
 
 /// Decodes an `ExecReport` payload.
@@ -104,42 +112,17 @@ pub fn decode_exec_report(payload: &[u8]) -> Result<ExecReport, WireError> {
             "ExecReport: payload size mismatch",
         ));
     }
-    let read_u64 = |offset: usize| -> Result<u64, WireError> {
-        let slot = payload
-            .get(offset..offset + 8)
-            .ok_or(WireError::Truncated)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(slot);
-        Ok(u64::from_le_bytes(arr))
-    };
-    let read_i64 = |offset: usize| -> Result<i64, WireError> {
-        let slot = payload
-            .get(offset..offset + 8)
-            .ok_or(WireError::Truncated)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(slot);
-        Ok(i64::from_le_bytes(arr))
-    };
-    let read_u16 = |offset: usize| -> Result<u16, WireError> {
-        let slot = payload
-            .get(offset..offset + 2)
-            .ok_or(WireError::Truncated)?;
-        let mut arr = [0u8; 2];
-        arr.copy_from_slice(slot);
-        Ok(u16::from_le_bytes(arr))
-    };
-
-    let engine_seq = read_u64(0)?;
-    let order_id = read_u64(8)?;
-    let status = *payload.get(16).ok_or(WireError::Truncated)?;
+    let engine_seq = read_u64_le(payload, 0)?;
+    let order_id = read_u64_le(payload, 8)?;
+    let status = read_u8(payload, 16)?;
     if status > STATUS_REJECTED {
         return Err(WireError::InvalidPayload("ExecReport: unknown status"));
     }
-    let filled_qty = read_u64(17)?;
-    let remaining_qty = read_u64(25)?;
-    let price = read_i64(33)?;
-    let reject_reason = read_u16(41)?;
-    let pad = *payload.get(43).ok_or(WireError::Truncated)?;
+    let filled_qty = read_u64_le(payload, 17)?;
+    let remaining_qty = read_u64_le(payload, 25)?;
+    let price = read_i64_le(payload, 33)?;
+    let reject_reason = read_u16_le(payload, 41)?;
+    let pad = read_u8(payload, 43)?;
     if pad != 0 {
         return Err(WireError::InvalidPayload(
             "ExecReport: non-zero reserved padding",
@@ -177,7 +160,7 @@ mod tests {
             _pad: 0,
         };
         let mut buf = Vec::new();
-        encode_exec_report(&report, &mut buf);
+        encode_exec_report(&report, &mut buf).expect("encode_exec_report");
         assert_eq!(buf.len(), EXEC_REPORT_SIZE);
     }
 
@@ -234,7 +217,7 @@ mod tests {
                 _pad: 0,
             };
             let mut payload = Vec::new();
-            encode_exec_report(&original, &mut payload);
+            encode_exec_report(&original, &mut payload).expect("encode_exec_report");
             let mut framed = Vec::new();
             encode_frame(0x81, &payload, &mut framed).expect("encode_frame");
 
@@ -250,6 +233,51 @@ mod tests {
         let buf = [0u8; EXEC_REPORT_SIZE - 1];
         assert!(matches!(
             decode_exec_report(&buf),
+            Err(WireError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn encode_at_capacity_edge_appends_without_disturbing_prefix() {
+        let msg = ExecReport {
+            engine_seq: 7,
+            order_id: 42,
+            status: STATUS_PARTIALLY_FILLED,
+            filled_qty: 3,
+            remaining_qty: 9,
+            price: -5,
+            reject_reason: 0,
+            _pad: 0,
+        };
+        // Buffer already full (len == capacity): the encoder must grow it
+        // through `try_reserve` and append after the existing prefix.
+        let mut full = Vec::with_capacity(3);
+        full.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        assert_eq!(full.len(), full.capacity());
+        encode_exec_report(&msg, &mut full).expect("encode into full buffer");
+        assert_eq!(full.get(..3), Some(&[0xAA, 0xBB, 0xCC][..]));
+        let tail = full.get(3..).expect("appended payload");
+        assert_eq!(tail.len(), EXEC_REPORT_SIZE);
+        assert_eq!(decode_exec_report(tail), Ok(msg));
+
+        // Exactly enough spare capacity: no reallocation is needed and the
+        // capacity is unchanged afterwards.
+        let mut exact = Vec::with_capacity(EXEC_REPORT_SIZE);
+        let cap = exact.capacity();
+        encode_exec_report(&msg, &mut exact).expect("encode into exact buffer");
+        assert_eq!(exact.len(), EXEC_REPORT_SIZE);
+        assert_eq!(exact.capacity(), cap);
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_payloads() {
+        assert!(matches!(
+            decode_exec_report(&[]),
+            Err(WireError::InvalidPayload(_))
+        ));
+        let long = [0u8; EXEC_REPORT_SIZE + 1];
+        assert!(matches!(
+            decode_exec_report(&long),
             Err(WireError::InvalidPayload(_))
         ));
     }

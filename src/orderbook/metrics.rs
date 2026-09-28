@@ -43,6 +43,20 @@
 //! does **not** rehydrate metric counters — they are operational only
 //! and live for the process lifetime.
 //!
+//! # Recorder boundary
+//!
+//! Every helper forwards to the process-wide recorder installed by the
+//! caller (`metrics::set_global_recorder` or an exporter such as
+//! `metrics-exporter-prometheus`). The crate never installs a recorder of
+//! its own; with none installed the `metrics` crate falls back to its no-op
+//! recorder. The recorder is caller-supplied code and runs synchronously on
+//! the calling thread, including the matching path: it **must not panic**
+//! and should return quickly (see `doc/panic-boundaries.md`, Caller-supplied
+//! code obligations). How a counter accumulates `increment(n)` (wrapping,
+//! saturating or checked) is the recorder's own contract; the helpers here
+//! perform no integer arithmetic of their own. The `u64` to `f64` casts in
+//! `record_depth` are exact for any count below 2^53 and cannot panic.
+//!
 //! [`RejectReason`]: crate::orderbook::reject_reason::RejectReason
 //! [`Display`]: std::fmt::Display
 

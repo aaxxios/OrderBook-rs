@@ -33,7 +33,10 @@ pub struct CancelReplaceWire {
     pub new_qty: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<CancelReplaceWire>() == 40);
+// Compile-time layout guard: a size drift is a type mismatch between
+// `[(); 40]` and `[(); size_of::<CancelReplaceWire>()]`, rejected by the compiler. It is
+// evaluated at compile time only and has no runtime (panicking) form.
+const _: [(); 40] = [(); core::mem::size_of::<CancelReplaceWire>()];
 
 impl CancelReplaceWire {
     /// Returns the packed byte representation of `self`.
