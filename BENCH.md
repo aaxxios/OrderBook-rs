@@ -208,6 +208,26 @@ sides; today's three scenarios (`add_only`, `cancel_only`,
 and `HEAD`, so both feature arms currently have the same body, but the
 seam is there for the next API break.
 
+**Pitfall found in PR review: don't give the compare crate its own
+`pricelevel` dependency.** Every scenario attaches a `user_id`, which
+needs a `pricelevel::Hash32` value. Depending on `pricelevel` directly
+from `benches/compare/Cargo.toml` (even with a version range wide
+enough to nominally cover both `0.9` and `0.10`) does not make Cargo
+unify on the version `orderbook-rs`'s own path dependency already
+resolves: a `0.9` → `0.10` bump is SemVer-*incompatible* under Cargo's
+pre-1.0 rules, so Cargo resolves the compare crate's own edge to the
+newest match independently of `orderbook-rs`'s transitive edge,
+producing two incompatible copies of the `pricelevel` crate in one
+build and an `E0308` on every `Hash32`-typed argument ("there are
+multiple different versions of crate `pricelevel` in the dependency
+graph"). `adapter::owner` returns a plain `[u8; 32]` instead, and
+`add_limit_order_with_user` / `submit_market_order_with_user` convert
+with `.into()` at the call site, so type inference resolves to
+whichever `Hash32` the active `orderbook-rs` edge provides —
+`From<[u8; 32]> for Hash32` is present in both `0.9.2` and `0.10.0`, so
+this crate never needs to name `pricelevel::Hash32`, or depend on
+`pricelevel` at all.
+
 Each round's raw output plus a `summary.md` / `summary.csv` (median
 `p50` per side, round-to-round spread as a percentage, delta, verdict)
 and `system_info.md` (CPU, cores, RAM, OS, rustc, load average

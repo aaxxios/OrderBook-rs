@@ -20,11 +20,29 @@
 //! `cancel_only_hdr`'s `submit_gtc` (which always attaches an owner),
 //! which meant this crate was comparing a different book/index shape
 //! than the scenario it claims to mirror.
+//!
+//! # `owner` returns `[u8; 32]`, not `pricelevel::Hash32`
+//!
+//! `add_limit_order_with_user` / `submit_market_order_with_user` take
+//! `user: [u8; 32]` and convert with `.into()` at the call site, letting
+//! type inference resolve to *whichever* `Hash32` the active
+//! `orderbook-rs` path dependency's own `pricelevel` edge provides.
+//! This crate tried a direct `pricelevel` dependency during #258 review
+//! to name `Hash32` explicitly and reverted it (see `Cargo.toml`'s doc
+//! comment): `v0.13.1` and HEAD pin semver-incompatible `pricelevel`
+//! minors (`0.9` / `0.10`), so a version range wide enough to match
+//! both does not make Cargo unify on one of them — it resolves this
+//! crate's own direct edge independently (to the newest match) from
+//! `orderbook-rs`'s transitive edge, yielding two incompatible copies
+//! of the crate and a type-mismatch on every `Hash32` argument.
+//! `From<[u8; 32]> for Hash32` is present in both `0.9.2` and `0.10.0`,
+//! so passing a plain array and converting through the callee's own
+//! resolved type sidesteps the whole problem — this file never needs
+//! to name `Hash32` at all.
 
 #[cfg(feature = "head")]
 mod imp {
     use orderbook_rs::{Id, OrderBook, Side, TimeInForce};
-    use pricelevel::Hash32;
 
     pub type Book = OrderBook<()>;
 
@@ -34,10 +52,10 @@ mod imp {
     }
 
     #[inline]
-    pub fn owner(byte: u8) -> Hash32 {
+    pub fn owner(byte: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         bytes[0] = byte;
-        Hash32::new(bytes)
+        bytes
     }
 
     #[inline]
@@ -47,9 +65,17 @@ mod imp {
         price: u128,
         qty: u64,
         side: Side,
-        user: Hash32,
+        user: [u8; 32],
     ) {
-        let _ = book.add_limit_order_with_user(id, price, qty, side, TimeInForce::Gtc, user, None);
+        let _ = book.add_limit_order_with_user(
+            id,
+            price,
+            qty,
+            side,
+            TimeInForce::Gtc,
+            user.into(),
+            None,
+        );
     }
 
     #[inline]
@@ -58,8 +84,14 @@ mod imp {
     }
 
     #[inline]
-    pub fn submit_market_order_with_user(book: &Book, id: Id, qty: u64, side: Side, user: Hash32) {
-        let _ = book.submit_market_order_with_user(id, qty, side, user);
+    pub fn submit_market_order_with_user(
+        book: &Book,
+        id: Id,
+        qty: u64,
+        side: Side,
+        user: [u8; 32],
+    ) {
+        let _ = book.submit_market_order_with_user(id, qty, side, user.into());
     }
 }
 
@@ -70,7 +102,6 @@ mod imp {
     // divergence is a one-file edit here instead of a rewrite of every
     // call site in `workloads.rs`.
     use orderbook_rs::{Id, OrderBook, Side, TimeInForce};
-    use pricelevel::Hash32;
 
     pub type Book = OrderBook<()>;
 
@@ -80,10 +111,10 @@ mod imp {
     }
 
     #[inline]
-    pub fn owner(byte: u8) -> Hash32 {
+    pub fn owner(byte: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         bytes[0] = byte;
-        Hash32::new(bytes)
+        bytes
     }
 
     #[inline]
@@ -93,9 +124,17 @@ mod imp {
         price: u128,
         qty: u64,
         side: Side,
-        user: Hash32,
+        user: [u8; 32],
     ) {
-        let _ = book.add_limit_order_with_user(id, price, qty, side, TimeInForce::Gtc, user, None);
+        let _ = book.add_limit_order_with_user(
+            id,
+            price,
+            qty,
+            side,
+            TimeInForce::Gtc,
+            user.into(),
+            None,
+        );
     }
 
     #[inline]
@@ -104,8 +143,14 @@ mod imp {
     }
 
     #[inline]
-    pub fn submit_market_order_with_user(book: &Book, id: Id, qty: u64, side: Side, user: Hash32) {
-        let _ = book.submit_market_order_with_user(id, qty, side, user);
+    pub fn submit_market_order_with_user(
+        book: &Book,
+        id: Id,
+        qty: u64,
+        side: Side,
+        user: [u8; 32],
+    ) {
+        let _ = book.submit_market_order_with_user(id, qty, side, user.into());
     }
 }
 

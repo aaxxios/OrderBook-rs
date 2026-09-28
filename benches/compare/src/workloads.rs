@@ -70,7 +70,7 @@ pub fn add_only(warmup_ops: u64, measured_ops: u64) -> Histogram<u64> {
 /// submit/cancel below picks one of these, never the userless path.
 const OWNERS: u8 = 4;
 
-fn pick_owner(rng: &mut Rng) -> pricelevel::Hash32 {
+fn pick_owner(rng: &mut Rng) -> [u8; 32] {
     owner(((rng.next() % OWNERS as u64) as u8) + 1)
 }
 

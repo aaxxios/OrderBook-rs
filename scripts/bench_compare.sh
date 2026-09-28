@@ -112,16 +112,31 @@ for side in baseline candidate; do
 done
 
 # ─── 3. Build each side, separate CARGO_TARGET_DIR per side ─────────
+#
+# The build is explicitly checked and `exit 1`'d on failure rather than
+# left to `set -e`: this function's result is captured via
+# `VAR="$(build_side ...)"` below, and by default bash does NOT
+# propagate `errexit` into a command substitution's subshell unless
+# `shopt -s inherit_errexit` is set (bash >= 4.4) — relying on it here
+# silently continued past a failed build in testing (the build's own
+# stderr was visible, but the script carried on to build the other side
+# and then tried to run a binary that was never produced). `exit 1`
+# inside a function always terminates the whole process, independent of
+# that quirk.
 build_side() {
     local side="$1" feature="$2"
     local dir="$SCRATCH/$side/benches/compare"
     local target_dir="$SCRATCH/$side/target-compare"
     echo "building $side (--features $feature)..." >&2
-    (
+    if ! (
         cd "$dir"
         CARGO_TARGET_DIR="$target_dir" cargo build --release \
             --no-default-features --features "$feature" --quiet
-    )
+    ); then
+        echo "FATAL: build failed for $side (--features $feature) — see cargo's" \
+            "output above. Aborting before running any round." >&2
+        exit 1
+    fi
     cp "$dir/Cargo.lock" "$OUT_DIR/Cargo.lock.$side"
     echo "$target_dir/release/compare"
 }
