@@ -844,11 +844,12 @@ mod tests {
                         solve_iv(&params, price, &SolverConfig::default()),
                         solve_iv_bisection(&params, price, &SolverConfig::default()),
                     ] {
-                        if let Ok((iv, _)) = result {
-                            assert!(iv.is_finite());
-                        }
-                        if let Err(IVError::ConvergenceFailure { last_iv, .. }) = result {
-                            assert!(last_iv.is_finite());
+                        match result {
+                            Ok((iv, _)) => assert!(iv.is_finite()),
+                            Err(IVError::ConvergenceFailure { last_iv, .. }) => {
+                                assert!(last_iv.is_finite());
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
