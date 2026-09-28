@@ -182,6 +182,24 @@ This order book engine is built with the following design principles:
   `with_fees` / `total_fees` and `TradeInfo::from_trade_result` return
   `Result` (`TradeArithmeticError`). `with_maker_rebate(i32::MIN, _)` and
   a pegged offset of `i64::MIN` no longer panic.
+- **Book analytics return `Result` with checked aggregates (#245).** VWAP,
+  market impact, simulation, micro price, imbalance, pressure, depth
+  statistics / distribution, the depth-to-target and liquidity queries,
+  `total_quantity_at_price`, `get_volume_by_price`, `is_thin_book`,
+  `find_level`, the `OrderBookSnapshot` totals, the `EnrichedSnapshot`
+  constructors and `OrderSimulation::total_cost` return
+  `Result<_, OrderBookError>`. `u128` notionals and `u64` depth sums are
+  checked (new `OrderBookError::ArithmeticOverflow`) instead of panicking
+  in debug, wrapping in release or saturating, and a level whose
+  `visible + hidden` total overflows surfaces as
+  `OrderBookError::PriceLevelError` instead of reading as an empty (or
+  `u64::MAX`) level. The depth iterators yield
+  `Result<LevelInfo, OrderBookError>` and stop after the first error.
+  `depth_distribution` caps `bins` at `MAX_DEPTH_DISTRIBUTION_BINS`
+  (4096) and reserves fallibly (`OrderBookError::AllocationFailed`).
+  Pegged orders referencing the mid price use the exact integer midpoint
+  (rounded down) instead of an `f64` round trip. The matching path is
+  unchanged.
 
 #### Migration from 0.13
 
@@ -223,6 +241,28 @@ This order book engine is built with the following design principles:
 | `TradeResult::total_fees() -> i128` (clamps) | `-> Result<i128, TradeArithmeticError>` |
 | `TradeInfo::from_trade_result(tr, schedule) -> TradeInfo` | `-> Result<TradeInfo, TradeArithmeticError>` |
 | taker with an unpriceable worst-case notional: trades with a clamped fee | rejected untouched: `FeeOverflow` (18) / `NotionalOverflow` (19) |
+| `OrderBook::vwap(qty, side) -> Option<f64>` | `-> Result<Option<f64>, OrderBookError>` |
+| `OrderBook::micro_price() -> Option<f64>` | `-> Result<Option<f64>, OrderBookError>` |
+| `OrderBook::order_book_imbalance(levels) -> f64` | `-> Result<f64, OrderBookError>` |
+| `OrderBook::market_impact(qty, side) -> MarketImpact` | `-> Result<MarketImpact, OrderBookError>` |
+| `OrderBook::simulate_market_order(qty, side) -> OrderSimulation` | `-> Result<OrderSimulation, OrderBookError>` |
+| `OrderBook::{price_at_depth, price_at_depth_adjusted}(..) -> Option<u128>` | `-> Result<Option<u128>, OrderBookError>` |
+| `OrderBook::cumulative_depth_to_target(..) -> Option<(u128, u64)>` | `-> Result<Option<(u128, u64)>, OrderBookError>` |
+| `OrderBook::{total_depth_at_levels, liquidity_in_range}(..) -> u64` | `-> Result<u64, OrderBookError>` |
+| `OrderBook::total_quantity_at_price(price, side) -> Option<u64>` (`u64::MAX` on level overflow) | `-> Result<Option<u64>, OrderBookError>` (`Err` on level overflow) |
+| `OrderBook::get_volume_by_price() -> (HashMap, HashMap)` | `-> Result<(HashMap, HashMap), OrderBookError>` |
+| `OrderBook::depth_statistics(side, levels) -> DepthStats` | `-> Result<DepthStats, OrderBookError>` |
+| `OrderBook::buy_sell_pressure() -> (u64, u64)` | `-> Result<(u64, u64), OrderBookError>` |
+| `OrderBook::is_thin_book(threshold, levels) -> bool` | `-> Result<bool, OrderBookError>` |
+| `OrderBook::depth_distribution(side, bins) -> Vec<DistributionBin>` (any `bins`) | `-> Result<Vec<DistributionBin>, OrderBookError>`; `bins` capped at `MAX_DEPTH_DISTRIBUTION_BINS` |
+| `OrderBook::find_level(side, pred) -> Option<LevelInfo>` | `-> Result<Option<LevelInfo>, OrderBookError>` |
+| `levels_with_cumulative_depth` / `levels_until_depth` / `levels_in_range`: `Item = LevelInfo` | `Item = Result<LevelInfo, OrderBookError>`; fused after the first `Err` |
+| `OrderBookSnapshot::{total_bid_volume, total_ask_volume}() -> u64` | `-> Result<u64, OrderBookError>` |
+| `OrderBookSnapshot::{total_bid_value, total_ask_value}() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
+| `EnrichedSnapshot::{new, with_metrics}(..) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
+| `OrderSimulation::total_cost() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
+| `DistributionBin::width() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
+| `OrderBookError` (no analytics overflow variant) | adds `ArithmeticOverflow { operation }`, `AllocationFailed { operation, requested }` (wire code `Other(0)`) |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
@@ -233,7 +273,9 @@ Re-exported pricelevel items change with pricelevel 0.10:
 functions add `?` (or handle the error); callers of `evict_expired_orders`
 do the same; code that treated an empty `MassCancelResult` as "nothing
 to cancel" should also check `has_failures()`. NATS users handle the
-`Result` now returned by `shutdown()`.
+`Result` now returned by `shutdown()`. Callers of the book analytics add
+`?` (or match the error); iterator consumers handle each item
+(`level?`, or `collect::<Result<Vec<_>, _>>()?`).
 
 ### What's New in Version 0.13.0
 
@@ -1139,6 +1181,9 @@ Memory-efficient, composable iterators for order book analysis:
 - **Depth-Limited Iteration**: `levels_until_depth()` - Auto-stop when target depth is reached
 - **Range-Based Iteration**: `levels_in_range()` - Filter levels by price range
 - **Predicate Search**: `find_level()` - Find first level matching custom conditions
+
+Items are `Result<LevelInfo, OrderBookError>`: a level whose depth
+overflows is yielded once as `Err`, then the iterator ends.
 
 **Benefits:**
 - Zero allocation - O(1) memory vs O(N) for vectors
