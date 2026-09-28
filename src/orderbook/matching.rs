@@ -59,6 +59,20 @@ fn fok_counter_overflow() -> OrderBookError {
     }
 }
 
+/// The abort source for a level the sweep's arithmetic backstop refused
+/// (#244): pricelevel's `InvalidOperation`, since `MatchAborted` carries a
+/// `PriceLevelError`. Cold: only reached when a maker admitted concurrently
+/// under the shared gate outruns the preflight.
+#[cold]
+#[inline(never)]
+fn arithmetic_abort_source(price: u128, err: &OrderBookError) -> PriceLevelError {
+    PriceLevelError::InvalidOperation {
+        message: format!(
+            "level {price} not matched: worst-case notional or fee is not representable ({err})"
+        ),
+    }
+}
+
 /// Return a sweep's scratch buffers to the thread-local pool. `stp_orders`
 /// only came from the pool when STP was active; otherwise it is an empty,
 /// never-filled `Vec` that is simply dropped.
@@ -442,6 +456,9 @@ where
         // has already captured and free its id for an unrelated order, and
         // the drain would then report a discard that never happened.
         let _gate = self.acquire_coherent_submit_gate(false);
+        // #244: worst-case notional / fee representability, before any
+        // mutation — identical to every publishing entry point.
+        self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -496,6 +513,8 @@ where
             false,
             false,
         ));
+        // #244: see `match_order`.
+        self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -708,6 +727,21 @@ where
         // A failed post-only probe (#240): no trade and no STP action can
         // have happened, so it is a clean, untouched rejection.
         let mut post_only_probe_error: Option<PriceLevelError> = None;
+        // #244 backstop: every level a base-quantity sweep trades at must
+        // keep `price × quantity` and its fees representable. The preflight
+        // (`check_trade_arithmetic`) already verified the worst price it
+        // could see; this re-checks only a price above every one verified so
+        // far (a buy walks asks upward, so each new level; a sell walks bids
+        // downward, so just the first), which only a maker admitted
+        // concurrently under the shared gate can exceed. A failing level
+        // aborts the sweep before it is touched. Quote-notional sweeps are
+        // bounded by their amount, checked by the preflight.
+        let arithmetic_quantity = match mode {
+            MatchMode::BaseQty { quantity, .. } => Some(quantity),
+            MatchMode::QuoteAmount { .. } => None,
+        };
+        let arithmetic_schedule = self.active_fee_schedule();
+        let mut arithmetic_checked_price: u128 = 0;
 
         // Iterate through prices in optimal order (already sorted by SkipMap)
         // For buy orders: iterate asks in ascending order (best ask first)
@@ -787,6 +821,16 @@ where
                 }
                 // No matchable depth at this crossing level; walk on.
                 continue;
+            }
+
+            if let Some(quantity) = arithmetic_quantity
+                && price > arithmetic_checked_price
+            {
+                if let Err(err) = Self::check_notional_bound(arithmetic_schedule, price, quantity) {
+                    sweep_error = Some(arithmetic_abort_source(price, &err));
+                    break;
+                }
+                arithmetic_checked_price = price;
             }
 
             // #240: reserve the aggregate result (and the pooled filled-maker

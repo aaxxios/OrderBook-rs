@@ -2,6 +2,7 @@ mod book;
 mod depth_analysis;
 mod enriched_snapshot_tests;
 mod error;
+mod fee_overflow;
 mod iterator_tests;
 mod journal_compat_0_13;
 mod lot_size_validation;

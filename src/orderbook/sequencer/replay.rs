@@ -1952,7 +1952,8 @@ mod tests {
                 trade_result: TradeResult::new(
                     "TEST".to_string(),
                     MatchResult::new(taker_id, Quantity::new(0)),
-                ),
+                )
+                .expect("valid trade result"),
             },
         };
         assert!(journal.append(&ev).is_ok());
@@ -2645,7 +2646,8 @@ mod tests {
                 trade_result: TradeResult::new(
                     "TEST".to_string(),
                     MatchResult::new(taker_id, Quantity::new(0)),
-                ),
+                )
+                .expect("valid trade result"),
             },
         };
         assert!(journal.append(&ev).is_ok());

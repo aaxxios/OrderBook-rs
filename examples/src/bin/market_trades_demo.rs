@@ -24,8 +24,10 @@ fn main() {
 
     // Create a trade listener that captures all trades
     let trade_listener: TradeListener = Arc::new(move |trade_result: &TradeResult| {
-        let trade_info = create_trade_info_from_result(trade_result);
-        trades_clone.lock().unwrap().push(trade_info);
+        match create_trade_info_from_result(trade_result) {
+            Ok(trade_info) => trades_clone.lock().unwrap().push(trade_info),
+            Err(e) => info!("  ✗ Could not build trade info: {}", e),
+        }
     });
 
     // Create order book with trade listener
@@ -184,7 +186,10 @@ fn execute_market_orders(book: &OrderBook) {
 /// populates the per-transaction maker/taker fees from the supplied fee
 /// schedule. This demo runs without a fee schedule, so it passes `None`
 /// (per-transaction fees are `0`); pass `Some(&schedule)` to populate them.
-fn create_trade_info_from_result(trade_result: &TradeResult) -> TradeInfo {
+/// Fallible since 0.14.0: notional and fee arithmetic is checked.
+fn create_trade_info_from_result(
+    trade_result: &TradeResult,
+) -> Result<TradeInfo, orderbook_rs::TradeArithmeticError> {
     TradeInfo::from_trade_result(trade_result, None)
 }
 

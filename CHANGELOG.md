@@ -93,7 +93,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prelude). `AllocSnapshot::since` is source-breaking for
   `alloc-counters` users: add `.expect(..)` or handle `None`. No wire,
   journal or snapshot format change.
-
+- **Fee and notional arithmetic on the trade path is checked (#244).**
+  Fees and trade notionals used to clamp or vanish on overflow:
+  `FeeSchedule::calculate_fee` clamped the fee, `TradeResult::with_fees`
+  dropped a fee whose running total overflowed, `TradeResult::total_fees`
+  clamped even a negative overflow to `+i128::MAX`, `quote_notional`
+  saturated, and `TradeInfo::from_trade_result` reported a failed
+  `executed_quantity()` as `0`. Every one of them is now checked and
+  typed. Fee representability is validated **before** the book is
+  touched: each taker's worst-case notional (worst reachable price ×
+  quantity; for a limit buy the limit, else the highest resting ask; for a
+  sell the best bid; for a `*_by_amount` order the amount) must fit `u128`
+  and be priced exactly by both fee legs, or the taker is rejected
+  untouched with `OrderBookError::FeeOverflow` (reject code 18) or
+  `OrderBookError::NotionalOverflow` (code 19), state
+  `Rejected { FeeOverflow | NotionalOverflow }`. The check runs under the
+  submit gate next to the #240 trade-id check, on every submission API
+  (`add_order*`, `submit_market_order*`, `submit_market_order_by_amount*`,
+  `match_market_order*`, `match_limit_order*`, the raw `match_order*`, and
+  `update_order` before the original is cancelled), with or without a
+  trade listener. Under the shared submit gate it is best effort, like the
+  #240 check: a maker admitted concurrently at a worse price is caught by a
+  per-level backstop in the sweep, which aborts with `MatchAborted` before
+  touching that level. Cost on the common path: one or two cached best-price
+  reads and up to three checked multiplications (a market buy adds one
+  `SkipMap::back` read); no allocation. A non-crossing or post-only order
+  is never checked against its notional.
+- **`FeeSchedule::with_maker_rebate(i32::MIN, _)` no longer panics
+  (#244).** `-maker_rebate_bps.abs()` overflowed; the maker rate is now
+  `-|x|`, which is representable for every `i32`.
+- **Repricing arithmetic is checked (#244).** A pegged offset of
+  `i64::MIN` no longer overflows its negation (`unsigned_abs`); a pegged
+  price or tick snap above `u128::MAX` and a trailing stop below `0` or
+  above `u128::MAX` now skip the re-price (`None`) instead of saturating.
+  A negative offset deeper than the reference still floors at the minimum
+  valid price, as documented.
 - **Pre-trade risk uses checked notional arithmetic (#243).** The
   per-account `resting_notional` counter was updated with a wrapping
   `fetch_add` and the notional check used `saturating_*`, so two orders
@@ -163,6 +197,33 @@ change.
   CI now runs it (#262). Test-only change.
 
 ### Changed (breaking)
+
+- **Checked fee / trade arithmetic API (#244).** Compatibility:
+  - `FeeSchedule::calculate_fee(notional, is_maker)`: `i128` →
+    `Result<i128, FeeOverflow>`. The clamping variant is gone; add `?` or
+    handle the error. Values are unchanged wherever the old call did not
+    clamp.
+  - `FeeSchedule::try_calculate_fee` is deprecated (same behaviour as
+    `calculate_fee`). New `FeeSchedule::check_notional(notional)` checks
+    both legs at once.
+  - `TradeResult::new` and `TradeResult::with_fees`: `TradeResult` →
+    `Result<TradeResult, TradeArithmeticError>`; `TradeResult::total_fees`:
+    `i128` → `Result<i128, TradeArithmeticError>`;
+    `TradeInfo::from_trade_result`: `TradeInfo` →
+    `Result<TradeInfo, TradeArithmeticError>`. `TradeArithmeticError` is
+    new, `#[non_exhaustive]`, and re-exported at the root and in the
+    prelude.
+  - `OrderBookError` gains `FeeOverflow` and `NotionalOverflow`;
+    `RejectReason` gains `FeeOverflow` (18) and `NotionalOverflow` (19).
+    Existing codes do not move. Exhaustive matches on `OrderBookError`
+    inside a consumer crate were already impossible (`#[non_exhaustive]`).
+  - Behaviour: a taker whose worst-case notional × fee rate overflowed
+    used to trade with a clamped or dropped fee (or a saturated
+    `quote_notional`); it is now rejected untouched. No snapshot, journal
+    or wire format changes; `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` stays 4.
+    A journal recorded by 0.13 in which such a clamped trade was accepted
+    replays as a `FeeOverflow` / `NotionalOverflow` rejection
+    (`ReplayError::OutcomeMismatch`).
 
 - **pricelevel upgraded to 0.10 (#239).** The crate version moves to
   0.14.0. pricelevel 0.10 makes level snapshots, queue views, dry runs and

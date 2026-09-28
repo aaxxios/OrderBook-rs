@@ -991,7 +991,7 @@ mod tests {
     fn make_trade_result(symbol: &str) -> TradeResult {
         let order_id = Id::from_uuid(Uuid::new_v4());
         let match_result = MatchResult::new(order_id, Quantity::new(100));
-        TradeResult::new(symbol.to_string(), match_result)
+        TradeResult::new(symbol.to_string(), match_result).expect("valid trade result")
     }
 
     #[test]

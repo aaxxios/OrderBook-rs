@@ -4,8 +4,9 @@
    Date: 2/10/25
 ******************************************************************************/
 use crate::orderbook::error::OrderBookError;
+use crate::orderbook::fees::FeeOverflow;
 use crate::orderbook::fees::FeeSchedule;
-use pricelevel::MatchResult;
+use pricelevel::{MatchResult, PriceLevelError, Trade};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -48,103 +49,164 @@ pub struct TradeResult {
     pub quote_notional: u128,
 }
 
+/// Checked arithmetic failure while building a [`TradeResult`] or a
+/// [`TradeInfo`] (#244).
+///
+/// The engine never clamps or drops a trade's notional or fee. On the
+/// book's own trade path these errors are unreachable: every taker's
+/// worst-case notional is validated against the configured
+/// [`FeeSchedule`] before the book is touched (rejected untouched with
+/// [`OrderBookError::FeeOverflow`] / [`OrderBookError::NotionalOverflow`]).
+/// They surface when a caller builds a `TradeResult` by hand from a
+/// `MatchResult` whose values the book would not have admitted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TradeArithmeticError {
+    /// A single trade's `price × quantity` does not fit `u128`.
+    #[error("trade notional overflow: price {price} × quantity {quantity} exceeds u128")]
+    NotionalOverflow {
+        /// Trade price, in price ticks.
+        price: u128,
+        /// Trade quantity, in quantity units.
+        quantity: u64,
+    },
+    /// The sum of the trades' notionals does not fit `u128`.
+    #[error(
+        "quote notional overflow: accumulated {accumulated} + trade notional {notional} exceeds u128"
+    )]
+    QuoteNotionalOverflow {
+        /// Notional summed over the earlier trades.
+        accumulated: u128,
+        /// Notional of the trade that overflowed the sum.
+        notional: u128,
+    },
+    /// A trade's fee is not exactly representable under the schedule.
+    #[error(transparent)]
+    Fee(#[from] FeeOverflow),
+    /// A sum of fees does not fit `i128`: the per-leg totals in
+    /// [`TradeResult::with_fees`], or maker + taker in
+    /// [`TradeResult::total_fees`].
+    #[error("fee total overflow: {accumulated} + {fee} exceeds i128")]
+    FeeTotalOverflow {
+        /// The running total.
+        accumulated: i128,
+        /// The fee that overflowed it.
+        fee: i128,
+    },
+    /// The match result's executed quantity could not be computed.
+    #[error("executed quantity unavailable: {0}")]
+    ExecutedQuantity(#[source] PriceLevelError),
+}
+
+/// `price × quantity` of one trade, checked.
+#[inline]
+fn trade_notional(trade: &Trade) -> Result<u128, TradeArithmeticError> {
+    let price = trade.price().as_u128();
+    let quantity = trade.quantity().as_u64();
+    price
+        .checked_mul(u128::from(quantity))
+        .ok_or(TradeArithmeticError::NotionalOverflow { price, quantity })
+}
+
+/// `accumulated + fee`, checked.
+#[inline]
+fn add_fee(accumulated: i128, fee: i128) -> Result<i128, TradeArithmeticError> {
+    accumulated
+        .checked_add(fee)
+        .ok_or(TradeArithmeticError::FeeTotalOverflow { accumulated, fee })
+}
+
+/// `accumulated + notional`, checked.
+#[inline]
+fn add_notional(accumulated: u128, notional: u128) -> Result<u128, TradeArithmeticError> {
+    accumulated
+        .checked_add(notional)
+        .ok_or(TradeArithmeticError::QuoteNotionalOverflow {
+            accumulated,
+            notional,
+        })
+}
+
 impl TradeResult {
     /// Create a new `TradeResult` with zero fees
     ///
-    /// Use this constructor when no `FeeSchedule` is configured.
-    /// Fees default to zero for backward compatibility. The
-    /// `quote_notional` field is populated from the supplied
-    /// `match_result` (sum of `price × quantity` across every trade).
-    pub fn new(symbol: String, match_result: MatchResult) -> Self {
-        let quote_notional = compute_quote_notional(&match_result);
-        Self {
-            symbol,
-            match_result,
-            total_maker_fees: 0,
-            total_taker_fees: 0,
-            engine_seq: 0,
-            quote_notional,
-        }
+    /// Use this constructor when no `FeeSchedule` is configured. The
+    /// `quote_notional` field is populated from the supplied `match_result`
+    /// (sum of `price × quantity` across every trade), with checked
+    /// arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// [`TradeArithmeticError::NotionalOverflow`] /
+    /// [`TradeArithmeticError::QuoteNotionalOverflow`] when a trade's
+    /// notional or their sum does not fit `u128` (it used to saturate).
+    pub fn new(symbol: String, match_result: MatchResult) -> Result<Self, TradeArithmeticError> {
+        Self::with_fees(symbol, match_result, None)
     }
 
     /// Create a new `TradeResult` with fees calculated from the given schedule
     ///
     /// For each transaction in the match result, the maker and taker fees
-    /// are computed using `FeeSchedule::calculate_fee` with the transaction
-    /// notional value (price × quantity).
+    /// are computed using [`FeeSchedule::calculate_fee`] with the
+    /// transaction notional value (price × quantity) and summed with
+    /// checked arithmetic. Nothing is clamped or dropped: before 0.14.0 an
+    /// overflowing fee was silently left out of the total and the notional
+    /// saturated.
     ///
     /// # Arguments
     ///
     /// * `symbol` - The trading symbol
     /// * `match_result` - The matching engine result containing transactions
     /// * `fee_schedule` - Optional fee schedule; `None` results in zero fees
+    ///
+    /// # Errors
+    ///
+    /// [`TradeArithmeticError`] when a trade's notional, the summed notional,
+    /// a fee, or a fee total is not representable.
     pub fn with_fees(
         symbol: String,
         match_result: MatchResult,
         fee_schedule: Option<FeeSchedule>,
-    ) -> Self {
-        let (total_maker_fees, total_taker_fees) = match fee_schedule {
-            Some(schedule) if !schedule.is_zero_fee() => {
-                let mut maker_sum: i128 = 0;
-                let mut taker_sum: i128 = 0;
-                for tx in match_result.trades().as_vec() {
-                    let notional = tx
-                        .price()
-                        .as_u128()
-                        .saturating_mul(tx.quantity().as_u64() as u128);
-                    maker_sum = maker_sum
-                        .checked_add(schedule.calculate_fee(notional, true))
-                        .unwrap_or(maker_sum);
-                    taker_sum = taker_sum
-                        .checked_add(schedule.calculate_fee(notional, false))
-                        .unwrap_or(taker_sum);
-                }
-                (maker_sum, taker_sum)
+    ) -> Result<Self, TradeArithmeticError> {
+        let schedule = fee_schedule.filter(|schedule| !schedule.is_zero_fee());
+        let mut quote_notional: u128 = 0;
+        let mut total_maker_fees: i128 = 0;
+        let mut total_taker_fees: i128 = 0;
+        for tx in match_result.trades().as_vec() {
+            let notional = trade_notional(tx)?;
+            quote_notional = add_notional(quote_notional, notional)?;
+            if let Some(schedule) = schedule {
+                total_maker_fees =
+                    add_fee(total_maker_fees, schedule.calculate_fee(notional, true)?)?;
+                total_taker_fees =
+                    add_fee(total_taker_fees, schedule.calculate_fee(notional, false)?)?;
             }
-            _ => (0, 0),
-        };
-
-        let quote_notional = compute_quote_notional(&match_result);
-        Self {
+        }
+        Ok(Self {
             symbol,
             match_result,
             total_maker_fees,
             total_taker_fees,
             engine_seq: 0,
             quote_notional,
-        }
+        })
     }
 
     /// Returns the sum of all fees (maker + taker) for this trade
     ///
     /// A positive value means net fees charged; a negative value means
     /// the maker rebate exceeds the taker fee (unusual but possible).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`TradeArithmeticError::FeeTotalOverflow`] when the sum does not fit
+    /// `i128` (it used to clamp to `i128::MAX`, even for a negative
+    /// overflow). Unreachable for a `TradeResult` the book built, whose
+    /// per-leg totals are bounded by `u128::MAX / 10_000`.
     #[inline]
-    pub fn total_fees(&self) -> i128 {
-        self.total_maker_fees
-            .checked_add(self.total_taker_fees)
-            .unwrap_or(i128::MAX)
+    pub fn total_fees(&self) -> Result<i128, TradeArithmeticError> {
+        add_fee(self.total_maker_fees, self.total_taker_fees)
     }
-}
-
-/// Sum of `price × quantity` across every trade in `match_result`.
-///
-/// Saturates on overflow rather than panicking — overflow on `u128` can
-/// only occur in adversarial fixtures with prices near `u128::MAX`, and
-/// the matching path already saturates equivalent multiplications.
-#[inline]
-#[must_use]
-fn compute_quote_notional(match_result: &MatchResult) -> u128 {
-    let mut total: u128 = 0;
-    for tx in match_result.trades().as_vec() {
-        let notional = tx
-            .price()
-            .as_u128()
-            .saturating_mul(u128::from(tx.quantity().as_u64()));
-        total = total.saturating_add(notional);
-    }
-    total
 }
 
 /// Trade listener specification using Arc for shared ownership
@@ -324,31 +386,33 @@ impl TradeInfo {
     /// authoritative engine-side population path for the `TransactionInfo`
     /// fee fields; consumers should prefer it to constructing
     /// `TransactionInfo` by hand (which historically left the fees at `0`).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`TradeArithmeticError`] when a transaction's notional or fee is not
+    /// representable, or the match result's executed quantity cannot be
+    /// computed (it used to be reported as `0`).
     pub fn from_trade_result(
         trade_result: &TradeResult,
         fee_schedule: Option<&FeeSchedule>,
-    ) -> Self {
+    ) -> Result<Self, TradeArithmeticError> {
         let match_result = &trade_result.match_result;
         let schedule = fee_schedule.filter(|s| !s.is_zero_fee());
 
-        let transactions: Vec<TransactionInfo> = match_result
+        let transactions = match_result
             .trades()
             .as_vec()
             .iter()
             .map(|tx| {
-                let notional = tx
-                    .price()
-                    .as_u128()
-                    .saturating_mul(u128::from(tx.quantity().as_u64()));
+                let notional = trade_notional(tx)?;
                 let (maker_fee, taker_fee) = match schedule {
                     Some(s) => (
-                        s.calculate_fee(notional, true),
-                        s.calculate_fee(notional, false),
+                        s.calculate_fee(notional, true)?,
+                        s.calculate_fee(notional, false)?,
                     ),
                     None => (0, 0),
                 };
-                TransactionInfo {
+                Ok(TransactionInfo {
                     price: tx.price().as_u128(),
                     quantity: tx.quantity().as_u64(),
                     transaction_id: tx.trade_id().to_string(),
@@ -356,22 +420,23 @@ impl TradeInfo {
                     taker_order_id: tx.taker_order_id().to_string(),
                     maker_fee,
                     taker_fee,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, TradeArithmeticError>>()?;
 
-        Self {
+        let executed_quantity = match_result
+            .executed_quantity()
+            .map_err(TradeArithmeticError::ExecutedQuantity)?
+            .as_u64();
+        Ok(Self {
             symbol: trade_result.symbol.clone(),
             order_id: match_result.order_id().to_string(),
-            executed_quantity: match_result
-                .executed_quantity()
-                .map(|q| q.as_u64())
-                .unwrap_or(0),
+            executed_quantity,
             remaining_quantity: match_result.remaining_quantity().as_u64(),
             is_complete: match_result.is_complete(),
             transaction_count: match_result.trades().len(),
             transactions,
-        }
+        })
     }
 }
 
@@ -428,32 +493,32 @@ mod tests {
     #[test]
     fn test_trade_result_new_has_zero_fees() {
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
 
         assert_eq!(tr.total_maker_fees, 0);
         assert_eq!(tr.total_taker_fees, 0);
-        assert_eq!(tr.total_fees(), 0);
+        assert_eq!(tr.total_fees().unwrap(), 0);
     }
 
     #[test]
     fn test_trade_result_with_fees_none_schedule() {
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, None);
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, None).unwrap();
 
         assert_eq!(tr.total_maker_fees, 0);
         assert_eq!(tr.total_taker_fees, 0);
-        assert_eq!(tr.total_fees(), 0);
+        assert_eq!(tr.total_fees().unwrap(), 0);
     }
 
     #[test]
     fn test_trade_result_with_fees_zero_schedule() {
         let schedule = FeeSchedule::zero_fee();
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule));
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule)).unwrap();
 
         assert_eq!(tr.total_maker_fees, 0);
         assert_eq!(tr.total_taker_fees, 0);
-        assert_eq!(tr.total_fees(), 0);
+        assert_eq!(tr.total_fees().unwrap(), 0);
     }
 
     #[test]
@@ -462,14 +527,14 @@ mod tests {
         let schedule = FeeSchedule::new(-2, 5);
         // notional = 1000 * 10 = 10_000
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule));
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule)).unwrap();
 
         // maker fee: 10_000 * -2 / 10_000 = -2
         assert_eq!(tr.total_maker_fees, -2);
         // taker fee: 10_000 * 5 / 10_000 = 5
         assert_eq!(tr.total_taker_fees, 5);
         // total = -2 + 5 = 3
-        assert_eq!(tr.total_fees(), 3);
+        assert_eq!(tr.total_fees().unwrap(), 3);
     }
 
     #[test]
@@ -479,24 +544,24 @@ mod tests {
             make_trade(1000, 10), // notional = 10_000
             make_trade(2000, 20), // notional = 40_000
         ]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule));
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule)).unwrap();
 
         // maker fees: (-2 * 10_000 / 10_000) + (-2 * 40_000 / 10_000) = -2 + -8 = -10
         assert_eq!(tr.total_maker_fees, -10);
         // taker fees: (5 * 10_000 / 10_000) + (5 * 40_000 / 10_000) = 5 + 20 = 25
         assert_eq!(tr.total_taker_fees, 25);
-        assert_eq!(tr.total_fees(), 15);
+        assert_eq!(tr.total_fees().unwrap(), 15);
     }
 
     #[test]
     fn test_trade_result_with_fees_no_transactions() {
         let schedule = FeeSchedule::new(-2, 5);
         let mr = make_match_result_with_trades(vec![]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule));
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule)).unwrap();
 
         assert_eq!(tr.total_maker_fees, 0);
         assert_eq!(tr.total_taker_fees, 0);
-        assert_eq!(tr.total_fees(), 0);
+        assert_eq!(tr.total_fees().unwrap(), 0);
     }
 
     #[test]
@@ -504,13 +569,13 @@ mod tests {
         let schedule = FeeSchedule::with_maker_rebate(5, 10);
         // notional = 100_000 * 50 = 5_000_000
         let mr = make_match_result_with_trades(vec![make_trade(100_000, 50)]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule));
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule)).unwrap();
 
         // maker: -5 * 5_000_000 / 10_000 = -2_500
         assert_eq!(tr.total_maker_fees, -2_500);
         // taker: 10 * 5_000_000 / 10_000 = 5_000
         assert_eq!(tr.total_taker_fees, 5_000);
-        assert_eq!(tr.total_fees(), 2_500);
+        assert_eq!(tr.total_fees().unwrap(), 2_500);
         assert!(tr.total_maker_fees < 0); // rebate
     }
 
@@ -521,9 +586,9 @@ mod tests {
             make_trade(1000, 10), // notional 10_000 → maker -2, taker 5
             make_trade(2000, 20), // notional 40_000 → maker -8, taker 20
         ]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule));
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule)).unwrap();
 
-        let info = TradeInfo::from_trade_result(&tr, Some(&schedule));
+        let info = TradeInfo::from_trade_result(&tr, Some(&schedule)).unwrap();
 
         assert_eq!(info.symbol, "BTC/USD");
         assert_eq!(info.transaction_count, 2);
@@ -545,10 +610,10 @@ mod tests {
     #[test]
     fn test_trade_info_from_result_none_schedule_zero_fees_issue_119() {
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::new("ETH/USD".to_string(), mr);
+        let tr = TradeResult::new("ETH/USD".to_string(), mr).unwrap();
 
         // No schedule → per-transaction fees are zero, metadata still populated.
-        let info = TradeInfo::from_trade_result(&tr, None);
+        let info = TradeInfo::from_trade_result(&tr, None).unwrap();
         assert_eq!(info.transaction_count, 1);
         assert_eq!(info.transactions.len(), 1);
         assert_eq!(info.transactions[0].maker_fee, 0);
@@ -558,7 +623,7 @@ mod tests {
 
         // A zero-fee schedule is treated the same as no schedule.
         let zero = FeeSchedule::zero_fee();
-        let info_zero = TradeInfo::from_trade_result(&tr, Some(&zero));
+        let info_zero = TradeInfo::from_trade_result(&tr, Some(&zero)).unwrap();
         assert_eq!(info_zero.transactions[0].maker_fee, 0);
         assert_eq!(info_zero.transactions[0].taker_fee, 0);
     }
@@ -566,7 +631,7 @@ mod tests {
     #[test]
     fn test_trade_result_symbol_preserved() {
         let mr = make_match_result_with_trades(vec![]);
-        let tr = TradeResult::with_fees("ETH/USDT".to_string(), mr, None);
+        let tr = TradeResult::with_fees("ETH/USDT".to_string(), mr, None).unwrap();
         assert_eq!(tr.symbol, "ETH/USDT");
     }
 
@@ -589,14 +654,14 @@ mod tests {
     #[test]
     fn test_trade_result_engine_seq_default_zero() {
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         assert_eq!(tr.engine_seq, 0);
     }
 
     #[test]
     fn test_trade_result_json_roundtrip_preserves_engine_seq() {
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let mut tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let mut tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         tr.engine_seq = 42;
 
         let json = serde_json::to_vec(&tr).expect("serialize trade");
@@ -613,7 +678,7 @@ mod tests {
         // Build a JSON payload that mirrors the pre-engine_seq schema by
         // first serializing a TradeResult and then stripping the field.
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let mut tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let mut tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         tr.engine_seq = 99;
 
         let mut value: serde_json::Value =
@@ -636,7 +701,7 @@ mod tests {
     fn test_trade_result_new_populates_quote_notional() {
         // single trade: 1000 * 10 = 10_000
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         assert_eq!(tr.quote_notional, 10_000);
     }
 
@@ -644,14 +709,14 @@ mod tests {
     fn test_trade_result_with_fees_populates_quote_notional_multi_trade() {
         // 1000*10 + 2000*20 = 10_000 + 40_000 = 50_000
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10), make_trade(2000, 20)]);
-        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, None);
+        let tr = TradeResult::with_fees("BTC/USD".to_string(), mr, None).unwrap();
         assert_eq!(tr.quote_notional, 50_000);
     }
 
     #[test]
     fn test_trade_result_quote_notional_zero_when_no_trades() {
         let mr = make_match_result_with_trades(vec![]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         assert_eq!(tr.quote_notional, 0);
     }
 
@@ -659,7 +724,7 @@ mod tests {
     fn test_trade_result_json_missing_quote_notional_defaults_zero() {
         // Pre-quote_notional payload: serialize, strip the field, decode.
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
 
         let mut value: serde_json::Value =
             serde_json::to_value(&tr).expect("serialize trade to value");
@@ -679,7 +744,7 @@ mod tests {
     #[test]
     fn test_trade_result_json_roundtrip_preserves_quote_notional() {
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10), make_trade(2000, 5)]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         let original = tr.quote_notional;
         assert_eq!(original, 20_000);
 
@@ -695,7 +760,7 @@ mod tests {
         use bincode::serde::{decode_from_slice, encode_to_vec};
 
         let mr = make_match_result_with_trades(vec![make_trade(1234, 7)]);
-        let tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         let original = tr.quote_notional;
         assert_eq!(original, 8_638);
 
@@ -713,7 +778,7 @@ mod tests {
         use bincode::serde::{decode_from_slice, encode_to_vec};
 
         let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
-        let mut tr = TradeResult::new("BTC/USD".to_string(), mr);
+        let mut tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
         tr.engine_seq = 7;
 
         let bytes = encode_to_vec(&tr, standard()).expect("bincode encode");
@@ -722,5 +787,102 @@ mod tests {
         assert_eq!(consumed, bytes.len(), "no trailing bytes expected");
         assert_eq!(decoded.engine_seq, 7);
         assert_eq!(decoded.symbol, tr.symbol);
+    }
+
+    #[test]
+    fn test_trade_result_total_fees_negative_overflow_is_an_error_issue_244() {
+        let mr = make_match_result_with_trades(vec![make_trade(1000, 10)]);
+        let mut tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
+        tr.total_maker_fees = i128::MIN;
+        tr.total_taker_fees = -1;
+        // Used to clamp to +i128::MAX, flipping the sign.
+        assert_eq!(
+            tr.total_fees(),
+            Err(TradeArithmeticError::FeeTotalOverflow {
+                accumulated: i128::MIN,
+                fee: -1,
+            })
+        );
+        tr.total_maker_fees = i128::MAX;
+        tr.total_taker_fees = 1;
+        assert!(tr.total_fees().is_err());
+        tr.total_maker_fees = i128::MIN;
+        tr.total_taker_fees = i128::MAX;
+        assert_eq!(tr.total_fees(), Ok(-1));
+    }
+
+    #[test]
+    fn test_trade_result_notional_overflow_is_an_error_issue_244() {
+        let mr = make_match_result_with_trades(vec![make_trade(u128::MAX, 2)]);
+        assert_eq!(
+            TradeResult::new("BTC/USD".to_string(), mr).map(|t| t.quote_notional),
+            Err(TradeArithmeticError::NotionalOverflow {
+                price: u128::MAX,
+                quantity: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_trade_result_quote_notional_sum_overflow_is_an_error_issue_244() {
+        let mr = make_match_result_with_trades(vec![make_trade(u128::MAX, 1), make_trade(1, 1)]);
+        assert_eq!(
+            TradeResult::new("BTC/USD".to_string(), mr).map(|t| t.quote_notional),
+            Err(TradeArithmeticError::QuoteNotionalOverflow {
+                accumulated: u128::MAX,
+                notional: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn test_trade_result_with_fees_fee_overflow_is_not_dropped_issue_244() {
+        // Notional u128::MAX / 2 fits, but × 5 bps does not: the fee used to
+        // be silently left out of the total.
+        let schedule = FeeSchedule::new(-2, 5);
+        let mr = make_match_result_with_trades(vec![make_trade(u128::MAX / 2, 1)]);
+        let err = TradeResult::with_fees("BTC/USD".to_string(), mr.clone(), Some(schedule))
+            .map(|t| t.total_taker_fees);
+        assert!(
+            matches!(
+                err,
+                Err(TradeArithmeticError::Fee(FeeOverflow { bps: 5, .. }))
+            ),
+            "got {err:?}"
+        );
+        // Without a schedule the same trade is fine.
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
+        assert_eq!(tr.quote_notional, u128::MAX / 2);
+    }
+
+    #[test]
+    fn test_trade_result_with_fees_extreme_rate_rejects_instead_of_dropping_issue_244() {
+        // At -10_000 bps (-100%) a maker fee equals -notional; for a notional
+        // near 2^126 the u128 product overflows and the fee is reported, not
+        // left out of the total.
+        let schedule = FeeSchedule::new(-10_000, 0);
+        let half = (i128::MAX as u128) / 2 + 1;
+        let mr = make_match_result_with_trades(vec![make_trade(half, 1), make_trade(half, 1)]);
+        let res = TradeResult::with_fees("BTC/USD".to_string(), mr, Some(schedule))
+            .map(|t| t.total_maker_fees);
+        assert!(
+            matches!(
+                res,
+                Err(TradeArithmeticError::Fee(FeeOverflow { bps: -10_000, .. }))
+            ),
+            "got {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_trade_info_from_result_propagates_fee_overflow_issue_244() {
+        let mr = make_match_result_with_trades(vec![make_trade(u128::MAX / 2, 1)]);
+        let tr = TradeResult::new("BTC/USD".to_string(), mr).unwrap();
+        let schedule = FeeSchedule::new(0, 5);
+        assert!(matches!(
+            TradeInfo::from_trade_result(&tr, Some(&schedule)),
+            Err(TradeArithmeticError::Fee(_))
+        ));
+        assert!(TradeInfo::from_trade_result(&tr, None).is_ok());
     }
 }

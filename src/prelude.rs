@@ -36,7 +36,7 @@ pub use crate::orderbook::statistics::{DepthStats, DistributionBin};
 
 // Trade-related types
 pub use crate::orderbook::trade::{
-    TradeEvent, TradeInfo, TradeListener, TradeResult, TransactionInfo,
+    TradeArithmeticError, TradeEvent, TradeInfo, TradeListener, TradeResult, TransactionInfo,
 };
 
 // Book change event types

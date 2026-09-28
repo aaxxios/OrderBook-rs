@@ -1705,6 +1705,21 @@ where
         }
 
         //
+        // Trade arithmetic preflight (#244): the worst-case notional this
+        // taker can reach (worst crossable price × total quantity) must fit
+        // `u128` and be priced exactly by both fee legs, so no committed
+        // trade can carry a clamped or dropped fee. Post-only takers never
+        // trade and are exempt; a non-crossing order passes. Runs before
+        // the original is cancelled on the modify path.
+        if !order.is_post_only() {
+            self.check_trade_arithmetic(
+                order.side(),
+                order.total_quantity(),
+                Some(order.price().as_u128()),
+            )?;
+        }
+
+        //
         // Fill-or-kill preflight (#240): a later level can fail after earlier
         // levels committed, which would turn the FOK into a partial fill.
         // Everything the sweep can exhaust and the book can observe is
@@ -2083,6 +2098,12 @@ where
                     },
                 );
                 crate::orderbook::metrics::record_reject(RejectReason::InsufficientLiquidity);
+            }
+            // The trade arithmetic preflight (#244): the book is untouched.
+            OrderBookError::FeeOverflow { .. } | OrderBookError::NotionalOverflow { .. } => {
+                let reason = RejectReason::from(err);
+                self.track_state(order.id(), OrderStatus::Rejected { reason });
+                crate::orderbook::metrics::record_reject(reason);
             }
             // A fill-or-kill preflight kill (#240): the feasibility dry run
             // failed or a resource the sweep would exhaust (trade-id
