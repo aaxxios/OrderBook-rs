@@ -18,7 +18,7 @@ mod tests {
     use orderbook_rs::orderbook::sequencer::snapshots_match;
     use orderbook_rs::{DefaultOrderBook, OrderBook};
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -64,17 +64,27 @@ mod tests {
     fn level_statistics_are_advisory_during_and_exact_after_concurrent_sweeps() {
         let live = Arc::new(seeded_book());
         let running = Arc::new(AtomicBool::new(true));
+        // Number of snapshots the reader captured; takers pause half-way
+        // until at least one exists, so the test always observes the book
+        // between the first and the last fill.
+        let captures = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(usize::try_from(TAKERS).expect("small") + 1));
 
         let mut takers = Vec::new();
         for t in 0..TAKERS {
             let book = Arc::clone(&live);
             let barrier = Arc::clone(&barrier);
+            let captures = Arc::clone(&captures);
             takers.push(thread::spawn(move || {
                 barrier.wait();
                 let mut executed = 0u64;
                 let mut trades = 0usize;
                 for i in 0..FILLS_PER_TAKER {
+                    if i == FILLS_PER_TAKER / 2 {
+                        while captures.load(Ordering::Acquire) == 0 {
+                            thread::yield_now();
+                        }
+                    }
                     // Anonymous sweep: shared side of the submit gate, so
                     // takers overlap on the same level.
                     let result = book
@@ -95,6 +105,7 @@ mod tests {
         let reader_book = Arc::clone(&live);
         let reader_running = Arc::clone(&running);
         let reader_barrier = Arc::clone(&barrier);
+        let reader_captures = Arc::clone(&captures);
         let reader = thread::spawn(move || {
             reader_barrier.wait();
             let mut captured = Vec::new();
@@ -105,6 +116,7 @@ mod tests {
                 if let Ok(snapshot) = reader_book.create_snapshot(usize::MAX) {
                     let level = snapshot.asks.first().expect("ask level").clone();
                     captured.push((exec_stats(&snapshot), level));
+                    reader_captures.fetch_add(1, Ordering::Release);
                 }
             }
             captured
@@ -119,6 +131,10 @@ mod tests {
         }
         running.store(false, Ordering::Release);
         let captured = reader.join().expect("reader thread");
+        assert!(
+            !captured.is_empty(),
+            "the reader must observe the book before the sweeps complete"
+        );
 
         // Trades are exact regardless of concurrency.
         assert_eq!(executed, TOTAL_FILLS);
