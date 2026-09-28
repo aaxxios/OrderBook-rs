@@ -113,6 +113,19 @@ This order book engine is built with the following design principles:
   applies to submits recorded through `*_with_committed` /
   `SequencerResult::from_submit_failure`, and aborted updates are
   reconciled by code only. See `doc/panic-boundaries.md`.
+- **NATS publishers validate their configuration (#253).** Builder values
+  are clamped with a `warn!` instead of panicking later (batch window and
+  publish interval at 60 s, batch size to `1..=65_536`, channel capacity
+  to Tokio's limit); retries use capped exponential backoff (5 s) with
+  jitter; `shutdown()` returns `Result<(), NatsPublisherError>` so a
+  panicked or cancelled background task is reported.
+
+- **Checked time helpers (#257).** `try_current_time_millis()` returns
+  `Result<u64, TimeError>` for a pre-epoch clock or a `u64` overflow;
+  `current_time_millis()` stays infallible with a documented, logged
+  fallback instead of a silent `0` / truncating cast.
+  `AllocSnapshot::since` (feature `alloc-counters`) returns `Option` and
+  rejects out-of-order snapshots instead of clamping.
 - **Wire codec is panic-free on untrusted bytes (#254).** Decoders read
   through checked offsets instead of `copy_from_slice` and raw offset
   arithmetic. `encode_exec_report`, `encode_trade_print` and
@@ -132,6 +145,7 @@ This order book engine is built with the following design principles:
 | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<Vec<..>, OrderBookError>>` |
 | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
 | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
+| `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |
 | `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
 | `BlackScholes::{price, vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
@@ -143,6 +157,7 @@ This order book engine is built with the following design principles:
 | `solve_iv` / `solve_iv_bisection` / `implied_volatility*` accept any config | reject an invalid config with `IVError::InvalidConfig` |
 | sweep stopped by a level failure: `Err(PriceLevelError)` (prefix unreported) | `Err(MatchAborted { .. })`, prefix published |
 | `CancelReason` (8 variants) | adds `MatchAborted` (exhaustive matches need an arm) |
+| `Nats{Trade,BookChange}Publisher::shutdown() -> ()` | `-> Result<(), NatsPublisherError>` |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
@@ -152,7 +167,8 @@ Re-exported pricelevel items change with pricelevel 0.10:
 `CounterExhausted`, `EntropyUnavailable`). Callers of the snapshot
 functions add `?` (or handle the error); callers of `evict_expired_orders`
 do the same; code that treated an empty `MassCancelResult` as "nothing
-to cancel" should also check `has_failures()`.
+to cancel" should also check `has_failures()`. NATS users handle the
+`Result` now returned by `shutdown()`.
 
 ### What's New in Version 0.13.0
 
