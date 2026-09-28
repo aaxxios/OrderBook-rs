@@ -570,12 +570,13 @@ pub enum ManagerError {
         message: String,
     },
 
-    /// `shutdown` was called while no trade processor is running: it was
-    /// never started, or it was already shut down (#255).
+    /// `stop_trade_processor` was called while no trade processor is
+    /// running: it was never started, or it was already stopped (#255).
     ProcessorNotRunning,
 
-    /// The trade processor panicked (#255). Reported by `shutdown` when it
-    /// joins the processor. The panic can only come from caller-supplied
+    /// The trade processor panicked (#255). Reported by
+    /// `stop_trade_processor` when it joins the thread (`BookManagerStd`) or
+    /// awaits the task (`BookManagerTokio`). The panic can only come from caller-supplied
     /// code: the handler given to `start_trade_processor_with`, or the
     /// installed `tracing` subscriber.
     ProcessorPanicked {
@@ -585,7 +586,7 @@ pub enum ManagerError {
 
     /// The Tokio trade processor task was cancelled before it finished
     /// (#255), for example because its runtime shut down. Reported by
-    /// `BookManagerTokio::shutdown`.
+    /// `BookManagerTokio::stop_trade_processor`.
     ProcessorCancelled,
 }
 
