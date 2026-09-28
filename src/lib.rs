@@ -32,6 +32,11 @@
 //! - **Research**: Platform for studying market microstructure and order flow
 //! - **Educational**: Reference implementation for understanding modern exchange architecture
 //!
+//! ## What's New in Version 0.14.0 (unreleased)
+//!
+//! - Dependency floors raised to the latest semver-compatible releases
+//!   (#237). `bincode` stays on 2.0.1.
+//!
 //! ## What's New in Version 0.13.0
 //!
 //! ### v0.13.0 — the public API hands out no level handles (#228); exclusive submit gate under STP (#225); replay re-executes coded submit rejections (#224)

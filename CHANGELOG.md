@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Dependency floors raised to the latest semver-compatible releases: uuid
+  1.26.1, serde_json 1.0.151, serde 1.0.229, crossbeam 0.8.5, bitflags
+  2.13.2, thiserror 2.0.21, bytes 1.12.1, crc32fast 1.5.2, memmap2 0.9.11,
+  metrics 0.24.6, zerocopy 0.8.59; dev-dependency hdrhistogram 7.6; examples
+  metrics-exporter-prometheus 0.18.3 (#237). `bincode` stays on 2.0.1: the
+  3.0.0 release on crates.io is a tombstone whose library is a single
+  `compile_error!`. No new dependencies and no feature changes.
+
 ## [0.13.1] - 2026-09-18
 
 ### Changed
