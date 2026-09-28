@@ -15,11 +15,16 @@ struct TestExtraFields {
 mod tests {
     use super::*;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     #[test]
     fn test_order_type_quantity_methods() {
         // Test quantity() method for different order types
         let standard_order = OrderType::Standard {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(100),
             side: Side::Buy,
@@ -31,7 +36,7 @@ mod tests {
         assert_eq!(standard_order.quantity(), 100);
 
         let reserve_order = OrderType::ReserveOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(30),
             hidden_quantity: Quantity::new(70),
@@ -47,7 +52,7 @@ mod tests {
         assert_eq!(reserve_order.quantity(), 30); // Returns visible quantity
 
         let post_only_order = OrderType::PostOnly {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(75),
             side: Side::Buy,
@@ -59,7 +64,7 @@ mod tests {
         assert_eq!(post_only_order.quantity(), 75);
 
         let trailing_stop_order = OrderType::TrailingStop {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(25),
             side: Side::Buy,
@@ -73,7 +78,7 @@ mod tests {
         assert_eq!(trailing_stop_order.quantity(), 25);
 
         let pegged_order = OrderType::PeggedOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(80),
             side: Side::Buy,
@@ -87,7 +92,7 @@ mod tests {
         assert_eq!(pegged_order.quantity(), 80);
 
         let market_to_limit_order = OrderType::MarketToLimit {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(60),
             side: Side::Sell,
@@ -99,7 +104,7 @@ mod tests {
         assert_eq!(market_to_limit_order.quantity(), 60);
 
         let reserve_order = OrderType::ReserveOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(30),
             hidden_quantity: Quantity::new(70),
@@ -119,7 +124,7 @@ mod tests {
     fn test_order_type_total_quantity_methods() {
         // Test total_quantity() method for different order types
         let iceberg_order = OrderType::IcebergOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(50),
             hidden_quantity: Quantity::new(150),
@@ -132,7 +137,7 @@ mod tests {
         assert_eq!(iceberg_order.total_quantity(), 200); // visible + hidden
 
         let reserve_order = OrderType::ReserveOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(30),
             hidden_quantity: Quantity::new(70),
@@ -148,7 +153,7 @@ mod tests {
         assert_eq!(reserve_order.total_quantity(), 100); // visible + hidden
 
         let standard_order = OrderType::Standard {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(100),
             side: Side::Buy,
@@ -164,7 +169,7 @@ mod tests {
     fn test_order_type_set_quantity_methods() {
         // Test set_quantity() method for different order types
         let mut standard_order = OrderType::Standard {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(100),
             side: Side::Buy,
@@ -177,7 +182,7 @@ mod tests {
         assert_eq!(standard_order.quantity(), 80);
 
         let mut iceberg_order = OrderType::IcebergOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(50),
             hidden_quantity: Quantity::new(150),
@@ -191,7 +196,7 @@ mod tests {
         assert_eq!(iceberg_order.quantity(), 40); // visible quantity updated
 
         let mut reserve_order = OrderType::ReserveOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(30),
             hidden_quantity: Quantity::new(70),
@@ -212,7 +217,7 @@ mod tests {
     #[test]
     fn test_update_order_price_same_value() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Add an order
         book.add_limit_order(order_id, 1000, 100, Side::Buy, TimeInForce::Gtc, None)
@@ -237,7 +242,7 @@ mod tests {
     #[test]
     fn test_update_order_price_success() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Add an order
         book.add_limit_order(order_id, 1000, 100, Side::Buy, TimeInForce::Gtc, None)
@@ -263,7 +268,7 @@ mod tests {
     #[test]
     fn test_update_order_quantity_success() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Add an order
         book.add_limit_order(order_id, 1000, 100, Side::Buy, TimeInForce::Gtc, None)
@@ -289,7 +294,7 @@ mod tests {
     #[test]
     fn test_update_order_price_and_quantity_success() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Add an order
         book.add_limit_order(order_id, 1000, 100, Side::Buy, TimeInForce::Gtc, None)
@@ -316,7 +321,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent_order() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
-        let nonexistent_id = Id::new_uuid();
+        let nonexistent_id = new_id();
 
         // Try to update a nonexistent order
         let update = OrderUpdate::UpdatePrice {

@@ -21,6 +21,11 @@ use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Hash32, Id, Side, TimeInForce, setup_logger};
 use tracing::{info, warn};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 fn main() {
     let _ = setup_logger();
     info!("Prometheus export demo");
@@ -64,15 +69,9 @@ fn seed_resting_book(book: &OrderBook<()>) {
     ];
 
     for (price, qty, side) in resting {
-        if let Err(err) = book.add_limit_order_with_user(
-            Id::new_uuid(),
-            price,
-            qty,
-            side,
-            TimeInForce::Gtc,
-            user,
-            None,
-        ) {
+        if let Err(err) =
+            book.add_limit_order_with_user(new_id(), price, qty, side, TimeInForce::Gtc, user, None)
+        {
             warn!("seed add failed: {err}");
         }
     }
@@ -81,14 +80,7 @@ fn seed_resting_book(book: &OrderBook<()>) {
 fn cross_some_trades(book: &OrderBook<()>) {
     // Aggressive buys against the resting asks.
     for (limit, qty) in [(102u128, 4u64), (103, 3)] {
-        match book.add_limit_order(
-            Id::new_uuid(),
-            limit,
-            qty,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        ) {
+        match book.add_limit_order(new_id(), limit, qty, Side::Buy, TimeInForce::Gtc, None) {
             Ok(_) => info!("aggressive buy filled at limit {limit} qty {qty}"),
             Err(err) => warn!("aggressive buy failed: {err}"),
         }
@@ -100,7 +92,7 @@ fn trigger_rejects(book: &OrderBook<()>) {
     // taxonomy. Releases immediately so the book still serves the
     // last metric render correctly.
     book.engage_kill_switch();
-    let result = book.add_limit_order(Id::new_uuid(), 100, 1, Side::Buy, TimeInForce::Gtc, None);
+    let result = book.add_limit_order(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, None);
     match result {
         Err(OrderBookError::KillSwitchActive) => {
             info!("expected KillSwitchActive reject recorded as a metric")

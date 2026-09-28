@@ -3,6 +3,11 @@ use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 /// Register all benchmarks for matching orders in an order book
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Match Orders");
@@ -12,7 +17,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
     group.bench_function("match_market_against_limit", |b| {
         b.iter(|| {
             let order_book = setup_limit_order_book(100);
-            let id = Id::new_uuid();
+            let id = new_id();
             let _ = black_box(order_book.submit_market_order(id, 50, Side::Buy));
         })
     });
@@ -21,7 +26,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
     group.bench_function("match_market_against_iceberg", |b| {
         b.iter(|| {
             let order_book = setup_iceberg_order_book(100);
-            let id = Id::new_uuid();
+            let id = new_id();
             let _ = black_box(order_book.submit_market_order(id, 75, Side::Buy));
         })
     });
@@ -34,7 +39,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             |b, &match_quantity| {
                 b.iter(|| {
                     let order_book = setup_limit_order_book(50);
-                    let id = Id::new_uuid();
+                    let id = new_id();
                     let _ =
                         black_box(order_book.submit_market_order(id, match_quantity, Side::Buy));
                 })
@@ -50,7 +55,7 @@ fn setup_limit_order_book(order_count: u64) -> OrderBook {
     let order_book = OrderBook::new("TEST-SYMBOL");
 
     for _i in 0..order_count {
-        let id = Id::new_uuid();
+        let id = new_id();
         order_book
             .add_limit_order(id, 1000, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
@@ -64,7 +69,7 @@ fn setup_iceberg_order_book(order_count: u64) -> OrderBook {
     let order_book = OrderBook::new("TEST-SYMBOL");
 
     for _i in 0..order_count {
-        let id = Id::new_uuid();
+        let id = new_id();
         order_book
             .add_iceberg_order(id, 1000, 5, 15, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();

@@ -4,6 +4,11 @@ use orderbook_rs::orderbook::mass_cancel::MassCancelResult;
 use orderbook_rs::{OrderBook, STPMode};
 use pricelevel::{Hash32, Id, Side, TimeInForce};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
@@ -34,19 +39,12 @@ fn cancel_all_removes_every_order() {
     let book = new_book();
 
     for price in [90, 95, 100] {
-        book.add_limit_order(Id::new_uuid(), price, 10, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), price, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add bid");
     }
     for price in [110, 115, 120] {
-        book.add_limit_order(
-            Id::new_uuid(),
-            price,
-            10,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("add ask");
+        book.add_limit_order(new_id(), price, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("add ask");
     }
 
     let result = book.cancel_all_orders();
@@ -60,7 +58,7 @@ fn cancel_all_removes_every_order() {
 #[test]
 fn cancel_all_cleans_order_locations() {
     let book = new_book();
-    let id = Id::new_uuid();
+    let id = new_id();
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("add");
 
@@ -76,11 +74,11 @@ fn cancel_all_cleans_order_locations() {
 fn cancel_by_side_buy_leaves_asks() {
     let book = new_book();
 
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid");
-    book.add_limit_order(Id::new_uuid(), 95, 5, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 95, 5, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid 2");
-    book.add_limit_order(Id::new_uuid(), 200, 8, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 200, 8, Side::Sell, TimeInForce::Gtc, None)
         .expect("ask");
 
     let result = book.cancel_orders_by_side(Side::Buy);
@@ -94,11 +92,11 @@ fn cancel_by_side_buy_leaves_asks() {
 fn cancel_by_side_sell_leaves_bids() {
     let book = new_book();
 
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid");
-    book.add_limit_order(Id::new_uuid(), 200, 8, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 200, 8, Side::Sell, TimeInForce::Gtc, None)
         .expect("ask");
-    book.add_limit_order(Id::new_uuid(), 210, 3, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 210, 3, Side::Sell, TimeInForce::Gtc, None)
         .expect("ask 2");
 
     let result = book.cancel_orders_by_side(Side::Sell);
@@ -111,7 +109,7 @@ fn cancel_by_side_sell_leaves_bids() {
 #[test]
 fn cancel_by_side_on_empty_side() {
     let book = new_book();
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid");
 
     let result = book.cancel_orders_by_side(Side::Sell);
@@ -129,9 +127,9 @@ fn cancel_by_user_removes_only_matching_orders() {
     let user_a = uid(1);
     let user_b = uid(2);
 
-    let id_a1 = Id::new_uuid();
-    let id_a2 = Id::new_uuid();
-    let id_b1 = Id::new_uuid();
+    let id_a1 = new_id();
+    let id_a2 = new_id();
+    let id_b1 = new_id();
 
     book.add_limit_order_with_user(id_a1, 100, 10, Side::Buy, TimeInForce::Gtc, user_a, None)
         .expect("a1");
@@ -156,16 +154,8 @@ fn cancel_by_user_no_match_returns_zero() {
     let user_a = uid(1);
     let user_b = uid(2);
 
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        100,
-        10,
-        Side::Buy,
-        TimeInForce::Gtc,
-        user_a,
-        None,
-    )
-    .expect("a1");
+    book.add_limit_order_with_user(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, user_a, None)
+        .expect("a1");
 
     let result = book.cancel_orders_by_user(user_b);
     assert!(result.is_empty());
@@ -178,46 +168,14 @@ fn cancel_by_user_across_multiple_levels_and_sides() {
     let user = uid(1);
     let other = uid(2);
 
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        100,
-        10,
-        Side::Buy,
-        TimeInForce::Gtc,
-        user,
-        None,
-    )
-    .expect("buy 100");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        95,
-        5,
-        Side::Buy,
-        TimeInForce::Gtc,
-        user,
-        None,
-    )
-    .expect("buy 95");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        200,
-        8,
-        Side::Sell,
-        TimeInForce::Gtc,
-        user,
-        None,
-    )
-    .expect("sell 200");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        90,
-        20,
-        Side::Buy,
-        TimeInForce::Gtc,
-        other,
-        None,
-    )
-    .expect("other buy");
+    book.add_limit_order_with_user(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, user, None)
+        .expect("buy 100");
+    book.add_limit_order_with_user(new_id(), 95, 5, Side::Buy, TimeInForce::Gtc, user, None)
+        .expect("buy 95");
+    book.add_limit_order_with_user(new_id(), 200, 8, Side::Sell, TimeInForce::Gtc, user, None)
+        .expect("sell 200");
+    book.add_limit_order_with_user(new_id(), 90, 20, Side::Buy, TimeInForce::Gtc, other, None)
+        .expect("other buy");
 
     let result = book.cancel_orders_by_user(user);
     assert_eq!(result.cancelled_count(), 3);
@@ -232,9 +190,9 @@ fn cancel_by_user_across_multiple_levels_and_sides() {
 fn cancel_by_price_range_inclusive_boundaries() {
     let book = new_book();
 
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
-    let id3 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
+    let id3 = new_id();
 
     book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("100");
@@ -254,10 +212,10 @@ fn cancel_by_price_range_inclusive_boundaries() {
 fn cancel_by_price_range_single_price() {
     let book = new_book();
 
-    let id = Id::new_uuid();
+    let id = new_id();
     book.add_limit_order(id, 150, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("add");
-    book.add_limit_order(Id::new_uuid(), 200, 10, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 200, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("add 2");
 
     let result = book.cancel_orders_by_price_range(Side::Sell, 150, 150);
@@ -269,7 +227,7 @@ fn cancel_by_price_range_single_price() {
 #[test]
 fn cancel_by_price_range_inverted_returns_zero() {
     let book = new_book();
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("add");
 
     let result = book.cancel_orders_by_price_range(Side::Buy, 200, 100);
@@ -280,7 +238,7 @@ fn cancel_by_price_range_inverted_returns_zero() {
 #[test]
 fn cancel_by_price_range_no_orders_in_range() {
     let book = new_book();
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("add");
 
     let result = book.cancel_orders_by_price_range(Side::Buy, 200, 300);
@@ -291,8 +249,8 @@ fn cancel_by_price_range_no_orders_in_range() {
 fn cancel_by_price_range_multiple_orders_at_same_level() {
     let book = new_book();
 
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
 
     book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("add 1");
@@ -308,7 +266,7 @@ fn cancel_by_price_range_multiple_orders_at_same_level() {
 #[test]
 fn cancel_by_price_range_on_wrong_side_returns_zero() {
     let book = new_book();
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("add bid");
 
     // Asks side has nothing at 100
@@ -325,17 +283,9 @@ fn cancel_by_price_range_on_wrong_side_returns_zero() {
 fn cancel_all_with_iceberg_orders() {
     let book = new_book();
 
-    book.add_iceberg_order(
-        Id::new_uuid(),
-        100,
-        5,
-        15,
-        Side::Buy,
-        TimeInForce::Gtc,
-        None,
-    )
-    .expect("iceberg");
-    book.add_limit_order(Id::new_uuid(), 200, 10, Side::Sell, TimeInForce::Gtc, None)
+    book.add_iceberg_order(new_id(), 100, 5, 15, Side::Buy, TimeInForce::Gtc, None)
+        .expect("iceberg");
+    book.add_limit_order(new_id(), 200, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("limit");
 
     let result = book.cancel_all_orders();
@@ -348,9 +298,9 @@ fn cancel_all_with_iceberg_orders() {
 fn cancel_all_with_post_only_orders() {
     let book = new_book();
 
-    book.add_post_only_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_post_only_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("post-only");
-    book.add_limit_order(Id::new_uuid(), 200, 10, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 200, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("limit");
 
     let result = book.cancel_all_orders();
@@ -390,26 +340,10 @@ fn cancel_by_user_on_stp_enabled_book() {
     let user_a = uid(1);
     let user_b = uid(2);
 
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        100,
-        10,
-        Side::Buy,
-        TimeInForce::Gtc,
-        user_a,
-        None,
-    )
-    .expect("a buy");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        200,
-        5,
-        Side::Sell,
-        TimeInForce::Gtc,
-        user_b,
-        None,
-    )
-    .expect("b sell");
+    book.add_limit_order_with_user(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, user_a, None)
+        .expect("a buy");
+    book.add_limit_order_with_user(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, user_b, None)
+        .expect("b sell");
 
     let result = book.cancel_orders_by_user(user_a);
     assert_eq!(result.cancelled_count(), 1);
@@ -424,7 +358,7 @@ fn cancel_by_user_on_stp_enabled_book() {
 fn double_cancel_all_is_idempotent() {
     let book = new_book();
 
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("add");
 
     let r1 = book.cancel_all_orders();
@@ -438,9 +372,9 @@ fn double_cancel_all_is_idempotent() {
 fn cancel_by_side_then_cancel_all() {
     let book = new_book();
 
-    book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid");
-    book.add_limit_order(Id::new_uuid(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
         .expect("ask");
 
     let r1 = book.cancel_orders_by_side(Side::Buy);
@@ -458,8 +392,8 @@ fn cancel_by_side_then_cancel_all() {
 fn user_orders_populated_on_add_and_cleared_on_cancel() {
     let book = new_book();
     let user = uid(1);
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
 
     book.add_limit_order_with_user(id1, 100, 10, Side::Buy, TimeInForce::Gtc, user, None)
         .expect("add1");
@@ -481,8 +415,8 @@ fn user_orders_populated_on_add_and_cleared_on_cancel() {
 fn user_orders_cleaned_after_individual_cancel() {
     let book = new_book();
     let user = uid(1);
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
 
     book.add_limit_order_with_user(id1, 100, 10, Side::Buy, TimeInForce::Gtc, user, None)
         .expect("add1");
@@ -502,7 +436,7 @@ fn user_orders_cleaned_after_individual_cancel() {
 fn user_orders_cleaned_after_full_match() {
     let book = new_book();
     let maker_user = uid(1);
-    let maker_id = Id::new_uuid();
+    let maker_id = new_id();
 
     // Place a resting sell order
     book.add_limit_order_with_user(
@@ -517,7 +451,7 @@ fn user_orders_cleaned_after_full_match() {
     .expect("maker");
 
     // Submit a buy that fully fills the maker
-    let _ = book.submit_market_order(Id::new_uuid(), 10, Side::Buy);
+    let _ = book.submit_market_order(new_id(), 10, Side::Buy);
 
     // The maker's order should be gone from the user_orders index
     let result = book.cancel_orders_by_user(maker_user);
@@ -528,7 +462,7 @@ fn user_orders_cleaned_after_full_match() {
 fn user_orders_partial_match_keeps_resting_order() {
     let book = new_book();
     let maker_user = uid(1);
-    let maker_id = Id::new_uuid();
+    let maker_id = new_id();
 
     // Place a resting sell order with qty 20
     book.add_limit_order_with_user(
@@ -543,7 +477,7 @@ fn user_orders_partial_match_keeps_resting_order() {
     .expect("maker");
 
     // Partially fill 5 of the 20
-    let _ = book.submit_market_order(Id::new_uuid(), 5, Side::Buy);
+    let _ = book.submit_market_order(new_id(), 5, Side::Buy);
 
     // The remaining order should still be in the user_orders index
     let result = book.cancel_orders_by_user(maker_user);
@@ -557,9 +491,9 @@ fn multi_user_cancel_does_not_affect_other_users() {
     let user_a = uid(1);
     let user_b = uid(2);
 
-    let a1 = Id::new_uuid();
-    let b1 = Id::new_uuid();
-    let b2 = Id::new_uuid();
+    let a1 = new_id();
+    let b1 = new_id();
+    let b2 = new_id();
 
     book.add_limit_order_with_user(a1, 100, 10, Side::Buy, TimeInForce::Gtc, user_a, None)
         .expect("a1");
@@ -583,26 +517,10 @@ fn cancel_all_clears_all_user_entries() {
     let user_a = uid(1);
     let user_b = uid(2);
 
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        100,
-        10,
-        Side::Buy,
-        TimeInForce::Gtc,
-        user_a,
-        None,
-    )
-    .expect("a");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        200,
-        5,
-        Side::Sell,
-        TimeInForce::Gtc,
-        user_b,
-        None,
-    )
-    .expect("b");
+    book.add_limit_order_with_user(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, user_a, None)
+        .expect("a");
+    book.add_limit_order_with_user(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, user_b, None)
+        .expect("b");
 
     let _ = book.cancel_all_orders();
 
@@ -617,12 +535,12 @@ fn stp_cancel_maker_cleans_user_orders() {
     let user = uid(1);
 
     // Place a resting sell order
-    let maker_id = Id::new_uuid();
+    let maker_id = new_id();
     book.add_limit_order_with_user(maker_id, 100, 10, Side::Sell, TimeInForce::Gtc, user, None)
         .expect("maker");
 
     // Same user submits a buy that would self-trade — CancelMaker removes the resting order
-    let taker_id = Id::new_uuid();
+    let taker_id = new_id();
     let _ =
         book.add_limit_order_with_user(taker_id, 100, 10, Side::Buy, TimeInForce::Gtc, user, None);
 
@@ -654,26 +572,12 @@ fn cancel_all_emits_price_level_changed_events() {
 
     // Create 3 distinct price levels on bids, 2 on asks = 5 levels total
     for i in 0..3 {
-        book.add_limit_order(
-            Id::new_uuid(),
-            100 + i,
-            10,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("bid");
+        book.add_limit_order(new_id(), 100 + i, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("bid");
     }
     for i in 0..2 {
-        book.add_limit_order(
-            Id::new_uuid(),
-            200 + i,
-            5,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("ask");
+        book.add_limit_order(new_id(), 200 + i, 5, Side::Sell, TimeInForce::Gtc, None)
+            .expect("ask");
     }
 
     // Reset counter — we only care about events from cancel_all
@@ -693,13 +597,13 @@ fn cancel_all_returns_all_ids() {
 
     // Use non-crossing prices: bids at 50..60, asks at 200..210
     for i in 0..10 {
-        let id = Id::new_uuid();
+        let id = new_id();
         ids.push(id);
         book.add_limit_order(id, 50 + i, 1, Side::Buy, TimeInForce::Gtc, None)
             .expect("bid");
     }
     for i in 0..10 {
-        let id = Id::new_uuid();
+        let id = new_id();
         ids.push(id);
         book.add_limit_order(id, 200 + i, 1, Side::Sell, TimeInForce::Gtc, None)
             .expect("ask");
@@ -716,7 +620,7 @@ fn cancel_all_returns_all_ids() {
 fn cancel_all_idempotent() {
     let book = new_book();
     for _ in 0..5 {
-        book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
     }
 
@@ -733,15 +637,8 @@ fn cancel_all_clears_book_completely() {
     let book = new_book();
     for i in 0..100 {
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
-        book.add_limit_order(
-            Id::new_uuid(),
-            100 + (i % 50),
-            10,
-            side,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("add");
+        book.add_limit_order(new_id(), 100 + (i % 50), 10, side, TimeInForce::Gtc, None)
+            .expect("add");
     }
 
     let _ = book.cancel_all_orders();
@@ -768,14 +665,14 @@ fn cancel_all_clears_book_completely() {
 /// identical order set.
 fn interleaved_plan() -> Vec<(Id, u128, Side)> {
     vec![
-        (Id::new_uuid(), 100, Side::Buy),  // b100a
-        (Id::new_uuid(), 120, Side::Sell), // a120a
-        (Id::new_uuid(), 90, Side::Buy),   // b90a
-        (Id::new_uuid(), 110, Side::Sell), // a110a
-        (Id::new_uuid(), 100, Side::Buy),  // b100b
-        (Id::new_uuid(), 110, Side::Sell), // a110b
-        (Id::new_uuid(), 90, Side::Buy),   // b90b
-        (Id::new_uuid(), 120, Side::Sell), // a120b
+        (new_id(), 100, Side::Buy),  // b100a
+        (new_id(), 120, Side::Sell), // a120a
+        (new_id(), 90, Side::Buy),   // b90a
+        (new_id(), 110, Side::Sell), // a110a
+        (new_id(), 100, Side::Buy),  // b100b
+        (new_id(), 110, Side::Sell), // a110b
+        (new_id(), 90, Side::Buy),   // b90b
+        (new_id(), 120, Side::Sell), // a120b
     ]
 }
 
@@ -845,7 +742,7 @@ fn test_cancel_orders_by_user_cross_instance_returns_identical_ids() {
     // cancel_orders_by_user was already deterministic (admission-history order);
     // this pins that it stays stable across independent instances.
     let user = uid(7);
-    let ids: Vec<Id> = (0..6).map(|_| Id::new_uuid()).collect();
+    let ids: Vec<Id> = (0..6).map(|_| new_id()).collect();
     let prices = [100u128, 120, 90, 110, 100, 90];
     let sides = [
         Side::Buy,

@@ -714,6 +714,7 @@ impl std::error::Error for ManagerError {}
 mod tests {
     use super::*;
     use pricelevel::{Hash32, Id};
+    use uuid::Uuid;
 
     #[test]
     fn test_clone_order_not_found() {
@@ -885,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_clone_missing_user_id() {
-        let order_id = Id::new_uuid();
+        let order_id = Id::from_uuid(Uuid::new_v4());
         let error = OrderBookError::MissingUserId { order_id };
         let cloned = error.clone();
         assert!(matches!(
@@ -896,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_clone_self_trade_prevented() {
-        let taker_id = Id::new_uuid();
+        let taker_id = Id::from_uuid(Uuid::new_v4());
         let user_id = Hash32::from([1u8; 32]);
         let error = OrderBookError::SelfTradePrevented {
             mode: crate::orderbook::stp::STPMode::CancelMaker,

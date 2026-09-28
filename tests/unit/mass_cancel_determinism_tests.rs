@@ -16,6 +16,11 @@ use orderbook_rs::orderbook::sequencer::{
 };
 use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 fn order(id: Id, price: u128, qty: u64, side: Side) -> OrderType<()> {
     OrderType::Standard {
         id,
@@ -69,18 +74,18 @@ fn test_replay_mass_cancel_payloads_match_journaled_originals() {
     // be range-cancelled (110, 120), and two surviving ask levels (130, 140) so
     // the final CancelAll spans multiple levels — a stronger byte-identity probe
     // than a single-level tail cancel.
-    let b90a = Id::new_uuid();
-    let b90b = Id::new_uuid();
-    let b100a = Id::new_uuid();
-    let b100b = Id::new_uuid();
-    let a110a = Id::new_uuid();
-    let a110b = Id::new_uuid();
-    let a120a = Id::new_uuid();
-    let a120b = Id::new_uuid();
-    let a130a = Id::new_uuid();
-    let a130b = Id::new_uuid();
-    let a140a = Id::new_uuid();
-    let a140b = Id::new_uuid();
+    let b90a = new_id();
+    let b90b = new_id();
+    let b100a = new_id();
+    let b100b = new_id();
+    let a110a = new_id();
+    let a110b = new_id();
+    let a120a = new_id();
+    let a120b = new_id();
+    let a130a = new_id();
+    let a130b = new_id();
+    let a140a = new_id();
+    let a140b = new_id();
 
     let adds = [
         order(b100a, 100, 1, Side::Buy),
@@ -153,8 +158,8 @@ fn test_replay_mass_cancel_payloads_match_journaled_originals() {
 
     // Residual orders so the post-session snapshot is non-empty and the
     // `snapshots_match` oracle is load-bearing.
-    let r_bid = order(Id::new_uuid(), 100, 3, Side::Buy);
-    let r_ask = order(Id::new_uuid(), 140, 4, Side::Sell);
+    let r_bid = order(new_id(), 100, 3, Side::Buy);
+    let r_ask = order(new_id(), 140, 4, Side::Sell);
     for ord in [r_bid, r_ask] {
         assert!(live.add_order(ord).is_ok(), "residual add");
         append(

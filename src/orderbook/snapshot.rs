@@ -418,10 +418,11 @@ bitflags! {
 /// ```
 /// use orderbook_rs::OrderBook;
 /// use pricelevel::{Id, Side, TimeInForce};
+/// use uuid::Uuid;
 ///
 /// let book = OrderBook::<()>::new("BTC/USD");
-/// let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-/// let _ = book.add_limit_order(Id::new(), 101, 10, Side::Sell, TimeInForce::Gtc, None);
+/// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+/// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 101, 10, Side::Sell, TimeInForce::Gtc, None);
 ///
 /// let snapshot = book.enriched_snapshot(10);
 ///

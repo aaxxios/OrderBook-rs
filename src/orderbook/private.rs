@@ -377,10 +377,11 @@ mod tests {
     use crate::utils::current_time_millis; // Import the time utility
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     // Helper function to create a unique order ID
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]

@@ -12,14 +12,15 @@ mod tests_filejournal_edge_cases {
     use pricelevel::Id;
     use std::fs;
     use std::path::Path;
+    use uuid::Uuid;
 
     fn make_event(seq: u64) -> SequencerEvent<()> {
         SequencerEvent {
             sequence_num: seq,
             timestamp_ns: 1_700_000_000_000_000_000u64.saturating_add(seq),
-            command: SequencerCommand::CancelOrder(Id::new_uuid()),
+            command: SequencerCommand::CancelOrder(Id::from_uuid(Uuid::new_v4())),
             result: SequencerResult::OrderCancelled {
-                order_id: Id::new_uuid(),
+                order_id: Id::from_uuid(Uuid::new_v4()),
             },
         }
     }

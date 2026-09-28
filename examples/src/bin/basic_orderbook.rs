@@ -3,6 +3,7 @@
 use orderbook_rs::{OrderBook, current_time_millis};
 use pricelevel::{Id, Quantity, Side, TimeInForce, setup_logger};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     // Set up logging
@@ -451,5 +452,5 @@ fn display_orderbook_state(book: &crate::OrderBook) {
 }
 
 fn new_order_id() -> Id {
-    Id::new_uuid()
+    Id::from_uuid(Uuid::new_v4())
 }

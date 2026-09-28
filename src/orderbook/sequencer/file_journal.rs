@@ -995,14 +995,17 @@ mod tests {
     use crate::orderbook::sequencer::types::{SequencerCommand, SequencerResult};
     use pricelevel::Id;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn make_event(seq: u64) -> SequencerEvent<()> {
         SequencerEvent {
             sequence_num: seq,
             timestamp_ns: 1_700_000_000_000_000_000u64.checked_add(seq).unwrap_or(0),
-            command: SequencerCommand::CancelOrder(Id::new_uuid()),
-            result: SequencerResult::OrderCancelled {
-                order_id: Id::new_uuid(),
-            },
+            command: SequencerCommand::CancelOrder(new_id()),
+            result: SequencerResult::OrderCancelled { order_id: new_id() },
         }
     }
 
@@ -1466,9 +1469,7 @@ mod tests {
             command: SequencerCommand::EvictExpiredOrders {
                 now_ms: TimestampMs::new(1_700_000_000_000),
             },
-            result: SequencerResult::OrderCancelled {
-                order_id: Id::new_uuid(),
-            },
+            result: SequencerResult::OrderCancelled { order_id: new_id() },
         };
         assert!(journal.append(&event).is_ok());
         assert!(journal.verify_integrity().is_ok());

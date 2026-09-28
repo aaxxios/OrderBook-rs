@@ -10,6 +10,11 @@ mod tests_kill_switch {
     use orderbook_rs::{OrderBook, OrderBookError, RejectReason};
     use pricelevel::{Hash32, Id, OrderUpdate, Price, Quantity, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn new_book() -> OrderBook<()> {
         OrderBook::new("TEST")
     }
@@ -28,12 +33,12 @@ mod tests_kill_switch {
     fn submit_market_under_kill_switch_returns_kill_switch_active() {
         let book = new_book();
         // Seed liquidity so the only failure mode is the kill switch.
-        book.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
             .expect("seed resting ask");
 
         book.engage_kill_switch();
 
-        let result = book.submit_market_order(Id::new_uuid(), 5, Side::Buy);
+        let result = book.submit_market_order(new_id(), 5, Side::Buy);
         assert!(
             matches!(result, Err(OrderBookError::KillSwitchActive)),
             "expected KillSwitchActive, got {result:?}"
@@ -43,17 +48,13 @@ mod tests_kill_switch {
     #[test]
     fn submit_market_with_user_under_kill_switch_returns_kill_switch_active() {
         let book = new_book();
-        book.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
             .expect("seed resting ask");
 
         book.engage_kill_switch();
 
-        let result = book.submit_market_order_with_user(
-            Id::new_uuid(),
-            5,
-            Side::Buy,
-            Hash32::new([1u8; 32]),
-        );
+        let result =
+            book.submit_market_order_with_user(new_id(), 5, Side::Buy, Hash32::new([1u8; 32]));
         assert!(
             matches!(result, Err(OrderBookError::KillSwitchActive)),
             "expected KillSwitchActive, got {result:?}"
@@ -65,8 +66,7 @@ mod tests_kill_switch {
         let book = new_book();
         book.engage_kill_switch();
 
-        let result =
-            book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(
             matches!(result, Err(OrderBookError::KillSwitchActive)),
             "expected KillSwitchActive, got {result:?}"
@@ -81,7 +81,7 @@ mod tests_kill_switch {
     #[test]
     fn update_order_price_under_kill_switch_returns_kill_switch_active() {
         let book = new_book();
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
@@ -102,7 +102,7 @@ mod tests_kill_switch {
     #[test]
     fn update_order_quantity_under_kill_switch_returns_kill_switch_active() {
         let book = new_book();
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
@@ -121,7 +121,7 @@ mod tests_kill_switch {
     #[test]
     fn update_order_price_and_quantity_under_kill_switch_returns_kill_switch_active() {
         let book = new_book();
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
@@ -141,7 +141,7 @@ mod tests_kill_switch {
     #[test]
     fn update_order_replace_under_kill_switch_returns_kill_switch_active() {
         let book = new_book();
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
@@ -162,7 +162,7 @@ mod tests_kill_switch {
     #[test]
     fn update_order_cancel_under_kill_switch_succeeds() {
         let book = new_book();
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
@@ -187,7 +187,7 @@ mod tests_kill_switch {
     #[test]
     fn cancel_order_under_kill_switch_succeeds() {
         let book = new_book();
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
@@ -207,10 +207,10 @@ mod tests_kill_switch {
     fn mass_cancel_by_side_under_kill_switch_succeeds() {
         let book = new_book();
         for price in [99, 100, 101] {
-            book.add_limit_order(Id::new_uuid(), price, 5, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), price, 5, Side::Buy, TimeInForce::Gtc, None)
                 .expect("seed bid");
         }
-        book.add_limit_order(Id::new_uuid(), 110, 5, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None)
             .expect("seed ask");
 
         book.engage_kill_switch();
@@ -225,11 +225,11 @@ mod tests_kill_switch {
     fn cancel_all_under_kill_switch_succeeds() {
         let book = new_book();
         for price in [99, 100] {
-            book.add_limit_order(Id::new_uuid(), price, 5, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), price, 5, Side::Buy, TimeInForce::Gtc, None)
                 .expect("seed bid");
         }
         for price in [110, 111] {
-            book.add_limit_order(Id::new_uuid(), price, 5, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), price, 5, Side::Sell, TimeInForce::Gtc, None)
                 .expect("seed ask");
         }
 
@@ -248,15 +248,15 @@ mod tests_kill_switch {
     #[test]
     fn release_then_submit_succeeds() {
         let book = new_book();
-        book.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
             .expect("seed resting ask");
 
         book.engage_kill_switch();
-        let blocked = book.submit_market_order(Id::new_uuid(), 5, Side::Buy);
+        let blocked = book.submit_market_order(new_id(), 5, Side::Buy);
         assert!(matches!(blocked, Err(OrderBookError::KillSwitchActive)));
 
         book.release_kill_switch();
-        let resumed = book.submit_market_order(Id::new_uuid(), 5, Side::Buy);
+        let resumed = book.submit_market_order(new_id(), 5, Side::Buy);
         assert!(
             resumed.is_ok(),
             "submit must succeed after release; got {resumed:?}"
@@ -268,7 +268,7 @@ mod tests_kill_switch {
         let book = book_with_tracker();
         book.engage_kill_switch();
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(matches!(result, Err(OrderBookError::KillSwitchActive)));
 
@@ -289,7 +289,7 @@ mod tests_kill_switch {
     fn kill_switch_state_round_trips_through_snapshot() {
         let original = OrderBook::<()>::new("TEST");
         original
-            .add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
         original.engage_kill_switch();
         assert!(original.is_kill_switch_engaged());
@@ -311,8 +311,7 @@ mod tests_kill_switch {
         );
 
         // And: the restored book actually enforces the gate.
-        let result =
-            restored.add_limit_order(Id::new_uuid(), 99, 5, Side::Buy, TimeInForce::Gtc, None);
+        let result = restored.add_limit_order(new_id(), 99, 5, Side::Buy, TimeInForce::Gtc, None);
         assert!(
             matches!(result, Err(OrderBookError::KillSwitchActive)),
             "restored book with engaged kill switch must reject new flow; got {result:?}"
@@ -326,7 +325,7 @@ mod tests_kill_switch {
         // field existed. `#[serde(default)]` should fill it back in
         // with `false` on deserialization.
         let book = OrderBook::<()>::new("TEST");
-        book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
 
         let json = book.snapshot_to_json(10).expect("serialize");

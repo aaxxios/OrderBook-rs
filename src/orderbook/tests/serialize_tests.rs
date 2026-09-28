@@ -5,6 +5,7 @@ mod tests {
     use crate::orderbook::OrderBook;
     use pricelevel::{Id, Side, TimeInForce};
     use serde_json;
+    use uuid::Uuid;
 
     #[test]
     fn test_orderbook_serialize_empty() {
@@ -34,8 +35,8 @@ mod tests {
         let orderbook: OrderBook<String> = OrderBook::new("ETHUSD");
 
         // Add some orders using the add_limit_order method
-        let buy_order_id = Id::new_uuid();
-        let sell_order_id = Id::new_uuid();
+        let buy_order_id = Id::from_uuid(Uuid::new_v4());
+        let sell_order_id = Id::from_uuid(Uuid::new_v4());
 
         let _ = orderbook.add_limit_order(
             buy_order_id,

@@ -20,34 +20,25 @@ use pricelevel::{Id, Quantity, Side, TimeInForce};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 /// Seed an ask wall: three asks at the supplied prices, each `qty` size,
 /// using fresh ids. Helpful for setting up most happy-path tests.
 fn seed_asks(book: &OrderBook<()>, prices: &[u128], qty: u64) {
     for &price in prices {
-        book.add_limit_order(
-            Id::new_uuid(),
-            price,
-            qty,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed ask");
+        book.add_limit_order(new_id(), price, qty, Side::Sell, TimeInForce::Gtc, None)
+            .expect("seed ask");
     }
 }
 
 /// Seed a bid wall mirroring `seed_asks` for sell-side tests.
 fn seed_bids(book: &OrderBook<()>, prices: &[u128], qty: u64) {
     for &price in prices {
-        book.add_limit_order(
-            Id::new_uuid(),
-            price,
-            qty,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed bid");
+        book.add_limit_order(new_id(), price, qty, Side::Buy, TimeInForce::Gtc, None)
+            .expect("seed bid");
     }
 }
 
@@ -58,7 +49,7 @@ fn test_buy_single_level_exact_fit() {
 
     // 100 * 50 = 5_000 fills exactly at best ask, leaves 50 resting.
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 5_000, Side::Buy)
+        .match_market_order_by_amount(new_id(), 5_000, Side::Buy)
         .expect("notional buy must succeed");
 
     let trades = result.trades().as_vec();
@@ -81,7 +72,7 @@ fn test_buy_walks_three_levels() {
 
     // 100*10 + 101*10 + 102*10 = 1_000 + 1_010 + 1_020 = 3_030 sweeps all.
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 3_030, Side::Buy)
+        .match_market_order_by_amount(new_id(), 3_030, Side::Buy)
         .expect("notional buy must succeed");
 
     let trades = result.trades().as_vec();
@@ -100,7 +91,7 @@ fn test_buy_with_dust_stops_short() {
 
     // 5_050 / 100 = 50 (residual dust = 50).
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 5_050, Side::Buy)
+        .match_market_order_by_amount(new_id(), 5_050, Side::Buy)
         .expect("notional buy must succeed");
 
     let trades = result.trades().as_vec();
@@ -118,7 +109,7 @@ fn test_buy_with_lot_size_rounds_down() {
 
     // budget allows 14 units (1_400 / 100 = 14); lot=10 ⇒ 14 - 4 = 10.
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 1_400, Side::Buy)
+        .match_market_order_by_amount(new_id(), 1_400, Side::Buy)
         .expect("notional buy must succeed");
 
     let trades = result.trades().as_vec();
@@ -138,7 +129,7 @@ fn test_buy_lot_size_fills_best_level_when_budget_allows_full_lots() {
     //   lot = 10 ⇒ 50 is already a whole number of lots
     //   so the order fills entirely at the best level.
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 5_000, Side::Buy)
+        .match_market_order_by_amount(new_id(), 5_000, Side::Buy)
         .expect("notional buy must succeed");
     assert_eq!(result.executed_value().expect("executed value"), 5_000);
 }
@@ -147,7 +138,7 @@ fn test_buy_lot_size_fills_best_level_when_budget_allows_full_lots() {
 fn test_buy_empty_book_errors_with_notional_variant() {
     let book: OrderBook<()> = OrderBook::new("TEST");
     let err = book
-        .match_market_order_by_amount(Id::new_uuid(), 1_000, Side::Buy)
+        .match_market_order_by_amount(new_id(), 1_000, Side::Buy)
         .expect_err("empty book must return error");
     match err {
         OrderBookError::InsufficientLiquidityNotional {
@@ -170,7 +161,7 @@ fn test_buy_budget_below_one_full_lot_errors() {
 
     // budget = 500 ⇒ 5 units; lot=10 ⇒ qty_cap = 0 ⇒ no fills.
     let err = book
-        .match_market_order_by_amount(Id::new_uuid(), 500, Side::Buy)
+        .match_market_order_by_amount(new_id(), 500, Side::Buy)
         .expect_err("must error: budget below one full lot");
     match err {
         OrderBookError::InsufficientLiquidityNotional { .. } => {}
@@ -186,7 +177,7 @@ fn test_sell_symmetric_walk() {
 
     // Sell sweeps highest bids first. budget 3_030 → 102*10 + 101*10 + 100*10 = 3_030
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 3_030, Side::Sell)
+        .match_market_order_by_amount(new_id(), 3_030, Side::Sell)
         .expect("notional sell must succeed");
 
     let trades = result.trades().as_vec();
@@ -214,18 +205,14 @@ fn test_sell_symmetric_walk() {
 #[test]
 fn test_sell_skips_an_unaffordable_level_and_reaches_a_cheaper_bid() {
     let book: OrderBook<()> = OrderBook::new("TEST");
-    let skipped = Id::new_uuid();
-    for (id, price) in [
-        (Id::new_uuid(), 100u128),
-        (skipped, 75),
-        (Id::new_uuid(), 50),
-    ] {
+    let skipped = new_id();
+    for (id, price) in [(new_id(), 100u128), (skipped, 75), (new_id(), 50)] {
         book.add_limit_order(id, price, 1, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
     }
 
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 150, Side::Sell)
+        .match_market_order_by_amount(new_id(), 150, Side::Sell)
         .expect("notional sell must succeed");
 
     let trades = result.trades().as_vec();
@@ -267,15 +254,15 @@ fn test_sell_skips_an_unaffordable_level_and_reaches_a_cheaper_bid() {
 #[test]
 fn test_sell_lot_rounding_leaves_cheaper_levels_untouched_when_no_lot_fits() {
     let book: OrderBook<()> = OrderBook::with_lot_size("TEST", 10);
-    let at_75 = Id::new_uuid();
-    let at_50 = Id::new_uuid();
-    for (id, price) in [(Id::new_uuid(), 100u128), (at_75, 75), (at_50, 50)] {
+    let at_75 = new_id();
+    let at_50 = new_id();
+    for (id, price) in [(new_id(), 100u128), (at_75, 75), (at_50, 50)] {
         book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("seed bid");
     }
 
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 1_100, Side::Sell)
+        .match_market_order_by_amount(new_id(), 1_100, Side::Sell)
         .expect("notional sell must succeed");
 
     let trades = result.trades().as_vec();
@@ -298,7 +285,7 @@ fn test_sell_lot_rounding_leaves_cheaper_levels_untouched_when_no_lot_fits() {
 fn test_sell_empty_book_errors_with_notional_variant() {
     let book: OrderBook<()> = OrderBook::new("TEST");
     let err = book
-        .match_market_order_by_amount(Id::new_uuid(), 1_000, Side::Sell)
+        .match_market_order_by_amount(new_id(), 1_000, Side::Sell)
         .expect_err("empty book must error");
     match err {
         OrderBookError::InsufficientLiquidityNotional { side, .. } => {
@@ -322,7 +309,7 @@ fn test_quote_notional_carried_through_to_listener() {
     book.set_trade_listener(listener);
 
     seed_asks(&book, &[100], 100);
-    book.match_market_order_by_amount(Id::new_uuid(), 5_000, Side::Buy)
+    book.match_market_order_by_amount(new_id(), 5_000, Side::Buy)
         .expect("notional buy");
 
     assert_eq!(
@@ -349,7 +336,7 @@ fn test_fee_schedule_applies_to_notional_path() {
     book.set_trade_listener(listener);
 
     seed_asks(&book, &[100], 1_000);
-    book.match_market_order_by_amount(Id::new_uuid(), 100_000, Side::Buy)
+    book.match_market_order_by_amount(new_id(), 100_000, Side::Buy)
         .expect("notional buy with fees");
 
     // 5 bps on notional = 100_000 * 5 / 10_000 = 50.
@@ -363,7 +350,7 @@ fn test_submit_market_order_by_amount_runs_kill_switch_gate() {
     book.engage_kill_switch();
 
     let err = book
-        .submit_market_order_by_amount(Id::new_uuid(), 1_000, Side::Buy)
+        .submit_market_order_by_amount(new_id(), 1_000, Side::Buy)
         .expect_err("kill-switch must reject");
     assert!(matches!(err, OrderBookError::KillSwitchActive));
 }
@@ -376,7 +363,7 @@ fn test_existing_base_qty_path_unaffected_by_refactor() {
     seed_asks(&book, &[100], 50);
 
     let result = book
-        .submit_market_order(Id::new_uuid(), 30, Side::Buy)
+        .submit_market_order(new_id(), 30, Side::Buy)
         .expect("base-qty market buy");
     let trades = result.trades().as_vec();
     assert_eq!(trades.len(), 1);
@@ -397,7 +384,7 @@ fn test_quote_notional_populated_on_base_qty_path() {
     book.set_trade_listener(listener);
 
     seed_asks(&book, &[100], 50);
-    book.submit_market_order(Id::new_uuid(), 30, Side::Buy)
+    book.submit_market_order(new_id(), 30, Side::Buy)
         .expect("base-qty market buy");
 
     assert_eq!(captured.load(Ordering::SeqCst), 100 * 30);
@@ -411,7 +398,7 @@ fn test_buy_partial_fill_when_book_too_thin() {
     seed_asks(&book, &[100], 50);
 
     let result = book
-        .match_market_order_by_amount(Id::new_uuid(), 1_000_000, Side::Buy)
+        .match_market_order_by_amount(new_id(), 1_000_000, Side::Buy)
         .expect("partial fill must return Ok");
     assert_eq!(result.executed_value().expect("executed value"), 50 * 100);
     assert_eq!(
@@ -428,7 +415,7 @@ fn test_buy_amount_zero_returns_no_fills_error() {
     let book: OrderBook<()> = OrderBook::new("TEST");
     seed_asks(&book, &[100], 50);
     let err = book
-        .match_market_order_by_amount(Id::new_uuid(), 0, Side::Buy)
+        .match_market_order_by_amount(new_id(), 0, Side::Buy)
         .expect_err("zero notional must error");
     assert!(matches!(
         err,

@@ -440,9 +440,10 @@ impl OrderStateTracker {
     /// ```
     /// use orderbook_rs::orderbook::order_state::{OrderStateTracker, OrderStatus};
     /// use pricelevel::Id;
+    /// use uuid::Uuid;
     ///
     /// let tracker = OrderStateTracker::new();
-    /// let id = Id::new_uuid();
+    /// let id = Id::from_uuid(Uuid::new_v4());
     /// tracker.transition(id, OrderStatus::Open);
     /// let history = tracker.get_history(id);
     /// assert!(history.is_some());
@@ -540,6 +541,11 @@ impl OrderStateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
 
     #[test]
     fn test_cancel_reason_display() {
@@ -707,7 +713,7 @@ mod tests {
     #[test]
     fn test_tracker_transition_and_get() {
         let tracker = OrderStateTracker::new();
-        let id = Id::new_uuid();
+        let id = new_id();
 
         tracker.transition(id, OrderStatus::Open);
         let status = tracker.get(id);
@@ -719,7 +725,7 @@ mod tests {
     #[test]
     fn test_tracker_lifecycle_open_to_filled() {
         let tracker = OrderStateTracker::new();
-        let id = Id::new_uuid();
+        let id = new_id();
 
         tracker.transition(id, OrderStatus::Open);
         tracker.transition(
@@ -748,7 +754,7 @@ mod tests {
     #[test]
     fn test_tracker_lifecycle_open_to_cancelled() {
         let tracker = OrderStateTracker::new();
-        let id = Id::new_uuid();
+        let id = new_id();
 
         tracker.transition(id, OrderStatus::Open);
         tracker.transition(
@@ -766,7 +772,7 @@ mod tests {
     #[test]
     fn test_tracker_rejected_order() {
         let tracker = OrderStateTracker::new();
-        let id = Id::new_uuid();
+        let id = new_id();
 
         tracker.transition(
             id,
@@ -782,7 +788,7 @@ mod tests {
     #[test]
     fn test_tracker_unknown_order_returns_none() {
         let tracker = OrderStateTracker::new();
-        assert!(tracker.get(Id::new_uuid()).is_none());
+        assert!(tracker.get(new_id()).is_none());
     }
 
     #[test]
@@ -791,7 +797,7 @@ mod tests {
 
         // Fill up with terminal states
         for _ in 0..5 {
-            let id = Id::new_uuid();
+            let id = new_id();
             tracker.transition(
                 id,
                 OrderStatus::Filled {
@@ -807,14 +813,14 @@ mod tests {
     #[test]
     fn test_tracker_active_orders_not_evicted() {
         let tracker = OrderStateTracker::with_capacity(2);
-        let active_id = Id::new_uuid();
+        let active_id = new_id();
 
         // Add an active order
         tracker.transition(active_id, OrderStatus::Open);
 
         // Add terminal orders to exceed capacity
         for _ in 0..5 {
-            let id = Id::new_uuid();
+            let id = new_id();
             tracker.transition(
                 id,
                 OrderStatus::Cancelled {
@@ -840,7 +846,7 @@ mod tests {
             }
         }));
 
-        let id = Id::new_uuid();
+        let id = new_id();
         tracker.transition(id, OrderStatus::Open);
         tracker.transition(
             id,
@@ -871,7 +877,7 @@ mod tests {
     #[test]
     fn test_tracker_clear() {
         let tracker = OrderStateTracker::new();
-        let id = Id::new_uuid();
+        let id = new_id();
         tracker.transition(id, OrderStatus::Open);
         assert!(!tracker.is_empty());
 
@@ -891,7 +897,7 @@ mod tests {
             let t = Arc::clone(&tracker);
             let handle = thread::spawn(move || {
                 for _ in 0..100 {
-                    let id = Id::new_uuid();
+                    let id = new_id();
                     t.transition(id, OrderStatus::Open);
                     t.transition(
                         id,

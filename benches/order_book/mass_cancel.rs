@@ -3,6 +3,11 @@ use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 /// Register all benchmarks for mass cancel operations.
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Mass Cancel");
@@ -18,7 +23,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         let book: OrderBook<()> = OrderBook::new("BENCH");
                         // Populate the book: half bids at low prices, half asks at high prices
                         for i in 0..count {
-                            let id = Id::new_uuid();
+                            let id = new_id();
                             let (price, side) = if i % 2 == 0 {
                                 (1000 + (i / 2 % 500) as u128, Side::Buy)
                             } else {
@@ -48,7 +53,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                     || {
                         let book: OrderBook<()> = OrderBook::new("BENCH");
                         for i in 0..count {
-                            let id = Id::new_uuid();
+                            let id = new_id();
                             let price = 1000 + (i % 500) as u128;
                             let _ = book.add_limit_order(
                                 id,
@@ -81,7 +86,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         let book: OrderBook<()> = OrderBook::new("BENCH");
                         let user = pricelevel::Hash32::new([1u8; 32]);
                         for i in 0..count {
-                            let id = Id::new_uuid();
+                            let id = new_id();
                             let (price, side) = if i % 2 == 0 {
                                 (1000 + (i / 2 % 500) as u128, Side::Buy)
                             } else {

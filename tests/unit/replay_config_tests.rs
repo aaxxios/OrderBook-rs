@@ -18,6 +18,11 @@ use pricelevel::{
 };
 use std::sync::Arc;
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn make_add_event(
@@ -98,7 +103,7 @@ fn replay_book_config_applies_to_fresh_book() {
     // orders are rejected with `MissingUserId`), a price on the 10-tick grid,
     // and a quantity that is a multiple of the 5-lot and within [2, 1000].
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(
@@ -132,7 +137,7 @@ fn replay_book_config_applies_to_fresh_book() {
 #[test]
 fn replay_book_config_default_is_all_defaults() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy, Hash32::zero()))
@@ -445,10 +450,10 @@ fn full_config_injection_preserves_lot_size_parity() {
 /// two books prove equal namespace AND equal counter position — which proves
 /// every trade ID the two books emitted before the probe was also identical.
 fn probe_next_trade_id(book: &OrderBook<()>) -> String {
-    let resting = Id::new_uuid();
+    let resting = new_id();
     book.add_limit_order(resting, 1_000, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("probe resting bid");
-    let taker = Id::new_uuid();
+    let taker = new_id();
     let result = book
         .match_market_order(taker, 10, Side::Sell)
         .expect("probe market sell");
@@ -474,7 +479,7 @@ fn test_replay_with_namespace_config_reproduces_live_trade_ids() {
     // two transactions, so the trade-ID counter advances past 0.
     let mut seq = 0u64;
     for price in [100u128, 101] {
-        let id = Id::new_uuid();
+        let id = new_id();
         live.add_limit_order(id, price, 10, Side::Sell, TimeInForce::Gtc, None)
             .expect("live maker");
         assert!(
@@ -491,7 +496,7 @@ fn test_replay_with_namespace_config_reproduces_live_trade_ids() {
         );
         seq += 1;
     }
-    let taker_id = Id::new_uuid();
+    let taker_id = new_id();
     let live_result = live
         .submit_market_order(taker_id, 20, Side::Buy)
         .expect("live taker");
@@ -548,7 +553,7 @@ fn test_replay_with_namespace_config_reproduces_live_trade_ids() {
 fn test_repeated_replay_with_namespace_config_is_identity() {
     let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"VENUE/REPEAT");
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let maker = Id::new_uuid();
+    let maker = new_id();
     assert!(
         journal
             .append(&make_add_event(
@@ -561,7 +566,7 @@ fn test_repeated_replay_with_namespace_config_is_identity() {
             ))
             .is_ok()
     );
-    let taker = Id::new_uuid();
+    let taker = new_id();
     let ev = SequencerEvent::<()> {
         sequence_num: 1,
         timestamp_ns: 0,

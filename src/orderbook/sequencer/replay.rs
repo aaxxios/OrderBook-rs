@@ -1236,6 +1236,11 @@ mod tests {
         Hash32, Id, MatchResult, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs,
     };
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn make_add_event(seq: u64, id: Id, price: u128, qty: u64, side: Side) -> SequencerEvent<()> {
         let order = OrderType::Standard {
             id,
@@ -1482,7 +1487,7 @@ mod tests {
     fn test_replay_sequence_counter_overflow_is_a_typed_error() {
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
         // A single event at the very top of the sequence space.
-        let ev = make_add_event(u64::MAX, Id::new_uuid(), 100, 10, Side::Buy);
+        let ev = make_add_event(u64::MAX, new_id(), 100, 10, Side::Buy);
         assert!(journal.append(&ev).is_ok());
 
         // Replaying from u64::MAX applies the event, then advancing the
@@ -1499,7 +1504,7 @@ mod tests {
     fn test_replay_from_with_clock_uses_injected_clock() {
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
         for (seq, price) in [(0u64, 100u128), (1, 101), (2, 102)] {
-            let ev = make_add_event(seq, Id::new_uuid(), price, 10, Side::Buy);
+            let ev = make_add_event(seq, new_id(), price, 10, Side::Buy);
             assert!(journal.append(&ev).is_ok());
         }
 
@@ -1524,7 +1529,7 @@ mod tests {
     fn test_replay_from_with_clock_preserves_behavior_of_replay_from() {
         // Journal shared across both replays.
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
-        let ids: Vec<Id> = (0..3).map(|_| Id::new_uuid()).collect();
+        let ids: Vec<Id> = (0..3).map(|_| new_id()).collect();
         let events = [
             make_add_event(0, ids[0], 100, 5, Side::Buy),
             make_add_event(1, ids[1], 101, 7, Side::Buy),
@@ -1558,10 +1563,10 @@ mod tests {
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
         // Sequences 0, 1, 2, then jump to 4 (gap at 3).
         let events = [
-            make_add_event(0, Id::new_uuid(), 100, 1, Side::Buy),
-            make_add_event(1, Id::new_uuid(), 101, 1, Side::Buy),
-            make_add_event(2, Id::new_uuid(), 102, 1, Side::Buy),
-            make_add_event(4, Id::new_uuid(), 104, 1, Side::Buy),
+            make_add_event(0, new_id(), 100, 1, Side::Buy),
+            make_add_event(1, new_id(), 101, 1, Side::Buy),
+            make_add_event(2, new_id(), 102, 1, Side::Buy),
+            make_add_event(4, new_id(), 104, 1, Side::Buy),
         ];
         for ev in &events {
             assert!(journal.append(ev).is_ok());
@@ -1608,7 +1613,7 @@ mod tests {
         // residual $96 is dust < 1*101 = 101 still — actually it can buy
         // 0 more at 101 → stop short of the third level. Exact behavior
         // doesn't matter for this test; what matters is replay parity.
-        let taker_id = Id::new_uuid();
+        let taker_id = new_id();
         let ev = SequencerEvent::<()> {
             sequence_num: seq,
             timestamp_ns: 0,
@@ -1669,7 +1674,7 @@ mod tests {
     #[test]
     fn test_replay_from_with_config_applies_every_field() {
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
-        let ev = make_add_event(0, Id::new_uuid(), 100, 10, Side::Buy);
+        let ev = make_add_event(0, new_id(), 100, 10, Side::Buy);
         assert!(journal.append(&ev).is_ok());
 
         // Default config => all-defaults book.
@@ -1724,7 +1729,7 @@ mod tests {
         ));
 
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
-        let ev = make_add_event(0, Id::new_uuid(), 100, 10, Side::Buy);
+        let ev = make_add_event(0, new_id(), 100, 10, Side::Buy);
         assert!(journal.append(&ev).is_ok());
         let clock: Arc<dyn Clock> = Arc::new(StubClock::new());
         match ReplayEngine::<()>::replay_from_with_clock_and_config(
@@ -1749,7 +1754,7 @@ mod tests {
     #[test]
     fn test_market_order_by_amount_command_serde_json_roundtrip() {
         let cmd: SequencerCommand<()> = SequencerCommand::MarketOrderByAmount {
-            id: Id::new_uuid(),
+            id: new_id(),
             amount: 12_345_678,
             side: Side::Buy,
         };
@@ -1770,7 +1775,7 @@ mod tests {
         use bincode::config::standard;
         use bincode::serde::{decode_from_slice, encode_to_vec};
         let cmd: SequencerCommand<()> = SequencerCommand::MarketOrderByAmount {
-            id: Id::new_uuid(),
+            id: new_id(),
             amount: 999_999,
             side: Side::Sell,
         };
@@ -1858,10 +1863,10 @@ mod tests {
         // Two GTD orders expire at t=1_000; one GTD rests until t=10_000; a GTC
         // order never expires. Built once so the live book and the journal carry
         // identical AddOrder commands.
-        let expiring_bid = order(Id::new_uuid(), 100, 5, Side::Buy, TimeInForce::Gtd(1_000));
-        let future_bid = order(Id::new_uuid(), 99, 3, Side::Buy, TimeInForce::Gtd(10_000));
-        let gtc_bid = order(Id::new_uuid(), 98, 4, Side::Buy, TimeInForce::Gtc);
-        let expiring_ask = order(Id::new_uuid(), 101, 7, Side::Sell, TimeInForce::Gtd(1_000));
+        let expiring_bid = order(new_id(), 100, 5, Side::Buy, TimeInForce::Gtd(1_000));
+        let future_bid = order(new_id(), 99, 3, Side::Buy, TimeInForce::Gtd(10_000));
+        let gtc_bid = order(new_id(), 98, 4, Side::Buy, TimeInForce::Gtc);
+        let expiring_ask = order(new_id(), 101, 7, Side::Sell, TimeInForce::Gtd(1_000));
         let orders = [expiring_bid, future_bid, gtc_bid, expiring_ask];
 
         // Live book on a logical clock so the small deadlines admit (wall-clock
@@ -1927,10 +1932,10 @@ mod tests {
     /// counter position are equal — which in turn proves every earlier trade
     /// ID the two books emitted was identical.
     fn probe_next_trade_id(book: &OrderBook<()>) -> String {
-        let resting = Id::new_uuid();
+        let resting = new_id();
         book.add_limit_order(resting, 1_000, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("probe resting bid");
-        let taker = Id::new_uuid();
+        let taker = new_id();
         let result = book
             .match_market_order(taker, 10, Side::Sell)
             .expect("probe market sell");
@@ -1988,8 +1993,8 @@ mod tests {
     #[test]
     fn test_replay_with_config_namespace_reproduces_trade_id_stream() {
         let namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"VENUE/TEST");
-        let maker_id = Id::new_uuid();
-        let taker_id = Id::new_uuid();
+        let maker_id = new_id();
+        let taker_id = new_id();
         let journal = trading_journal(maker_id, taker_id);
 
         // Reference "live" book: same namespace, same command stream.
@@ -2031,7 +2036,7 @@ mod tests {
     #[test]
     fn test_replay_with_namespace_config_rejects_suffix_replay() {
         let namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"VENUE/TEST");
-        let journal = trading_journal(Id::new_uuid(), Id::new_uuid());
+        let journal = trading_journal(new_id(), new_id());
         let config = ReplayBookConfig::default().with_trade_id_namespace(namespace);
 
         // from_sequence = 1 is a valid suffix of the two-event journal, so
@@ -2067,12 +2072,12 @@ mod tests {
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
         assert!(
             journal
-                .append(&make_add_event(0, Id::new_uuid(), 100, 10, Side::Buy))
+                .append(&make_add_event(0, new_id(), 100, 10, Side::Buy))
                 .is_ok()
         );
         assert!(
             journal
-                .append(&make_add_event(1, Id::new_uuid(), 99, 10, Side::Buy))
+                .append(&make_add_event(1, new_id(), 99, 10, Side::Buy))
                 .is_ok()
         );
 
@@ -2105,7 +2110,7 @@ mod tests {
     /// random namespace — two replays of the same journal diverge.
     #[test]
     fn test_replay_with_default_config_keeps_random_namespace() {
-        let journal = trading_journal(Id::new_uuid(), Id::new_uuid());
+        let journal = trading_journal(new_id(), new_id());
 
         let (a, _) = ReplayEngine::<()>::replay_from_with_config(
             &journal,

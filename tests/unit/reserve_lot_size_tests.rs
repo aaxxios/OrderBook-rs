@@ -27,6 +27,11 @@ mod tests_reserve_lot_size {
     };
     use std::num::NonZeroU64;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     const PRICE: u128 = 100;
 
     /// Build a reserve buy order with the given tranches and replenishment
@@ -116,7 +121,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_order_reserve_misaligned_tranche_rejects() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT", 10);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_order(reserve_buy(order_id, 15, 5, 0, None, false));
 
@@ -133,7 +138,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_iceberg_order_misaligned_tranche_rejects() {
         let book: OrderBook<()> = OrderBook::with_lot_size("ICEBERG-LOT", 10);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result =
             book.add_iceberg_order(order_id, PRICE, 15, 5, Side::Buy, TimeInForce::Gtc, None);
@@ -151,7 +156,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_order_reserve_misaligned_replenish_amount_with_auto_rejects() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT", 10);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_order(reserve_buy(order_id, 10, 20, 0, Some(7), true));
 
@@ -169,7 +174,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_order_reserve_misaligned_replenish_amount_without_auto_accepts() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT", 10);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_order(reserve_buy(order_id, 10, 20, 0, Some(7), false));
 
@@ -186,7 +191,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_order_reserve_default_replenish_capped_by_hidden_accepts() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT-25", 25);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_order(reserve_buy(order_id, 25, 50, 0, None, true));
 
@@ -202,7 +207,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_order_reserve_default_replenish_uncapped_rejects() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT-25", 25);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_order(reserve_buy(order_id, 25, 100, 0, None, true));
 
@@ -215,7 +220,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_add_order_reserve_without_auto_replenish_accepts() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT-25", 25);
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_order(reserve_buy(order_id, 25, 100, 0, None, false));
 
@@ -256,7 +261,7 @@ mod tests_reserve_lot_size {
     /// validator before cancelling anything.
     #[test]
     fn test_update_order_reserve_price_and_quantity_misaligned_rejects() {
-        let order_id = Id::new();
+        let order_id = new_id();
         let book = book_with_resting_reserve(order_id);
 
         let result = book.update_order(OrderUpdate::UpdatePriceAndQuantity {
@@ -272,7 +277,7 @@ mod tests_reserve_lot_size {
     /// `UpdateQuantity` takes the same validate-first path.
     #[test]
     fn test_update_order_reserve_quantity_misaligned_rejects() {
-        let order_id = Id::new();
+        let order_id = new_id();
         let book = book_with_resting_reserve(order_id);
 
         let result = book.update_order(OrderUpdate::UpdateQuantity {
@@ -288,7 +293,7 @@ mod tests_reserve_lot_size {
     /// so it is rejected on the same quantity.
     #[test]
     fn test_update_order_reserve_replace_misaligned_rejects() {
-        let order_id = Id::new();
+        let order_id = new_id();
         let book = book_with_resting_reserve(order_id);
 
         let result = book.update_order(OrderUpdate::Replace {
@@ -306,7 +311,7 @@ mod tests_reserve_lot_size {
     /// tranche (#221) and hidden is untouched, so the order rests 30 / 20.
     #[test]
     fn test_update_order_reserve_aligned_quantity_applies() {
-        let order_id = Id::new();
+        let order_id = new_id();
         let book = book_with_resting_reserve(order_id);
 
         let result = book.update_order(OrderUpdate::UpdateQuantity {
@@ -330,13 +335,13 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_reserve_maker_depletion_replenishes_aligned_tranches() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-FILL", 10);
-        let maker_id = Id::new();
+        let maker_id = new_id();
 
         let added = book.add_order(reserve_buy(maker_id, 10, 20, 0, Some(10), true));
         assert!(added.is_ok(), "seeding the maker must succeed: {added:?}");
 
         let taken = book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             10,
             Side::Sell,
@@ -369,7 +374,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_reserve_maker_below_threshold_replenishes_aligned_tranches() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-THRESHOLD", 10);
-        let maker_id = Id::new();
+        let maker_id = new_id();
 
         let added = book.add_order(reserve_buy(maker_id, 20, 40, 15, Some(10), true));
         assert!(
@@ -378,7 +383,7 @@ mod tests_reserve_lot_size {
         );
 
         let taken = book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             10,
             Side::Sell,
@@ -417,7 +422,7 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_reserve_maker_without_auto_replenish_leaves_book_on_depletion() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-NO-AUTO", 25);
-        let maker_id = Id::new();
+        let maker_id = new_id();
 
         // Admitted with no transfer check: 25 / 100 with no explicit amount
         // and no auto-replenishment. The default amount (80) would not be a
@@ -428,7 +433,7 @@ mod tests_reserve_lot_size {
         assert_eq!(resting_tranches(&book, maker_id), (25, 100));
 
         let taken = book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             25,
             Side::Sell,
@@ -478,13 +483,13 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_reserve_taker_residual_rests_aligned_tranches() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-TAKER", 10);
-        let contra = book.add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None);
+        let contra = book.add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(
             contra.is_ok(),
             "seeding contra depth must succeed: {contra:?}"
         );
 
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let submitted =
             book.add_order_with_result(reserve_buy(taker_id, 10, 20, 0, Some(10), true));
         let executed = match submitted {
@@ -514,14 +519,14 @@ mod tests_reserve_lot_size {
     #[test]
     fn test_reserve_taker_misaligned_replenish_amount_rejects_before_matching() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-TAKER", 10);
-        let contra_id = Id::new();
+        let contra_id = new_id();
         let contra = book.add_limit_order(contra_id, PRICE, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(
             contra.is_ok(),
             "seeding contra depth must succeed: {contra:?}"
         );
 
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.add_order(reserve_buy(taker_id, 10, 20, 0, Some(7), true));
 
         assert_invalid_lot(result, 7, 10);

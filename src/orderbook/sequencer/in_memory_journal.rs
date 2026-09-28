@@ -20,6 +20,7 @@ use std::sync::RwLock;
 /// ```
 /// use orderbook_rs::orderbook::sequencer::{InMemoryJournal, Journal, SequencerCommand, SequencerEvent, SequencerResult};
 /// use pricelevel::Id;
+/// use uuid::Uuid;
 ///
 /// let journal: InMemoryJournal<()> = InMemoryJournal::new();
 /// assert_eq!(journal.last_sequence(), None);
@@ -27,8 +28,8 @@ use std::sync::RwLock;
 /// let event = SequencerEvent {
 ///     sequence_num: 1,
 ///     timestamp_ns: 0,
-///     command: SequencerCommand::CancelOrder(Id::new()),
-///     result: SequencerResult::OrderCancelled { order_id: Id::new() },
+///     command: SequencerCommand::CancelOrder(Id::from_uuid(Uuid::new_v4())),
+///     result: SequencerResult::OrderCancelled { order_id: Id::from_uuid(Uuid::new_v4()) },
 /// };
 /// journal.append(&event).ok();
 /// assert_eq!(journal.last_sequence(), Some(1));

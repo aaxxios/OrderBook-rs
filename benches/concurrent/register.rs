@@ -5,6 +5,11 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Concurrent Operations");
 
@@ -20,7 +25,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         iters,
                         |order_book, _thread_id, _iteration| {
                             // Each thread adds orders with unique IDs
-                            let id = Id::new_uuid();
+                            let id = new_id();
                             order_book
                                 .add_limit_order(id, 1000, 10, Side::Buy, TimeInForce::Gtc, None)
                                 .unwrap();
@@ -94,7 +99,7 @@ fn measure_concurrent_mixed_operations(thread_count: usize, iterations: u64) -> 
 
     // Pre-populate with some orders
     for i in 0..200 {
-        let id = Id::new_uuid();
+        let id = new_id();
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         let price = if side == Side::Buy { 990 } else { 1010 };
         order_book
@@ -117,7 +122,7 @@ fn measure_concurrent_mixed_operations(thread_count: usize, iterations: u64) -> 
                 match i % 4 {
                     0 => {
                         // Add a new order
-                        let id = Id::new_uuid();
+                        let id = new_id();
                         let side = if thread_id % 2 == 0 {
                             Side::Buy
                         } else {
@@ -130,7 +135,7 @@ fn measure_concurrent_mixed_operations(thread_count: usize, iterations: u64) -> 
                     }
                     1 => {
                         // Match with a market order
-                        let id = Id::new_uuid();
+                        let id = new_id();
                         let side = if thread_id % 2 == 0 {
                             Side::Buy
                         } else {

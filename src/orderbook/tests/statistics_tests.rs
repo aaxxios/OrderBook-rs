@@ -5,21 +5,26 @@ mod tests {
     use crate::OrderBook;
     use pricelevel::{Id, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn setup_test_book() -> OrderBook<()> {
         let book = OrderBook::<()>::new("TEST");
 
         // Add buy orders with varying sizes
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 97, 40, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 96, 50, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 97, 40, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 96, 50, Side::Buy, TimeInForce::Gtc, None);
 
         // Add sell orders with varying sizes
-        let _ = book.add_limit_order(Id::new(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 104, 45, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 104, 45, Side::Sell, TimeInForce::Gtc, None);
 
         book
     }
@@ -116,7 +121,7 @@ mod tests {
     #[test]
     fn test_buy_sell_pressure_one_sided() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
         let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
 
@@ -127,8 +132,8 @@ mod tests {
     #[test]
     fn test_is_thin_book_true() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 5, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 101, 5, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 5, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 5, Side::Sell, TimeInForce::Gtc, None);
 
         assert!(book.is_thin_book(100, 10));
     }
@@ -143,8 +148,8 @@ mod tests {
     #[test]
     fn test_is_thin_book_one_side_thin() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 200, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 101, 5, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 200, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 5, Side::Sell, TimeInForce::Gtc, None);
 
         // Sell side is thin
         assert!(book.is_thin_book(100, 10));
@@ -177,7 +182,7 @@ mod tests {
         // Add orders at specific prices
         for i in 0..10 {
             let price = 100 - i;
-            let _ = book.add_limit_order(Id::new(), price, 10, Side::Buy, TimeInForce::Gtc, None);
+            let _ = book.add_limit_order(new_id(), price, 10, Side::Buy, TimeInForce::Gtc, None);
         }
 
         let distribution = book.depth_distribution(Side::Buy, 3);
@@ -210,7 +215,7 @@ mod tests {
     #[test]
     fn test_depth_distribution_single_price() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
         let distribution = book.depth_distribution(Side::Buy, 3);
 
@@ -226,9 +231,9 @@ mod tests {
         let book = OrderBook::<()>::new("TEST");
 
         // Add multiple orders at different prices
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 98, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 10, Side::Buy, TimeInForce::Gtc, None);
 
         let distribution = book.depth_distribution(Side::Buy, 2);
 
@@ -242,9 +247,9 @@ mod tests {
         let book = OrderBook::<()>::new("TEST");
 
         // Add orders with known sizes for std dev calculation
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
 
         let stats = book.depth_statistics(Side::Buy, 3);
 
@@ -256,8 +261,8 @@ mod tests {
     #[test]
     fn test_order_book_imbalance_balanced() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
 
         let imbalance = book.order_book_imbalance(5);
 
@@ -267,8 +272,8 @@ mod tests {
     #[test]
     fn test_order_book_imbalance_buy_heavy() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 100, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 100, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
 
         let imbalance = book.order_book_imbalance(5);
 
@@ -279,8 +284,8 @@ mod tests {
     #[test]
     fn test_order_book_imbalance_sell_heavy() {
         let book = OrderBook::<()>::new("TEST");
-        let _ = book.add_limit_order(Id::new(), 100, 30, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 101, 100, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 100, Side::Sell, TimeInForce::Gtc, None);
 
         let imbalance = book.order_book_imbalance(5);
 
@@ -314,8 +319,8 @@ mod tests {
         let book = OrderBook::<()>::new("TEST");
 
         // Add orders spanning a known range
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 90, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 90, 10, Side::Buy, TimeInForce::Gtc, None);
 
         let distribution = book.depth_distribution(Side::Buy, 2);
 

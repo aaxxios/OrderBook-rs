@@ -5,21 +5,26 @@ mod tests {
     use crate::OrderBook;
     use pricelevel::{Id, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn setup_test_book() -> OrderBook {
         let book = OrderBook::new("TEST");
 
         // Add buy orders at different prices
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 95, 15, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 90, 20, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 85, 25, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 80, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 95, 15, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 90, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 85, 25, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 80, 30, Side::Buy, TimeInForce::Gtc, None);
 
         // Add sell orders at different prices
-        let _ = book.add_limit_order(Id::new(), 105, 12, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 110, 18, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 115, 24, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 120, 30, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 105, 12, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 110, 18, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 115, 24, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 120, 30, Side::Sell, TimeInForce::Gtc, None);
 
         book
     }

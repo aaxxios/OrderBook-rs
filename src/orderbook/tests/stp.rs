@@ -9,6 +9,11 @@ mod tests {
         Hash32, Id, OrderType, OrderUpdate, Price, Quantity, Side, TimeInForce, TimestampMs,
     };
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     /// Helper: create a non-zero user hash from a single byte value.
     fn user(byte: u8) -> Hash32 {
         Hash32::new([byte; 32])
@@ -22,7 +27,7 @@ mod tests {
         user_id: Hash32,
     ) -> Id {
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(price),
             quantity: Quantity::new(quantity),
             side: Side::Sell,
@@ -45,7 +50,7 @@ mod tests {
         user_id: Hash32,
     ) -> Id {
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(price),
             quantity: Quantity::new(quantity),
             side: Side::Buy,
@@ -70,7 +75,7 @@ mod tests {
         timestamp: u64,
     ) -> Id {
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(price),
             quantity: Quantity::new(quantity),
             side: Side::Sell,
@@ -114,7 +119,7 @@ mod tests {
         let m_self = add_sell_order_with_ts(&book, 100, 5, taker_user, 30);
         let m3 = add_sell_order_with_ts(&book, 100, 6, other, 40);
 
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 50, Side::Buy, taker_user);
 
         assert!(result.is_ok(), "expected partial fill, got {result:?}");
@@ -161,7 +166,7 @@ mod tests {
         let self1 = add_sell_order_with_ts(&book, 100, 5, taker_user, 20);
         let self2 = add_sell_order_with_ts(&book, 100, 6, taker_user, 30);
 
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 50, Side::Buy, taker_user);
 
         assert!(result.is_ok(), "expected partial fill, got {result:?}");
@@ -207,7 +212,7 @@ mod tests {
         let m_other = add_sell_order_with_ts(&book, 100, 4, other, 30);
         let m_self = add_sell_order_with_ts(&book, 100, 5, taker_user, 10);
 
-        let result = book.match_market_order_with_user(Id::new(), 20, Side::Buy, taker_user);
+        let result = book.match_market_order_with_user(new_id(), 20, Side::Buy, taker_user);
 
         assert!(
             result.is_ok(),
@@ -260,7 +265,7 @@ mod tests {
         }));
 
         // Same user crosses -> CancelMaker cancels the resting maker.
-        let taker = Id::new();
+        let taker = new_id();
         let _ = book.match_market_order_with_user(taker, 10, Side::Buy, u);
 
         match book.order_status(maker) {
@@ -302,7 +307,7 @@ mod tests {
         let self_c = add_sell_order_with_user(&book, 100, 20, taker_user);
 
         // Same-user taker crosses with ample size.
-        let taker = Id::new();
+        let taker = new_id();
         let result = book.match_market_order_with_user(taker, 100, Side::Buy, taker_user);
         assert!(
             result.is_ok(),
@@ -353,12 +358,12 @@ mod tests {
 
         let u = user(7);
         // Consumes the single per-account open-order slot.
-        let maker = Id::new();
+        let maker = new_id();
         book.add_limit_order_with_user(maker, 100, 10, Side::Sell, TimeInForce::Gtc, u, None)
             .expect("maker admitted (1/1)");
 
         // Same user crosses -> CancelBoth cancels the maker (and the taker).
-        let taker = Id::new();
+        let taker = new_id();
         let _ = book.match_market_order_with_user(taker, 5, Side::Buy, u);
 
         match book.order_status(maker) {
@@ -371,7 +376,7 @@ mod tests {
         // The risk slot must have been released: a new order from the same account
         // is admitted. If on_cancel were skipped, the counter would still read 1/1
         // and this would fail with RiskMaxOpenOrders.
-        book.add_limit_order_with_user(Id::new(), 101, 1, Side::Sell, TimeInForce::Gtc, u, None)
+        book.add_limit_order_with_user(new_id(), 101, 1, Side::Sell, TimeInForce::Gtc, u, None)
             .expect("STP cancel must free the per-account risk slot");
     }
 
@@ -390,7 +395,7 @@ mod tests {
         let maker = add_sell_order_with_user(&book, 100, 10, u);
 
         let fok = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -438,7 +443,7 @@ mod tests {
         // GTC buy 20 at limit 200: fills 5 vs `other` at 100, then hits its own
         // order at 200 -> CancelTaker cancels the taker. The 15-unit residual must
         // NOT rest, and the taker records Cancelled { SelfTradePrevention }.
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let taker = OrderType::Standard {
             id: taker_id,
             price: Price::new(200),
@@ -499,7 +504,7 @@ mod tests {
 
         // Notional buy of 1000 quote: 5 @ 100 (500 spent) vs `other`, then the
         // self-cross at 200 cancels the taker. Match-only -> Ok with the 5-unit fill.
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result =
             book.match_market_order_by_amount_with_user(taker_id, 1000, Side::Buy, taker_user);
 
@@ -525,7 +530,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, same_user);
 
         // Same user submits a buy market order — should match (no STP)
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, same_user);
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -546,7 +551,7 @@ mod tests {
         let maker_id = add_sell_order_with_user(&book, 100, 10, same_user);
 
         // Same user tries to buy — STP should block
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, same_user);
 
         match result {
@@ -571,7 +576,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, maker_user);
 
         // Different user buys — should match normally
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, taker_user);
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -594,7 +599,7 @@ mod tests {
         add_sell_order_with_user(&book, 200, 10, taker_user);
 
         // Taker tries to buy 20 — should fill 5 at price 100, then STP at 200
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 20, Side::Buy, taker_user);
 
         // Should succeed with partial fill (STP only returns error when zero fills)
@@ -613,7 +618,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, maker_user);
 
         // Matching with Hash32::zero() as taker_user_id should bypass STP
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, Hash32::zero());
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -638,7 +643,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, other_user);
 
         // Same user buys 10 — maker should be cancelled, match against other
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, same_user);
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -661,7 +666,7 @@ mod tests {
         let maker_id2 = add_sell_order_with_user(&book, 100, 3, same_user);
 
         // Taker tries to buy — all makers cancelled, level empty, no fills
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, same_user);
 
         // Market order with no liquidity after cancellations returns InsufficientLiquidity
@@ -690,7 +695,7 @@ mod tests {
         add_sell_order_with_user(&book, 200, 10, other_user);
 
         // Buy 10 — cancel maker at 100, then match at 200
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, same_user);
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -713,7 +718,7 @@ mod tests {
         let maker_id = add_sell_order_with_user(&book, 100, 10, same_user);
 
         // Same user tries to buy — both should be cancelled
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, same_user);
 
         match result {
@@ -742,7 +747,7 @@ mod tests {
         let maker_id = add_sell_order_with_user(&book, 200, 10, taker_user);
 
         // Taker buys 20 — fills 3 at 100, then CancelBoth at 200
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 20, Side::Buy, taker_user);
 
         // Partial fill occurred, so result is Ok (not error)
@@ -769,7 +774,7 @@ mod tests {
 
         // Same user adds an aggressive buy that would cross
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -806,7 +811,7 @@ mod tests {
 
         // Same user adds aggressive buy at 100 for qty 8
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(8),
             side: Side::Buy,
@@ -836,7 +841,7 @@ mod tests {
         let maker_id = add_buy_order_with_user(&book, 100, 10, same_user);
 
         // Same user tries to sell — STP should block
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Sell, same_user);
 
         match result {
@@ -865,7 +870,7 @@ mod tests {
         add_buy_order_with_user(&book, 200, 10, other_user);
 
         // Same user sells 10 — maker cancelled, match against other
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Sell, same_user);
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -913,7 +918,7 @@ mod tests {
         let mut book: OrderBook<()> = OrderBook::new("TEST");
         book.set_stp_mode(STPMode::CancelTaker);
 
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 10, Side::Buy, user(1));
 
         match result {
@@ -932,7 +937,7 @@ mod tests {
 
         // Same user adds buy at 100 (no cross) — should rest in book
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(5),
             side: Side::Buy,
@@ -956,7 +961,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, same_user);
 
         // Use the submit_market_order_with_user convenience method
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.submit_market_order_with_user(taker_id, 10, Side::Buy, same_user);
 
         match result {
@@ -976,7 +981,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, same_user);
 
         // Use match_limit_order_with_user
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_limit_order_with_user(taker_id, 10, Side::Buy, 100, same_user);
 
         match result {
@@ -996,7 +1001,7 @@ mod tests {
         add_sell_order_with_user(&book, 100, 10, same_user);
 
         // Using the old API (no user_id) should bypass STP
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order(taker_id, 10, Side::Buy);
         assert!(result.is_ok());
         let mr = result.unwrap();
@@ -1017,7 +1022,7 @@ mod tests {
         add_sell_order_with_user(&book, 200, 10, taker_user);
 
         // Buy 20 — fills 5 at 100, then STP at 200
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let result = book.match_market_order_with_user(taker_id, 20, Side::Buy, taker_user);
 
         assert!(result.is_ok());
@@ -1036,7 +1041,7 @@ mod tests {
         book.set_stp_mode(STPMode::CancelTaker);
 
         // add_limit_order defaults to Hash32::zero() → should be rejected
-        let result = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         match result {
             Err(OrderBookError::MissingUserId { .. }) => {}
             other => panic!("expected MissingUserId, got {other:?}"),
@@ -1049,7 +1054,7 @@ mod tests {
         assert_eq!(book.stp_mode(), STPMode::None);
 
         // STP disabled → Hash32::zero() is fine
-        let result = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_ok());
     }
 
@@ -1060,7 +1065,7 @@ mod tests {
 
         // Non-zero user_id → accepted
         let result = book.add_limit_order_with_user(
-            Id::new(),
+            new_id(),
             100,
             10,
             Side::Buy,
@@ -1078,7 +1083,7 @@ mod tests {
 
         // Explicitly zero user_id via _with_user → should be rejected
         let result = book.add_limit_order_with_user(
-            Id::new(),
+            new_id(),
             100,
             10,
             Side::Buy,
@@ -1098,7 +1103,7 @@ mod tests {
         book.set_stp_mode(STPMode::CancelBoth);
 
         let result =
-            book.add_iceberg_order(Id::new(), 100, 5, 10, Side::Sell, TimeInForce::Gtc, None);
+            book.add_iceberg_order(new_id(), 100, 5, 10, Side::Sell, TimeInForce::Gtc, None);
         match result {
             Err(OrderBookError::MissingUserId { .. }) => {}
             other => panic!("expected MissingUserId, got {other:?}"),
@@ -1111,7 +1116,7 @@ mod tests {
         book.set_stp_mode(STPMode::CancelTaker);
 
         let result = book.add_iceberg_order_with_user(
-            Id::new(),
+            new_id(),
             100,
             5,
             10,
@@ -1128,7 +1133,7 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         let result =
-            book.add_iceberg_order(Id::new(), 100, 5, 10, Side::Sell, TimeInForce::Gtc, None);
+            book.add_iceberg_order(new_id(), 100, 5, 10, Side::Sell, TimeInForce::Gtc, None);
         assert!(result.is_ok());
     }
 
@@ -1137,8 +1142,7 @@ mod tests {
         let mut book: OrderBook<()> = OrderBook::new("TEST");
         book.set_stp_mode(STPMode::CancelTaker);
 
-        let result =
-            book.add_post_only_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_post_only_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         match result {
             Err(OrderBookError::MissingUserId { .. }) => {}
             other => panic!("expected MissingUserId, got {other:?}"),
@@ -1151,7 +1155,7 @@ mod tests {
         book.set_stp_mode(STPMode::CancelMaker);
 
         let result = book.add_post_only_order_with_user(
-            Id::new(),
+            new_id(),
             200,
             10,
             Side::Sell,
@@ -1166,8 +1170,7 @@ mod tests {
     fn test_post_only_order_stp_disabled() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        let result =
-            book.add_post_only_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_post_only_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_ok());
     }
 
@@ -1178,7 +1181,7 @@ mod tests {
 
         // Direct add_order with zero user_id → should be rejected
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -1201,7 +1204,7 @@ mod tests {
 
         // Direct add_order with non-zero user_id → should be accepted
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -1225,8 +1228,7 @@ mod tests {
             let mut book: OrderBook<()> = OrderBook::new("TEST");
             book.set_stp_mode(mode);
 
-            let result =
-                book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+            let result = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
             match result {
                 Err(OrderBookError::MissingUserId { .. }) => {}
                 other => panic!("expected MissingUserId for mode {mode}, got {other:?}"),
@@ -1239,7 +1241,7 @@ mod tests {
         let mut book: OrderBook<()> = OrderBook::new("TEST");
         book.set_stp_mode(STPMode::CancelTaker);
 
-        let oid = Id::new();
+        let oid = new_id();
         let order = OrderType::Standard {
             id: oid,
             price: Price::new(100),
@@ -1261,7 +1263,7 @@ mod tests {
 
     #[test]
     fn test_missing_user_id_display() {
-        let oid = Id::new();
+        let oid = new_id();
         let err = OrderBookError::MissingUserId { order_id: oid };
         let msg = err.to_string();
         assert!(msg.contains("missing user_id"));

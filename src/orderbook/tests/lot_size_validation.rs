@@ -18,6 +18,11 @@ mod tests {
     };
     use std::num::NonZeroU64;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     const PRICE: u128 = 100;
 
     /// A lot-`lot` book with no other admission constraint.
@@ -34,7 +39,7 @@ mod tests {
         auto_replenish: bool,
     ) -> OrderType<()> {
         OrderType::ReserveOrder {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(PRICE),
             visible_quantity: Quantity::new(visible),
             hidden_quantity: Quantity::new(hidden),
@@ -52,7 +57,7 @@ mod tests {
     /// An iceberg order with the given tranches.
     fn iceberg(visible: u64, hidden: u64) -> OrderType<()> {
         OrderType::IcebergOrder {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(PRICE),
             visible_quantity: Quantity::new(visible),
             hidden_quantity: Quantity::new(hidden),
@@ -218,7 +223,7 @@ mod tests {
     #[test]
     fn test_validate_order_shape_single_tranche_kinds_check_quantity() {
         let book = book_with_lot(10);
-        let id = Id::new();
+        let id = new_id();
         let price = Price::new(PRICE);
         let timestamp = TimestampMs::new(crate::utils::current_time_millis());
 

@@ -1,6 +1,7 @@
 use criterion::Criterion;
 use orderbook_rs::OrderBook;
 use pricelevel::{Id, Side, TimeInForce};
+use uuid::Uuid;
 
 pub fn benchmark_data(c: &mut Criterion) {
     let mut group = c.benchmark_group("Basic OrderBook Operations");
@@ -16,7 +17,7 @@ pub fn benchmark_data(c: &mut Criterion) {
     group.bench_function("add_single_order", |b| {
         b.iter(|| {
             let order_book: OrderBook = OrderBook::new("TEST-SYMBOL");
-            let id = Id::new_uuid();
+            let id = Id::from_uuid(Uuid::new_v4());
             let _ = order_book.add_limit_order(id, 1000, 10, Side::Buy, TimeInForce::Gtc, None);
         })
     });

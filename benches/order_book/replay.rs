@@ -4,6 +4,7 @@ use orderbook_rs::orderbook::sequencer::{
 };
 use pricelevel::{Hash32, Id, Price, Quantity, Side, TimeInForce, TimestampMs};
 use std::hint::black_box;
+use uuid::Uuid;
 
 /// Build an add-order event for the journal.
 fn make_add_event(seq: u64, id: Id, price: u128, qty: u64, side: Side) -> SequencerEvent<()> {
@@ -29,7 +30,7 @@ fn make_add_event(seq: u64, id: Id, price: u128, qty: u64, side: Side) -> Sequen
 fn make_journal(n: usize) -> InMemoryJournal<()> {
     let journal = InMemoryJournal::new();
     for i in 0..n {
-        let id = Id::new_uuid();
+        let id = Id::from_uuid(Uuid::new_v4());
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         let price = if side == Side::Buy {
             1000_u128.saturating_sub((i % 100) as u128)
@@ -53,7 +54,8 @@ pub fn register_benchmarks(c: &mut Criterion) {
             |b, &count| {
                 b.iter_with_setup(
                     || {
-                        let ids: Vec<_> = (0..count).map(|_| Id::new_uuid()).collect();
+                        let ids: Vec<_> =
+                            (0..count).map(|_| Id::from_uuid(Uuid::new_v4())).collect();
                         let events: Vec<_> = ids
                             .iter()
                             .enumerate()

@@ -3,6 +3,7 @@
 use orderbook_rs::{FeeSchedule, OrderBook, TradeResult};
 use pricelevel::{Id, Side, TimeInForce};
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[test]
 fn test_fee_schedule_creation() {
@@ -130,7 +131,7 @@ fn test_orderbook_fee_schedule_persistence() {
     book.set_fee_schedule(Some(schedule));
 
     // Add an order (maker)
-    let order_id = Id::new_uuid();
+    let order_id = Id::from_uuid(Uuid::new_v4());
     let result = book.add_limit_order(order_id, 100_000, 10, Side::Buy, TimeInForce::Gtc, None);
     assert!(result.is_ok());
 
@@ -243,6 +244,11 @@ mod integration_tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     #[test]
     fn test_fee_schedule_with_matching() {
         let mut book = OrderBook::<()>::new("BTC/USD");
@@ -250,13 +256,13 @@ mod integration_tests {
         book.set_fee_schedule(Some(schedule));
 
         // Add a bid order (maker)
-        let bid_order_id = Id::new_uuid();
+        let bid_order_id = new_id();
         let bid_result =
             book.add_limit_order(bid_order_id, 100_000, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(bid_result.is_ok());
 
         // Add an ask order that will match (taker)
-        let ask_order_id = Id::new_uuid();
+        let ask_order_id = new_id();
         let ask_result =
             book.add_limit_order(ask_order_id, 100_000, 5, Side::Sell, TimeInForce::Ioc, None);
         assert!(ask_result.is_ok());
@@ -278,7 +284,7 @@ mod integration_tests {
         assert_eq!(book.fee_schedule(), None);
 
         // Add orders with no fees
-        let order1_id = Id::new_uuid();
+        let order1_id = new_id();
         book.add_limit_order(order1_id, 100_000, 10, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
         assert_eq!(book.fee_schedule(), None);
@@ -289,7 +295,7 @@ mod integration_tests {
         assert_eq!(book.fee_schedule(), Some(schedule));
 
         // Add more orders with fees active
-        let order2_id = Id::new_uuid();
+        let order2_id = new_id();
         book.add_limit_order(order2_id, 100_000, 5, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
         assert_eq!(book.fee_schedule(), Some(schedule));
@@ -319,12 +325,12 @@ mod integration_tests {
         book.set_fee_schedule(Some(schedule));
 
         // Add a resting sell order (will become maker)
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 10_000, 100, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Submit market buy (taker) — will match and trigger listener
-        let buy_id = Id::new_uuid();
+        let buy_id = new_id();
         book.submit_market_order(buy_id, 50, Side::Buy).unwrap();
 
         // Verify the captured trade has correct fees
@@ -357,11 +363,11 @@ mod integration_tests {
         let book = OrderBook::<()>::with_trade_listener("BTC/USD", listener);
         // No fee schedule configured (None by default)
 
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 10_000, 100, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
-        let buy_id = Id::new_uuid();
+        let buy_id = new_id();
         book.submit_market_order(buy_id, 50, Side::Buy).unwrap();
 
         let trades = captured_trades.lock().unwrap();
@@ -389,16 +395,16 @@ mod integration_tests {
         book.set_fee_schedule(Some(schedule));
 
         // Add two sell orders at different prices
-        let sell_id1 = Id::new_uuid();
+        let sell_id1 = new_id();
         book.add_limit_order(sell_id1, 1000, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
-        let sell_id2 = Id::new_uuid();
+        let sell_id2 = new_id();
         book.add_limit_order(sell_id2, 2000, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Market buy that sweeps both levels
-        let buy_id = Id::new_uuid();
+        let buy_id = new_id();
         book.submit_market_order(buy_id, 20, Side::Buy).unwrap();
 
         let trades = captured_trades.lock().unwrap();

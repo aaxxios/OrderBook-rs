@@ -1,9 +1,10 @@
 #[cfg(test)]
 mod tests {
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
+    use uuid::Uuid;
 
     fn create_sample_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]

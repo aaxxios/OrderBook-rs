@@ -7,6 +7,11 @@ mod tests_order_state {
     use pricelevel::{Hash32, Id, Side, TimeInForce};
     use std::sync::{Arc, Mutex};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     /// Create a book with state tracking enabled.
     fn book_with_tracker(symbol: &str) -> OrderBook<()> {
         let mut book = OrderBook::new(symbol);
@@ -21,7 +26,7 @@ mod tests_order_state {
     #[test]
     fn add_order_no_match_tracks_open() {
         let book = book_with_tracker("TEST");
-        let id = Id::new_uuid();
+        let id = new_id();
         let result = book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_ok());
 
@@ -34,13 +39,13 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Place a resting ask
-        let ask_id = Id::new_uuid();
+        let ask_id = new_id();
         book.add_limit_order(ask_id, 100, 10, Side::Sell, TimeInForce::Gtc, None)
             .expect("add ask");
         assert_eq!(book.order_status(ask_id), Some(OrderStatus::Open));
 
         // Place an aggressive buy that fully matches the ask
-        let bid_id = Id::new_uuid();
+        let bid_id = new_id();
         book.add_limit_order(bid_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add bid");
 
@@ -65,12 +70,12 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Place a small resting ask
-        let ask_id = Id::new_uuid();
+        let ask_id = new_id();
         book.add_limit_order(ask_id, 100, 5, Side::Sell, TimeInForce::Gtc, None)
             .expect("add ask");
 
         // Place a larger buy that partially matches
-        let bid_id = Id::new_uuid();
+        let bid_id = new_id();
         book.add_limit_order(bid_id, 100, 15, Side::Buy, TimeInForce::Gtc, None)
             .expect("add bid");
 
@@ -97,7 +102,7 @@ mod tests_order_state {
         let mut book = book_with_tracker("TEST");
         book.set_tick_size(100);
 
-        let id = Id::new_uuid();
+        let id = new_id();
         let result = book.add_limit_order(id, 150, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_err());
 
@@ -115,11 +120,11 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Place a resting ask at 100
-        book.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
             .expect("add ask");
 
         // Post-only buy at 100 would cross → rejected
-        let id = Id::new_uuid();
+        let id = new_id();
         let post_only = OrderType::PostOnly {
             id,
             price: Price::new(100),
@@ -147,7 +152,7 @@ mod tests_order_state {
     #[test]
     fn cancel_order_tracks_user_requested() {
         let book = book_with_tracker("TEST");
-        let id = Id::new_uuid();
+        let id = new_id();
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
 
@@ -169,11 +174,11 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Resting ask
-        book.add_limit_order(Id::new_uuid(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
             .expect("add ask");
 
         // Buy partially matches
-        let bid_id = Id::new_uuid();
+        let bid_id = new_id();
         book.add_limit_order(bid_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add bid");
 
@@ -197,8 +202,8 @@ mod tests_order_state {
     #[test]
     fn mass_cancel_all_tracks_correct_reason() {
         let book = book_with_tracker("TEST");
-        let id1 = Id::new_uuid();
-        let id2 = Id::new_uuid();
+        let id1 = new_id();
+        let id2 = new_id();
         book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.add_limit_order(id2, 200, 5, Side::Sell, TimeInForce::Gtc, None)
@@ -225,8 +230,8 @@ mod tests_order_state {
     #[test]
     fn mass_cancel_by_side_tracks_correct_reason() {
         let book = book_with_tracker("TEST");
-        let bid_id = Id::new_uuid();
-        let ask_id = Id::new_uuid();
+        let bid_id = new_id();
+        let ask_id = new_id();
         book.add_limit_order(bid_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.add_limit_order(ask_id, 200, 5, Side::Sell, TimeInForce::Gtc, None)
@@ -248,9 +253,9 @@ mod tests_order_state {
     #[test]
     fn mass_cancel_by_price_range_tracks_correct_reason() {
         let book = book_with_tracker("TEST");
-        let id1 = Id::new_uuid();
-        let id2 = Id::new_uuid();
-        let id3 = Id::new_uuid();
+        let id1 = new_id();
+        let id2 = new_id();
+        let id3 = new_id();
         book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.add_limit_order(id2, 200, 10, Side::Buy, TimeInForce::Gtc, None)
@@ -287,7 +292,7 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // No liquidity at all
-        let id = Id::new_uuid();
+        let id = new_id();
         let result = book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Fok, None);
         assert!(result.is_err());
 
@@ -306,11 +311,11 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Small resting ask
-        book.add_limit_order(Id::new_uuid(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
             .expect("add ask");
 
         // IOC buy for 10 — only 3 can fill, rest is cancelled
-        let id = Id::new_uuid();
+        let id = new_id();
         let result = book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Ioc, None);
         assert!(result.is_err()); // IOC returns Err when not fully filled
 
@@ -331,7 +336,7 @@ mod tests_order_state {
     #[test]
     fn no_tracker_returns_none_and_no_panic() {
         let book = DefaultOrderBook::new("TEST");
-        let id = Id::new_uuid();
+        let id = new_id();
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
 
@@ -363,7 +368,7 @@ mod tests_order_state {
         let mut book: OrderBook<()> = OrderBook::new("TEST");
         book.set_order_state_tracker(tracker);
 
-        let id = Id::new_uuid();
+        let id = new_id();
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.cancel_order(id).expect("cancel");
@@ -387,7 +392,7 @@ mod tests_order_state {
     #[test]
     fn order_status_unknown_returns_none() {
         let book = book_with_tracker("TEST");
-        assert!(book.order_status(Id::new_uuid()).is_none());
+        assert!(book.order_status(new_id()).is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -404,12 +409,12 @@ mod tests_order_state {
         let user = Hash32::from([1u8; 32]);
 
         // Resting ask from user
-        let ask_id = Id::new_uuid();
+        let ask_id = new_id();
         book.add_limit_order_with_user(ask_id, 100, 10, Side::Sell, TimeInForce::Gtc, user, None)
             .expect("add ask");
 
         // Aggressive buy from same user → STP cancels taker
-        let bid_id = Id::new_uuid();
+        let bid_id = new_id();
         let result =
             book.add_limit_order_with_user(bid_id, 100, 5, Side::Buy, TimeInForce::Gtc, user, None);
         assert!(result.is_err()); // SelfTradePrevented
@@ -436,11 +441,11 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Place a small resting ask
-        book.add_limit_order(Id::new_uuid(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
             .expect("add ask");
 
         // Buy partially matches, then rests
-        let bid_id = Id::new_uuid();
+        let bid_id = new_id();
         book.add_limit_order(bid_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add bid");
 
@@ -480,13 +485,13 @@ mod tests_order_state {
     #[test]
     fn get_order_history_returns_none_for_unknown() {
         let book = book_with_tracker("TEST");
-        assert!(book.get_order_history(Id::new_uuid()).is_none());
+        assert!(book.get_order_history(new_id()).is_none());
     }
 
     #[test]
     fn get_order_history_no_tracker_returns_none() {
         let book = DefaultOrderBook::new("TEST");
-        let id = Id::new_uuid();
+        let id = new_id();
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         assert!(book.get_order_history(id).is_none());
@@ -495,7 +500,7 @@ mod tests_order_state {
     #[test]
     fn get_order_history_single_transition_open() {
         let book = book_with_tracker("TEST");
-        let id = Id::new_uuid();
+        let id = new_id();
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
 
@@ -519,9 +524,9 @@ mod tests_order_state {
         assert_eq!(book.terminal_order_count(), 0);
 
         // Add 3 resting orders
-        let id1 = Id::new_uuid();
-        let id2 = Id::new_uuid();
-        let id3 = Id::new_uuid();
+        let id1 = new_id();
+        let id2 = new_id();
+        let id3 = new_id();
         book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.add_limit_order(id2, 99, 10, Side::Buy, TimeInForce::Gtc, None)
@@ -539,7 +544,7 @@ mod tests_order_state {
         assert_eq!(book.terminal_order_count(), 1);
 
         // Fill one via aggressive order
-        let aggressive_id = Id::new_uuid();
+        let aggressive_id = new_id();
         book.add_limit_order(aggressive_id, 200, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("aggressive buy");
 
@@ -565,8 +570,8 @@ mod tests_order_state {
         let book = book_with_tracker("TEST");
 
         // Add and cancel orders
-        let id1 = Id::new_uuid();
-        let id2 = Id::new_uuid();
+        let id1 = new_id();
+        let id2 = new_id();
         book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.add_limit_order(id2, 200, 10, Side::Sell, TimeInForce::Gtc, None)
@@ -591,7 +596,7 @@ mod tests_order_state {
     fn purge_terminal_states_keeps_recent_entries() {
         let book = book_with_tracker("TEST");
 
-        let id = Id::new_uuid();
+        let id = new_id();
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.cancel_order(id).expect("cancel");
@@ -606,8 +611,8 @@ mod tests_order_state {
     fn purge_terminal_states_does_not_affect_active() {
         let book = book_with_tracker("TEST");
 
-        let active_id = Id::new_uuid();
-        let terminal_id = Id::new_uuid();
+        let active_id = new_id();
+        let terminal_id = new_id();
         book.add_limit_order(active_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("add");
         book.add_limit_order(terminal_id, 200, 10, Side::Sell, TimeInForce::Gtc, None)

@@ -258,6 +258,11 @@ mod tests {
     use super::*;
     use pricelevel::{Hash32, Id, PriceLevelError, Side};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
     fn named_variants() -> [RejectReason; 14] {
@@ -421,17 +426,13 @@ mod tests {
 
     #[test]
     fn test_from_order_book_error_missing_user_id() {
-        let err = OrderBookError::MissingUserId {
-            order_id: Id::new_uuid(),
-        };
+        let err = OrderBookError::MissingUserId { order_id: new_id() };
         assert_eq!(RejectReason::from(&err), RejectReason::MissingUserId);
     }
 
     #[test]
     fn test_from_order_book_error_duplicate_order_id() {
-        let err = OrderBookError::DuplicateOrderId {
-            order_id: Id::new_uuid(),
-        };
+        let err = OrderBookError::DuplicateOrderId { order_id: new_id() };
         assert_eq!(RejectReason::from(&err), RejectReason::DuplicateOrderId);
     }
 
@@ -439,7 +440,7 @@ mod tests {
     fn test_from_order_book_error_self_trade_prevented_maps_to_self_trade_prevention() {
         let err = OrderBookError::SelfTradePrevented {
             mode: crate::orderbook::stp::STPMode::CancelTaker,
-            taker_order_id: Id::new_uuid(),
+            taker_order_id: new_id(),
             user_id: Hash32::from([1u8; 32]),
         };
         assert_eq!(RejectReason::from(&err), RejectReason::SelfTradePrevention);

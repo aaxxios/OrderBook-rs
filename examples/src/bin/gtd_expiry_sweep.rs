@@ -15,6 +15,11 @@
 
 use std::sync::Arc;
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 use orderbook_rs::{Clock, OrderBook, StubClock, TimestampMs};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
 use tracing::info;
@@ -66,35 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn seed(book: &OrderBook<()>) -> Result<(), Box<dyn std::error::Error>> {
     // Two GTD bids expiring at t=1_000, at different prices so the sweep must
     // visit them in ascending-price order.
-    book.add_limit_order(
-        Id::new_uuid(),
-        95,
-        5,
-        Side::Buy,
-        TimeInForce::Gtd(1_000),
-        None,
-    )?;
-    book.add_limit_order(
-        Id::new_uuid(),
-        96,
-        5,
-        Side::Buy,
-        TimeInForce::Gtd(1_000),
-        None,
-    )?;
+    book.add_limit_order(new_id(), 95, 5, Side::Buy, TimeInForce::Gtd(1_000), None)?;
+    book.add_limit_order(new_id(), 96, 5, Side::Buy, TimeInForce::Gtd(1_000), None)?;
     // A GTC bid that never expires.
-    book.add_limit_order(Id::new_uuid(), 97, 5, Side::Buy, TimeInForce::Gtc, None)?;
+    book.add_limit_order(new_id(), 97, 5, Side::Buy, TimeInForce::Gtc, None)?;
     // A DAY ask expiring at the market close (3_000).
-    book.add_limit_order(Id::new_uuid(), 101, 5, Side::Sell, TimeInForce::Day, None)?;
+    book.add_limit_order(new_id(), 101, 5, Side::Sell, TimeInForce::Day, None)?;
     // A GTD ask expiring at t=5_000.
-    book.add_limit_order(
-        Id::new_uuid(),
-        102,
-        5,
-        Side::Sell,
-        TimeInForce::Gtd(5_000),
-        None,
-    )?;
+    book.add_limit_order(new_id(), 102, 5, Side::Sell, TimeInForce::Gtd(5_000), None)?;
     Ok(())
 }
 
