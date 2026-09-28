@@ -50,6 +50,9 @@ This order book engine is built with the following design principles:
 
 - Dependency floors raised to the latest semver-compatible releases
   (#237). `bincode` stays on 2.0.1.
+- The Production Panic Policy is enforced mechanically: a clippy deny set
+  plus `scripts/check_panic_policy.py` in `make lint` (#242). See
+  `doc/panic-boundaries.md`.
 - **pricelevel 0.10 (#239).** Level snapshots, queue views and
   match-result growth are fallible upstream; the book now propagates
   those errors instead of ignoring them. `create_snapshot`,
