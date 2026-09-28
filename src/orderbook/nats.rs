@@ -12,10 +12,25 @@
 //! serialization, no `format!`, and no per-trade task spawn happen on the
 //! engine thread. A single background Tokio task drains the channel, batches
 //! and (optionally) throttles, and performs the serialization, subject
-//! construction, and JetStream publish with exponential-backoff retry. This
+//! construction, and JetStream publish with capped exponential backoff and
+//! jitter between retries (see
+//! [`BASE_RETRY_DELAY_MS`](crate::orderbook::nats::BASE_RETRY_DELAY_MS) and
+//! [`MAX_RETRY_DELAY_MS`](crate::orderbook::nats::MAX_RETRY_DELAY_MS)). This
 //! mirrors the sibling [`NatsBookChangePublisher`](crate::orderbook::nats_book_change::NatsBookChangePublisher)
 //! so neither outbound path floods the runtime with tiny per-event tasks under
 //! a burst.
+//!
+//! # Runtime requirements
+//!
+//! The background task runs on the Tokio runtime handle passed to
+//! [`NatsTradePublisher::new`]. That runtime must have its **time driver
+//! enabled** (`Builder::enable_time` / `enable_all`; `#[tokio::main]` does
+//! this by default) because the task uses `tokio::time::timeout_at` and
+//! `tokio::time::sleep`. Tokio cannot report from a `Handle` whether timers
+//! are enabled, so this is not checked up front: without them the task
+//! panics on its first batch, and [`NatsTradePublisher::shutdown`] returns
+//! [`NatsPublisherError::TaskPanicked`]. The listener itself never panics;
+//! once the task is gone, events are counted in `dropped_events`.
 //!
 //! # Feature Gate
 //!
@@ -26,36 +41,28 @@
 //! orderbook-rs = { version = "0.6", features = ["nats"] }
 //! ```
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
+use crate::orderbook::nats_common::{
+    DropLog, LinkState, RetryPolicy, batch_deadline, checked_reserve, clamp_channel_capacity,
+    clamp_duration_ms, clamp_max_batch_size, counter_exhausted, drain_buffered, increment_metric,
+    new_batch_buffer, new_jitter_seed, publish_with_backoff, shutdown_task, store_slot,
+    throttle_or_shutdown,
+};
 use crate::orderbook::serialization::{EventSerializer, JsonEventSerializer};
 use crate::orderbook::trade::{TradeListener, TradeResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{error, trace, warn};
+use tracing::{debug, error, info, trace};
 
-/// Drain every immediately-available item from `rx` into `out` (up to `limit`),
-/// without awaiting new sends. Returns the number drained.
-///
-/// Used by the shutdown path to flush events that were already accepted into
-/// the channel before teardown, so none are silently lost. `try_recv` never
-/// blocks: it stops as soon as the channel is momentarily empty or closed.
-fn drain_buffered<T>(rx: &mut mpsc::Receiver<T>, out: &mut Vec<T>, limit: usize) -> usize {
-    let mut drained = 0;
-    while out.len() < limit {
-        match rx.try_recv() {
-            Ok(item) => {
-                out.push(item);
-                drained += 1;
-            }
-            Err(_) => break,
-        }
-    }
-    drained
-}
+pub use crate::orderbook::nats_common::{
+    BASE_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BATCH_WINDOW_MS, MAX_CHANNEL_CAPACITY,
+    MAX_MIN_PUBLISH_INTERVAL_MS, MAX_RETRY_DELAY_MS, NatsPublisherError,
+};
+
+/// Name used in this publisher's log fields.
+const PUBLISHER_NAME: &str = "trade";
 
 /// Records the outcome of publishing one trade to its two subjects, using a
 /// single **per-trade** granularity shared with `publish_count`.
@@ -73,26 +80,11 @@ fn account_publish_outcome(
     all_ok: bool,
 ) -> bool {
     if symbol_ok && all_ok {
-        publish_count.fetch_add(1, Ordering::Relaxed);
+        increment_metric(publish_count, "publish_count");
         true
     } else {
-        error_count.fetch_add(1, Ordering::Relaxed);
+        increment_metric(error_count, "error_count");
         false
-    }
-}
-
-/// Clamps a caller-supplied bounded-channel capacity up to the minimum a Tokio
-/// mpsc channel accepts (`1`).
-///
-/// A capacity of `0` is recoverable bad input — a runtime-derived `0` should not
-/// abort the process via a builder `assert!`. It is clamped to `1` with a
-/// `tracing::warn!`.
-fn clamp_channel_capacity(requested: usize) -> usize {
-    if requested == 0 {
-        warn!("with_channel_capacity(0) is invalid; clamping to 1");
-        1
-    } else {
-        requested
     }
 }
 
@@ -114,9 +106,6 @@ const DEFAULT_MIN_PUBLISH_INTERVAL_MS: u64 = 0;
 
 /// Default maximum number of retry attempts for transient NATS publish failures.
 const DEFAULT_MAX_RETRIES: u32 = 3;
-
-/// Base delay in milliseconds for exponential backoff between retries.
-const BASE_RETRY_DELAY_MS: u64 = 10;
 
 /// A trade event publisher that sends [`TradeResult`] events to NATS JetStream.
 ///
@@ -148,7 +137,8 @@ const BASE_RETRY_DELAY_MS: u64 = 10;
 ///   background task and a partial failure is attributable to exactly one trade.
 /// - **events_received** — total trades received from the listener callback
 /// - **batches_published** — total drain/flush cycles performed
-/// - **dropped_events** — trades dropped because the channel was full
+/// - **dropped_events** — trades dropped because the channel was full or the
+///   background task was no longer running
 /// - **sequence** — monotonically increasing sequence number; each publish
 ///   (symbol-specific and aggregate) receives its own unique value
 ///
@@ -224,6 +214,15 @@ pub struct NatsTradePublisher {
     /// Trades dropped because the bounded channel was full.
     dropped_events: AtomicU64,
 
+    /// Per-publisher seed for retry backoff jitter.
+    jitter_seed: u64,
+
+    /// Connected / disconnected transition tracker for `INFO` logging.
+    link: LinkState,
+
+    /// Rate-limited logging of events the listener had to drop.
+    drop_log: DropLog,
+
     /// Pluggable event serializer. Defaults to [`JsonEventSerializer`] for
     /// backward compatibility. Can be overridden via
     /// [`with_serializer`](NatsTradePublisher::with_serializer).
@@ -248,7 +247,10 @@ impl NatsTradePublisher {
     ///
     /// * `jetstream` — JetStream context obtained from an `async_nats` client
     /// * `subject_prefix` — prefix for NATS subjects (e.g. `"trades"`)
-    /// * `runtime` — handle to the Tokio runtime for spawning the batch task
+    /// * `runtime` — handle to the Tokio runtime for spawning the batch task.
+    ///   Its time driver must be enabled; see the
+    ///   [module docs](self#runtime-requirements). The runtime is supplied
+    ///   explicitly, so construction never looks up an ambient runtime.
     #[inline]
     pub fn new(
         jetstream: async_nats::jetstream::Context,
@@ -272,6 +274,9 @@ impl NatsTradePublisher {
             events_received: AtomicU64::new(0),
             batches_published: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
+            jitter_seed: new_jitter_seed(),
+            link: LinkState::default(),
+            drop_log: DropLog::default(),
             serializer: Arc::new(JsonEventSerializer),
             task_handle: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
@@ -282,10 +287,14 @@ impl NatsTradePublisher {
     ///
     /// Trades are accumulated for at most this duration before being flushed.
     /// Defaults to [`DEFAULT_BATCH_WINDOW_MS`] (1 ms).
+    ///
+    /// Values above [`MAX_BATCH_WINDOW_MS`] (60,000 ms) are **clamped** to it
+    /// with a `tracing::warn!`; the builder never panics.
     #[must_use = "builders do nothing unless consumed"]
     #[inline]
     pub fn with_batch_window_ms(mut self, batch_window_ms: u64) -> Self {
-        self.batch_window_ms = batch_window_ms;
+        self.batch_window_ms =
+            clamp_duration_ms("batch_window_ms", batch_window_ms, MAX_BATCH_WINDOW_MS);
         self
     }
 
@@ -293,10 +302,14 @@ impl NatsTradePublisher {
     ///
     /// When the batch reaches this size it is flushed immediately, regardless
     /// of the time window. Defaults to [`DEFAULT_MAX_BATCH_SIZE`] (100).
+    ///
+    /// The value is **clamped** into `1..=`[`MAX_BATCH_SIZE`] with a
+    /// `tracing::warn!`: `0` becomes `1` (a zero batch size could not drain
+    /// buffered trades on shutdown) and larger values become the maximum.
     #[must_use = "builders do nothing unless consumed"]
     #[inline]
     pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
-        self.max_batch_size = max_batch_size;
+        self.max_batch_size = clamp_max_batch_size(max_batch_size);
         self
     }
 
@@ -305,10 +318,11 @@ impl NatsTradePublisher {
     /// When the channel is full, new trades are dropped and `dropped_events`
     /// is incremented. Defaults to [`DEFAULT_CHANNEL_CAPACITY`] (10,000).
     ///
-    /// A `channel_capacity` of `0` is invalid for a Tokio mpsc channel. Rather
+    /// A `channel_capacity` of `0`, or one above [`MAX_CHANNEL_CAPACITY`]
+    /// (Tokio's semaphore limit), is invalid for a Tokio mpsc channel. Rather
     /// than panic on caller-supplied (possibly runtime-derived) input, it is
-    /// **clamped up to `1`** with a `tracing::warn!` — the builder never aborts
-    /// the process.
+    /// **clamped** into `1..=`[`MAX_CHANNEL_CAPACITY`] with a
+    /// `tracing::warn!`; the builder never aborts the process.
     #[must_use = "builders do nothing unless consumed"]
     #[inline]
     pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
@@ -321,16 +335,25 @@ impl NatsTradePublisher {
     /// When set to a value greater than 0, the background task waits at least
     /// this long between consecutive flushes. Defaults to
     /// [`DEFAULT_MIN_PUBLISH_INTERVAL_MS`] (0, disabled).
+    ///
+    /// Values above [`MAX_MIN_PUBLISH_INTERVAL_MS`] (60,000 ms) are
+    /// **clamped** to it with a `tracing::warn!`.
     #[must_use = "builders do nothing unless consumed"]
     #[inline]
     pub fn with_min_publish_interval_ms(mut self, min_publish_interval_ms: u64) -> Self {
-        self.min_publish_interval_ms = min_publish_interval_ms;
+        self.min_publish_interval_ms = clamp_duration_ms(
+            "min_publish_interval_ms",
+            min_publish_interval_ms,
+            MAX_MIN_PUBLISH_INTERVAL_MS,
+        );
         self
     }
 
     /// Set the maximum number of retry attempts for transient NATS failures.
     ///
     /// Defaults to [`DEFAULT_MAX_RETRIES`] (3). Set to 0 to disable retries.
+    /// Retry `n` (zero-based) waits a jittered delay in
+    /// `[c / 2, c]` where `c = min(BASE_RETRY_DELAY_MS * 2^n, MAX_RETRY_DELAY_MS)`.
     #[must_use = "builders do nothing unless consumed"]
     #[inline]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
@@ -343,6 +366,11 @@ impl NatsTradePublisher {
     /// Defaults to [`JsonEventSerializer`]. Use this to switch to a more
     /// compact binary format (e.g. `BincodeEventSerializer`) for lower
     /// latency publishing.
+    ///
+    /// The serializer runs inside the background task and must return a
+    /// `SerializationError` instead of panicking. If it panics anyway, the
+    /// task stops and [`shutdown`](Self::shutdown) reports
+    /// [`NatsPublisherError::TaskPanicked`].
     ///
     /// # Arguments
     ///
@@ -382,7 +410,8 @@ impl NatsTradePublisher {
         self.batches_published.load(Ordering::Relaxed)
     }
 
-    /// Returns the number of trades dropped because the channel was full.
+    /// Returns the number of trades dropped because the channel was full or
+    /// the background task was no longer running.
     #[must_use]
     #[inline]
     pub fn dropped_events(&self) -> u64 {
@@ -416,6 +445,11 @@ impl NatsTradePublisher {
     /// `{prefix}.{symbol}` and the precomputed `{prefix}.all` subject with a
     /// unique sequence number per publish.
     ///
+    /// The runtime passed to [`new`](Self::new) must have its time driver
+    /// enabled; see the [module docs](self#runtime-requirements). Call
+    /// [`shutdown`](Self::shutdown) to stop the task and learn whether it
+    /// failed.
+    ///
     /// # Returns
     ///
     /// A tuple of `(Arc<NatsTradePublisher>, TradeListener)`. The `Arc` handle
@@ -436,24 +470,20 @@ impl NatsTradePublisher {
         let join = publisher
             .runtime
             .spawn(Self::publish_task(task_publisher, rx, shutdown_rx));
-        if let Ok(mut slot) = publisher.task_handle.lock() {
-            *slot = Some(join);
-        }
-        if let Ok(mut slot) = publisher.shutdown_tx.lock() {
-            *slot = Some(shutdown_tx);
-        }
+        store_slot(&publisher.task_handle, join);
+        store_slot(&publisher.shutdown_tx, shutdown_tx);
 
         // Build the hot-path listener closure: clone + non-blocking send only.
         let listener_publisher = Arc::clone(&publisher);
         let listener = Arc::new(move |trade_result: &TradeResult| {
-            listener_publisher
-                .events_received
-                .fetch_add(1, Ordering::Relaxed);
-            if tx.try_send(trade_result.clone()).is_err() {
-                listener_publisher
-                    .dropped_events
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!("trade channel full, event dropped");
+            increment_metric(&listener_publisher.events_received, "events_received");
+            match tx.try_send(trade_result.clone()) {
+                Ok(()) => listener_publisher.drop_log.on_sent(),
+                Err(err) => listener_publisher.drop_log.on_dropped(
+                    &err,
+                    &listener_publisher.dropped_events,
+                    PUBLISHER_NAME,
+                ),
             }
         });
 
@@ -462,33 +492,30 @@ impl NatsTradePublisher {
 
     /// Gracefully shut down the background publish task.
     ///
-    /// Signals the background task to drain any trades still buffered in the
-    /// channel, flush them to NATS, and exit, then awaits the task's join
-    /// handle so teardown does not race in-flight publishes. Safe to call more
-    /// than once and from any task — the second call is a no-op.
+    /// Signals the background task to stop accepting trades, drain the ones
+    /// still buffered in the channel, flush them to NATS (without the
+    /// `min_publish_interval_ms` throttle), and exit, then awaits the task's
+    /// join handle so teardown does not race in-flight publishes. The signal
+    /// is observed both while idle and while a batch window is open.
     ///
     /// Note that the [`TradeListener`] closure still holds a channel sender, so
     /// shutdown does not rely on the listener being dropped first; the explicit
-    /// signal is what unblocks the task. After shutdown, further trades sent to
-    /// the (now-departed) task are dropped and counted in `dropped_events`.
-    pub async fn shutdown(&self) {
-        if let Ok(mut slot) = self.shutdown_tx.lock()
-            && let Some(tx) = slot.take()
-        {
-            // A failed send means the task already exited; nothing to drain.
-            let _ = tx.send(());
-        }
-
-        // Take the handle out of the mutex before awaiting so the guard is not
-        // held across the await point.
-        let handle = self
-            .task_handle
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        if let Some(handle) = handle {
-            let _ = handle.await;
-        }
+    /// signal is what unblocks the task. After shutdown, further trades are
+    /// dropped and counted in `dropped_events`.
+    ///
+    /// Safe to call more than once and from any task: only the call that
+    /// joins the task reports its outcome; later calls (and a call racing
+    /// the one joining) return `Ok(())` immediately.
+    ///
+    /// # Errors
+    ///
+    /// - [`NatsPublisherError::TaskPanicked`] if the background task panicked
+    ///   (for example in a caller-supplied serializer, or because the runtime
+    ///   has no time driver).
+    /// - [`NatsPublisherError::TaskCancelled`] if the task was cancelled,
+    ///   for example because its runtime shut down first.
+    pub async fn shutdown(&self) -> Result<(), NatsPublisherError> {
+        shutdown_task(&self.shutdown_tx, &self.task_handle, PUBLISHER_NAME).await
     }
 
     /// Background task that drains the trade channel, batches trades, and
@@ -500,21 +527,25 @@ impl NatsTradePublisher {
     ///
     /// When throttling is enabled (`min_publish_interval_ms > 0`), the task
     /// waits at least that duration between consecutive flushes.
+    ///
+    /// `shutdown_rx` is polled only until it completes: every branch that
+    /// observes it returns, so the `oneshot::Receiver` is never polled again
+    /// after completion.
     async fn publish_task(
         publisher: Arc<Self>,
         mut rx: mpsc::Receiver<TradeResult>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
-        let batch_window = std::time::Duration::from_millis(publisher.batch_window_ms);
-        let min_interval = if publisher.min_publish_interval_ms > 0 {
-            Some(std::time::Duration::from_millis(
-                publisher.min_publish_interval_ms,
-            ))
-        } else {
-            None
-        };
+        info!(
+            publisher = PUBLISHER_NAME,
+            prefix = %publisher.subject_prefix,
+            "NATS publisher task started"
+        );
+        let batch_window = Duration::from_millis(publisher.batch_window_ms);
+        let min_interval = (publisher.min_publish_interval_ms > 0)
+            .then(|| Duration::from_millis(publisher.min_publish_interval_ms));
 
-        let mut batch: Vec<TradeResult> = Vec::with_capacity(publisher.max_batch_size);
+        let mut batch: Vec<TradeResult> = new_batch_buffer(publisher.max_batch_size);
         let mut last_publish = tokio::time::Instant::now();
 
         loop {
@@ -523,21 +554,7 @@ impl NatsTradePublisher {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_rx => {
-                        // Drain everything already buffered, flushing in
-                        // max-sized chunks, so no accepted trade is lost.
-                        loop {
-                            drain_buffered(&mut rx, &mut batch, publisher.max_batch_size);
-                            if batch.is_empty() {
-                                break;
-                            }
-                            Self::flush_batch(
-                                &publisher,
-                                &mut batch,
-                                &mut last_publish,
-                                min_interval,
-                            )
-                            .await;
-                        }
+                        Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
                         return;
                     }
                     maybe = rx.recv() => match maybe {
@@ -547,39 +564,77 @@ impl NatsTradePublisher {
                 }
             }
 
-            // Collect more trades within the batch window.
-            let deadline = tokio::time::Instant::now() + batch_window;
-            while batch.len() < publisher.max_batch_size {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(trade)) => batch.push(trade),
-                    Ok(None) => {
-                        // Channel closed — flush remaining and exit.
-                        Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval)
-                            .await;
-                        return;
+            // Collect more trades within the batch window. A deadline that
+            // overflows the clock (not reachable with the clamped window)
+            // flushes immediately instead of panicking.
+            if let Some(deadline) = batch_deadline(tokio::time::Instant::now(), batch_window) {
+                while batch.len() < publisher.max_batch_size {
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => {
+                            Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
+                            return;
+                        }
+                        received = tokio::time::timeout_at(deadline, rx.recv()) => {
+                            match received {
+                                Ok(Some(trade)) => batch.push(trade),
+                                Ok(None) => {
+                                    // Channel closed — flush remaining and exit.
+                                    Self::flush_batch(&publisher, &mut batch).await;
+                                    return;
+                                }
+                                Err(_) => break, // Timeout — flush batch
+                            }
+                        }
                     }
-                    Err(_) => break, // Timeout — flush batch
                 }
+            } else {
+                debug!(
+                    publisher = PUBLISHER_NAME,
+                    "batch window deadline overflows the clock; flushing immediately"
+                );
             }
 
-            Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval).await;
+            Self::flush_batch(&publisher, &mut batch).await;
+
+            // Throttle before the next flush, raced with the shutdown signal
+            // so a long interval never delays teardown.
+            if throttle_or_shutdown(&mut last_publish, min_interval, &mut shutdown_rx).await {
+                Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
+                return;
+            }
         }
 
         // Flush any remaining trades.
-        Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval).await;
+        Self::flush_batch(&publisher, &mut batch).await;
+    }
+
+    /// Shutdown path: close the channel to new trades, then flush the current
+    /// batch plus everything already buffered in `max_batch_size` chunks, so
+    /// no accepted trade is lost. Closing first bounds the loop even while the
+    /// listener keeps firing. The throttle is skipped so teardown is prompt.
+    async fn drain_on_shutdown(
+        publisher: &Arc<Self>,
+        rx: &mut mpsc::Receiver<TradeResult>,
+        batch: &mut Vec<TradeResult>,
+    ) {
+        rx.close();
+        loop {
+            drain_buffered(rx, batch, publisher.max_batch_size);
+            if batch.is_empty() {
+                break;
+            }
+            Self::flush_batch(publisher, batch).await;
+        }
     }
 
     /// Flush the accumulated batch: serialize and publish each trade to its
-    /// per-symbol and aggregate subjects, then apply throttling.
+    /// per-symbol and aggregate subjects. The throttle is applied by the
+    /// caller, raced with the shutdown signal.
     ///
     /// Serialization, subject construction, and the JetStream publish all
     /// happen here in the background task — never on the matching hot path.
-    async fn flush_batch(
-        publisher: &Arc<Self>,
-        batch: &mut Vec<TradeResult>,
-        last_publish: &mut tokio::time::Instant,
-        min_interval: Option<std::time::Duration>,
-    ) {
+    async fn flush_batch(publisher: &Arc<Self>, batch: &mut Vec<TradeResult>) {
         if batch.is_empty() {
             return;
         }
@@ -589,14 +644,20 @@ impl NatsTradePublisher {
             let payload = match publisher.serializer.serialize_trade(&trade) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    publisher.error_count.fetch_add(1, Ordering::Relaxed);
+                    increment_metric(&publisher.error_count, "error_count");
                     error!(error = %e, "failed to serialize trade result for NATS");
                     continue;
                 }
             };
 
-            let symbol_seq = publisher.sequence.fetch_add(1, Ordering::Relaxed);
-            let all_seq = publisher.sequence.fetch_add(1, Ordering::Relaxed);
+            // Reserve both sequence numbers at once; never wrap.
+            let Some((symbol_seq, all_seq)) = checked_reserve(&publisher.sequence, 2)
+                .and_then(|first| first.checked_add(1).map(|second| (first, second)))
+            else {
+                counter_exhausted("sequence");
+                increment_metric(&publisher.error_count, "error_count");
+                continue;
+            };
             let symbol_subject = format!("{}.{}", publisher.subject_prefix, trade.symbol);
             let all_subject = publisher.all_subject.clone();
             let payload_bytes: bytes::Bytes = payload.into();
@@ -612,17 +673,7 @@ impl NatsTradePublisher {
             .await;
         }
 
-        publisher.batches_published.fetch_add(1, Ordering::Relaxed);
-
-        // Throttle: wait if needed before allowing the next flush.
-        if let Some(interval) = min_interval {
-            let elapsed = last_publish.elapsed();
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
-            }
-        }
-
-        *last_publish = tokio::time::Instant::now();
+        increment_metric(&publisher.batches_published, "batches_published");
     }
 
     /// Publish a trade event to both the symbol-specific and aggregate subjects
@@ -649,16 +700,39 @@ impl NatsTradePublisher {
         all_headers.insert("Nats-Sequence", all_seq.to_string().as_str());
         all_headers.insert("Content-Type", content_type);
 
+        let policy = RetryPolicy {
+            max_retries: publisher.max_retries,
+            jitter_seed: publisher.jitter_seed,
+        };
+
         // Publish to symbol-specific subject
-        let symbol_ok =
-            Self::publish_single(&publisher, &symbol_subject, payload.clone(), symbol_headers)
-                .await;
+        let symbol_ok = publish_with_backoff(
+            &publisher.jetstream,
+            &publisher.link,
+            policy,
+            &symbol_subject,
+            payload.clone(),
+            symbol_headers,
+            symbol_seq,
+        )
+        .await;
 
         // Publish to aggregate subject
-        let all_ok = Self::publish_single(&publisher, &all_subject, payload, all_headers).await;
+        let all_ok = publish_with_backoff(
+            &publisher.jetstream,
+            &publisher.link,
+            policy,
+            &all_subject,
+            payload,
+            all_headers,
+            all_seq,
+        )
+        .await;
 
         // Per-trade accounting: a trade is either a clean success or a failure,
-        // counted once on the matching counter.
+        // counted once on the matching counter. `error_count` is NOT
+        // incremented per subject so a trade whose two subjects both fail is
+        // not double-counted.
         if account_publish_outcome(
             &publisher.publish_count,
             &publisher.error_count,
@@ -667,75 +741,6 @@ impl NatsTradePublisher {
         ) {
             trace!(symbol_seq, all_seq, symbol = %symbol_subject, "trade event published to NATS");
         }
-    }
-
-    /// Publish a single message to a subject with exponential backoff retry.
-    ///
-    /// Returns `true` if the publish succeeded, `false` if all retries were
-    /// exhausted.
-    async fn publish_single(
-        publisher: &Arc<Self>,
-        subject: &str,
-        payload: bytes::Bytes,
-        headers: async_nats::HeaderMap,
-    ) -> bool {
-        // Widen to u64 so the `+ 1` cannot overflow even when `max_retries`
-        // is `u32::MAX` — no saturating cap on this retry counter (per the
-        // no-saturating-on-protocol-counters rule). The delay-clamp
-        // `saturating_mul` below intentionally stays: it bounds the backoff
-        // duration, not a protocol counter.
-        let max_attempts = u64::from(publisher.max_retries) + 1;
-
-        for attempt in 0..max_attempts {
-            let publish_result = publisher
-                .jetstream
-                .publish_with_headers(subject.to_string(), headers.clone(), payload.clone())
-                .await;
-
-            match publish_result {
-                Ok(ack_future) => {
-                    // Wait for the server acknowledgement
-                    match ack_future.await {
-                        Ok(_) => return true,
-                        Err(e) => {
-                            warn!(
-                                attempt = attempt + 1,
-                                max = max_attempts,
-                                subject,
-                                error = %e,
-                                "NATS ack failed, retrying"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        attempt = attempt + 1,
-                        max = max_attempts,
-                        subject,
-                        error = %e,
-                        "NATS publish failed, retrying"
-                    );
-                }
-            }
-
-            // Exponential backoff: 10ms, 20ms, 40ms, ... clamped to avoid
-            // panic from over-shifting when max_retries is large.
-            if attempt + 1 < max_attempts {
-                // `attempt.min(63)` is ≤ 63, so the cast to u32 is lossless.
-                let shift = attempt.min(63) as u32;
-                let delay_ms =
-                    BASE_RETRY_DELAY_MS.saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX));
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-        }
-
-        // NOTE: `error_count` is NOT incremented here. It is accounted once per
-        // logical trade in `publish_with_retry` so it shares the per-trade
-        // granularity of `publish_count` (a per-subject increment here would
-        // double-count a trade whose two subjects both fail).
-        error!(subject, "NATS publish failed after all retries");
-        false
     }
 }
 
@@ -769,10 +774,219 @@ impl std::fmt::Debug for NatsTradePublisher {
 }
 
 #[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
+    use crate::orderbook::book_change_event::PriceLevelChangedEvent;
+    use crate::orderbook::serialization::SerializationError;
     use pricelevel::{Id, MatchResult, Quantity};
     use uuid::Uuid;
+
+    /// A JetStream context backed by a client that never reaches a server
+    /// (`retry_on_initial_connect` connects in the background), so tests can
+    /// build publishers without a NATS server. Nothing in these tests
+    /// reaches an actual publish.
+    async fn offline_jetstream() -> async_nats::jetstream::Context {
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("background connect never fails up front");
+        async_nats::jetstream::new(client)
+    }
+
+    /// Serializer test double: panics or fails on every trade.
+    #[derive(Debug)]
+    struct FaultySerializer {
+        panic: bool,
+    }
+
+    // Deliberate panic to exercise the task-failure path.
+    #[allow(clippy::panic_in_result_fn, clippy::manual_assert)]
+    impl EventSerializer for FaultySerializer {
+        fn serialize_trade(&self, _trade: &TradeResult) -> Result<Vec<u8>, SerializationError> {
+            if self.panic {
+                panic!("serializer boom");
+            }
+            Err(SerializationError::Bincode("refused".to_string()))
+        }
+
+        fn serialize_book_change(
+            &self,
+            _event: &PriceLevelChangedEvent,
+        ) -> Result<Vec<u8>, SerializationError> {
+            Err(SerializationError::Bincode("unused".to_string()))
+        }
+
+        fn deserialize_trade(&self, _data: &[u8]) -> Result<TradeResult, SerializationError> {
+            Err(SerializationError::Bincode("unused".to_string()))
+        }
+
+        fn deserialize_book_change(
+            &self,
+            _data: &[u8],
+        ) -> Result<PriceLevelChangedEvent, SerializationError> {
+            Err(SerializationError::Bincode("unused".to_string()))
+        }
+
+        fn content_type(&self) -> &'static str {
+            "application/x-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_extreme_values_are_clamped_without_panicking() {
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_batch_window_ms(u64::MAX)
+        .with_max_batch_size(usize::MAX)
+        .with_channel_capacity(usize::MAX)
+        .with_min_publish_interval_ms(u64::MAX)
+        .with_max_retries(u32::MAX);
+        assert_eq!(publisher.batch_window_ms, MAX_BATCH_WINDOW_MS);
+        assert_eq!(publisher.max_batch_size, MAX_BATCH_SIZE);
+        assert_eq!(publisher.channel_capacity, MAX_CHANNEL_CAPACITY);
+        assert_eq!(
+            publisher.min_publish_interval_ms,
+            MAX_MIN_PUBLISH_INTERVAL_MS
+        );
+
+        // Spawning the task with the clamped values must not panic, and a
+        // shutdown while idle is prompt and clean.
+        let (handle, _listener) = publisher.into_listener();
+        assert_eq!(handle.shutdown().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_builder_zero_values_are_clamped_and_shutdown_drains() {
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_batch_window_ms(0)
+        .with_max_batch_size(0)
+        .with_channel_capacity(0)
+        .with_min_publish_interval_ms(0)
+        .with_max_retries(0)
+        .with_serializer(Arc::new(FaultySerializer { panic: false }));
+        assert_eq!(publisher.max_batch_size, 1);
+        assert_eq!(publisher.channel_capacity, 1);
+
+        let (handle, listener) = publisher.into_listener();
+        listener(&make_trade_result("BTC/USD"));
+        // max_batch_size 0 used to drop buffered trades on shutdown; clamped
+        // to 1, every accepted trade reaches the flush (and fails serializing
+        // here, so no NATS publish is attempted).
+        assert_eq!(handle.shutdown().await, Ok(()));
+        assert_eq!(handle.events_received(), 1);
+        assert_eq!(
+            handle.error_count() + handle.dropped_events(),
+            1,
+            "the trade was either flushed (error_count) or dropped at a full channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_flushes_buffered_trades_with_huge_window() {
+        // A clamped 60 s window must not delay shutdown: the signal is
+        // observed while the batch window is open.
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_batch_window_ms(u64::MAX)
+        .with_serializer(Arc::new(FaultySerializer { panic: false }));
+        let (handle, listener) = publisher.into_listener();
+        for _ in 0..5 {
+            listener(&make_trade_result("BTC/USD"));
+        }
+        // Let the task pick up the first trade and open its batch window.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())), "shutdown must not wait out the window");
+        assert_eq!(handle.error_count(), 5, "every buffered trade was flushed");
+        assert_eq!(handle.dropped_events(), 0);
+        assert_eq!(handle.sequence(), 0, "no publish was attempted");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_during_throttle_completes_promptly() {
+        // A 60 s (clamped) publish interval must not delay shutdown: the
+        // throttle wait is raced with the shutdown signal.
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_min_publish_interval_ms(u64::MAX)
+        .with_serializer(Arc::new(FaultySerializer { panic: false }));
+        let (handle, listener) = publisher.into_listener();
+        listener(&make_trade_result("BTC/USD"));
+        // Let the task flush the first trade and enter the throttle wait.
+        for _ in 0..1_000 {
+            if handle.batches_published() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(handle.batches_published(), 1, "first flush happened");
+        // Buffered while the task is throttled; must still be drained.
+        listener(&make_trade_result("BTC/USD"));
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle.shutdown()).await;
+        assert_eq!(
+            joined,
+            Ok(Ok(())),
+            "shutdown must not wait out the throttle"
+        );
+        assert_eq!(handle.error_count(), 2, "both trades reached a flush");
+        assert_eq!(handle.dropped_events(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_reports_task_panic() {
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_serializer(Arc::new(FaultySerializer { panic: true }));
+        let (handle, listener) = publisher.into_listener();
+        listener(&make_trade_result("BTC/USD"));
+        assert_eq!(
+            handle.shutdown().await,
+            Err(NatsPublisherError::TaskPanicked {
+                message: "serializer boom".to_string()
+            })
+        );
+        // The failure is reported once; a repeated shutdown is a no-op.
+        assert_eq!(handle.shutdown().await, Ok(()));
+
+        // The listener keeps working after the task died: trades are counted
+        // as dropped, never panicking.
+        listener(&make_trade_result("BTC/USD"));
+        listener(&make_trade_result("BTC/USD"));
+        assert_eq!(handle.dropped_events(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_ok_when_idle_and_idempotent() {
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        );
+        let (handle, _listener) = publisher.into_listener();
+        assert_eq!(handle.shutdown().await, Ok(()));
+        assert_eq!(handle.shutdown().await, Ok(()));
+    }
 
     fn make_trade_result(symbol: &str) -> TradeResult {
         let order_id = Id::from_uuid(Uuid::new_v4());
@@ -864,38 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn test_exponential_backoff_calculation() {
-        // Verify the backoff sequence: 10, 20, 40, 80, ...
-        for attempt in 0u32..4 {
-            let shift = u32::min(attempt, 63);
-            let delay =
-                BASE_RETRY_DELAY_MS.saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX));
-            let expected = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
-            assert_eq!(delay, expected);
-        }
-    }
-
-    #[test]
-    fn test_exponential_backoff_high_retry_count_does_not_panic() {
-        // With max_retries >= 64, the shift must not panic.
-        for attempt in [63u32, 64, 100, u32::MAX] {
-            let shift = u32::min(attempt, 63);
-            let delay =
-                BASE_RETRY_DELAY_MS.saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX));
-            // All values saturate rather than panic
-            assert!(delay >= BASE_RETRY_DELAY_MS);
-        }
-    }
-
-    #[test]
-    fn test_clamp_channel_capacity_handles_zero_without_panicking() {
-        // #128: a 0 capacity must clamp up to 1 (no assert!/abort).
-        assert_eq!(clamp_channel_capacity(0), 1);
-        assert_eq!(clamp_channel_capacity(1), 1);
-        assert_eq!(clamp_channel_capacity(10_000), 10_000);
-    }
-
-    #[test]
     fn test_publish_outcome_accounting_is_per_trade() {
         // #127: publish_count and error_count share one per-trade granularity.
         let publish_count = AtomicU64::new(0);
@@ -943,44 +1125,6 @@ mod tests {
             4,
             "publish_count + error_count == trades processed"
         );
-    }
-
-    #[test]
-    fn test_drain_buffered_collects_all_pending_items() {
-        // The shutdown path must drain every already-accepted item so none is
-        // lost on teardown. A capacity-4 channel with 3 buffered items drains
-        // all 3.
-        let (tx, mut rx) = mpsc::channel::<u32>(4);
-        for i in 0..3u32 {
-            tx.try_send(i).expect("channel has room");
-        }
-        let mut out = Vec::new();
-        let drained = drain_buffered(&mut rx, &mut out, 100);
-        assert_eq!(drained, 3, "all buffered items must be drained");
-        assert_eq!(out, vec![0, 1, 2], "drain preserves FIFO order");
-
-        // A second drain on the now-empty channel yields nothing.
-        let mut out2 = Vec::new();
-        assert_eq!(drain_buffered(&mut rx, &mut out2, 100), 0);
-        assert!(out2.is_empty());
-    }
-
-    #[test]
-    fn test_drain_buffered_respects_limit() {
-        // Draining stops once `out` reaches the limit, leaving the rest for the
-        // next flush chunk.
-        let (tx, mut rx) = mpsc::channel::<u32>(8);
-        for i in 0..5u32 {
-            tx.try_send(i).expect("channel has room");
-        }
-        let mut out = Vec::new();
-        let drained = drain_buffered(&mut rx, &mut out, 2);
-        assert_eq!(drained, 2, "drain stops at the limit");
-        assert_eq!(out, vec![0, 1]);
-        // Remaining items are still in the channel for the next chunk.
-        let mut rest = Vec::new();
-        assert_eq!(drain_buffered(&mut rx, &mut rest, 100), 3);
-        assert_eq!(rest, vec![2, 3, 4]);
     }
 
     #[test]

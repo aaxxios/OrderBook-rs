@@ -68,7 +68,7 @@ pub use crate::orderbook::serialization::{
 
 // NATS integration types
 #[cfg(feature = "nats")]
-pub use crate::orderbook::nats::NatsTradePublisher;
+pub use crate::orderbook::nats::{NatsPublisherError, NatsTradePublisher};
 #[cfg(feature = "nats")]
 pub use crate::orderbook::nats_book_change::{
     BookChangeBatch, BookChangeEntry, NatsBookChangePublisher,

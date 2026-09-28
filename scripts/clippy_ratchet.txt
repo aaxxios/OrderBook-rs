@@ -16,8 +16,6 @@ src/orderbook/fees.rs:arithmetic_side_effects:8
 src/orderbook/matching.rs:arithmetic_side_effects:4
 src/orderbook/matching.rs:cast_possible_truncation:2
 src/orderbook/modifications.rs:arithmetic_side_effects:6
-src/orderbook/nats.rs:arithmetic_side_effects:12
-src/orderbook/nats_book_change.rs:arithmetic_side_effects:12
 src/orderbook/repricing.rs:arithmetic_side_effects:4
 src/orderbook/repricing.rs:cast_sign_loss:4
 src/orderbook/sequencer/file_journal.rs:arithmetic_side_effects:20
