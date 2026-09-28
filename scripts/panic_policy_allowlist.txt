@@ -14,11 +14,8 @@
 # saturating_wrapping, indexing_slicing.
 
 src/orderbook/book.rs:saturating_wrapping:3
-src/orderbook/matching.rs:debug_assert:3
-src/orderbook/matching.rs:saturating_wrapping:9
 src/orderbook/modifications.rs:debug_assert:3
 src/orderbook/modifications.rs:saturating_wrapping:15
 src/orderbook/order_state.rs:saturating_wrapping:2
 src/orderbook/sequencer/file_journal.rs:saturating_wrapping:2
 src/orderbook/snapshot.rs:saturating_wrapping:1
-src/orderbook/stp.rs:saturating_wrapping:2
