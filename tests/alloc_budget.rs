@@ -23,11 +23,15 @@ static GLOBAL: CountingAllocator<System> = CountingAllocator::new(System);
 
 const WARMUP_OPS: u64 = 1_000;
 const MEASURED_OPS: u64 = 10_000;
-// Conservative ceiling. Mixed workload allocates per-op via `DashMap`
-// shard-grow on early submissions plus per-resting-order
-// `Arc<PriceLevel>` allocations. Real engines hit ~1-2 allocs/op
-// amortised; this ceiling fires only on a 5x or worse regression.
-const ALLOCS_PER_OP_CEILING: f64 = 10.0;
+// Ceiling on the median allocs/op across `WINDOWS` windows. Measured on
+// 0.13.1 (#262): medians range from about 6.5 to 10.4 across runs (debug
+// and release alike). 15.0 sits about 45% above the worst observed median,
+// so it catches a structural regression (an extra allocation on every op
+// is +1/op; a per-order `Vec` in the hot path is several) without
+// flipping on noise.
+const ALLOCS_PER_OP_CEILING: f64 = 15.0;
+// Independent measured windows; the ceiling applies to their median.
+const WINDOWS: usize = 7;
 
 fn account(byte: u8) -> Hash32 {
     let mut bytes = [0u8; 32];
@@ -63,8 +67,9 @@ fn run_workload(book: &OrderBook<()>, count: u64, base: u64) {
     }
 }
 
-#[test]
-fn alloc_budget_mixed_workload_stays_under_ceiling() {
+/// Build a seeded book, warm it up, then count allocations across one
+/// measured window of `MEASURED_OPS` mixed ops.
+fn measure_window() -> f64 {
     let book = OrderBook::<()>::new("BUDGET");
 
     // Seed liquidity so cancels and aggressive market orders find
@@ -87,14 +92,31 @@ fn alloc_budget_mixed_workload_stays_under_ceiling() {
     let after = GLOBAL.snapshot();
 
     let delta = after.since(before);
-    let allocs_per_op = delta.allocs as f64 / MEASURED_OPS as f64;
+    delta.allocs as f64 / MEASURED_OPS as f64
+}
+
+#[test]
+fn alloc_budget_mixed_workload_stays_under_ceiling() {
+    // The workload is deterministic (fixed ids, prices and order of
+    // operations), but the process-wide allocation count is not: the
+    // counter sees every thread and `crossbeam-epoch` allocates
+    // deferred-free bags on a schedule that depends on epoch advancement.
+    // Measured on 0.13.1 (#262), one window ranged from about 5.7 to 12.3
+    // allocs/op across runs, while the median of several windows (fresh
+    // book each) stayed within about 6.5 to 10.4. The ceiling is asserted
+    // on that median.
+    let mut samples: Vec<f64> = (0..WINDOWS).map(|_| measure_window()).collect();
+    samples.sort_by(f64::total_cmp);
+    let median = samples[WINDOWS / 2];
 
     assert!(
-        allocs_per_op < ALLOCS_PER_OP_CEILING,
-        "alloc-budget regression: {} allocs across {} ops = {:.4} allocs/op (ceiling {:.4})",
-        delta.allocs,
+        median < ALLOCS_PER_OP_CEILING,
+        "alloc-budget regression: median {:.4} allocs/op over {} windows of {} ops \
+         (ceiling {:.4}); samples {:?}",
+        median,
+        WINDOWS,
         MEASURED_OPS,
-        allocs_per_op,
         ALLOCS_PER_OP_CEILING,
+        samples,
     );
 }

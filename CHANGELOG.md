@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `tests/alloc_budget.rs` (feature `alloc-counters`) now asserts the median
+  over seven independent measured windows against a ceiling of 15.0
+  allocs/op, derived from the measured per-process range (about 6.5 to
+  10.4) instead of a single window against 10.0, which flipped on noise.
+  CI now runs it (#262). Test-only change.
+
 - Dependency floors raised to the latest semver-compatible releases: uuid
   1.26.1, serde_json 1.0.151, serde 1.0.229, crossbeam 0.8.5, bitflags
   2.13.2, thiserror 2.0.21, bytes 1.12.1, crc32fast 1.5.2, memmap2 0.9.11,

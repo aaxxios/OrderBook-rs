@@ -35,3 +35,6 @@ jobs:
 
       - name: Run tests
         run: make test
+
+      - name: Run allocation budget test
+        run: cargo test --features alloc-counters --test alloc_budget
