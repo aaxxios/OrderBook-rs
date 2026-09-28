@@ -487,6 +487,14 @@ pub struct OrderBook<T = ()> {
     pub(super) rest_fault_hook:
         Option<std::sync::Arc<dyn Fn(Id) -> Option<pricelevel::PriceLevelError> + Send + Sync>>,
 
+    /// Test-only interleaving point right after a level admitted an order
+    /// that is resting (#288), receiving its id. From that point the order
+    /// is matchable by a concurrent sweep, so a test can park the resting
+    /// thread there and consume the order from another thread. Like its
+    /// siblings it exists only in `cfg(test)` builds.
+    #[cfg(test)]
+    pub(super) rest_interleave_hook: Option<std::sync::Arc<dyn Fn(Id) + Send + Sync>>,
+
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
 
@@ -858,6 +866,8 @@ where
             cancel_fault_hook: None,
             #[cfg(test)]
             rest_fault_hook: None,
+            #[cfg(test)]
+            rest_interleave_hook: None,
             #[cfg(test)]
             modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
@@ -1817,6 +1827,8 @@ where
             #[cfg(test)]
             rest_fault_hook: None,
             #[cfg(test)]
+            rest_interleave_hook: None,
+            #[cfg(test)]
             modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
@@ -1881,6 +1893,8 @@ where
             cancel_fault_hook: None,
             #[cfg(test)]
             rest_fault_hook: None,
+            #[cfg(test)]
+            rest_interleave_hook: None,
             #[cfg(test)]
             modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),

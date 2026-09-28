@@ -69,6 +69,18 @@ where
     }
 
     /// Places a resting order in the book, updates its location.
+    ///
+    /// Raw placement: no matching, risk or order-state bookkeeping. The
+    /// location and the user index are published before the level admits
+    /// the order, so a concurrent sweep that consumes it finds and removes
+    /// them (#288); a level refusal withdraws them again.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::DuplicateOrderId`] when an order with this id is
+    /// already located on the book (nothing is touched), and
+    /// [`OrderBookError::PriceLevelError`] when the level refuses the
+    /// order.
     #[allow(dead_code)]
     pub fn place_order_in_book(
         &self,
@@ -81,6 +93,20 @@ where
             Side::Sell => &self.asks,
         };
 
+        // #288: claim the location (stored as (price, side) for cancel_order)
+        // and index the owner before the order becomes matchable.
+        let claimed = match self.order_locations.entry(order_id) {
+            dashmap::Entry::Occupied(_) => false,
+            dashmap::Entry::Vacant(slot) => {
+                slot.insert((price, side));
+                true
+            }
+        };
+        if !claimed {
+            return Err(OrderBookError::DuplicateOrderId { order_id });
+        }
+        self.track_user_order(order.user_id(), order_id);
+
         // Get or create the price level and admit under the shared side of
         // the price's stripe, so a concurrent empty-level removal cannot
         // unlink it (#247).
@@ -92,16 +118,18 @@ where
 
         // Convert OrderType<T> to OrderType<()> for compatibility with current PriceLevel API
         let unit_order = self.convert_to_unit_type(&*order);
-        let _added_order = price_level.add_order(unit_order)?;
+        if let Err(err) = price_level.add_order(unit_order) {
+            drop(stripe);
+            self.order_locations
+                .remove_if(&order_id, |_, location| *location == (price, side));
+            self.untrack_user_order(order.user_id(), &order_id);
+            self.remove_level_if_empty(side, price);
+            return Err(err.into());
+        }
         drop(stripe);
 
         // notify price level changes
         self.emit_level_changed(side, &price_level);
-        // The location is stored as (price, side) for efficient retrieval in cancel_order
-        self.order_locations.insert(order_id, (price, side));
-
-        // Track the order in the user_orders index for efficient user-based cancellation
-        self.track_user_order(order.user_id(), order_id);
 
         // Refresh the operational depth gauges. No-op when the
         // `metrics` feature is disabled.

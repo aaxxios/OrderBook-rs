@@ -252,6 +252,14 @@ This order book engine is built with the following design principles:
   never creates quantity when a fill races it, never restores into a
   locked book, and keeps `filled_quantity` cumulative; an emptied price
   level is never removed while a concurrent submit is admitting into it.
+- **Consistent indices under concurrent crossing adds (#288).** An
+  order's location, special-order tracking and resting state are
+  published before its level admits it (its user-index entry right
+  after, re-checked against the location), so a concurrent sweep that
+  consumes it removes them instead of racing their insertion, and a
+  same-id submit is refused with `DuplicateOrderId`. The risk layer
+  removes a fully filled maker's entry under the same lock that zeroes
+  it, so two sweeps sharing a maker release its open-order slot once.
 
 #### Migration from 0.13
 

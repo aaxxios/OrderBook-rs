@@ -2444,11 +2444,13 @@ where
         // typed error (which the wire layer maps to
         // `RejectReason::DuplicateOrderId`) are sufficient.
         //
-        // This is a sequential guard, not a concurrency guard: the check
-        // and the eventual `order_locations.insert` straddle the match
-        // walk, so two concurrent `add_order` calls with the same *fresh*
-        // id can both pass here and both rest (last-writer-wins on insert).
-        // Serializing order ids is the ingress / sequencing layer's job.
+        // This is the pre-trade fast path, not the concurrency guard: the
+        // check and the rest straddle the match walk, so two concurrent
+        // `add_order` calls with the same *fresh* id can both pass here.
+        // `rest_on_level` claims the location atomically (#288), so only
+        // one of them rests; the other fails there with `DuplicateOrderId`,
+        // possibly after trading. Serializing order ids is still the
+        // ingress / sequencing layer's job.
         if self.order_locations.contains_key(&order.id()) {
             if admission.records_rejections() {
                 crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
@@ -2766,7 +2768,21 @@ where
             // sweep's irreversible trades, the remainder does not rest, the
             // taker ends in a terminal state and the error is surfaced
             // loudly (#211, #247).
-            let unit_order_arc = match self.rest_on_level(&order, remaining) {
+            //
+            // State: Open (no fills) or PartiallyFilled (some fills,
+            // resting), counting a modified original's earlier fills.
+            // `rest_on_level` records it before the order becomes
+            // matchable, so a concurrent sweep's `Filled` lands after it
+            // (#288).
+            let resting_state = if state_filled > 0 {
+                OrderStatus::PartiallyFilled {
+                    original_quantity: cumulative_filled(order.id(), prior_filled, total),
+                    filled_quantity: state_filled,
+                }
+            } else {
+                OrderStatus::Open
+            };
+            let unit_order_arc = match self.rest_on_level(&order, remaining, resting_state) {
                 Ok(admitted) => admitted,
                 Err(failure) => {
                     return Err(self.rest_failed(
@@ -2778,20 +2794,6 @@ where
                     ));
                 }
             };
-
-            // Track state: Open (no fills) or PartiallyFilled (some fills,
-            // resting), counting a modified original's earlier fills.
-            if state_filled > 0 {
-                self.track_state(
-                    order.id(),
-                    OrderStatus::PartiallyFilled {
-                        original_quantity: cumulative_filled(order.id(), prior_filled, total),
-                        filled_quantity: state_filled,
-                    },
-                );
-            } else {
-                self.track_state(order.id(), OrderStatus::Open);
-            }
 
             // Convert back to generic type for return
             let generic_order = self.convert_from_unit_type(&unit_order_arc);
@@ -2934,22 +2936,49 @@ where
     }
 
     /// Rests `order` with `quantity` units on its price level and indexes
-    /// it: the #243 risk reservation first, then the level admission, then
-    /// the strandable-maker count, the level event, the location, the depth
-    /// gauges, the user index and special-order tracking. Records no order
-    /// state; the caller does.
+    /// it, recording `state` as its order state.
+    ///
+    /// From the moment the level admits it, the order is matchable by a
+    /// concurrent sweep on the shared submit gate, and cancellable. Indexing
+    /// it only after the admission (before #288) let a sweep drain an order
+    /// whose indices did not exist yet; they were then inserted for an
+    /// order that no longer rested. So (#288):
+    ///
+    /// - published **before** the admission: the #243 risk reservation,
+    ///   the location (claimed atomically, so a same-id order that won a
+    ///   concurrent admission race is refused here instead of being
+    ///   overwritten), special-order tracking and `state`. A sweep that
+    ///   consumes the order finds them and removes them, and its `Filled`
+    ///   lands after `state`;
+    /// - published **after** it: the user index entry, followed by a
+    ///   re-check of the location. Every remover (the sweep's drain, the
+    ///   single-order cancel) drops the location before it untracks the
+    ///   user entry, so if the location is still this order's the
+    ///   remover's untrack is ordered after the push and removes it; if it
+    ///   is gone the remover may have untracked first, and this call
+    ///   untracks the entry itself (idempotent). Pushing the entry before
+    ///   the admission would need no re-check, but measured 7% slower on
+    ///   two threads admitting for one account (`concurrent_add_limit_orders`);
+    /// - the strandable-maker count (a strandable maker always rests under
+    ///   the exclusive gate, so no sweep overlaps it), the level event and
+    ///   the depth gauges.
     ///
     /// # Errors
     ///
-    /// [`RestFailure::Risk`] when the risk reservation is refused (nothing
-    /// was touched); [`RestFailure::Level`] when the level refuses the order
-    /// (the reservation is released and a level this call left empty is
-    /// removed, so no phantom level is exposed).
+    /// [`RestFailure::Risk`] when the risk reservation is refused and
+    /// [`RestFailure::Duplicate`] when another live order holds the id;
+    /// neither records `state` or touches the book. [`RestFailure::Level`]
+    /// when the level refuses the order: every index published above is
+    /// withdrawn, the reservation is released and a level this call left
+    /// empty is removed, so no phantom level or index is exposed. `state`
+    /// was already recorded; the caller records the terminal state over it.
     fn rest_on_level(
         &self,
         order: &OrderType<T>,
         quantity: u64,
+        state: OrderStatus,
     ) -> Result<Arc<OrderType<()>>, RestFailure> {
+        let order_id = order.id();
         let price = order.price().as_u128();
         let side = order.side();
         let price_levels = match side {
@@ -2967,8 +2996,26 @@ where
         // when no `RiskConfig` is installed.
         let risk_reservation = self
             .risk_state
-            .on_admission(order.id(), order.user_id(), price, quantity)
+            .on_admission(order_id, order.user_id(), price, quantity)
             .map_err(RestFailure::Risk)?;
+
+        // #288: claim the location before the order becomes matchable. The
+        // map's shard guard is dropped at the end of the `match`, before
+        // anything else is locked.
+        let claimed = match self.order_locations.entry(order_id) {
+            dashmap::Entry::Occupied(_) => false,
+            dashmap::Entry::Vacant(slot) => {
+                slot.insert((price, side));
+                true
+            }
+        };
+        if !claimed {
+            self.risk_state.release_reservation(risk_reservation);
+            return Err(RestFailure::Duplicate(order_id));
+        }
+        #[cfg(feature = "special_orders")]
+        self.register_special_order(order);
+        self.track_state(order_id, state);
 
         // #247: admission into the level runs under the shared side of the
         // price's stripe, so a concurrent removal of the level (it was
@@ -2988,10 +3035,8 @@ where
         let admitted = match self.admit_to_level(level, self.convert_to_unit_type(order)) {
             Ok(admitted) => admitted,
             Err(err) => {
-                // Keyed by the reservation's generation, so this can never
-                // release a same-id order's entry (#243 review).
-                self.risk_state.release_reservation(risk_reservation);
                 drop(stripe);
+                self.withdraw_unrested(order, price, side, risk_reservation);
                 self.remove_level_if_empty(side, price);
                 self.cache.invalidate();
                 self.record_depth_metric();
@@ -2999,6 +3044,20 @@ where
             }
         };
         drop(stripe);
+        #[cfg(test)]
+        if let Some(hook) = self.rest_interleave_hook.as_ref() {
+            hook(order_id);
+        }
+        // #288: see the method docs for why the re-check makes this safe
+        // against a sweep or cancel that removed the order meanwhile.
+        self.track_user_order(order.user_id(), order_id);
+        if self
+            .order_locations
+            .get(&order_id)
+            .is_none_or(|location| *location != (price, side))
+        {
+            self.untrack_user_order(order.user_id(), &order_id);
+        }
         // #230: this is the single point where the book rests an order on a
         // level (the untouched submit, the partially-filled residual and a
         // restored modify original), so flagging here covers the whole
@@ -3006,19 +3065,48 @@ where
         // book from now on.
         self.note_rested_order(admitted.as_ref());
         self.emit_level_changed(side, level);
-        self.order_locations.insert(admitted.id(), (price, side));
 
         // Refresh the depth gauges. The level may be brand-new
         // (`get_or_insert` created it) or pre-existing — either way the
         // gauge reflects current state. No-op when the `metrics` feature is
         // disabled.
         self.record_depth_metric();
+        Ok(admitted)
+    }
 
-        // Track the order in the user_orders index
-        self.track_user_order(order.user_id(), admitted.id());
-
-        // Register special orders for re-pricing tracking
+    /// Withdraws what [`Self::rest_on_level`] published before an
+    /// admission its level then refused (#288): the location, special-order
+    /// tracking and the risk reservation. The order never rested, so no
+    /// sweep or cancel can have removed any of them; the location is still
+    /// removed only if it is still this order's.
+    #[cold]
+    #[inline(never)]
+    fn withdraw_unrested(
+        &self,
+        order: &OrderType<T>,
+        price: u128,
+        side: Side,
+        risk_reservation: crate::orderbook::risk::RiskReservation,
+    ) {
+        let order_id = order.id();
+        self.order_locations
+            .remove_if(&order_id, |_, location| *location == (price, side));
         #[cfg(feature = "special_orders")]
+        {
+            self.special_order_tracker
+                .unregister_pegged_order(&order_id);
+            self.special_order_tracker
+                .unregister_trailing_stop(&order_id);
+        }
+        // Keyed by the reservation's generation, so this can never
+        // release a same-id order's entry (#243 review).
+        self.risk_state.release_reservation(risk_reservation);
+    }
+
+    /// Registers a pegged or trailing-stop order for re-pricing.
+    #[cfg(feature = "special_orders")]
+    #[inline]
+    fn register_special_order(&self, order: &OrderType<T>) {
         match order {
             OrderType::PeggedOrder { id, .. } => {
                 self.special_order_tracker.register_pegged_order(*id);
@@ -3028,7 +3116,6 @@ where
             }
             _ => {}
         }
-        Ok(admitted)
     }
 
     /// Adds `order` to `level`. In `cfg(test)` builds the `rest_fault_hook`
@@ -3321,9 +3408,12 @@ where
             return Err(self.price_crossing(original));
         }
         let quantity = original.total_quantity()?;
-        self.rest_on_level(original, quantity)
-            .map_err(RestFailure::into_error)?;
-        self.track_state(order_id, prior_status.unwrap_or(OrderStatus::Open));
+        self.rest_on_level(
+            original,
+            quantity,
+            prior_status.unwrap_or(OrderStatus::Open),
+        )
+        .map_err(RestFailure::into_error)?;
         self.cache.invalidate();
         Ok(())
     }
@@ -3484,6 +3574,9 @@ impl From<OrderBookError> for AdmitFailure {
 enum RestFailure {
     /// The per-account risk reservation was refused; nothing was touched.
     Risk(OrderBookError),
+    /// Another live order holds the id (#288: the location is claimed
+    /// atomically); the reservation was released and nothing was touched.
+    Duplicate(Id),
     /// The price level refused the order; the reservation was released.
     Level(PriceLevelError),
 }
@@ -3494,6 +3587,7 @@ impl RestFailure {
     fn into_error(self) -> OrderBookError {
         match self {
             Self::Risk(error) => error,
+            Self::Duplicate(order_id) => OrderBookError::DuplicateOrderId { order_id },
             Self::Level(error) => OrderBookError::PriceLevelError(error),
         }
     }
