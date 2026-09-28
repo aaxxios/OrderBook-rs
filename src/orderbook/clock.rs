@@ -17,7 +17,7 @@
 
 use pricelevel::TimestampMs;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A source of wall-clock or logical millisecond timestamps for the
 /// matching core.
@@ -62,10 +62,20 @@ impl Clock for MonotonicClock {
 /// an internal counter by `step` (default `1` millisecond). Intended for
 /// sequencer replay, proptests, and snapshot tests that require
 /// byte-identical timestamps across runs.
+///
+/// # Ceiling (#250)
+///
+/// The counter never wraps. A call whose advance by `step` would overflow
+/// `u64` returns the current value and leaves the counter where it is, so
+/// the clock stops at its last representable value: from then on every
+/// call returns that same value (monotonic, no longer strictly), and the
+/// first such call logs once at `WARN`. [`Self::is_exhausted`] reports it.
+/// A clock started at `u64::MAX` is exhausted from the first call.
 #[derive(Debug)]
 pub struct StubClock {
     counter: AtomicU64,
     step: u64,
+    exhausted: AtomicBool,
 }
 
 impl StubClock {
@@ -75,6 +85,7 @@ impl StubClock {
         Self {
             counter: AtomicU64::new(0),
             step: 1,
+            exhausted: AtomicBool::new(false),
         }
     }
 
@@ -84,6 +95,7 @@ impl StubClock {
         Self {
             counter: AtomicU64::new(start),
             step: 1,
+            exhausted: AtomicBool::new(false),
         }
     }
 
@@ -97,6 +109,7 @@ impl StubClock {
         Self {
             counter: AtomicU64::new(start),
             step: step.max(1),
+            exhausted: AtomicBool::new(false),
         }
     }
 
@@ -104,6 +117,14 @@ impl StubClock {
     #[must_use]
     pub fn peek(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
+    }
+
+    /// `true` once a call to [`Clock::now_millis`] could not advance the
+    /// counter by `step` without overflowing `u64` (#250). Latched: the
+    /// clock is pinned at its last value from then on.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Relaxed)
     }
 }
 
@@ -116,7 +137,25 @@ impl Default for StubClock {
 impl Clock for StubClock {
     #[inline]
     fn now_millis(&self) -> TimestampMs {
-        let v = self.counter.fetch_add(self.step, Ordering::Relaxed);
+        // Checked advance (#250): `Err(current)` means `current + step`
+        // overflows, so the counter stays put and `current` is returned.
+        let v = match self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(self.step)
+            }) {
+            Ok(previous) => previous,
+            Err(current) => {
+                if !self.exhausted.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        counter = current,
+                        step = self.step,
+                        "StubClock reached its u64 ceiling; now_millis is pinned at the last value"
+                    );
+                }
+                current
+            }
+        };
         TimestampMs::new(v)
     }
 }
@@ -210,6 +249,29 @@ mod tests {
             .expect("overflow");
         let observed_max = all.iter().copied().max().expect("non-empty");
         assert_eq!(observed_max, expected_max);
+    }
+
+    #[test]
+    fn test_stub_clock_starting_at_max_is_pinned_not_wrapped() {
+        let clock = StubClock::starting_at(u64::MAX);
+        assert!(!clock.is_exhausted());
+        assert_eq!(clock.now_millis().as_u64(), u64::MAX);
+        assert_eq!(clock.now_millis().as_u64(), u64::MAX);
+        assert_eq!(clock.peek(), u64::MAX);
+        assert!(clock.is_exhausted());
+    }
+
+    #[test]
+    fn test_stub_clock_with_step_stops_at_last_representable_value() {
+        // MAX - 5 + 4 = MAX - 1 is still representable; the next advance
+        // (MAX - 1 + 4) is not, so the clock pins at MAX - 1.
+        let clock = StubClock::with_step(u64::MAX - 5, 4);
+        assert_eq!(clock.now_millis().as_u64(), u64::MAX - 5);
+        assert!(!clock.is_exhausted());
+        assert_eq!(clock.now_millis().as_u64(), u64::MAX - 1);
+        assert_eq!(clock.now_millis().as_u64(), u64::MAX - 1);
+        assert_eq!(clock.now_millis().as_u64(), u64::MAX - 1);
+        assert!(clock.is_exhausted());
     }
 
     #[test]

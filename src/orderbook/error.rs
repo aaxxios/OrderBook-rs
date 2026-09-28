@@ -398,6 +398,33 @@ pub enum OrderBookError {
         requested: usize,
     },
 
+    /// The engine sequence counter cannot mint another value (#250):
+    /// `engine_seq` is at `u64::MAX`, so `engine_seq + 1` is not
+    /// representable. Returned by
+    /// [`OrderBook::next_engine_seq`](crate::orderbook::OrderBook::next_engine_seq)
+    /// instead of wrapping to `0` (which would break the strict
+    /// monotonicity downstream gap detection relies on), and by the
+    /// snapshot-package restore when the package carries an `engine_seq`
+    /// the restored book could never advance. Not a reject: maps to the
+    /// wire code `RejectReason::Other(0)`.
+    EngineSeqExhausted {
+        /// The counter value that cannot be advanced.
+        engine_seq: u64,
+    },
+
+    /// A snapshot being restored describes a crossed or locked book (#250):
+    /// its best bid is at or above its best ask. A live book can never rest
+    /// such a pair (the incoming side would have matched), so the snapshot
+    /// is malformed and is rejected in the restore's prepare phase, before
+    /// any live state is touched. Not a reject: maps to the wire code
+    /// `RejectReason::Other(0)`.
+    SnapshotCrossed {
+        /// Highest bid price in the snapshot, in price ticks.
+        best_bid: u128,
+        /// Lowest ask price in the snapshot, in price ticks.
+        best_ask: u128,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -612,6 +639,18 @@ impl fmt::Display for OrderBookError {
                 write!(
                     f,
                     "allocation failed: could not reserve {requested} elements for {operation}"
+                )
+            }
+            OrderBookError::EngineSeqExhausted { engine_seq } => {
+                write!(
+                    f,
+                    "engine sequence exhausted: engine_seq {engine_seq} cannot be advanced without wrapping"
+                )
+            }
+            OrderBookError::SnapshotCrossed { best_bid, best_ask } => {
+                write!(
+                    f,
+                    "snapshot is crossed: best bid {best_bid} is at or above best ask {best_ask}"
                 )
             }
             #[cfg(feature = "nats")]

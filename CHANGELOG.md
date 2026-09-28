@@ -160,6 +160,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   book either way; with identity reconciliation the documented order
   matters wherever the index is rebuilt differently.
 
+- **Checked counters, snapshot restore validation and remaining core forms
+  (#250).** `engine_seq` was minted with a wrapping `fetch_add` and is
+  restored verbatim from an untrusted snapshot package, so a package
+  carrying `u64::MAX` made the next event wrap to `0`.
+  `OrderBook::next_engine_seq()` now returns `Result<u64, OrderBookError>`
+  and refuses with the new `OrderBookError::EngineSeqExhausted { engine_seq }`
+  instead of wrapping (the last mintable value is `u64::MAX - 1`). The
+  engine's own emission paths run after the mutation, so on exhaustion they
+  suppress the listener `TradeResult` / `PriceLevelChangedEvent` (logged
+  once at `ERROR`, reported by the new `OrderBook::engine_seq_exhausted()`)
+  instead of stamping a wrapped sequence; the book keeps matching. A
+  caller-owned result is never affected: `add_order_with_result` and the
+  `*_with_committed` APIs still return their committed fills, stamped with
+  the new `UNSTAMPED_ENGINE_SEQ` (`u64::MAX`, never minted). All
+  `PriceLevelChangedEvent` emissions now go through one helper.
+  Snapshot restore, both `restore_from_snapshot` and
+  `restore_from_snapshot_package`, now rejects in the prepare phase, before
+  any live state is touched: a crossed or locked book (best bid >= best ask,
+  new `OrderBookError::SnapshotCrossed { best_bid, best_ask }`); an order
+  whose `visible + hidden` does not fit `u64` (`QuantityOverflow`, now
+  checked for every order, not only when risk is rebuilt; pricelevel's level
+  validation already refuses it first as `PriceLevelError`); and, on the
+  package path, `engine_seq == u64::MAX` (`EngineSeqExhausted`). A package
+  restore clears the exhaustion latch. `OrderBookSnapshot::refresh_aggregates`
+  returns `Result` and `OrderBookSnapshotPackage::new` propagates its error
+  instead of checksumming stale aggregates. `spread()` (book and snapshot)
+  and `spread_bps()` return `None` for a crossed read instead of a clamped
+  `0`. The strandable-maker count, `StubClock`, the order-state tracker's
+  purge cutoff and purge count, the repricing counters and the trade /
+  depth metric casts use checked forms: the strandable count refuses (and
+  logs at `WARN`) an increment past `usize::MAX` or a decrement at zero;
+  `StubClock` stops at its last representable value instead of wrapping
+  (`StubClock::is_exhausted()`, logged once); a retention window reaching
+  before the clock's epoch purges nothing. The order-state tracker
+  recovers a poisoned terminal-queue mutex (the queue is an eviction hint,
+  re-checked per id) instead of silently skipping eviction forever. Each
+  order's status and history now live in one map entry, so a transition
+  updates both atomically and an eviction (`DashMap::remove_if` on that
+  entry) removes exactly the lifecycle it checked: an id re-activated or
+  re-terminated concurrently is never evicted or split from its history.
+  The eviction queue lock is never held while a map lock is taken.
+  `book.rs`, `order_state.rs` and `snapshot.rs` leave both ratchet ledgers.
+  Compatibility: `next_engine_seq()` and
+  `OrderBookSnapshot::refresh_aggregates()` change signature (see the
+  migration table). `OrderBookError` gains `EngineSeqExhausted` and
+  `SnapshotCrossed` (wire code `RejectReason::Other(0)`; the enum is
+  `#[non_exhaustive]`). Restore now rejects packages and snapshots that
+  earlier versions accepted: crossed or locked books (a live book never
+  rests one; such a state only came from hand-merged or corrupted
+  snapshots, including the #194 recovery fixture with a trailing stop
+  inside the market) and packages with `engine_seq == u64::MAX`. Tick and
+  lot alignment is deliberately not enforced on restore, because a live
+  book keeps orders admitted under a previous tick or lot size (see
+  `set_lot_size`), and its snapshot must keep restoring. `spread()` /
+  `spread_bps()` can return `None` where they used to return `Some(0)`.
+  An `OrderStateTracker::purge_terminal_older_than` window longer
+  than the clock's current value no longer purges entries stamped at `0`.
+  No snapshot, journal or wire format change:
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged.
+
 - **Default trade-id namespace no longer reads panicking OS entropy
   (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
   `with_trade_and_price_level_listener` (and every constructor built on

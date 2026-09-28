@@ -1,7 +1,9 @@
 //! #211: pricelevel 0.9 mutation failures are atomic and observable.
 //!
 //! - A submit whose residual could not be admitted is rejected BEFORE the
-//!   sweep emits any trade (headroom pre-check).
+//!   sweep emits any trade (headroom pre-check). Only a locked book reaches
+//!   it; since #250 that regression lives in
+//!   `src/orderbook/tests/restore_validation.rs`.
 //! - `UpdateQuantity` is validate-first: projected tick/lot/min-max/
 //!   two-tranche/risk violations and upstream `PriceLevelError`s surface
 //!   as typed errors with the maker unchanged; `Ok(None)` means only that
@@ -17,15 +19,16 @@ mod tests_mutation_failure_atomicity {
         TimestampMs,
     };
 
-    /// A buy whose residual would overflow the same-side level's aggregate
-    /// is rejected before any trade: the crossing ask stays fully intact.
-    ///
-    /// A live book can never lock (bid and ask at one price), so the repro
-    /// state — a near-capacity bid level AND a crossing ask at the same
-    /// price — is built via snapshot restore, exactly the disaster-recovery
-    /// shape the issue describes.
+    /// #250: the locked-book fixture the residual-headroom regression used
+    /// (a near-capacity bid level AND a crossing ask at the same price) is a
+    /// state live matching never builds, and restore now rejects it with
+    /// `SnapshotCrossed`, leaving the book untouched. The headroom
+    /// regression itself moved, assertions unchanged, to
+    /// `src/orderbook/tests/restore_validation.rs`
+    /// (`residual_headroom_rejects_before_any_trade`), which installs the
+    /// fixture through a `cfg(test)`-only hook.
     #[test]
-    fn residual_headroom_rejects_before_any_trade() {
+    fn residual_headroom_fixture_is_rejected_by_restore() {
         let make_level = |order_id: u64, qty: u64, side: Side| {
             let level = PriceLevel::new(100);
             let admitted = level.add_order(OrderType::Standard {
@@ -43,33 +46,26 @@ mod tests_mutation_failure_atomicity {
         };
 
         let book: OrderBook<()> = DefaultOrderBook::new("HEAD");
-        book.restore_from_snapshot(OrderBookSnapshot {
-            symbol: "HEAD".to_string(),
-            timestamp: 1_700_000_000_000,
-            bids: vec![make_level(1, u64::MAX - 2, Side::Buy)],
-            asks: vec![make_level(2, 5, Side::Sell)],
-        })
-        .expect("restore locked book");
-
-        // Buy 10 @ 100 would fill 5 from the ask, then rest 5 into the
-        // bid level — whose aggregate (u64::MAX - 2) cannot absorb it.
-        // The headroom pre-check must reject BEFORE the fill happens.
         let err = book
-            .add_limit_order(Id::from_u64(3), 100, 10, Side::Buy, TimeInForce::Gtc, None)
-            .expect_err("residual could not rest; submit must be rejected pre-trade");
+            .restore_from_snapshot(OrderBookSnapshot {
+                symbol: "HEAD".to_string(),
+                timestamp: 1_700_000_000_000,
+                bids: vec![make_level(1, u64::MAX - 2, Side::Buy)],
+                asks: vec![make_level(2, 5, Side::Sell)],
+            })
+            .expect_err("a locked book is malformed restore input");
         assert!(
-            matches!(err, OrderBookError::InvalidOperation { .. }),
-            "expected the typed capacity rejection, got {err:?}"
+            matches!(
+                err,
+                OrderBookError::SnapshotCrossed {
+                    best_bid: 100,
+                    best_ask: 100
+                }
+            ),
+            "expected SnapshotCrossed, got {err:?}"
         );
-
-        // Zero trades: the crossing ask is untouched and no last trade exists.
-        assert!(book.last_trade_price().is_none(), "no trade was emitted");
-        let ask = book.get_order(Id::from_u64(2)).expect("ask still resting");
-        assert_eq!(ask.visible_quantity().as_u64(), 5, "ask fully intact");
-        assert!(
-            book.get_order(Id::from_u64(3)).is_none(),
-            "rejected taker never rests"
-        );
+        assert!(book.best_bid().is_none(), "nothing was installed");
+        assert!(book.best_ask().is_none(), "nothing was installed");
     }
 
     /// `UpdateQuantity` enforces the projected lot-size rule and leaves the

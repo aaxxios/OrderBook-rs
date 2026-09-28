@@ -300,6 +300,8 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::ChecksumMismatch { .. } => Self::Other(0),
             OrderBookError::ArithmeticOverflow { .. } => Self::Other(0),
             OrderBookError::AllocationFailed { .. } => Self::Other(0),
+            OrderBookError::EngineSeqExhausted { .. } => Self::Other(0),
+            OrderBookError::SnapshotCrossed { .. } => Self::Other(0),
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { .. } => Self::Other(0),
             #[cfg(feature = "nats")]

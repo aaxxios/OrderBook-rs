@@ -1,8 +1,5 @@
 //! Core OrderBook implementation for managing price levels and orders
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
-
 use super::cache::PriceLevelCache;
 use super::clock::{Clock, MonotonicClock};
 use super::error::OrderBookError;
@@ -15,7 +12,7 @@ use super::market_impact::{MarketImpact, OrderSimulation};
 use super::risk::{ReferencePriceSource, RiskConfig, RiskRebuild, RiskState};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
-use crate::orderbook::book_change_event::PriceLevelChangedListener;
+use crate::orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChangedListener};
 use crate::orderbook::matching::MatchOutcome;
 #[cfg(feature = "special_orders")]
 use crate::orderbook::repricing::SpecialOrderTracker;
@@ -139,6 +136,15 @@ pub(crate) fn default_trade_id_namespace(symbol: &str) -> Uuid {
 /// histogram's allocation is bounded by a constant rather than by caller
 /// input.
 pub const MAX_DEPTH_DISTRIBUTION_BINS: usize = 4_096;
+
+/// `engine_seq` carried by a caller-owned [`TradeResult`] whose trades
+/// committed after the book's `engine_seq` was exhausted (#250).
+///
+/// [`OrderBook::next_engine_seq`] never mints `u64::MAX` (the last
+/// mintable value is `u64::MAX - 1`), so this value is unambiguous: the
+/// trades are real, the result was returned to an `add_order_with_result`
+/// / `*_with_committed` caller, and no listener event was emitted for it.
+pub const UNSTAMPED_ENGINE_SEQ: u64 = u64::MAX;
 
 /// The OrderBook manages a collection of price levels for both bid and ask sides.
 /// It supports adding, cancelling, and matching orders with lock-free operations where possible.
@@ -305,9 +311,9 @@ pub struct OrderBook<T = ()> {
     /// `filled_orders` is the same order in both — not a `Standard` order
     /// that reused a cancelled reserve's id.
     ///
-    /// The saturating decrement is defence in depth against a future path
-    /// that removes a maker without passing one of the three, not a licence
-    /// to be approximate.
+    /// The checked decrement (a refused underflow, logged at `WARN`, #250)
+    /// is defence in depth against a future path that removes a maker
+    /// without passing one of the three, not a licence to be approximate.
     ///
     /// Not part of the snapshot format: the restore commit resets it to
     /// zero with the rest of the book state and recounts from the orders it
@@ -333,6 +339,13 @@ pub struct OrderBook<T = ()> {
     /// exhausted (#240). A latched book cannot trade again until its
     /// generator is replaced. Not part of the snapshot format.
     pub(super) trade_ids_exhausted: AtomicBool,
+
+    /// Latched the first time an emission path finds `engine_seq`
+    /// exhausted (#250); from then on outbound events are suppressed
+    /// rather than stamped with a wrapped sequence. Cleared by a
+    /// snapshot-package restore, which installs a fresh (validated)
+    /// counter. Not part of the snapshot format.
+    pub(super) engine_seq_exhausted: AtomicBool,
 
     /// The timestamp of market close, if applicable (for DAY orders)
     pub(super) market_close_timestamp: AtomicU64,
@@ -782,6 +795,7 @@ where
             match_aborts: AtomicU64::new(0),
             match_fold_failures: AtomicU64::new(0),
             trade_ids_exhausted: AtomicBool::new(false),
+            engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -904,6 +918,16 @@ where
         self.trade_ids_exhausted.load(Ordering::Relaxed)
     }
 
+    /// `true` once an emission path has found `engine_seq` exhausted
+    /// (#250). Latched: outbound `TradeResult` / `PriceLevelChangedEvent`
+    /// emission is then suppressed (see [`Self::next_engine_seq`]) until a
+    /// snapshot-package restore installs a counter that can advance.
+    #[must_use]
+    #[inline]
+    pub fn engine_seq_exhausted(&self) -> bool {
+        self.engine_seq_exhausted.load(Ordering::Relaxed)
+    }
+
     /// Increment a diagnostic counter with checked arithmetic. At `u64::MAX`
     /// the counter stays put and the refusal is logged.
     #[inline]
@@ -943,19 +967,107 @@ where
     /// Mint the next monotonic outbound sequence number.
     ///
     /// Called exactly once per outbound event (trade emission, price-level
-    /// change emission). Internally an `AtomicU64::fetch_add(1, Relaxed)` —
-    /// strict total order across all events of this `OrderBook<T>` instance.
-    /// Single source of truth for the minting contract; every emission
-    /// path in the matching engine routes through this method so the
-    /// counter cannot drift between sites.
+    /// change emission). Internally a checked
+    /// `AtomicU64::fetch_update(checked_add(1))` — strict total order across
+    /// all events of this `OrderBook<T>` instance. Single source of truth
+    /// for the minting contract; every emission path in the matching engine
+    /// routes through this method so the counter cannot drift between
+    /// sites.
     ///
     /// The contract is **per-instance**, not per-journal-stream: replay into
     /// a fresh book produces fresh seqs, not the original ones. Consumers
     /// that need to replay the exact original outbound stream should use
     /// the journal's `sequence_num` + `timestamp_ns` instead.
+    ///
+    /// # Exhaustion (#250)
+    ///
+    /// The counter holds the next value to mint and never wraps: the last
+    /// mintable value is `u64::MAX - 1`, after which the counter rests at
+    /// `u64::MAX` and every call fails. The engine's own emission paths
+    /// then stop publishing `TradeResult` / `PriceLevelChangedEvent`
+    /// events to the listeners (logged once at `ERROR`) rather than
+    /// stamping a wrapped or repeated sequence; the book itself keeps
+    /// working. Event stamping never affects a caller-owned result: an
+    /// `add_order_with_result` / `*_with_committed` caller still receives
+    /// its committed fills, with `engine_seq` set to
+    /// [`UNSTAMPED_ENGINE_SEQ`]. Snapshot restore rejects a package whose
+    /// `engine_seq` is already `u64::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::EngineSeqExhausted`] when the counter is at
+    /// `u64::MAX` and cannot advance.
     #[inline]
-    pub fn next_engine_seq(&self) -> u64 {
-        self.engine_seq.fetch_add(1, Ordering::Relaxed)
+    pub fn next_engine_seq(&self) -> Result<u64, OrderBookError> {
+        self.engine_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+                seq.checked_add(1)
+            })
+            .map_err(engine_seq_exhausted)
+    }
+
+    /// Mint an `engine_seq` for an outbound event the engine is about to
+    /// emit after a committed mutation (#250).
+    ///
+    /// Emission happens after the book has already changed, so an
+    /// exhausted counter cannot be reported to the caller as a failure of
+    /// the operation. Instead the event is suppressed: `None` is returned,
+    /// the first exhaustion is logged at `ERROR` (latched, so a hot
+    /// emission loop does not flood the log), and no event carrying a
+    /// wrapped or repeated sequence is ever published.
+    #[inline]
+    pub(super) fn mint_event_seq(&self) -> Option<u64> {
+        match self.next_engine_seq() {
+            Ok(seq) => Some(seq),
+            Err(_) => {
+                self.latch_engine_seq_exhausted();
+                None
+            }
+        }
+    }
+
+    /// Emit a [`PriceLevelChangedEvent`] to the installed listener, if any,
+    /// stamped with a freshly minted `engine_seq` (#250).
+    ///
+    /// Single emission helper for every price-level-change site, so the
+    /// listener check, the sequence mint and the exhaustion handling of
+    /// [`Self::mint_event_seq`] cannot drift between them. The sequence is
+    /// minted only when a listener is installed, exactly as before.
+    #[inline]
+    pub(super) fn emit_price_level_changed(&self, side: Side, price: u128, quantity: u64) {
+        if let Some(listener) = self.price_level_changed_listener.as_ref()
+            && let Some(engine_seq) = self.mint_event_seq()
+        {
+            listener(PriceLevelChangedEvent {
+                side,
+                price,
+                quantity,
+                engine_seq,
+            });
+        }
+    }
+
+    /// [`Self::emit_price_level_changed`] for a live level: the level's
+    /// price and visible quantity are read only when a listener is
+    /// installed, so the no-listener path does no extra work.
+    #[inline]
+    pub(super) fn emit_level_changed(&self, side: Side, level: &PriceLevel) {
+        if self.price_level_changed_listener.is_some() {
+            self.emit_price_level_changed(side, level.price(), level.visible_quantity());
+        }
+    }
+
+    /// Latch `engine_seq` exhaustion (#250): the first caller logs at
+    /// `ERROR`; later calls are no-ops.
+    #[cold]
+    #[inline(never)]
+    fn latch_engine_seq_exhausted(&self) {
+        if !self.engine_seq_exhausted.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                symbol = %self.symbol,
+                "engine_seq exhausted at u64::MAX: outbound trade and price-level events are no longer published"
+            );
+        }
     }
 
     /// Current value of the engine sequence counter without advancing.
@@ -980,7 +1092,15 @@ where
     #[cfg(feature = "metrics")]
     #[inline]
     pub(super) fn record_depth_metric(&self) {
-        super::metrics::record_depth(self.bids.len() as u64, self.asks.len() as u64);
+        // A level count always fits `u64` on the supported targets; were it
+        // not to, the gauge update is skipped rather than fed a clamped or
+        // truncated value.
+        if let (Ok(bid_levels), Ok(ask_levels)) = (
+            u64::try_from(self.bids.len()),
+            u64::try_from(self.asks.len()),
+        ) {
+            super::metrics::record_depth(bid_levels, ask_levels);
+        }
     }
 
     /// No-op variant when the `metrics` feature is disabled.
@@ -1550,6 +1670,7 @@ where
             match_aborts: AtomicU64::new(0),
             match_fold_failures: AtomicU64::new(0),
             trade_ids_exhausted: AtomicBool::new(false),
+            engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1609,6 +1730,7 @@ where
             match_aborts: AtomicU64::new(0),
             match_fold_failures: AtomicU64::new(0),
             trade_ids_exhausted: AtomicBool::new(false),
+            engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -2055,13 +2177,22 @@ where
         }
     }
 
-    /// Get the spread (best ask - best bid)
+    /// Get the spread (best ask - best bid), in price ticks.
+    ///
+    /// Returns `None` when either side is empty, and also when the two
+    /// best prices, read one after the other, describe a crossed book
+    /// (best ask below best bid). A resting book is never crossed, so the
+    /// latter only happens when a concurrent submit moves the top of book
+    /// between the two reads; the difference is then not a spread and is
+    /// not reported as one (it used to be clamped to `0`, #250). A locked
+    /// read (equal prices) returns `Some(0)`.
+    #[must_use]
     pub fn spread(&self) -> Option<u128> {
         match (
             OrderBook::<T>::best_bid(self),
             OrderBook::<T>::best_ask(self),
         ) {
-            (Some(bid), Some(ask)) => Some(ask.saturating_sub(bid)),
+            (Some(bid), Some(ask)) => ask.checked_sub(bid),
             _ => None,
         }
     }
@@ -2283,7 +2414,8 @@ where
     ///
     /// # Returns
     /// - `Some(bps)` if both best bid and best ask exist
-    /// - `None` if either side is empty or mid price is zero
+    /// - `None` if either side is empty, mid price is zero, or the two best
+    ///   prices read as crossed (see [`Self::spread`], #250)
     ///
     /// # Examples
     /// ```
@@ -2311,7 +2443,7 @@ where
 
         match (self.best_bid(), self.best_ask(), self.mid_price()) {
             (Some(bid), Some(ask), Some(mid)) if mid > 0.0 => {
-                let spread = ask.saturating_sub(bid) as f64;
+                let spread = ask.checked_sub(bid)? as f64;
                 Some((spread / mid) * multiplier)
             }
             _ => None,
@@ -4017,13 +4149,17 @@ where
         match_result: &MatchResult,
         want_result: bool,
     ) -> Option<TradeResult> {
-        let trades_emitted = u64::try_from(match_result.trades().len()).unwrap_or(u64::MAX);
-        if trades_emitted == 0 {
+        let trade_count = match_result.trades().len();
+        if trade_count == 0 {
             return None;
         }
         // The metric is independent of whether a listener is configured;
-        // the `TradeResult` is only built when someone consumes it.
-        super::metrics::record_trades(trades_emitted);
+        // the `TradeResult` is only built when someone consumes it. A
+        // `usize` count always fits `u64` on the supported targets; were it
+        // not to, the gauge is skipped rather than fed a clamped value.
+        if let Ok(trades_emitted) = u64::try_from(trade_count) {
+            super::metrics::record_trades(trades_emitted);
+        }
         let listener = self.trade_listener.as_ref();
         if !want_result && listener.is_none() {
             return None;
@@ -4047,9 +4183,24 @@ where
                 return None;
             }
         };
-        trade_result.engine_seq = self.next_engine_seq();
-        if let Some(listener) = listener {
-            listener(&trade_result);
+        // #250: event stamping never affects the caller-owned result. With
+        // `engine_seq` exhausted only the listener emission is suppressed
+        // (logged once); the committed fills are still returned to an
+        // `add_order_with_result` / `*_with_committed` caller, stamped with
+        // the never-minted sentinel `u64::MAX`.
+        match self.mint_event_seq() {
+            Some(engine_seq) => {
+                trade_result.engine_seq = engine_seq;
+                if let Some(listener) = listener {
+                    listener(&trade_result);
+                }
+            }
+            None => {
+                trade_result.engine_seq = UNSTAMPED_ENGINE_SEQ;
+                if !want_result {
+                    return None;
+                }
+            }
         }
         Some(trade_result)
     }
@@ -4362,7 +4513,10 @@ where
     ///
     /// Returns [`OrderBookError::ChecksumMismatch`] /
     /// [`OrderBookError::InvalidOperation`] when package validation
-    /// fails, and every error [`restore_from_snapshot`](Self::restore_from_snapshot)
+    /// fails, [`OrderBookError::EngineSeqExhausted`] when the package's
+    /// `engine_seq` is `u64::MAX` (the restored book could never mint
+    /// another event, #250), and every error
+    /// [`restore_from_snapshot`](Self::restore_from_snapshot)
     /// documents. All of them fire before any live state is mutated
     /// (#207) — a failed package restore leaves the book, its
     /// configuration, and its risk state untouched.
@@ -4386,6 +4540,14 @@ where
         // Take ownership of the validated snapshot.
         let snapshot = package.into_snapshot()?;
 
+        // #250: the package is untrusted input. A counter already at
+        // `u64::MAX` could never mint another event (`next_engine_seq`
+        // refuses to wrap), so the restored book would silently stop
+        // publishing; reject it before any live state is touched.
+        if engine_seq == u64::MAX {
+            return Err(engine_seq_exhausted(engine_seq));
+        }
+
         // Fallible phase (#207): symbol guard + level conversion + the
         // cross-level duplicate-id check all run before ANY live state —
         // book, indices, risk, config — is touched, so an invalid package
@@ -4395,6 +4557,8 @@ where
         // aggregates are computed (checked) here too, so an overflowing
         // snapshot is a typed error before any live state is touched.
         let prepared = Self::prepare_snapshot_levels(snapshot, risk_config.is_some())?;
+        // #250: a crossed or locked book is malformed input.
+        Self::ensure_snapshot_not_crossed(&prepared)?;
 
         // ---- Point of no return: everything below is infallible. ----
 
@@ -4427,6 +4591,9 @@ where
         // exactly the snapshotted value, preserving cross-snapshot
         // monotonicity for downstream consumers.
         self.engine_seq.store(engine_seq, Ordering::Release);
+        // #250: the restored counter was validated to be able to advance,
+        // so a latched exhaustion from the pre-restore counter is cleared.
+        *self.engine_seq_exhausted.get_mut() = false;
 
         // Restore the operational kill-switch flag so that a book
         // recovered from disaster snapshot resumes in the same
@@ -4493,7 +4660,18 @@ where
     /// pricelevel's validation, and
     /// [`OrderBookError::DuplicateOrderId`] when the same order id
     /// appears in more than one level of the snapshot (installing it
-    /// would silently orphan one of the two in `order_locations`).
+    /// would silently orphan one of the two in `order_locations`),
+    /// [`OrderBookError::QuantityOverflow`] when an order's
+    /// `visible + hidden` does not fit `u64` (#250),
+    /// [`OrderBookError::SnapshotCrossed`] when the snapshot's best bid is
+    /// at or above its best ask (#250), and
+    /// [`OrderBookError::ZeroVisibleTranche`] for a non-replenishing
+    /// reserve with no visible tranche (#230).
+    ///
+    /// Tick / lot alignment of the restored orders is not validated: a
+    /// live book legitimately keeps orders admitted under a previous tick
+    /// or lot size (see [`Self::set_lot_size`]), and its snapshot must
+    /// restore.
     ///
     /// # Concurrency (#225)
     ///
@@ -4507,6 +4685,8 @@ where
     pub fn restore_from_snapshot(&self, snapshot: OrderBookSnapshot) -> Result<(), OrderBookError> {
         self.ensure_snapshot_symbol(&snapshot)?;
         let prepared = Self::prepare_snapshot_levels(snapshot, false)?;
+        // #250: a crossed or locked book is malformed input.
+        Self::ensure_snapshot_not_crossed(&prepared)?;
         // #225: a live restore replaces every level and rebuilds the
         // `order_locations` / `user_orders` indices, so it must exclude
         // every in-flight submit, cancel and modify exactly like a
@@ -4532,6 +4712,50 @@ where
         Ok(())
     }
 
+    /// Reject a prepared snapshot that describes a crossed or locked book
+    /// (#250): highest bid at or above lowest ask.
+    ///
+    /// A live book never rests such a pair — the later order would have
+    /// matched — so the snapshot is malformed. Runs on the prepared (sorted,
+    /// off-book) levels, before any live state is touched. Levels are
+    /// compared as installed, empty ones included, because an installed
+    /// empty level still answers `best_bid` / `best_ask`.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::SnapshotCrossed`] carrying both prices.
+    fn ensure_snapshot_not_crossed(
+        prepared: &PreparedSnapshotLevels,
+    ) -> Result<(), OrderBookError> {
+        // Both vectors are sorted ascending by price.
+        match (prepared.bids.last(), prepared.asks.first()) {
+            (Some((best_bid, _)), Some((best_ask, _))) if best_bid >= best_ask => {
+                Err(OrderBookError::SnapshotCrossed {
+                    best_bid: *best_bid,
+                    best_ask: *best_ask,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Test-only restore that skips [`Self::ensure_snapshot_not_crossed`]
+    /// (#250), for regression tests of engine defences that only a crossed
+    /// or locked book can reach (the residual-headroom pre-check, trailing
+    /// stops resting inside the market). Every other prepare-phase check
+    /// still runs. Exists only in `cfg(test)` builds.
+    #[cfg(test)]
+    pub(crate) fn restore_crossed_snapshot_for_test(
+        &self,
+        snapshot: OrderBookSnapshot,
+    ) -> Result<(), OrderBookError> {
+        self.ensure_snapshot_symbol(&snapshot)?;
+        let prepared = Self::prepare_snapshot_levels(snapshot, false)?;
+        let _gate = self.submit_gate_write();
+        self.commit_restored_levels(&prepared);
+        Ok(())
+    }
+
     /// Fallible phase of a snapshot restore (#207): converts every level
     /// through pricelevel's validating [`PriceLevel::from_snapshot`] and
     /// rejects order ids that appear in more than one level — all against
@@ -4545,6 +4769,22 @@ where
     /// with checked arithmetic (#243), so a snapshot whose open-order
     /// count, remaining quantity or resting notional is not representable
     /// fails with a typed error instead of being clamped in the commit.
+    ///
+    /// # Validation (#250)
+    ///
+    /// The snapshot is untrusted input. Per order, in the fixed traversal
+    /// order, this phase rejects an id already seen at another level
+    /// (`DuplicateOrderId`), a `visible + hidden` total that does not fit
+    /// `u64` (`QuantityOverflow` — checked for every order since #250, not
+    /// only on the risk-rebuild path), a risk aggregate overflow, and the
+    /// zero-visible reserve ghost (`ZeroVisibleTranche`). Both restore entry
+    /// points then run [`Self::ensure_snapshot_not_crossed`] on the result.
+    ///
+    /// Tick / lot alignment is deliberately **not** enforced: a live book
+    /// legitimately keeps resting orders admitted under a previous tick or
+    /// lot size after [`Self::set_tick_size`] / [`Self::set_lot_size`]
+    /// (documented there, with the repair path), so rejecting them here
+    /// would make the snapshot of a valid book fail to restore.
     fn prepare_snapshot_levels(
         snapshot: OrderBookSnapshot,
         rebuild_risk: bool,
@@ -4567,11 +4807,14 @@ where
             // orders the live book does not hold. The old SkipMap-sourced
             // rebuild silently dropped one level; neither outcome is
             // acceptable, so the snapshot is rejected up front.
-            if let Some(window) = converted.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            let duplicate = converted.windows(2).find_map(|pair| match pair {
+                [(lower, _), (upper, _)] if lower == upper => Some(*lower),
+                _ => None,
+            });
+            if let Some(price) = duplicate {
                 return Err(OrderBookError::InvalidOperation {
                     message: format!(
-                        "Snapshot contains two {side} levels at the same price {}",
-                        window[0].0
+                        "Snapshot contains two {side} levels at the same price {price}"
                     ),
                 });
             }
@@ -4617,12 +4860,15 @@ where
                         order_id: order.id(),
                     });
                 }
+                // #250: tranche representability is checked for every
+                // order, not only when risk is rebuilt: every quantity path
+                // downstream assumes an admitted order's total fits `u64`.
+                let visible = order.visible_quantity().as_u64();
+                let hidden = order.hidden_quantity().as_u64();
+                let remaining_qty = visible
+                    .checked_add(hidden)
+                    .ok_or(OrderBookError::QuantityOverflow { visible, hidden })?;
                 if let Some(risk) = risk.as_mut() {
-                    let visible = order.visible_quantity().as_u64();
-                    let hidden = order.hidden_quantity().as_u64();
-                    let remaining_qty = visible
-                        .checked_add(hidden)
-                        .ok_or(OrderBookError::QuantityOverflow { visible, hidden })?;
                     risk.accumulate(order.id(), order.user_id(), *price, remaining_qty)?;
                 }
                 // #230: a legacy package can carry the one two-tranche shape
@@ -4785,28 +5031,59 @@ where
     /// insertion in `add_order_inner` and the snapshot-restore commit. See
     /// [`Self::strandable_makers_resting`] for why those two make the count
     /// exact.
+    ///
+    /// Checked (#250): the count is bounded by the number of resting
+    /// orders, so it cannot reach `usize::MAX`; were it to, the increment
+    /// is refused and logged at `WARN` instead of wrapping to zero (which
+    /// would close the strandable-maker gate while such makers rest).
     #[inline]
     pub(super) fn note_rested_order<E>(&self, order: &OrderType<E>) {
-        if Self::is_strandable_maker(order) {
-            self.strandable_makers_resting
-                .fetch_add(1, Ordering::Relaxed);
+        if Self::is_strandable_maker(order)
+            && self
+                .strandable_makers_resting
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .is_err()
+        {
+            Self::warn_strandable_count("increment overflow at usize::MAX");
         }
     }
 
-    /// Count one strandable maker out, by the saturating rule
+    /// Count one strandable maker out, by the checked rule
     /// [`Self::note_removed_order`] also uses, when the caller has already
     /// established that the maker leaving the level is one.
     ///
     /// Used by the fill drain in `match_order_inner`, which identifies the
     /// maker from that sweep's own capture list rather than from an
-    /// `OrderType` it still holds. Single implementation of the saturating
+    /// `OrderType` it still holds. Single implementation of the checked
     /// decrement, so the two removal shapes cannot drift.
+    ///
+    /// Checked (#250): a decrement at zero means a removal was reported
+    /// for a maker the count never saw. It is refused (the count stays at
+    /// zero, never wraps to `usize::MAX`) and logged at `WARN`, since it
+    /// signals an accounting bug rather than a reachable state.
     #[inline]
     pub(super) fn note_removed_strandable_maker(&self) {
-        let _ = self.strandable_makers_resting.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(1)),
+        if self
+            .strandable_makers_resting
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            Self::warn_strandable_count("decrement underflow at zero");
+        }
+    }
+
+    /// Log a refused strandable-maker count update (#250) out of line.
+    #[cold]
+    #[inline(never)]
+    fn warn_strandable_count(reason: &'static str) {
+        tracing::warn!(
+            counter = "strandable_makers_resting",
+            reason,
+            "strandable-maker count update refused; count left unchanged"
         );
     }
 
@@ -4827,7 +5104,7 @@ where
     ///
     /// Called from the only three paths that remove one:
     /// `cancel_order_with_reason`, `cancel_resting_maker_on_level` and the
-    /// fill drain in `match_order_inner`. Saturating, so a spurious call can
+    /// fill drain in `match_order_inner`. Checked, so a spurious call can
     /// never wrap the count below zero; see
     /// [`Self::strandable_makers_resting`].
     #[inline]
@@ -5458,6 +5735,15 @@ where
     }
 }
 
+/// Build the [`OrderBookError::EngineSeqExhausted`] error out of line
+/// (#250).
+#[cold]
+#[inline(never)]
+#[must_use]
+fn engine_seq_exhausted(engine_seq: u64) -> OrderBookError {
+    OrderBookError::EngineSeqExhausted { engine_seq }
+}
+
 // Implementation of RepricingOperations trait for OrderBook
 #[cfg(feature = "special_orders")]
 use crate::orderbook::repricing::{
@@ -5483,10 +5769,19 @@ where
     /// gate once per order (#225). Correct and deadlock-free — the gate is
     /// never held across iterations — but the sweep is not atomic as a
     /// batch: concurrent flow interleaves between consecutive re-prices.
-    fn reprice_pegged_collecting(&self, failures: &mut Vec<(Id, String)>) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::ArithmeticOverflow`] if the repriced count cannot
+    /// be incremented (#250). The count is bounded by the tracker's id
+    /// list, so this is unreachable; it is checked rather than assumed.
+    fn reprice_pegged_collecting(
+        &self,
+        failures: &mut Vec<(Id, String)>,
+    ) -> Result<usize, OrderBookError> {
         let pegged_ids = self.special_order_tracker.pegged_order_ids();
         if pegged_ids.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let best_bid = self.best_bid();
@@ -5528,7 +5823,7 @@ where
                     };
                     match self.update_order(update) {
                         Ok(_) => {
-                            repriced_count += 1;
+                            repriced_count = checked_reprice_count(repriced_count)?;
                             trace!(
                                 "Re-priced pegged order {} from {} to {}",
                                 order_id, current_price, new_price
@@ -5553,7 +5848,7 @@ where
             }
         }
 
-        repriced_count
+        Ok(repriced_count)
     }
 
     /// Re-price every trailing stop, returning the count repriced and pushing a
@@ -5561,10 +5856,19 @@ where
     /// `update_order` (mirrors [`Self::reprice_pegged_collecting`], #174),
     /// including its per-order gate acquisition and the batch-atomicity
     /// caveat that comes with it (#225).
-    fn reprice_trailing_collecting(&self, failures: &mut Vec<(Id, String)>) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::ArithmeticOverflow`] if the repriced count cannot
+    /// be incremented (#250); unreachable for the same reason as in
+    /// `reprice_pegged_collecting`.
+    fn reprice_trailing_collecting(
+        &self,
+        failures: &mut Vec<(Id, String)>,
+    ) -> Result<usize, OrderBookError> {
         let trailing_ids = self.special_order_tracker.trailing_stop_ids();
         if trailing_ids.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let mut repriced_count = 0;
@@ -5604,7 +5908,7 @@ where
                         };
                         match self.update_order(update) {
                             Ok(_) => {
-                                repriced_count += 1;
+                                repriced_count = checked_reprice_count(repriced_count)?;
                                 trace!(
                                     "Re-priced trailing stop {} from {} to {} (ref: {} -> {})",
                                     order_id,
@@ -5636,8 +5940,20 @@ where
             }
         }
 
-        repriced_count
+        Ok(repriced_count)
     }
+}
+
+/// Increment a repricing sweep's repriced-order count with checked
+/// arithmetic (#250).
+#[cfg(feature = "special_orders")]
+#[inline]
+fn checked_reprice_count(count: usize) -> Result<usize, OrderBookError> {
+    count
+        .checked_add(1)
+        .ok_or(OrderBookError::ArithmeticOverflow {
+            operation: "repriced order count",
+        })
 }
 
 #[cfg(feature = "special_orders")]
@@ -5652,7 +5968,7 @@ where
     /// [`reprice_special_orders`](Self::reprice_special_orders), whose
     /// [`RepricingResult::failed_orders`] records every rejected re-price.
     fn reprice_pegged_orders(&self) -> Result<usize, OrderBookError> {
-        Ok(self.reprice_pegged_collecting(&mut Vec::new()))
+        self.reprice_pegged_collecting(&mut Vec::new())
     }
 
     /// Re-prices all trailing stop orders based on current market conditions.
@@ -5661,7 +5977,7 @@ where
     /// [`reprice_special_orders`](Self::reprice_special_orders) for the
     /// failure-reporting variant.
     fn reprice_trailing_stops(&self) -> Result<usize, OrderBookError> {
-        Ok(self.reprice_trailing_collecting(&mut Vec::new()))
+        self.reprice_trailing_collecting(&mut Vec::new())
     }
 
     /// Re-prices all special orders (both pegged and trailing stops) and reports
@@ -5674,8 +5990,8 @@ where
     /// modify, #98/#168).
     fn reprice_special_orders(&self) -> Result<RepricingResult, OrderBookError> {
         let mut failed_orders = Vec::new();
-        let pegged_count = self.reprice_pegged_collecting(&mut failed_orders);
-        let trailing_count = self.reprice_trailing_collecting(&mut failed_orders);
+        let pegged_count = self.reprice_pegged_collecting(&mut failed_orders)?;
+        let trailing_count = self.reprice_trailing_collecting(&mut failed_orders)?;
 
         Ok(RepricingResult {
             pegged_orders_repriced: pegged_count,

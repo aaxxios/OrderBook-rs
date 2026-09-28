@@ -2,7 +2,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use crate::orderbook::book::OrderBook;
-use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::matching::MatchOutcome;
 use crate::orderbook::matching::ShapeVerdict;
@@ -757,15 +756,7 @@ where
                                     OrderQuantity::<()>::total_quantity(order.as_ref()),
                                 );
                                 // notify price level changes
-                                if let Some(ref listener) = self.price_level_changed_listener {
-                                    let engine_seq = self.next_engine_seq();
-                                    listener(PriceLevelChangedEvent {
-                                        side,
-                                        price: price_level.price(),
-                                        quantity: price_level.visible_quantity(),
-                                        engine_seq,
-                                    })
-                                }
+                                self.emit_level_changed(side, price_level);
                                 result = Some(Arc::new(self.convert_from_unit_type(&order)));
                             }
                             Ok(None) => {
@@ -917,17 +908,10 @@ where
                             let cancel_update = OrderUpdate::Cancel { order_id };
                             let result = price_level.update_order(cancel_update);
                             // notify price level changes
-                            if let Some(ref listener) = self.price_level_changed_listener
-                                && let Ok(updated_order) = result
+                            if let Ok(updated_order) = result
                                 && updated_order.is_some()
                             {
-                                let engine_seq = self.next_engine_seq();
-                                listener(PriceLevelChangedEvent {
-                                    side,
-                                    price: price_level.price(),
-                                    quantity: price_level.visible_quantity(),
-                                    engine_seq,
-                                })
+                                self.emit_level_changed(side, price_level);
                             }
                             is_empty = price_level.order_count() == 0;
                         }
@@ -1203,16 +1187,8 @@ where
             }
 
             // notify price level changes
-            if removed.is_some()
-                && let Some(ref listener) = self.price_level_changed_listener
-            {
-                let engine_seq = self.next_engine_seq();
-                listener(PriceLevelChangedEvent {
-                    side,
-                    price: price_level.price(),
-                    quantity: price_level.visible_quantity(),
-                    engine_seq,
-                })
+            if removed.is_some() {
+                self.emit_level_changed(side, price_level);
             }
 
             // Check if the level became empty
@@ -1379,15 +1355,7 @@ where
         self.cache.invalidate();
 
         // 1. Notify the level change (same shape as cancel_order_with_reason).
-        if let Some(ref listener) = self.price_level_changed_listener {
-            let engine_seq = self.next_engine_seq();
-            listener(PriceLevelChangedEvent {
-                side,
-                price: price_level.price(),
-                quantity: price_level.visible_quantity(),
-                engine_seq,
-            });
-        }
+        self.emit_level_changed(side, price_level);
 
         // 2. Record the terminal cancellation, preserving any prior fill.
         let prev_filled = self
@@ -2853,15 +2821,7 @@ where
             // strandable-maker scan for this book from now on.
             self.note_rested_order(unit_order_arc.as_ref());
             // notify price level changes
-            if let Some(ref listener) = self.price_level_changed_listener {
-                let engine_seq = self.next_engine_seq();
-                listener(PriceLevelChangedEvent {
-                    side,
-                    price: level.price(),
-                    quantity: level.visible_quantity(),
-                    engine_seq,
-                })
-            }
+            self.emit_level_changed(side, level);
             self.order_locations
                 .insert(unit_order_arc.id(), (price, side));
 

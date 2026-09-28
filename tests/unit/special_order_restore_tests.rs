@@ -113,25 +113,27 @@ fn test_restore_reregisters_pegged_and_reprices_issue_194() {
 }
 
 /// #194: a trailing-stop order recovered from a snapshot must be re-registered
-/// and re-price after restore, reading its watermark (`last_reference_price`)
-/// straight from the restored order data.
+/// with the tracker.
 ///
 /// A trailing stop only re-prices when its stop price sits inside the market
-/// (a Sell stop below the bid), which the live matching path never lets rest —
-/// it would trade on admission. A recovered snapshot legitimately holds one,
-/// so we build the snapshot by merging a bid-only book with a stop-only book,
-/// exactly the disaster-recovery shape #194 targets.
+/// (a Sell stop below the bid) — a crossed book, which live matching never
+/// builds and which restore rejects since #250. The crossed re-price
+/// regression moved, assertions unchanged, to
+/// `src/orderbook/tests/restore_validation.rs`
+/// (`restore_reregisters_trailing_stop_and_reprices_issue_194`), which installs
+/// that fixture through a `cfg(test)`-only hook. Here the re-registration is
+/// pinned on an uncrossed recovered book (Sell stop at 100 above a bid of 95).
 #[test]
-fn test_restore_reregisters_trailing_stop_and_reprices_issue_194() {
+fn test_restore_reregisters_trailing_stop_issue_194() {
     let stop_id = Id::from_u64(2000);
 
-    // Market book: best bid 110 only.
+    // Market book: best bid 95 only.
     let market = OrderBook::<()>::new("TS/USD");
-    let _ = market.add_limit_order(Id::from_u64(1), 110, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = market.add_limit_order(Id::from_u64(1), 95, 10, Side::Buy, TimeInForce::Gtc, None);
     let market_snapshot = market.create_snapshot(usize::MAX).expect("snapshot");
 
-    // Stop book: a lone Sell trailing stop resting at 100 (empty book, so no
-    // crossing on admission). Watermark 90, trail 5.
+    // Stop book: a lone Sell trailing stop resting at 100. Watermark 90,
+    // trail 5.
     let stop_book = OrderBook::<()>::new("TS/USD");
     stop_book
         .add_order(OrderType::TrailingStop {
@@ -149,9 +151,6 @@ fn test_restore_reregisters_trailing_stop_and_reprices_issue_194() {
         .expect("lone trailing stop rests");
     let stop_snapshot = stop_book.create_snapshot(usize::MAX).expect("snapshot");
 
-    // Merge: bid 110 from the market book, the Sell stop at 100 from the stop
-    // book — a book that could not be built through live matching but is a valid
-    // recovered snapshot.
     let merged = OrderBookSnapshot {
         symbol: "TS/USD".to_string(),
         timestamp: 0,
@@ -173,38 +172,17 @@ fn test_restore_reregisters_trailing_stop_and_reprices_issue_194() {
     );
     assert_eq!(restored.trailing_stop_ids(), vec![stop_id]);
     assert_eq!(restored.pegged_order_count(), 0, "no pegged orders present");
-    assert_eq!(restored.best_bid(), Some(110), "bid liquidity restored");
+    assert_eq!(restored.best_bid(), Some(95), "bid liquidity restored");
 
-    let before = restored.get_order(stop_id).expect("stop restored");
-    assert_eq!(before.price().as_u128(), 100);
-
-    // best_bid 110 > watermark 90, so the Sell stop trails up to
-    // best_bid - trail = 105 and is re-priced. A trailing stop always trails
-    // *toward* the market, so the re-priced 105 sits inside the bid (110) and
-    // triggers — the re-price is validate-first modify + re-add, which matches
-    // the now-marketable stop against the bid. The count returning 1 is the
-    // #194 proof: the loop only visits (and re-prices) the stop because restore
-    // re-registered it. Against the unfixed code the tracker is empty, so this
-    // returns 0.
+    // best_bid 95 > watermark 90, but the trailed stop (95 - 5 = 90) is not
+    // above the current stop (100): the loop visits the re-registered stop
+    // and leaves it in place.
     let repriced = restored
         .reprice_trailing_stops()
         .expect("reprice runs on the restored book");
-    assert_eq!(
-        repriced, 1,
-        "the restored trailing stop must actually re-price"
-    );
-
-    // The stop trailed into the bid and executed, so it no longer rests at its
-    // stale price of 100 — the re-price genuinely acted on the restored order.
-    assert!(
-        restored.get_order(stop_id).is_none(),
-        "the trailing stop trailed into the market and triggered on re-price"
-    );
-    assert_eq!(
-        restored.best_bid(),
-        Some(110),
-        "the bid absorbed the triggered stop and is still the best bid"
-    );
+    assert_eq!(repriced, 0, "an uncrossed stop does not move");
+    let after = restored.get_order(stop_id).expect("stop still resting");
+    assert_eq!(after.price().as_u128(), 100, "stop unchanged");
 }
 
 /// #194: a book with no special orders restores with an empty tracker, and a
