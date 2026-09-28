@@ -4,14 +4,11 @@
 //! via [`crate::STPMode`]. When STP is disabled (`STPMode::None`, the default),
 //! the matching hot path is unchanged with zero overhead.
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
-
 use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::pool::MatchingPool;
 use crate::orderbook::reject_reason::RejectReason;
-use crate::orderbook::stp::{STPAction, check_stp_at_level};
+use crate::orderbook::stp::{STPAction, capped_depth_add, check_stp_at_level};
 use crate::{OrderBook, OrderBookError};
 use either::Either;
 use pricelevel::{
@@ -72,6 +69,17 @@ fn fok_counter_overflow() -> OrderBookError {
     }
 }
 
+/// `peek_match` accounting failed: the matched quantity exceeded the
+/// requested one. Each level adds at most what is still needed, so this is
+/// an invariant breach, reported instead of clamped (#246).
+#[cold]
+#[inline(never)]
+fn peek_accounting_breach() -> OrderBookError {
+    OrderBookError::InvalidOperation {
+        message: "peek_match accounting exceeded the requested quantity".to_string(),
+    }
+}
+
 /// The abort source for a level the sweep's arithmetic backstop refused
 /// (#244): pricelevel's `InvalidOperation`, since `MatchAborted` carries a
 /// `PriceLevelError`. Cold: only reached when a maker admitted concurrently
@@ -86,9 +94,62 @@ fn arithmetic_abort_source(price: u128, err: &OrderBookError) -> PriceLevelError
     }
 }
 
+/// A sweep's scratch buffers: `(filled_orders, empty_price_levels,
+/// strandable_makers, stp_orders)`.
+type SweepBuffers = (
+    Vec<(Id, u64)>,
+    Vec<u128>,
+    Option<Vec<(Id, u64)>>,
+    Vec<std::sync::Arc<OrderType<()>>>,
+);
+
+/// Take a sweep's scratch buffers from the thread-local pool.
+///
+/// `strandable_makers` is only drawn when `watch_strandable` is set and
+/// `stp_orders` only when `stp_active`; otherwise they are `None` / an empty
+/// `Vec::new()` that allocates nothing.
+///
+/// The pool is a cache, never state (#246): `LocalKey::try_with` fails once
+/// the thread-local has been destroyed (a sweep run from another
+/// thread-local's destructor during thread teardown), and the pool itself
+/// hands out a fresh buffer when it is already borrowed. Both degrade to
+/// fresh, empty buffers instead of panicking; only the reuse is lost.
+#[inline]
+fn acquire_sweep_buffers(watch_strandable: bool, stp_active: bool) -> SweepBuffers {
+    MATCHING_POOL
+        .try_with(|pool| {
+            (
+                pool.get_filled_orders_vec(),
+                pool.get_price_vec(),
+                watch_strandable.then(|| pool.get_filled_orders_vec()),
+                if stp_active {
+                    pool.get_order_snapshot_vec()
+                } else {
+                    Vec::new()
+                },
+            )
+        })
+        .unwrap_or_else(|_destroyed| fresh_sweep_buffers(watch_strandable))
+}
+
+/// Fresh scratch buffers for a sweep that cannot reach its thread-local
+/// pool (#246). Cold: only thread teardown gets here.
+#[cold]
+#[inline(never)]
+fn fresh_sweep_buffers(watch_strandable: bool) -> SweepBuffers {
+    (
+        Vec::new(),
+        Vec::new(),
+        watch_strandable.then(Vec::new),
+        Vec::new(),
+    )
+}
+
 /// Return a sweep's scratch buffers to the thread-local pool. `stp_orders`
 /// only came from the pool when STP was active; otherwise it is an empty,
-/// never-filled `Vec` that is simply dropped.
+/// never-filled `Vec` that is simply dropped. When the pool has already been
+/// destroyed (thread teardown, #246) the closure never runs and the buffers
+/// are dropped with it.
 #[inline]
 fn release_sweep_buffers(
     filled_orders: Vec<(Id, u64)>,
@@ -97,7 +158,9 @@ fn release_sweep_buffers(
     stp_orders: Vec<std::sync::Arc<OrderType<()>>>,
     stp_active: bool,
 ) {
-    MATCHING_POOL.with(|pool| {
+    // `Err` only means the pool is gone; the buffers were dropped with the
+    // closure, which is all a release has to achieve.
+    let _pool_destroyed = MATCHING_POOL.try_with(|pool| {
         pool.return_filled_orders_vec(filled_orders);
         if let Some(strandable) = strandable_makers {
             pool.return_filled_orders_vec(strandable);
@@ -108,11 +171,85 @@ fn release_sweep_buffers(
         }
     });
 }
-/// Matchable depth of a single resting order: its visible quantity plus any
-/// hidden quantity the sweep can actually draw. An iceberg always replenishes
-/// its hidden tranche; a reserve only when `auto_replenish` is set — a
-/// non-auto-replenish reserve drops its hidden unfilled, so that hidden is NOT
-/// reachable depth.
+
+/// The per-level budget arithmetic of a sweep failed (#246): a level
+/// reported more remaining quantity than it was asked to fill, or the
+/// executed quantity exceeded the budget it was capped by. Both are ruled
+/// out by pricelevel's `MatchResult` invariant and by the level cap, so this
+/// is an invariant breach, reported as the level's failure (the sweep stops
+/// there with its committed prefix) instead of being clamped.
+#[cold]
+#[inline(never)]
+fn sweep_budget_breach(what: &'static str, quantity: u64, price: u128) -> PriceLevelError {
+    PriceLevelError::InvalidOperation {
+        message: format!(
+            "sweep budget accounting failed ({what}): quantity {quantity} at price {price}"
+        ),
+    }
+}
+
+/// Quantity a level executed for a request of `requested` units: the
+/// request minus what the level left unfilled (#246: checked).
+///
+/// # Errors
+///
+/// [`PriceLevelError::InvalidOperation`] when the level reports more
+/// remaining quantity than it was asked for (an invariant breach).
+#[inline]
+fn level_executed(
+    requested: u64,
+    level_match: &MatchResult,
+    price: u128,
+) -> Result<u64, PriceLevelError> {
+    requested
+        .checked_sub(level_match.remaining_quantity().as_u64())
+        .ok_or_else(|| sweep_budget_breach("level remaining exceeds request", requested, price))
+}
+
+/// The first maker `level_match` filled that is absent from the STP
+/// `snapshot` the level's verdict was taken on (#225).
+///
+/// `None` is the invariant: an STP-engaged sweep holds the exclusive submit
+/// gate, so nothing can join the level between the scan and the match.
+/// `O(trades × snapshot)`, so it only runs in debug builds (see
+/// [`report_stp_snapshot_breach`]).
+#[must_use]
+fn stp_snapshot_breach(
+    snapshot: &[std::sync::Arc<OrderType<()>>],
+    level_match: &MatchResult,
+) -> Option<Id> {
+    level_match
+        .trades()
+        .as_vec()
+        .iter()
+        .map(|trade| trade.maker_order_id())
+        .find(|maker| !snapshot.iter().any(|order| order.id() == *maker))
+}
+
+/// Report a breach of the #225 STP snapshot invariant found by
+/// [`stp_snapshot_breach`] (#246: replaces three `debug_assert!`s).
+///
+/// Runs in debug builds only, like the assertions it replaces, but logs at
+/// `ERROR` instead of panicking: the trade is already committed, so there is
+/// nothing to roll back and a panic would only lose the sweep's bookkeeping.
+#[cold]
+#[inline(never)]
+fn report_stp_snapshot_breach(site: &'static str, price: u128, maker: Id) {
+    tracing::error!(
+        site,
+        price,
+        maker_order_id = %maker,
+        "#225 invariant breached: the sweep filled a maker absent from the STP snapshot (exclusive submit gate not held?)"
+    );
+}
+
+/// Add the depth a single resting order contributes to a sweep to `acc`,
+/// bounded by `cap`: `min(cap, acc + visible + drawable hidden)` (#246).
+///
+/// The drawable hidden quantity is the part the sweep can actually draw: an
+/// iceberg always replenishes its hidden tranche; a reserve only when
+/// `auto_replenish` is set — a non-auto-replenish reserve drops its hidden
+/// unfilled, so that hidden is NOT reachable depth.
 ///
 /// As of #136 the non-STP and STP-NoConflict FOK feasibility paths delegate to
 /// `PriceLevel::matchable_quantity` (the authoritative upstream dry run). This
@@ -124,8 +261,13 @@ fn release_sweep_buffers(
 /// new `OrderType` variant is added whose sweep total differs from
 /// `visible + drawable_hidden`, update this helper or the CancelMaker FOK path
 /// will silently mis-predict while the delegated paths stay correct.
+///
+/// Precondition `acc <= cap`, kept by [`capped_depth_add`]; the result is
+/// then the exact `min(cap, depth)` even when the depth overflows `u64` (see
+/// that function).
 #[inline]
-fn order_matchable_qty(order: &OrderType<()>) -> u64 {
+#[must_use]
+fn add_order_matchable_qty(acc: u64, order: &OrderType<()>, cap: u64) -> u64 {
     let visible = order.visible_quantity().as_u64();
     let drawable_hidden = match order {
         OrderType::IcebergOrder {
@@ -138,7 +280,7 @@ fn order_matchable_qty(order: &OrderType<()>) -> u64 {
         } if *auto_replenish => hidden_quantity.as_u64(),
         _ => 0,
     };
-    visible.saturating_add(drawable_hidden)
+    capped_depth_add(capped_depth_add(acc, visible, cap), drawable_hidden, cap)
 }
 
 /// Hidden quantity `filled_id` would strand, looked up in the sweep's
@@ -310,28 +452,59 @@ impl StopCondition {
         let raw = match self {
             Self::BaseQty { remaining } => *remaining,
             Self::QuoteAmount { remaining } => {
-                if level_price == 0 || *remaining < level_price {
+                // Whole units the budget funds at this price; a zero price
+                // funds nothing (and is never divided by).
+                let Some(units) = remaining.checked_div(level_price) else {
                     return 0;
-                }
-                (*remaining / level_price).min(u128::from(u64::MAX)) as u64
+                };
+                // A level match takes a `u64` request, and the taker's
+                // `MatchResult` cannot record more than `u64::MAX` units in
+                // total, so a budget funding more than that at this price
+                // requests `u64::MAX`: the most any sweep can execute. What
+                // the level does not fill stays in the notional budget
+                // (`consume` deducts only the executed quantity).
+                u64::try_from(units).unwrap_or(u64::MAX)
             }
         };
-        if lot <= 1 { raw } else { raw - (raw % lot) }
+        if lot <= 1 {
+            raw
+        } else {
+            // Round down to a whole lot. `lot > 1` and `raw % lot <= raw`,
+            // so neither step can fail; a failure would stop the walk (zero
+            // cap), never over-fill.
+            raw.checked_rem(lot)
+                .and_then(|dust| raw.checked_sub(dust))
+                .unwrap_or(0)
+        }
     }
 
     /// Decrement the remaining budget by what was actually executed at
     /// the given price.
+    ///
+    /// The executed quantity never exceeds the level cap derived from this
+    /// budget (`level_qty_cap`), so neither the subtraction nor the notional
+    /// product can fail; both are checked anyway (#246).
+    ///
+    /// # Errors
+    ///
+    /// [`PriceLevelError::InvalidOperation`] when `executed_qty` exceeds the
+    /// remaining budget (an invariant breach). The budget is left unchanged.
     #[inline]
-    fn consume(&mut self, executed_qty: u64, level_price: u128) {
-        match self {
-            Self::BaseQty { remaining } => {
-                *remaining = remaining.saturating_sub(executed_qty);
-            }
-            Self::QuoteAmount { remaining } => {
-                let spent = level_price.saturating_mul(u128::from(executed_qty));
-                *remaining = remaining.saturating_sub(spent);
-            }
-        }
+    fn consume(&mut self, executed_qty: u64, level_price: u128) -> Result<(), PriceLevelError> {
+        let next = match self {
+            Self::BaseQty { remaining } => remaining.checked_sub(executed_qty).map(|left| {
+                *remaining = left;
+            }),
+            Self::QuoteAmount { remaining } => level_price
+                .checked_mul(u128::from(executed_qty))
+                .and_then(|spent| remaining.checked_sub(spent))
+                .map(|left| {
+                    *remaining = left;
+                }),
+        };
+        next.ok_or_else(|| {
+            sweep_budget_breach("executed exceeds budget", executed_qty, level_price)
+        })
     }
 
     /// Returns `true` when no further fills are needed (budget exhausted).
@@ -618,8 +791,8 @@ where
     /// One inner implementation handles both base-quantity and
     /// quote-notional walks. The `BaseQty` path is identical in shape to
     /// the previous implementation: `level_qty_cap` is a no-op for
-    /// `lot <= 1` and a single `% lot` otherwise; `consume` is one
-    /// `saturating_sub` per level. The `QuoteAmount` path adds one
+    /// `lot <= 1` and a single checked `% lot` otherwise; `consume` is one
+    /// `checked_sub` per level. The `QuoteAmount` path adds one
     /// `u128` divide per level (to derive the per-level qty cap) and one
     /// `u128` multiply per fill (to deduct from the remaining notional).
     ///
@@ -703,19 +876,8 @@ where
         // nothing to return. That matters because the capture walks the
         // level's `DashMap` of orders, which read-locks every shard.
         let watch_strandable = self.strandable_makers_resting.load(Ordering::Relaxed) > 0;
-        let (mut filled_orders, mut empty_price_levels, mut strandable_makers) = MATCHING_POOL
-            .with(|pool| {
-                (
-                    pool.get_filled_orders_vec(),
-                    pool.get_price_vec(),
-                    watch_strandable.then(|| pool.get_filled_orders_vec()),
-                )
-            });
-        let mut stp_orders = if stp_active {
-            MATCHING_POOL.with(|pool| pool.get_order_snapshot_vec())
-        } else {
-            Vec::new()
-        };
+        let (mut filled_orders, mut empty_price_levels, mut strandable_makers, mut stp_orders) =
+            acquire_sweep_buffers(watch_strandable, stp_active);
 
         // Fill-or-kill preflight (#240): reserve the aggregate trade /
         // filled-id storage and the pooled maker buffer for every maker
@@ -943,15 +1105,13 @@ where
                                 // on. A maker outside it means something
                                 // landed between the scan and the sweep, i.e.
                                 // the exclusive submit gate was not held.
-                                debug_assert!(
-                                    price_level_match.trades().as_vec().iter().all(|t| {
-                                        stp_orders.iter().any(|o| o.id() == t.maker_order_id())
-                                    }),
-                                    "#225: CancelTaker pre-match filled a maker absent from the STP snapshot"
-                                );
-                                let executed = match_qty.saturating_sub(
-                                    price_level_match.remaining_quantity().as_u64(),
-                                );
+                                if cfg!(debug_assertions)
+                                    && let Some(maker) =
+                                        stp_snapshot_breach(&stp_orders, &price_level_match)
+                                {
+                                    report_stp_snapshot_breach("cancel_taker", price, maker);
+                                }
+                                let executed = level_executed(match_qty, &price_level_match, price);
                                 if let Err(err) = self.process_level_match(
                                     &mut match_result,
                                     &price_level_match,
@@ -964,7 +1124,12 @@ where
                                     sweep_error = Some(err);
                                     break;
                                 }
-                                stop.consume(executed, price);
+                                if let Err(err) =
+                                    executed.and_then(|executed| stop.consume(executed, price))
+                                {
+                                    sweep_error = Some(err);
+                                    break;
+                                }
                             }
                         }
                         // Reachability: the same-user maker is only reached
@@ -1047,15 +1212,13 @@ where
                                 // #225: see the CancelTaker arm — the makers
                                 // filled here must all belong to the snapshot
                                 // the STP verdict was taken on.
-                                debug_assert!(
-                                    price_level_match.trades().as_vec().iter().all(|t| {
-                                        stp_orders.iter().any(|o| o.id() == t.maker_order_id())
-                                    }),
-                                    "#225: CancelBoth pre-match filled a maker absent from the STP snapshot"
-                                );
-                                let executed = match_qty.saturating_sub(
-                                    price_level_match.remaining_quantity().as_u64(),
-                                );
+                                if cfg!(debug_assertions)
+                                    && let Some(maker) =
+                                        stp_snapshot_breach(&stp_orders, &price_level_match)
+                                {
+                                    report_stp_snapshot_breach("cancel_both", price, maker);
+                                }
+                                let executed = level_executed(match_qty, &price_level_match, price);
                                 if let Err(err) = self.process_level_match(
                                     &mut match_result,
                                     &price_level_match,
@@ -1068,7 +1231,12 @@ where
                                     sweep_error = Some(err);
                                     break;
                                 }
-                                stop.consume(executed, price);
+                                if let Err(err) =
+                                    executed.and_then(|executed| stop.consume(executed, price))
+                                {
+                                    sweep_error = Some(err);
+                                    break;
+                                }
                             }
                         }
                         // Same reachability rule as `CancelTaker` above, and
@@ -1126,16 +1294,13 @@ where
             // #225: when STP ran for this level, the sweep may only fill
             // makers the verdict was taken on. `stp_orders` is only populated
             // while `stp_active`, hence the guard.
-            debug_assert!(
-                !stp_active
-                    || price_level_match
-                        .trades()
-                        .as_vec()
-                        .iter()
-                        .all(|t| { stp_orders.iter().any(|o| o.id() == t.maker_order_id()) }),
-                "#225: sweep filled a maker absent from the STP snapshot"
-            );
-            let executed = qty_cap.saturating_sub(price_level_match.remaining_quantity().as_u64());
+            if cfg!(debug_assertions)
+                && stp_active
+                && let Some(maker) = stp_snapshot_breach(&stp_orders, &price_level_match)
+            {
+                report_stp_snapshot_breach("sweep", price, maker);
+            }
+            let executed = level_executed(qty_cap, &price_level_match, price);
 
             if let Err(err) = self.process_level_match(
                 &mut match_result,
@@ -1149,7 +1314,10 @@ where
                 sweep_error = Some(err);
                 break;
             }
-            stop.consume(executed, price);
+            if let Err(err) = executed.and_then(|executed| stop.consume(executed, price)) {
+                sweep_error = Some(err);
+                break;
+            }
 
             // Early exit if budget is exhausted
             if stop.is_done() {
@@ -1307,9 +1475,17 @@ where
         // quote currency, not base qty, so the natural meaning of
         // "remaining base qty" is zero — the residual the caller cares
         // about is `requested - executed_value`, available directly on
-        // `MatchResult`.
+        // `MatchResult`. #246: a rebuild that fails (only an allocator
+        // refusal can) no longer returns the unnormalized result as a
+        // success: the committed trades come back as an abort.
         if matches!(mode, MatchMode::QuoteAmount { .. }) {
-            match_result = Self::normalize_notional_match_result(order_id, match_result);
+            match_result = match Self::normalize_notional_match_result(order_id, match_result) {
+                Ok(normalized) => normalized,
+                Err((unnormalized, source)) => {
+                    Self::report_unnormalized_prefix(order_id, &source);
+                    return self.abort_with_prefix(order_id, unnormalized, source);
+                }
+            };
         }
 
         Ok(MatchOutcome {
@@ -1324,31 +1500,64 @@ where
     /// internal `remaining_quantity` is `0` (rather than
     /// `u64::MAX - executed_qty`). Trade list, filled-order ids, and
     /// monotonic engine sequence stamping are preserved.
-    fn normalize_notional_match_result(order_id: Id, src: MatchResult) -> MatchResult {
-        let executed_qty: u64 = src
+    ///
+    /// The rebuilt result is sized up front (`try_with_capacity`), so the
+    /// appends below never grow it. The trade quantities were each
+    /// subtracted from the `u64::MAX` working budget, so their checked sum
+    /// fits and every `add_trade` fits the rebuilt budget exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the untouched `src` with the failure (#246) instead of
+    /// silently handing `src` back as if it were normalized: an allocator
+    /// refusal of the rebuilt buffers ([`PriceLevelError::CapacityExceeded`])
+    /// or, as an invariant breach, an overflowing executed quantity or a
+    /// refused append ([`PriceLevelError::InvalidOperation`]). The caller
+    /// reports the committed trades as an abort.
+    // Both variants carry a whole `MatchResult`; boxing the `Err` would add
+    // an allocation to the failure path that exists for allocator refusals.
+    #[allow(clippy::result_large_err)]
+    fn normalize_notional_match_result(
+        order_id: Id,
+        src: MatchResult,
+    ) -> Result<MatchResult, (MatchResult, PriceLevelError)> {
+        let executed_qty = match src.executed_quantity() {
+            Ok(quantity) => quantity,
+            Err(err) => return Err((src, err)),
+        };
+        let capacity = src.trades().len().max(src.filled_order_ids().len());
+        let mut rebuilt = match MatchResult::try_with_capacity(order_id, executed_qty, capacity) {
+            Ok(rebuilt) => rebuilt,
+            Err(err) => return Err((src, err)),
+        };
+        let appended = src
             .trades()
             .as_vec()
             .iter()
-            .map(|t| t.quantity().as_u64())
-            .fold(0u64, u64::saturating_add);
-        let mut rebuilt = MatchResult::new(order_id, Quantity::new(executed_qty));
-        for trade in src.trades().as_vec() {
-            // `add_trade` only fails on underflow; with `executed_qty`
-            // exactly equal to the sum of trade quantities this cannot
-            // underflow. Treat any error as a logic bug surfaced by
-            // returning the original (unnormalized) result.
-            if rebuilt.add_trade(*trade).is_err() {
-                return src;
-            }
+            .try_for_each(|trade| rebuilt.add_trade(*trade))
+            .and_then(|()| {
+                src.filled_order_ids()
+                    .iter()
+                    .try_for_each(|filled_id| rebuilt.add_filled_order_id(*filled_id))
+            });
+        match appended {
+            Ok(()) => Ok(rebuilt),
+            Err(err) => Err((src, err)),
         }
-        for filled_id in src.filled_order_ids() {
-            // Same fallback as `add_trade`: a refused append (capacity,
-            // pricelevel 0.10) keeps the original, complete result.
-            if rebuilt.add_filled_order_id(*filled_id).is_err() {
-                return src;
-            }
-        }
-        rebuilt
+    }
+
+    /// Log a quote-notional result that could not be normalized (#246). The
+    /// taker is reported as aborted; its `remaining_quantity()` still holds
+    /// the working bound (`u64::MAX` minus the executed quantity), which the
+    /// abort makes explicit instead of passing off as a normal result.
+    #[cold]
+    #[inline(never)]
+    fn report_unnormalized_prefix(order_id: Id, err: &PriceLevelError) {
+        tracing::error!(
+            order_id = %order_id,
+            error = %err,
+            "quote-notional result could not be normalized; committed trades reported as an abort"
+        );
     }
 
     /// Build the empty-book result. Market paths return a typed error;
@@ -1707,18 +1916,48 @@ where
     /// `MatchResult` invariant (every fold is a checked subtraction from a
     /// `u64` budget) rules out; reported as
     /// [`OrderBookError::PriceLevelError`] rather than guessed.
+    ///
+    /// A quote-notional prefix is normalized first; if that fails the
+    /// unnormalized prefix is reported (#246, see
+    /// [`Self::report_unnormalized_prefix`]) and the original `source`
+    /// stays the abort's cause.
     #[cold]
     #[inline(never)]
     fn abort_sweep(
         &self,
         order_id: Id,
         mode: &MatchMode,
-        mut match_result: MatchResult,
+        match_result: MatchResult,
         source: PriceLevelError,
     ) -> Result<MatchOutcome, OrderBookError> {
-        if matches!(mode, MatchMode::QuoteAmount { .. }) {
-            match_result = Self::normalize_notional_match_result(order_id, match_result);
-        }
+        let match_result = if matches!(mode, MatchMode::QuoteAmount { .. }) {
+            match Self::normalize_notional_match_result(order_id, match_result) {
+                Ok(normalized) => normalized,
+                Err((unnormalized, err)) => {
+                    Self::report_unnormalized_prefix(order_id, &err);
+                    unnormalized
+                }
+            }
+        } else {
+            match_result
+        };
+        self.abort_with_prefix(order_id, match_result, source)
+    }
+
+    /// Second half of [`Self::abort_sweep`]: record and return the abort for
+    /// a committed prefix that needs no (further) normalization.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::abort_sweep`].
+    #[cold]
+    #[inline(never)]
+    fn abort_with_prefix(
+        &self,
+        order_id: Id,
+        match_result: MatchResult,
+        source: PriceLevelError,
+    ) -> Result<MatchOutcome, OrderBookError> {
         let executed_quantity = match_result.executed_quantity()?.as_u64();
         let trade_count = match_result.trades().len();
         tracing::error!(
@@ -1760,19 +1999,35 @@ where
         })
     }
 
-    /// Optimized peek match without memory pooling or sorting
+    /// Optimized peek match without memory pooling or sorting: the quantity,
+    /// in quantity units, of `quantity` that the raw resting depth (visible
+    /// plus hidden) up to `price_limit` could absorb. It does not model
+    /// self-trade prevention, lot rounding or undrawable reserve depth.
     ///
     /// # Performance Optimization
     /// Uses SkipMap's natural ordering to eliminate sorting overhead.
     /// Time complexity: O(M log N) where M = price levels inspected.
-    pub fn peek_match(&self, side: Side, quantity: u64, price_limit: Option<u128>) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookError::PriceLevelError`] when a level it reaches
+    /// cannot report its depth because `visible + hidden` overflows `u64`
+    /// (#246: such a level used to be read as empty).
+    /// [`OrderBookError::InvalidOperation`] reports a breach of the
+    /// `matched <= quantity` accounting invariant, which cannot happen.
+    pub fn peek_match(
+        &self,
+        side: Side,
+        quantity: u64,
+        price_limit: Option<u128>,
+    ) -> Result<u64, OrderBookError> {
         let price_levels = match side {
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
         };
 
         if price_levels.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let mut matched_quantity = 0u64;
@@ -1801,15 +2056,21 @@ where
                 }
             }
 
-            // Get available quantity at this level
+            // Get available quantity at this level. `matched_quantity <
+            // quantity` here (loop head), and each level adds at most what
+            // is still needed, so the checked steps below cannot fail.
             let price_level = entry.value();
-            let available_quantity = price_level.total_quantity().unwrap_or(0);
-            let needed_quantity = quantity.saturating_sub(matched_quantity);
+            let available_quantity = price_level.total_quantity()?;
+            let needed_quantity = quantity
+                .checked_sub(matched_quantity)
+                .ok_or_else(peek_accounting_breach)?;
             let quantity_to_match = needed_quantity.min(available_quantity);
-            matched_quantity = matched_quantity.saturating_add(quantity_to_match);
+            matched_quantity = matched_quantity
+                .checked_add(quantity_to_match)
+                .ok_or_else(peek_accounting_breach)?;
         }
 
-        matched_quantity
+        Ok(matched_quantity)
     }
 
     /// Faithful fill-or-kill feasibility: the quantity an immediate match of
@@ -1923,12 +2184,22 @@ where
                     // resting depth is reachable; the walk continues. The upstream
                     // primitive cannot filter by user, so the non-self matchable
                     // depth is still summed per order here.
+                    //
+                    // #246: summed as `min(cap, Σ)` rather than `Σ`, since only
+                    // `cap.min(reachable)` is used below. Depth summing past
+                    // `u64::MAX` (legal: a visible and a hidden tranche near
+                    // `u64::MAX` each) therefore reads as `cap` — exactly what the
+                    // taker can take here — instead of panicking (debug) or
+                    // wrapping into a false kill (release). Stops scanning once
+                    // the cap is reached.
                     STPAction::CancelMaker => {
-                        let non_self: u64 = orders
-                            .iter()
-                            .filter(|o| o.user_id() != taker_user_id)
-                            .map(|o| order_matchable_qty(o))
-                            .sum();
+                        let mut non_self = 0u64;
+                        for order in orders.iter().filter(|o| o.user_id() != taker_user_id) {
+                            non_self = add_order_matchable_qty(non_self, order, cap);
+                            if non_self == cap {
+                                break;
+                            }
+                        }
                         (non_self, false)
                     }
                     // The taker is cancelled at the first same-user order: it can
@@ -2051,9 +2322,10 @@ mod stop_condition_tests {
     }
 
     #[test]
-    fn test_quote_amount_cap_saturates_to_u64_max() {
+    fn test_quote_amount_cap_bounded_at_u64_max() {
         // remaining = u128::MAX, level_price = 1 ⇒ derived qty would
-        // exceed u64::MAX; must saturate at u64::MAX.
+        // exceed u64::MAX; the per-level request is bounded at u64::MAX,
+        // the most a `u64` `MatchResult` can record (#246: `try_from`).
         let stop = StopCondition::QuoteAmount {
             remaining: u128::MAX,
         };
@@ -2063,32 +2335,58 @@ mod stop_condition_tests {
     #[test]
     fn test_consume_base_qty_subtracts_executed() {
         let mut stop = StopCondition::BaseQty { remaining: 100 };
-        stop.consume(30, 999);
+        assert!(stop.consume(30, 999).is_ok());
         assert!(matches!(stop, StopCondition::BaseQty { remaining: 70 }));
     }
 
+    /// #246: an over-consumption used to saturate the budget at zero; it is
+    /// now a typed invariant failure and the budget is left untouched.
     #[test]
-    fn test_consume_base_qty_saturates() {
+    fn test_consume_base_qty_over_budget_is_an_error() {
         let mut stop = StopCondition::BaseQty { remaining: 5 };
-        stop.consume(10, 999);
-        assert!(matches!(stop, StopCondition::BaseQty { remaining: 0 }));
+        assert!(matches!(
+            stop.consume(10, 999),
+            Err(PriceLevelError::InvalidOperation { .. })
+        ));
+        assert!(matches!(stop, StopCondition::BaseQty { remaining: 5 }));
     }
 
     #[test]
     fn test_consume_quote_amount_deducts_price_times_qty() {
         let mut stop = StopCondition::QuoteAmount { remaining: 10_000 };
-        stop.consume(30, 100); // spent = 100 * 30 = 3_000
+        assert!(stop.consume(30, 100).is_ok()); // spent = 100 * 30 = 3_000
         assert!(matches!(
             stop,
             StopCondition::QuoteAmount { remaining: 7_000 }
         ));
     }
 
+    /// #246: spending more notional than remains, or a notional product
+    /// that overflows `u128`, is a typed invariant failure; the budget is
+    /// left untouched (it used to saturate at zero).
     #[test]
-    fn test_consume_quote_amount_saturates() {
+    fn test_consume_quote_amount_over_budget_is_an_error() {
         let mut stop = StopCondition::QuoteAmount { remaining: 100 };
-        stop.consume(10, 1_000); // spent = 10_000 > 100, saturates
-        assert!(matches!(stop, StopCondition::QuoteAmount { remaining: 0 }));
+        // spent = 10_000 > 100
+        assert!(matches!(
+            stop.consume(10, 1_000),
+            Err(PriceLevelError::InvalidOperation { .. })
+        ));
+        assert!(matches!(
+            stop,
+            StopCondition::QuoteAmount { remaining: 100 }
+        ));
+
+        let mut stop = StopCondition::QuoteAmount {
+            remaining: u128::MAX,
+        };
+        assert!(stop.consume(u64::MAX, u128::MAX).is_err());
+        assert!(matches!(
+            stop,
+            StopCondition::QuoteAmount {
+                remaining: u128::MAX
+            }
+        ));
     }
 
     #[test]
@@ -2179,5 +2477,364 @@ mod stop_condition_tests {
         let one = StopCondition::QuoteAmount { remaining: 1 };
         assert!(!one.zero_cap_is_terminal(Side::Sell, 1));
         assert!(!one.zero_cap_is_terminal(Side::Sell, 0));
+    }
+}
+
+#[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::arithmetic_side_effects)]
+mod panic_forms_tests {
+    //! #246: the panicking forms removed from matching, STP and the pool.
+    use super::*;
+    use crate::orderbook::stp::STPMode;
+    use crate::orderbook::trade::TradeResult;
+    use pricelevel::{Price, PriceLevel, TimestampMs, UuidGenerator};
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    fn user(byte: u8) -> Hash32 {
+        Hash32::new([byte; 32])
+    }
+
+    fn standard(id: u64, quantity: u64, user_id: Hash32) -> OrderType<()> {
+        OrderType::Standard {
+            id: Id::from_u64(id),
+            price: Price::new(100),
+            quantity: Quantity::new(quantity),
+            side: Side::Sell,
+            user_id,
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
+        }
+    }
+
+    /// Sum of every traded quantity reaching the trade listener, in `u128`
+    /// so the test's own arithmetic cannot overflow.
+    fn install_filled_sum(book: &mut OrderBook<()>) -> Arc<Mutex<u128>> {
+        let sum = Arc::new(Mutex::new(0u128));
+        let sink = Arc::clone(&sum);
+        book.trade_listener = Some(Arc::new(move |result: &TradeResult| {
+            let mut total = sink.lock().expect("sum mutex");
+            for trade in result.match_result.trades().as_vec() {
+                *total += u128::from(trade.quantity().as_u64());
+            }
+        }));
+        sum
+    }
+
+    /// A level whose non-self matchable depth sums past `u64::MAX`: a
+    /// visible tranche of 2^63 plus an iceberg of 2^62 visible / 2^63
+    /// hidden (2^64 + 2^62 in total), behind which rests one unit of the
+    /// taker's own. The `CancelMaker` fill-or-kill walk used to `.sum()`
+    /// that depth: a panic in debug, a wrap to 2^62 (a false kill) in
+    /// release. It now reads as the taker's cap, and the sweep fills it.
+    #[test]
+    fn test_fok_cancel_maker_depth_past_u64_max_is_fillable() {
+        let taker_user = user(1);
+        let other_user = user(2);
+        let mut book: OrderBook<()> = OrderBook::new("FOK-EXTREME");
+        book.set_stp_mode(STPMode::CancelMaker);
+        let filled = install_filled_sum(&mut book);
+
+        let big = 1u64 << 63;
+        let quarter = 1u64 << 62;
+        let limit = Id::from_u64(1);
+        let iceberg = Id::from_u64(2);
+        let own = Id::from_u64(3);
+        let seeded = book.add_limit_order_with_user(
+            limit,
+            100,
+            big,
+            Side::Sell,
+            TimeInForce::Gtc,
+            other_user,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed limit: {seeded:?}");
+        let seeded = book.add_iceberg_order_with_user(
+            iceberg,
+            100,
+            quarter,
+            big,
+            Side::Sell,
+            TimeInForce::Gtc,
+            other_user,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed iceberg: {seeded:?}");
+        let seeded = book.add_limit_order_with_user(
+            own,
+            100,
+            1,
+            Side::Sell,
+            TimeInForce::Gtc,
+            taker_user,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed own maker: {seeded:?}");
+
+        let taker = Id::from_u64(10);
+        let feasibility = book
+            .fok_fillable_quantity(Side::Buy, u64::MAX, Some(100), taker_user, taker)
+            .expect("feasibility walk");
+        assert_eq!(
+            feasibility.fillable,
+            u64::MAX,
+            "depth past u64::MAX reads as the whole cap, not a wrapped remainder"
+        );
+
+        let submitted = book.add_limit_order_with_user(
+            taker,
+            100,
+            u64::MAX,
+            Side::Buy,
+            TimeInForce::Fok,
+            taker_user,
+            None,
+        );
+        assert!(submitted.is_ok(), "the FOK is fillable: {submitted:?}");
+        assert_eq!(
+            *filled.lock().expect("sum mutex"),
+            u128::from(u64::MAX),
+            "the whole FOK quantity traded"
+        );
+        assert!(
+            book.get_order(own).is_none(),
+            "CancelMaker cancelled the taker's own maker"
+        );
+    }
+
+    /// Resting depth whose `visible + hidden` overflows `u64` used to read
+    /// as an empty level in `peek_match` (`total_quantity().unwrap_or(0)`);
+    /// it is now a typed error.
+    #[test]
+    fn test_peek_match_overflowing_level_is_an_error() {
+        let book: OrderBook<()> = OrderBook::new("PEEK-EXTREME");
+        let seeded = book.add_limit_order(
+            Id::from_u64(1),
+            100,
+            u64::MAX - 1,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed limit: {seeded:?}");
+        let seeded = book.add_iceberg_order(
+            Id::from_u64(2),
+            100,
+            1,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed iceberg: {seeded:?}");
+
+        assert!(matches!(
+            book.peek_match(Side::Buy, 10, None),
+            Err(OrderBookError::PriceLevelError(_))
+        ));
+        // The other side is unaffected.
+        assert_eq!(book.peek_match(Side::Sell, 10, None).ok(), Some(0));
+    }
+
+    /// The #225 invariant check that replaced the `debug_assert!`s: a maker
+    /// outside the snapshot is found, a covered level is clean.
+    #[test]
+    fn test_stp_snapshot_breach_finds_a_maker_outside_the_snapshot() {
+        let level = PriceLevel::new(100);
+        let first = level.add_order(standard(1, 5, user(2))).expect("add first");
+        let second = level
+            .add_order(standard(2, 5, user(2)))
+            .expect("add second");
+        let generator = UuidGenerator::new(uuid::Uuid::nil());
+        let level_match = level.match_order(
+            10,
+            Id::from_u64(9),
+            TimeInForce::Gtc,
+            TakerKind::Standard,
+            TimestampMs::new(0),
+            &generator,
+        );
+        assert_eq!(level_match.trades().len(), 2);
+
+        assert_eq!(
+            stp_snapshot_breach(&[Arc::clone(&first), Arc::clone(&second)], &level_match),
+            None
+        );
+        assert_eq!(
+            stp_snapshot_breach(&[first], &level_match),
+            Some(second.id())
+        );
+    }
+
+    /// Drives the breach end to end through the test seam: a maker slipped
+    /// into the level behind the STP scan (bypassing the submit gate, which
+    /// no production path can do) is filled by the `CancelMaker` sweep. The
+    /// debug build used to panic on the `debug_assert!`; it now logs and
+    /// the sweep completes with every committed trade.
+    #[test]
+    fn test_stp_snapshot_breach_is_reported_not_panicked() {
+        let taker_user = user(1);
+        let other_user = user(2);
+        let mut book: OrderBook<()> = OrderBook::new("STP-BREACH");
+        book.set_stp_mode(STPMode::CancelMaker);
+        let filled = install_filled_sum(&mut book);
+        let seeded = book.add_limit_order_with_user(
+            Id::from_u64(1),
+            100,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            other_user,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed foreign: {seeded:?}");
+        let own = Id::from_u64(2);
+        let seeded = book.add_limit_order_with_user(
+            own,
+            100,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            taker_user,
+            None,
+        );
+        assert!(seeded.is_ok(), "seed own: {seeded:?}");
+
+        let level = book
+            .asks
+            .get(&100)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("ask level");
+        let injected = Id::from_u64(3);
+        let armed = std::sync::atomic::AtomicBool::new(true);
+        book.stp_interleave_hook = Some(Arc::new(move |_price: u128| {
+            if armed.swap(false, Ordering::SeqCst) {
+                let added = level.add_order(standard(3, 5, user(3)));
+                assert!(added.is_ok(), "inject maker: {added:?}");
+            }
+        }));
+
+        let result =
+            book.submit_market_order_with_user(Id::from_u64(10), 10, Side::Buy, taker_user);
+        let result = result.expect("the sweep completes");
+        assert!(
+            result
+                .trades()
+                .as_vec()
+                .iter()
+                .any(|trade| trade.maker_order_id() == injected),
+            "the injected maker traded"
+        );
+        assert_eq!(*filled.lock().expect("sum mutex"), 10);
+        assert!(book.get_order(own).is_none(), "own maker cancelled");
+    }
+
+    /// A failed notional normalization hands the source back with a typed
+    /// error instead of silently returning it as if normalized.
+    #[test]
+    fn test_normalize_failure_returns_source_and_error() {
+        let level = PriceLevel::new(100);
+        level.add_order(standard(1, 5, user(2))).expect("add maker");
+        let generator = UuidGenerator::new(uuid::Uuid::nil());
+        let taker = Id::from_u64(9);
+        let level_match = level.match_order(
+            5,
+            taker,
+            TimeInForce::Gtc,
+            TakerKind::Standard,
+            TimestampMs::new(0),
+            &generator,
+        );
+        let mut src = MatchResult::new(taker, Quantity::new(u64::MAX));
+        for trade in level_match.trades().as_vec() {
+            src.add_trade(*trade).expect("fold");
+        }
+
+        let normalized = OrderBook::<()>::normalize_notional_match_result(taker, src.clone())
+            .expect("normalizes");
+        assert_eq!(normalized.remaining_quantity().as_u64(), 0);
+        assert_eq!(normalized.trades().len(), 1);
+
+        // A trade that does not belong to the rebuilt result's taker is
+        // refused by `add_trade`: the source comes back untouched.
+        let Err((returned, err)) =
+            OrderBook::<()>::normalize_notional_match_result(Id::from_u64(77), src)
+        else {
+            panic!("normalizing under a foreign taker id must fail");
+        };
+        assert!(matches!(err, PriceLevelError::InvalidOperation { .. }));
+        assert_eq!(returned.remaining_quantity().as_u64(), u64::MAX - 5);
+        assert_eq!(returned.trades().len(), 1);
+    }
+
+    /// Runs a crossing sweep from a thread-local destructor, after the
+    /// thread's `MATCHING_POOL` was destroyed: `LocalKey::with` panicked
+    /// there, `try_with` falls back to fresh buffers.
+    #[test]
+    fn test_sweep_from_tls_destructor_after_pool_teardown() {
+        /// `(pool destroyed before the sweep, filled quantity)`.
+        type Recorded = Option<(bool, Result<u64, OrderBookError>)>;
+        struct SweepOnDrop {
+            book: Arc<OrderBook<()>>,
+            outcome: Arc<Mutex<Recorded>>,
+        }
+        impl Drop for SweepOnDrop {
+            fn drop(&mut self) {
+                let pool_destroyed = MATCHING_POOL.try_with(|_| ()).is_err();
+                let result = self
+                    .book
+                    .submit_market_order(Id::from_u64(10), 5, Side::Buy)
+                    .map(|result| {
+                        result
+                            .trades()
+                            .as_vec()
+                            .iter()
+                            .map(|trade| trade.quantity().as_u64())
+                            .sum::<u64>()
+                    });
+                *self.outcome.lock().expect("outcome mutex") = Some((pool_destroyed, result));
+            }
+        }
+        thread_local! {
+            static GUARD: RefCell<Option<SweepOnDrop>> = const { RefCell::new(None) };
+        }
+
+        let book: Arc<OrderBook<()>> = Arc::new(OrderBook::new("TLS-TEARDOWN"));
+        let seeded =
+            book.add_limit_order(Id::from_u64(1), 100, 20, Side::Sell, TimeInForce::Gtc, None);
+        assert!(seeded.is_ok(), "seed: {seeded:?}");
+        let outcome = Arc::new(Mutex::new(None));
+
+        let thread_book = Arc::clone(&book);
+        let thread_outcome = Arc::clone(&outcome);
+        std::thread::spawn(move || {
+            // Register the guard first and the pool second: thread-local
+            // destructors run in reverse registration order on the
+            // platforms this crate targets, so the pool is gone by the time
+            // the guard sweeps.
+            GUARD.with(|guard| {
+                *guard.borrow_mut() = Some(SweepOnDrop {
+                    book: thread_book,
+                    outcome: thread_outcome,
+                });
+            });
+            MATCHING_POOL.with(|_| ());
+        })
+        .join()
+        .expect("teardown thread did not panic");
+
+        let recorded = outcome.lock().expect("outcome mutex").take();
+        let Some((pool_destroyed, result)) = recorded else {
+            panic!("the guard's destructor did not run");
+        };
+        assert!(
+            matches!(result, Ok(5)),
+            "the sweep filled from fresh buffers: {result:?}"
+        );
+        // Documents the scenario actually exercised on this platform.
+        assert!(pool_destroyed, "the pool was destroyed before the guard");
     }
 }
