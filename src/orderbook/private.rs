@@ -81,8 +81,9 @@ where
             Side::Sell => &self.asks,
         };
 
-        // Get or create the price level and admit under the price's stripe,
-        // so a concurrent empty-level removal cannot unlink it (#247).
+        // Get or create the price level and admit under the shared side of
+        // the price's stripe, so a concurrent empty-level removal cannot
+        // unlink it (#247).
         let stripe = self.lock_level(price);
         let price_level = book_side
             .get_or_insert(price, Arc::new(PriceLevel::new(price)))

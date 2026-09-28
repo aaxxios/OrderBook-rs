@@ -459,19 +459,29 @@ the remover saw it empty; an unconditional `SkipMap::remove` then unlinked
 the level with that live order inside, indexed in `order_locations` but
 unreachable through `bids` / `asks`.
 
-Design: every admission into a level (`get_or_insert` plus
-`PriceLevel::add_order`) and every removal of an emptied level run under a
-striped per-price `std::sync::Mutex<()>` (`OrderBook::level_locks`, 64
-stripes by `price % 64`), and the removal re-reads the level under the
-stripe (`OrderBook::remove_level_if_empty`): it removes the entry only if it
-is still empty, so a refilled level, or one removed and re-created by
-someone else, is left in place. Matching and in-place updates never add
-orders and take no stripe. A stripe is held for one level operation only,
-never across a sweep, a listener call or another lock, so it cannot
-deadlock; poisoning is recovered like the submit gate's (the data is
-`()`). Mass cancels and eviction run under the exclusive gate and were
-already safe. Cost: one uncontended mutex per rested order and per
-removed level.
+Design: a striped per-price `std::sync::RwLock<()>` (`OrderBook::level_locks`,
+64 stripes by `price % 64`). Every admission into a level (`get_or_insert`
+plus `PriceLevel::add_order`) takes the stripe's **shared** side, so
+admissions at the same price still run in parallel; removing an emptied
+level takes the **exclusive** side and re-reads the level under it
+(`OrderBook::remove_level_if_empty`): the entry is removed only if it is
+still empty, so a refilled level, or one removed and re-created by someone
+else, is left in place. Matching and in-place updates never add orders and
+take no stripe. A guard is held for one level operation only, never across
+a sweep, a listener call or another lock, and never upgraded (a failed
+rest drops its shared guard before its cleanup takes the exclusive one), so
+the stripes cannot deadlock. Poisoning can only follow a panic that
+unwound while a guard was held; the data is `()`, so the guard is
+recovered and the poison logged at `ERROR`, as for the submit gate. Mass
+cancels and eviction run under the exclusive submit gate and were already
+safe.
+
+Cost, measured against main with three interleaved rounds: a first design
+with a `Mutex` per stripe serialised admissions at a hot price
+(`concurrent_add_limit_orders` 1.7x to 4.5x slower at 2 to 16 threads, all
+adding at one price); the shared side keeps concurrent admissions at
+main's speed. Single-threaded adds pay one uncontended shared acquire and
+release per rested order, and a removed level one exclusive acquire.
 
 ## Ratchet
 

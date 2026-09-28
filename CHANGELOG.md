@@ -421,10 +421,12 @@ change.
   removed a level they had seen empty without re-checking, so an order a
   concurrent submit admitted into it in between was left indexed but
   unreachable (pre-existing on main). Admissions into a level and
-  removals of emptied levels now run under a striped per-price lock and
-  the removal re-checks emptiness under it
-  (`OrderBook::remove_level_if_empty`). Cost: one uncontended mutex per
-  rested order and per removed level.
+  removals of emptied levels now run under a striped per-price
+  reader-writer lock (admission shared, removal exclusive) and the removal
+  re-checks emptiness under it (`OrderBook::remove_level_if_empty`).
+  Concurrent admissions at the same price still run in parallel; cost is
+  one uncontended shared acquire per rested order and one exclusive
+  acquire per removed level.
 
 ### Changed
 

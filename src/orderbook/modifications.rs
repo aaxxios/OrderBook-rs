@@ -2970,11 +2970,12 @@ where
             .on_admission(order.id(), order.user_id(), price, quantity)
             .map_err(RestFailure::Risk)?;
 
-        // #247: admission into the level runs under the price's stripe, so
-        // a concurrent removal of the level (it was empty a moment ago)
-        // either happens before `get_or_insert` (a fresh level is created)
-        // or sees this order and leaves the level in place. Released before
-        // the listener runs.
+        // #247: admission into the level runs under the shared side of the
+        // price's stripe, so a concurrent removal of the level (it was
+        // empty a moment ago) either completes before `get_or_insert` (a
+        // fresh level is created) or waits and then sees this order and
+        // leaves the level in place. Concurrent admissions do not exclude
+        // each other. Released before the listener runs.
         let stripe = self.lock_level(price);
         let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
         let level = price_level.value();
@@ -2990,8 +2991,8 @@ where
                 // Keyed by the reservation's generation, so this can never
                 // release a same-id order's entry (#243 review).
                 self.risk_state.release_reservation(risk_reservation);
-                Self::remove_empty_level_locked(price_levels, price);
                 drop(stripe);
+                self.remove_level_if_empty(side, price);
                 self.cache.invalidate();
                 self.record_depth_metric();
                 return Err(RestFailure::Level(err));
