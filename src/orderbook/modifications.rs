@@ -1099,6 +1099,12 @@ where
     /// still resting and tracked, and no event was emitted. Before 0.14.0
     /// this case returned `Ok(None)`, indistinguishable from an absent order
     /// (#248).
+    ///
+    /// [`OrderBookError::OrderRemovedWithLevelFault`] when the level removed
+    /// the order and then reported a failure. The order **is gone**: the
+    /// book completed the removal exactly like a successful cancel (events,
+    /// `Cancelled` state, indices, risk release), and the error reports the
+    /// faulty level (#248).
     pub fn cancel_order(&self, order_id: Id) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         // #209: shared gate — a concurrent FOK's exclusive window must not
         // interleave with this cancel.
@@ -1112,8 +1118,20 @@ where
     /// and mass cancel operations to track the correct
     /// [`CancelReason`] in the order state tracker.
     ///
-    /// Fails with [`OrderBookError::PriceLevelError`] when the level refuses
-    /// the removal, before any book-side mutation or event (#248).
+    /// # Errors
+    ///
+    /// A level that fails the removal is resolved by what the level still
+    /// holds afterwards, so the book's indices never disagree with it
+    /// (#248):
+    ///
+    /// - the order **still rests**: [`OrderBookError::PriceLevelError`],
+    ///   with no book-side mutation and no event;
+    /// - the order is **gone** (pricelevel can commit a removal and then
+    ///   report a broken level invariant, poisoning the level): the removal
+    ///   is completed on the book side exactly like a successful cancel
+    ///   (level event, `Cancelled { reason }`, location, user index, risk,
+    ///   special-order tracking, empty-level removal), logged at `ERROR`,
+    ///   and reported as [`OrderBookError::OrderRemovedWithLevelFault`].
     pub(super) fn cancel_order_with_reason(
         &self,
         order_id: Id,
@@ -1123,116 +1141,186 @@ where
         // First, we find the order's location (price and side) without locking
         let location = self.order_locations.get(&order_id).map(|val| *val);
 
-        if let Some((price, side)) = location {
-            // Obtener el mapa de niveles de precio apropiado
-            let price_levels = match side {
-                Side::Buy => &self.bids,
-                Side::Sell => &self.asks,
-            };
+        let Some((price, side)) = location else {
+            return Ok(None);
+        };
+        let price_levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
 
-            // Create the update to cancel
-            let update = OrderUpdate::Cancel { order_id };
+        // Attempt to cancel the order from the price level
+        let mut removed: Option<RemovedOrder> = None;
+        let mut empty_level = false;
 
-            // Attempt to cancel the order from the price level
-            let mut result = None;
-            let mut empty_level = false;
-
-            if let Some(entry) = price_levels.get(&price) {
-                let price_level = entry.value();
-                // Try to cancel the order. #248: a level that refuses the
-                // removal is an error, not "order absent": returning
-                // `Ok(None)` made every mass cancel under-report silently.
-                // Nothing below has run yet, so the order is still indexed
-                // exactly as before (location, user index, risk, state).
-                #[cfg(test)]
-                let outcome = match self
-                    .cancel_fault_hook
-                    .as_ref()
-                    .and_then(|hook| hook(order_id))
-                {
-                    Some(injected) => Err(injected),
-                    None => price_level.update_order(update),
-                };
-                #[cfg(not(test))]
-                let outcome = price_level.update_order(update);
-                let cancelled = outcome.map_err(OrderBookError::PriceLevelError)?;
-                result = cancelled;
-
-                // notify price level changes
-                if result.is_some()
-                    && let Some(ref listener) = self.price_level_changed_listener
-                {
-                    let engine_seq = self.next_engine_seq();
-                    listener(PriceLevelChangedEvent {
-                        side,
-                        price: price_level.price(),
-                        quantity: price_level.visible_quantity(),
-                        engine_seq,
-                    })
+        if let Some(entry) = price_levels.get(&price) {
+            let price_level = entry.value();
+            match self.remove_from_level(price_level, order_id) {
+                Ok(None) => {}
+                Ok(Some(order)) => removed = Some(RemovedOrder::Clean(order)),
+                Err(error) => {
+                    // #248: a failed removal is resolved by what the level
+                    // still holds. Cold path: one scan of this level.
+                    if price_level
+                        .iter_orders()
+                        .any(|order| order.id() == order_id)
+                    {
+                        // Refused with nothing mutated: the order is still
+                        // indexed exactly as before (location, user index,
+                        // risk, state).
+                        return Err(OrderBookError::PriceLevelError(error));
+                    }
+                    removed = Some(RemovedOrder::Faulted(error));
                 }
-
-                // Check if the level became empty
-                empty_level = price_level.order_count() == 0;
             }
 
-            self.cache.invalidate();
-            // If we got a result and the order was canceled
-            if let Some(ref cancelled_order) = result {
-                // Track the cancellation in the order state tracker
-                let prev_filled = self
-                    .order_state_tracker
-                    .as_ref()
-                    .and_then(|t| t.get(order_id))
-                    .map(|s| s.filled_quantity())
-                    .unwrap_or(0);
-                self.track_state(
-                    order_id,
-                    OrderStatus::Cancelled {
-                        filled_quantity: prev_filled,
-                        reason,
-                    },
-                );
+            // notify price level changes
+            if removed.is_some()
+                && let Some(ref listener) = self.price_level_changed_listener
+            {
+                let engine_seq = self.next_engine_seq();
+                listener(PriceLevelChangedEvent {
+                    side,
+                    price: price_level.price(),
+                    quantity: price_level.visible_quantity(),
+                    engine_seq,
+                })
+            }
 
-                // Remove the order from the locations map
-                self.order_locations.remove(&order_id);
+            // Check if the level became empty
+            empty_level = price_level.order_count() == 0;
+        }
 
-                // Pre-trade risk hook: drop the per-account counter
-                // contribution before the order leaves the index. Does
-                // not depend on `cancelled_order` because the risk
-                // state already stores `account` and `remaining_qty`.
-                // No-op when no `RiskConfig` is installed.
-                self.risk_state.on_cancel(order_id);
+        self.cache.invalidate();
+        let Some(removed) = removed else {
+            return Ok(None);
+        };
 
+        // Track the cancellation in the order state tracker
+        let prev_filled = self
+            .order_state_tracker
+            .as_ref()
+            .and_then(|t| t.get(order_id))
+            .map(|s| s.filled_quantity())
+            .unwrap_or(0);
+        self.track_state(
+            order_id,
+            OrderStatus::Cancelled {
+                filled_quantity: prev_filled,
+                reason,
+            },
+        );
+
+        // Remove the order from the locations map
+        self.order_locations.remove(&order_id);
+
+        // Pre-trade risk hook: drop the per-account counter contribution
+        // before the order leaves the index. The risk state stores
+        // `account` and `remaining_qty` itself, so this needs no order
+        // body. No-op when no `RiskConfig` is installed.
+        self.risk_state.on_cancel(order_id);
+
+        match &removed {
+            RemovedOrder::Clean(order) => {
                 // Remove the order from the user_orders index
-                self.untrack_user_order(cancelled_order.user_id(), &order_id);
-
+                self.untrack_user_order(order.user_id(), &order_id);
                 // #230: this helper is the funnel for user cancels, the
                 // cancel-then-add modifies, mass cancel and expiry eviction,
                 // so one decrement here covers all of them.
-                self.note_removed_order(cancelled_order.as_ref());
+                self.note_removed_order(order.as_ref());
+            }
+            RemovedOrder::Faulted(_) => {
+                // The level kept no body for the order it removed, so the
+                // owner is found by scanning the user index. The
+                // strandable-maker count is deliberately NOT decremented:
+                // without the body it cannot tell whether the order was
+                // one, and an over-count only makes sweeps take the
+                // exclusive gate (safe), where an under-count would not be.
+                self.untrack_order_by_id(&order_id);
+            }
+        }
 
-                // Unregister special orders from re-pricing tracking
-                #[cfg(feature = "special_orders")]
-                {
-                    self.special_order_tracker
-                        .unregister_pegged_order(&order_id);
-                    self.special_order_tracker
-                        .unregister_trailing_stop(&order_id);
-                }
+        // Unregister special orders from re-pricing tracking
+        #[cfg(feature = "special_orders")]
+        {
+            self.special_order_tracker
+                .unregister_pegged_order(&order_id);
+            self.special_order_tracker
+                .unregister_trailing_stop(&order_id);
+        }
 
-                // If the level became empty, remove it
-                if empty_level {
-                    price_levels.remove(&price);
-                    // Refresh the depth gauges now that a level was
-                    // removed. No-op when the `metrics` feature is
-                    // disabled.
-                    self.record_depth_metric();
+        // If the level became empty, remove it
+        if empty_level {
+            price_levels.remove(&price);
+            // Refresh the depth gauges now that a level was removed. No-op
+            // when the `metrics` feature is disabled.
+            self.record_depth_metric();
+        }
+
+        match removed {
+            RemovedOrder::Clean(order) => Ok(Some(Arc::new(self.convert_from_unit_type(&order)))),
+            RemovedOrder::Faulted(error) => {
+                Err(self.order_removed_with_level_fault(order_id, side, price, reason, error))
+            }
+        }
+    }
+
+    /// Asks `price_level` to remove `order_id`. In `cfg(test)` builds the
+    /// `cancel_fault_hook` can make the removal fail, before or after the
+    /// level commits it (#248).
+    #[inline]
+    fn remove_from_level(
+        &self,
+        price_level: &PriceLevel,
+        order_id: Id,
+    ) -> Result<Option<Arc<OrderType<()>>>, PriceLevelError> {
+        let update = OrderUpdate::Cancel { order_id };
+        #[cfg(test)]
+        {
+            use super::book::CancelFault;
+            match self
+                .cancel_fault_hook
+                .as_ref()
+                .and_then(|hook| hook(order_id))
+            {
+                None => price_level.update_order(update),
+                Some(CancelFault::Refuse(error)) => Err(error),
+                Some(CancelFault::RemoveThenFail(error)) => {
+                    price_level.update_order(update)?;
+                    Err(error)
                 }
             }
+        }
+        #[cfg(not(test))]
+        {
+            price_level.update_order(update)
+        }
+    }
 
-            Ok(result.map(|order| Arc::new(self.convert_from_unit_type(&order))))
-        } else {
-            Ok(None)
+    /// Logs a removal the level committed and then failed, and builds its
+    /// error (#248).
+    #[cold]
+    #[inline(never)]
+    fn order_removed_with_level_fault(
+        &self,
+        order_id: Id,
+        side: Side,
+        price: u128,
+        reason: CancelReason,
+        error: PriceLevelError,
+    ) -> OrderBookError {
+        tracing::error!(
+            symbol = %self.symbol,
+            %order_id,
+            %side,
+            price,
+            %reason,
+            %error,
+            "price level failed after removing a cancelled order; the book completed the removal, the level is likely poisoned"
+        );
+        OrderBookError::OrderRemovedWithLevelFault {
+            order_id,
+            source: Box::new(error),
         }
     }
 
@@ -2737,4 +2825,12 @@ where
             Ok((Arc::new(order), trade_result))
         }
     }
+}
+
+/// What a single-order cancel removed from its level (#248).
+enum RemovedOrder {
+    /// The level removed the order and returned its body.
+    Clean(Arc<OrderType<()>>),
+    /// The level removed the order and then reported this failure.
+    Faulted(PriceLevelError),
 }

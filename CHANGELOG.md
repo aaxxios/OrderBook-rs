@@ -175,13 +175,14 @@ change.
     `OrderBook::enriched_snapshot_with_metrics(depth, flags)`:
     `EnrichedSnapshot` → `Result<EnrichedSnapshot, OrderBookError>`.
   - `OrderBook::evict_expired_orders(now_ms)`: `Vec<Arc<OrderType<T>>>` →
-    `Result<Vec<Arc<OrderType<T>>>, OrderBookError>`. The read phase runs
-    before any eviction, so `Err` means nothing was evicted.
+    `Result<EvictionResult<T>, OrderBookError>` (the `EvictionResult` is
+    from #248, see below). The read phase runs before any eviction, so
+    `Err` means nothing was evicted.
   - `BookManagerStd` / `BookManagerTokio`: `evict_expired_orders(symbol,
-    now_ms)` returns `Option<Result<Vec<..>, OrderBookError>>` and
-    `evict_expired_across_books(now_ms)` returns
-    `HashMap<String, Result<Vec<..>, OrderBookError>>` (one failing book does
-    not stop the others). Both managers stay in parity.
+    now_ms)` returns `Option<Result<EvictionResult<T>, OrderBookError>>`
+    and `evict_expired_across_books(now_ms)` returns
+    `HashMap<String, Result<EvictionResult<T>, OrderBookError>>` (one
+    failing book does not stop the others). Both managers stay in parity.
   - `OrderBookError` now derives `Clone` (the hand-written impl is gone,
     since `PriceLevelError` derives `Clone` upstream); behaviour unchanged.
   - Re-exported pricelevel items follow pricelevel 0.10: `PriceLevel::snapshot`
@@ -238,26 +239,48 @@ change.
     `MassCancelResult::is_refused()` / `MassCancelFailure::is_refusal()`
     tell a refused call (`LevelUnreadable`, nothing cancelled) from a
     partial one.
-  - `OrderBook::cancel_order` (and every internal cancel) returns
-    `Err(OrderBookError::PriceLevelError(_))` when the price level refuses
-    the removal; before, that case returned `Ok(None)`, indistinguishable
-    from an absent order. The order is untouched on `Err`.
-  - `evict_expired_orders` carries on past a failed order and returns the
-    new `OrderBookError::EvictionIncomplete { evicted_count, failed_count,
-    order_id, source }` (reject code `Other(0)`), after evicting everything
-    else; a later sweep retries the failed orders. The sequencer classifies
-    it as possibly mutating.
+  - `OrderBook::cancel_order` (and every internal cancel) resolves a failed
+    level removal by what the level still holds. If the order still rests
+    it returns `Err(OrderBookError::PriceLevelError(_))` with nothing
+    mutated; before, that case returned `Ok(None)`, indistinguishable from
+    an absent order. If the level removed the order and then failed
+    (pricelevel can commit a removal and then report a broken invariant),
+    the book completes the removal like a successful cancel (level event,
+    `Cancelled` state, location, user index, risk, special-order tracking,
+    empty level) and returns the new
+    `OrderBookError::OrderRemovedWithLevelFault { order_id, source }`
+    (reject code `Other(0)`; logged at `ERROR`), so no index goes stale.
+    Mass cancels list such an order as cancelled and record
+    `MassCancelFailure::LevelFaultAfterRemoval`. The strandable-maker count
+    is not decremented in that case (no order body), which errs on the
+    safe side.
+  - `evict_expired_orders` returns the new `EvictionResult<T>` (evicted
+    orders, their ids and per-order failures, in sweep order;
+    `mass_cancel_result()` gives the `MassCancelResult` to journal as
+    `SequencerResult::MassCancelled`). It carries on past a failed order,
+    which stays resting; a later sweep retries it. New
+    `MassCancelResult::failed_order_ids()`.
+  - Replay of an `EvictExpiredOrders` event journaled as `MassCancelled`
+    evicts exactly the journaled ids instead of re-running the sweep, so
+    an order the live sweep failed to evict keeps resting; a journaled id
+    the replay book cannot evict is reported as `ReplayError::OrderBookError`.
+    Without a journaled result the sweep is re-run and any failure is
+    reported.
   - Replay skips only a **refused** journaled mass cancel
     (`is_refused()`), not every result with failures; a mass cancel
     journaled with per-order failures is re-executed and reported as
     `ReplayError::OrderBookError` until #252 reconciles mass cancels by
     identity.
-  - Compatibility: no signature changes. `MassCancelFailure` and
+  - Compatibility: `evict_expired_orders` (and the manager pass-throughs)
+    change their success type to `EvictionResult<T>`, a second change in
+    the 0.14 cycle: `len()`, `is_empty()`, `iter()` and `for order in
+    &result` keep working, indexing becomes `evicted_orders()[i]`. No
+    other signature changes. `MassCancelFailure` and
     `OrderBookError` are `#[non_exhaustive]`, so downstream matches already
     carry a wildcard arm. JSON `MassCancelResult`s written by 0.13 (no
     `failures`) and by 0.14 builds before #248 (`level_unreadable` only)
-    decode unchanged; a JSON result carrying `order_cancel_failed` does
-    not decode on those older readers. No snapshot or journal format
+    decode unchanged; a JSON result carrying `order_cancel_failed` or
+    `level_fault_after_removal` does not decode on those older readers. No snapshot or journal format
     change. Callers that treated `cancel_order`'s `Ok(None)` as "gone"
     should also handle `Err`.
 - **Snapshot package format v4.** `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` goes

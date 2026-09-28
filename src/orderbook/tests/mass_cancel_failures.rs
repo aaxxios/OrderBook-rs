@@ -15,7 +15,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::orderbook::book::OrderBook;
+    use crate::orderbook::book::{CancelFault, OrderBook};
     use crate::orderbook::book_change_event::PriceLevelChangedEvent;
     use crate::orderbook::clock::{Clock, StubClock};
     use crate::orderbook::mass_cancel::{MassCancelFailure, MassCancelResult};
@@ -47,11 +47,30 @@ mod tests {
         book
     }
 
-    /// Makes every cancel of an id in `failing` fail while `armed` is set.
+    /// Makes every cancel of an id in `failing` be refused by its level,
+    /// with nothing mutated, while `armed` is set.
     fn inject_failures(book: &mut OrderBook<()>, failing: &[u64], armed: Arc<AtomicBool>) {
+        inject(book, failing, armed, || CancelFault::Refuse(refused()));
+    }
+
+    /// Makes every cancel of an id in `failing` succeed on the level and
+    /// then report a failure (the level removed the order), while `armed`
+    /// is set.
+    fn inject_remove_then_fail(book: &mut OrderBook<()>, failing: &[u64], armed: Arc<AtomicBool>) {
+        inject(book, failing, armed, || {
+            CancelFault::RemoveThenFail(refused())
+        });
+    }
+
+    fn inject(
+        book: &mut OrderBook<()>,
+        failing: &[u64],
+        armed: Arc<AtomicBool>,
+        fault: fn() -> CancelFault,
+    ) {
         let failing: HashSet<Id> = failing.iter().copied().map(Id::from_u64).collect();
         book.cancel_fault_hook = Some(Arc::new(move |id| {
-            (armed.load(Ordering::SeqCst) && failing.contains(&id)).then(refused)
+            (armed.load(Ordering::SeqCst) && failing.contains(&id)).then(fault)
         }));
     }
 
@@ -418,52 +437,65 @@ mod tests {
         assert_eq!(book.cancel_order(Id::from_u64(9)).ok(), Some(None));
     }
 
-    /// Eviction carries on past a failed order, evicts the rest, and ends
-    /// in `EvictionIncomplete` naming the first failure; the failed order
-    /// stays resting and a later sweep evicts it.
-    #[test]
-    fn evict_expired_reports_an_incomplete_sweep() {
-        let owner = user(1);
-        let armed = Arc::new(AtomicBool::new(true));
+    fn gtd_book(symbol: &str) -> OrderBook<()> {
         let mut book = OrderBook::<()>::with_clock(
-            "EVICT",
+            symbol,
             Arc::new(StubClock::starting_at(0)) as Arc<dyn Clock>,
         );
         book.set_order_state_tracker(OrderStateTracker::new());
         book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(100));
+        book
+    }
+
+    fn rest_gtd(book: &OrderBook<()>, id: u64, price: u128, owner: Hash32) {
+        book.add_limit_order_with_user(
+            Id::from_u64(id),
+            price,
+            5,
+            Side::Buy,
+            TimeInForce::Gtd(1_000),
+            owner,
+            None,
+        )
+        .expect("gtd");
+    }
+
+    /// Eviction carries on past a failed order and evicts the rest; the
+    /// result names the evicted orders and the failure, the failed order
+    /// stays resting, and a later sweep evicts it.
+    #[test]
+    fn evict_expired_reports_a_partial_sweep() {
+        let owner = user(1);
+        let armed = Arc::new(AtomicBool::new(true));
+        let mut book = gtd_book("EVICT");
         inject_failures(&mut book, &[2, 3], Arc::clone(&armed));
         for (id, price) in [(1, 100), (2, 101), (3, 102), (4, 103)] {
-            book.add_limit_order_with_user(
-                Id::from_u64(id),
-                price,
-                5,
-                Side::Buy,
-                TimeInForce::Gtd(1_000),
-                owner,
-                None,
-            )
-            .expect("gtd");
+            rest_gtd(&book, id, price, owner);
         }
 
-        let err = book
+        let swept = book
             .evict_expired_orders(TimestampMs::new(1_000))
-            .expect_err("incomplete");
-        match &err {
-            OrderBookError::EvictionIncomplete {
-                evicted_count,
-                failed_count,
-                order_id,
-                source,
-            } => {
-                assert_eq!(*evicted_count, 2);
-                assert_eq!(*failed_count, 2);
-                assert_eq!(*order_id, Id::from_u64(2));
-                assert_eq!(source.as_ref(), &refused());
-            }
-            other => panic!("expected EvictionIncomplete, got {other:?}"),
-        }
-        assert_eq!(RejectReason::from(&err), RejectReason::Other(0));
-        assert!(std::error::Error::source(&err).is_some());
+            .expect("sweep ran");
+        assert_eq!(swept.evicted_order_ids(), ids(&[1, 4]).as_slice());
+        let bodies: Vec<Id> = swept.iter().map(|o| o.id()).collect();
+        assert_eq!(bodies, ids(&[1, 4]));
+        assert_eq!(swept.len(), 2);
+        assert!(swept.has_failures());
+        assert_eq!(
+            swept.failures(),
+            &[
+                MassCancelFailure::OrderCancelFailed {
+                    order_id: Id::from_u64(2),
+                    error: refused(),
+                },
+                MassCancelFailure::OrderCancelFailed {
+                    order_id: Id::from_u64(3),
+                    error: refused(),
+                },
+            ]
+        );
+        let failed: Vec<Id> = swept.mass_cancel_result().failed_order_ids().collect();
+        assert_eq!(failed, ids(&[2, 3]));
         assert_cancelled(&book, Id::from_u64(1), CancelReason::TimeInForceExpired);
         assert_cancelled(&book, Id::from_u64(4), CancelReason::TimeInForceExpired);
         assert_resting_and_tracked(&book, Id::from_u64(2), owner);
@@ -471,12 +503,92 @@ mod tests {
         assert_eq!(open_count(&book, owner), 2);
 
         armed.store(false, Ordering::SeqCst);
-        let evicted = book
+        let retry = book
             .evict_expired_orders(TimestampMs::new(1_000))
             .expect("retry");
-        let evicted: Vec<Id> = evicted.iter().map(|o| o.id()).collect();
-        assert_eq!(evicted, ids(&[2, 3]));
+        assert_eq!(retry.evicted_order_ids(), ids(&[2, 3]).as_slice());
+        assert!(!retry.has_failures());
         assert_eq!(open_count(&book, owner), 0);
+    }
+
+    // --- level removes the order, then fails ---------------------------------
+
+    /// A level that removes the order and then reports a failure: the book
+    /// completes the removal (no stale location, user index, risk or state
+    /// entry, empty level dropped) and `cancel_order` reports the fault.
+    #[test]
+    fn cancel_order_completes_a_removal_the_level_committed() {
+        let owner = user(1);
+        let events: Arc<Mutex<Vec<PriceLevelChangedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let armed = Arc::new(AtomicBool::new(true));
+        let mut book = tracked_book("FAULT");
+        book.set_price_level_listener(Arc::new(move |ev: PriceLevelChangedEvent| {
+            sink.lock().expect("events").push(ev);
+        }));
+        inject_remove_then_fail(&mut book, &[1], Arc::clone(&armed));
+        rest(&book, 1, 100, Side::Buy, owner);
+        rest(&book, 2, 99, Side::Buy, owner);
+        events.lock().expect("events").clear();
+
+        let err = book.cancel_order(Id::from_u64(1)).expect_err("fault");
+        match &err {
+            OrderBookError::OrderRemovedWithLevelFault { order_id, source } => {
+                assert_eq!(*order_id, Id::from_u64(1));
+                assert_eq!(source.as_ref(), &refused());
+            }
+            other => panic!("expected OrderRemovedWithLevelFault, got {other:?}"),
+        }
+        assert_eq!(RejectReason::from(&err), RejectReason::Other(0));
+        assert!(std::error::Error::source(&err).is_some());
+        assert_cancelled(&book, Id::from_u64(1), CancelReason::UserRequested);
+        assert_eq!(book.best_bid(), Some(99), "the emptied level is gone");
+        assert_eq!(open_count(&book, owner), 1);
+        let events = events.lock().expect("events");
+        assert_eq!(events.len(), 1, "one level event for the removal");
+        assert_eq!(events[0].price, 100);
+        assert_eq!(events[0].quantity, 0);
+        drop(events);
+
+        // A later mass cancel does not trip over a stale entry.
+        let all = book.cancel_orders_by_user(owner);
+        assert_eq!(all.cancelled_order_ids(), ids(&[2]).as_slice());
+        assert!(!all.has_failures());
+    }
+
+    /// A mass cancel lists an order whose level removed it and then failed
+    /// as cancelled, and also records the fault.
+    #[test]
+    fn mass_cancel_reports_a_removal_the_level_committed() {
+        let owner = user(1);
+        let armed = Arc::new(AtomicBool::new(true));
+        let mut book = tracked_book("FAULTS");
+        inject_remove_then_fail(&mut book, &[2], Arc::clone(&armed));
+        rest(&book, 1, 100, Side::Buy, owner);
+        rest(&book, 2, 100, Side::Buy, owner);
+        rest(&book, 3, 101, Side::Buy, owner);
+
+        let result = book.cancel_orders_by_side(Side::Buy);
+        assert_eq!(result.cancelled_order_ids(), ids(&[1, 2, 3]).as_slice());
+        assert_eq!(
+            result.failures(),
+            &[MassCancelFailure::LevelFaultAfterRemoval {
+                order_id: Id::from_u64(2),
+                error: refused(),
+            }]
+        );
+        assert!(!result.is_refused());
+        assert_eq!(result.failed_order_ids().count(), 0);
+        assert!(matches!(
+            result.failures()[0].to_order_book_error(),
+            OrderBookError::OrderRemovedWithLevelFault { .. }
+        ));
+        for id in [1, 2, 3] {
+            assert_cancelled(&book, Id::from_u64(id), CancelReason::MassCancelBySide);
+        }
+        assert_eq!(open_count(&book, owner), 0);
+        assert!(book.user_orders.is_empty());
+        assert_eq!(book.best_bid(), None);
     }
 
     // --- risk release -------------------------------------------------------

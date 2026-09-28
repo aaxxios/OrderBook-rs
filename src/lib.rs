@@ -153,9 +153,11 @@
 //!   `cancel_all_orders` emits its events after the book is cleared.
 //!   Per-order failures are recorded as `MassCancelFailure::OrderCancelFailed`
 //!   (the order stays resting and tracked; see `MassCancelResult::is_refused`),
-//!   `cancel_order` returns `Err` when a level refuses the removal, and an
-//!   eviction that could not remove every expired order ends in
-//!   `OrderBookError::EvictionIncomplete`.
+//!   `cancel_order` returns `Err` when a level refuses the removal (and
+//!   completes, then reports as `OrderBookError::OrderRemovedWithLevelFault`,
+//!   a removal the level committed before failing), and
+//!   `evict_expired_orders` returns an `EvictionResult` with the evicted
+//!   orders and per-order failures, which replay reproduces by identity.
 //!
 //! ### Migration from 0.13
 //!
@@ -164,12 +166,14 @@
 //! | `OrderBook::create_snapshot(depth) -> OrderBookSnapshot` | `-> Result<OrderBookSnapshot, OrderBookError>` |
 //! | `OrderBook::enriched_snapshot(depth) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
 //! | `OrderBook::enriched_snapshot_with_metrics(depth, flags) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
-//! | `OrderBook::evict_expired_orders(now_ms) -> Vec<Arc<OrderType<T>>>` | `-> Result<Vec<Arc<OrderType<T>>>, OrderBookError>` |
-//! | `BookManager{Std,Tokio}::evict_expired_orders(symbol, now_ms) -> Option<Vec<..>>` | `-> Option<Result<Vec<..>, OrderBookError>>` |
-//! | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<Vec<..>, OrderBookError>>` |
+//! | `OrderBook::evict_expired_orders(now_ms) -> Vec<Arc<OrderType<T>>>` | `-> Result<EvictionResult<T>, OrderBookError>` (`iter()`, `len()`, `evicted_orders()`, `failures()`, `mass_cancel_result()`) |
+//! | `BookManager{Std,Tokio}::evict_expired_orders(symbol, now_ms) -> Option<Vec<..>>` | `-> Option<Result<EvictionResult<T>, OrderBookError>>` |
+//! | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<EvictionResult<T>, OrderBookError>>` |
 //! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
 //! | `OrderBook::cancel_order`: level refusal → `Ok(None)` | `Err(OrderBookError::PriceLevelError(_))`, order untouched |
-//! | `evict_expired_orders`: per-order failure silently skipped | `Err(OrderBookError::EvictionIncomplete { .. })` after evicting the rest |
+//! | cancel whose level removed the order, then failed: `Ok(None)`, indices stale | removal completed, `Err(OrderBookError::OrderRemovedWithLevelFault { .. })` |
+//! | `evict_expired_orders`: per-order failure silently skipped | recorded in `EvictionResult::failures()`; the rest is still evicted |
+//! | journaled eviction replayed by re-running the sweep | replay evicts exactly the journaled ids (`MassCancelled` result) |
 //! | mass cancels on the shared submit gate | exclusive gate; `cancel_all_orders` emits after clearing |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
@@ -1354,8 +1358,8 @@ pub use orderbook::{
 #[cfg(feature = "nats")]
 pub use orderbook::{BookChangeBatch, BookChangeEntry, NatsBookChangePublisher};
 pub use orderbook::{
-    FeeOverflow, FeeSchedule, ManagerError, MassCancelFailure, MassCancelResult, OrderBook,
-    OrderBookError, OrderBookSnapshot,
+    EvictionResult, FeeOverflow, FeeSchedule, ManagerError, MassCancelFailure, MassCancelResult,
+    OrderBook, OrderBookError, OrderBookSnapshot,
 };
 #[cfg(feature = "nats")]
 pub use orderbook::{NatsPublisherError, NatsTradePublisher};

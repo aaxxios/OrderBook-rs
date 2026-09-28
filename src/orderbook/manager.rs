@@ -34,10 +34,11 @@
 
 use crate::orderbook::OrderBook;
 use crate::orderbook::error::{ManagerError, OrderBookError};
-use crate::orderbook::mass_cancel::MassCancelResult;
+use crate::orderbook::mass_cancel::{EvictionResult, MassCancelResult};
 use crate::orderbook::trade::{TradeEvent, TradeListener, TradeResult};
 use pricelevel::{Hash32, OrderType, Side, TimestampMs};
 use std::any::Any;
+use pricelevel::{Hash32, Side, TimestampMs};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -46,9 +47,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use tracing::{debug, error, info};
 
-/// Per-book outcome of [`OrderBook::evict_expired_orders`]: the evicted
-/// orders, or the error that refused the sweep before anything was evicted.
-type EvictResult<T> = Result<Vec<Arc<OrderType<T>>>, OrderBookError>;
+/// Per-book outcome of [`OrderBook::evict_expired_orders`]: the
+/// [`EvictionResult`] (evicted orders plus per-order failures), or the error
+/// that refused the sweep before anything was evicted.
+type EvictResult<T> = Result<EvictionResult<T>, OrderBookError>;
 
 /// Name given to the `BookManagerStd` trade processor thread.
 const STD_PROCESSOR_THREAD_NAME: &str = "orderbook-trade-processor";

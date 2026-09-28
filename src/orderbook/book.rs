@@ -407,15 +407,16 @@ pub struct OrderBook<T = ()> {
     /// Test-only fault injection for the single-order cancel path (#248).
     ///
     /// Consulted by `cancel_order_with_reason` right before it asks the
-    /// order's price level to remove the order; returning `Some(err)` makes
-    /// that removal fail with `err` exactly as a refusing level would, with
-    /// nothing mutated. pricelevel 0.10 has no public way to make a level
-    /// refuse a cancel on demand, so this is what lets the mass-cancel
-    /// failure paths be tested. Like its siblings it exists only in
-    /// `cfg(test)` builds.
+    /// order's price level to remove the order; returning a [`CancelFault`]
+    /// makes that removal fail either with nothing mutated (a refusing
+    /// level) or after the level committed it (a level that removes the
+    /// order and then reports a broken invariant). pricelevel 0.10 has no
+    /// public way to trigger either on demand, so this is what lets the
+    /// mass-cancel failure paths be tested. Like its siblings it exists only
+    /// in `cfg(test)` builds.
     #[cfg(test)]
     pub(super) cancel_fault_hook:
-        Option<std::sync::Arc<dyn Fn(Id) -> Option<pricelevel::PriceLevelError> + Send + Sync>>,
+        Option<std::sync::Arc<dyn Fn(Id) -> Option<CancelFault> + Send + Sync>>,
 
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
@@ -5272,6 +5273,17 @@ struct PreparedSnapshotLevels {
     /// orders (#243); `Some` only on the package-restore path with a risk
     /// config.
     risk: Option<RiskRebuild>,
+}
+
+/// Test-only failure injected into a single-order cancel (#248); see
+/// `OrderBook::cancel_fault_hook`.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(super) enum CancelFault {
+    /// The level refuses the removal; nothing is mutated.
+    Refuse(pricelevel::PriceLevelError),
+    /// The level removes the order, then reports this failure.
+    RemoveThenFail(pricelevel::PriceLevelError),
 }
 
 /// Guard over the submit gate (#209 / #225) in either mode — held for the

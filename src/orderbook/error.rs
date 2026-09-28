@@ -315,28 +315,25 @@ pub enum OrderBookError {
         source: Box<PriceLevelError>,
     },
 
-    /// An expired-order sweep (`OrderBook::evict_expired_orders`) could not
-    /// remove every expired order (#248).
+    /// A cancel whose price level removed the order and then reported a
+    /// failure (#248): pricelevel can commit a removal and then find a
+    /// broken level invariant, poisoning the level.
     ///
-    /// Returned **after** the sweep ran to completion: every other expired
-    /// order was evicted, with its usual price-level event and
-    /// `Cancelled { TimeInForceExpired }` transition, and every order whose
-    /// price level refused the removal is still resting and fully tracked
-    /// (location, user index, risk, order state). A later sweep retries it.
+    /// The order **is gone**. The book completed the removal exactly like a
+    /// successful cancel (price-level event, `Cancelled` order state,
+    /// location, user index, risk release, special-order tracking), so its
+    /// indices agree with the level; the error only reports that the level
+    /// is now faulty (later mutations on it will likely be refused;
+    /// reconstruct it from a snapshot). Mass cancels list such an order as
+    /// cancelled and also record the fault.
     ///
     /// Carries primitive and upstream types only, so this module stays a
-    /// leaf. Like [`Self::MatchAborted`] it reports a committed prefix, so a
-    /// journal must treat it as a command that may have mutated the book.
-    EvictionIncomplete {
-        /// Number of expired orders the sweep did evict.
-        evicted_count: usize,
-        /// Number of expired orders whose removal failed.
-        failed_count: usize,
-        /// The first failed order, in sweep order.
+    /// leaf.
+    OrderRemovedWithLevelFault {
+        /// The order that was removed.
         order_id: pricelevel::Id,
-        /// The failure the first failed order's price level reported.
-        /// Boxed so the variant does not widen every
-        /// `Result<_, OrderBookError>`.
+        /// The failure the level reported after the removal. Boxed so the
+        /// variant does not widen every `Result<_, OrderBookError>`.
         source: Box<PriceLevelError>,
     },
 
@@ -522,15 +519,10 @@ impl fmt::Display for OrderBookError {
                     "match aborted: taker {order_id} stopped by a price level failure after executing {executed_quantity} in {trade_count} trades; remainder cancelled: {source}"
                 )
             }
-            OrderBookError::EvictionIncomplete {
-                evicted_count,
-                failed_count,
-                order_id,
-                source,
-            } => {
+            OrderBookError::OrderRemovedWithLevelFault { order_id, source } => {
                 write!(
                     f,
-                    "eviction incomplete: {evicted_count} expired orders evicted, {failed_count} still resting; first failure on order {order_id}: {source}"
+                    "order {order_id} was removed but its price level then failed: {source}"
                 )
             }
             #[cfg(feature = "nats")]
@@ -549,7 +541,7 @@ impl std::error::Error for OrderBookError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             OrderBookError::MatchAborted { source, .. }
-            | OrderBookError::EvictionIncomplete { source, .. } => Some(source.as_ref()),
+            | OrderBookError::OrderRemovedWithLevelFault { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

@@ -38,7 +38,7 @@ fn expired_gtd_is_evicted_and_no_longer_matchable() {
         .evict_expired_orders(TimestampMs::new(1_000))
         .expect("evict");
     assert_eq!(evicted.len(), 1);
-    assert_eq!(evicted[0].id(), gtd);
+    assert_eq!(evicted.evicted_orders()[0].id(), gtd);
     assert_eq!(book.best_ask(), None);
 
     // A crossing buy now finds no liquidity.
@@ -234,7 +234,7 @@ fn manager_std_per_symbol_and_all_books_parity() {
         .expect("BTC managed")
         .expect("BTC evict");
     assert_eq!(btc_evicted.len(), 1);
-    assert_eq!(btc_evicted[0].id(), btc_id);
+    assert_eq!(btc_evicted.evicted_orders()[0].id(), btc_id);
     // Unknown symbol -> None.
     assert!(
         mgr.evict_expired_orders("NOPE", TimestampMs::new(1_000))

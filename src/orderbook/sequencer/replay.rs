@@ -10,7 +10,7 @@ use super::journal::Journal;
 use super::types::{CommittedPrefix, SequencerCommand, SequencerEvent, SequencerResult};
 use crate::orderbook::clock::Clock;
 use crate::orderbook::fees::FeeSchedule;
-use crate::orderbook::mass_cancel::MassCancelResult;
+use crate::orderbook::mass_cancel::{MassCancelFailure, MassCancelResult};
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::stp::STPMode;
 use crate::orderbook::trade::SubmitFailure;
@@ -1019,19 +1019,29 @@ where
                     &book.cancel_orders_by_price_range(*side, *min_price, *max_price),
                 )?;
             }
-            SequencerCommand::EvictExpiredOrders { now_ms } => {
-                // Apply the journaled cutoff, never the replay clock, so the
-                // sweep evicts exactly the orders it evicted live. The sweep
-                // is idempotent, so a duplicate replay is a no-op. A refused
-                // sweep (unreadable price level) evicted nothing, so replay
-                // would silently diverge from the live book: surface it.
-                book.evict_expired_orders(*now_ms).map_err(|source| {
-                    ReplayError::OrderBookError {
-                        sequence_num: event.sequence_num,
-                        source,
-                    }
-                })?;
-            }
+            SequencerCommand::EvictExpiredOrders { now_ms } => match &event.result {
+                // A sweep journaled as refused evicted nothing.
+                SequencerResult::MassCancelled { result } if result.is_refused() => {}
+                // #248: the journal names the evicted orders. Evict exactly
+                // those, never re-run the sweep: an order the live sweep
+                // failed to evict must keep resting on replay too.
+                SequencerResult::MassCancelled { result } => {
+                    let replayed = book.evict_orders_by_id(result.cancelled_order_ids());
+                    Self::ensure_same_evictions(event, result, &replayed)?;
+                }
+                // No journaled outcome to follow: apply the journaled cutoff,
+                // never the replay clock. A refused or partial sweep diverges
+                // from a live one that completed, so surface it.
+                _ => {
+                    let replayed = book.evict_expired_orders(*now_ms).map_err(|source| {
+                        ReplayError::OrderBookError {
+                            sequence_num: event.sequence_num,
+                            source,
+                        }
+                    })?;
+                    Self::ensure_mass_cancel_complete(event, replayed.mass_cancel_result())?;
+                }
+            },
         }
 
         Ok(true)
@@ -1056,7 +1066,7 @@ where
     ///
     /// A refused mass cancel cancels nothing and a partial one leaves orders
     /// resting (see
-    /// [`MassCancelFailure`](crate::orderbook::mass_cancel::MassCancelFailure)),
+    /// [`MassCancelFailure`]),
     /// so continuing would leave the replayed book diverged from the live one
     /// without any signal. Likewise, a live mass cancel journaled with
     /// per-order failures left those orders resting, and a replay that
@@ -1079,6 +1089,43 @@ where
                 source: failure.to_order_book_error(),
             }),
         }
+    }
+
+    /// Fails replay unless a journaled eviction removed exactly the
+    /// journaled ids on the replay book (#248).
+    ///
+    /// `replayed` comes from evicting the recorded ids by identity, so any
+    /// disagreement means the replay book no longer holds an order the live
+    /// sweep evicted (or its level refused it). Reported as
+    /// [`ReplayError::OrderBookError`] carrying the replay's own failure, or
+    /// [`OrderBookError::OrderNotFound`] for the first journaled id that was
+    /// not evicted.
+    fn ensure_same_evictions(
+        event: &SequencerEvent<T>,
+        recorded: &MassCancelResult,
+        replayed: &MassCancelResult,
+    ) -> Result<(), ReplayError> {
+        if replayed.cancelled_order_ids() == recorded.cancelled_order_ids() {
+            return Ok(());
+        }
+        let source = match replayed
+            .failures()
+            .iter()
+            .find(|failure| !matches!(failure, MassCancelFailure::LevelFaultAfterRemoval { .. }))
+        {
+            Some(failure) => failure.to_order_book_error(),
+            None => {
+                let missing = recorded
+                    .cancelled_order_ids()
+                    .iter()
+                    .find(|id| !replayed.cancelled_order_ids().contains(id));
+                OrderBookError::OrderNotFound(missing.map(ToString::to_string).unwrap_or_default())
+            }
+        };
+        Err(ReplayError::OrderBookError {
+            sequence_num: event.sequence_num,
+            source,
+        })
     }
 
     /// Whether a submit journaled as rejected under `code` is re-executed
@@ -2084,8 +2131,6 @@ mod tests {
     /// determinism contract for the variant.
     #[test]
     fn test_replay_evict_expired_orders_matches_live_book() {
-        use crate::orderbook::mass_cancel::MassCancelResult;
-
         fn order(id: Id, price: u128, qty: u64, side: Side, tif: TimeInForce) -> OrderType<()> {
             OrderType::Standard {
                 id,
@@ -2138,10 +2183,7 @@ mod tests {
             timestamp_ns: 0,
             command: SequencerCommand::EvictExpiredOrders { now_ms: now },
             result: SequencerResult::MassCancelled {
-                result: MassCancelResult::new(
-                    evicted.len(),
-                    evicted.iter().map(|o| o.id()).collect(),
-                ),
+                result: evicted.mass_cancel_result().clone(),
             },
         };
         assert!(journal.append(&sweep).is_ok());
@@ -2164,6 +2206,126 @@ mod tests {
         // Sanity: the expired levels are gone, the survivors remain.
         assert_eq!(replayed_snap.bids.len(), 2, "99 and 98 bids survive");
         assert!(replayed_snap.asks.is_empty(), "the only ask expired");
+    }
+
+    fn gtd_order(id: u64, price: u128, side: Side) -> OrderType<()> {
+        OrderType::Standard {
+            id: Id::from_u64(id),
+            price: Price::new(price),
+            quantity: Quantity::new(5),
+            side,
+            time_in_force: TimeInForce::Gtd(1_000),
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(0),
+            extra_fields: (),
+        }
+    }
+
+    /// Journal of three GTD admissions on a logical-clock live book whose
+    /// cancel of id 2 is refused by its level (#248).
+    fn partial_eviction_fixture() -> (OrderBook<()>, InMemoryJournal<()>) {
+        use crate::orderbook::book::CancelFault;
+
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let clock: Arc<dyn Clock> = Arc::new(StubClock::starting_at(0));
+        let mut live = OrderBook::<()>::with_clock("PEVICT", clock);
+        live.cancel_fault_hook = Some(Arc::new(|id| {
+            (id == Id::from_u64(2)).then(|| {
+                CancelFault::Refuse(pricelevel::PriceLevelError::InvalidOperation {
+                    message: "refused".to_string(),
+                })
+            })
+        }));
+        for (seq, ord) in [
+            gtd_order(1, 100, Side::Buy),
+            gtd_order(2, 101, Side::Buy),
+            gtd_order(3, 110, Side::Sell),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            live.add_order(ord).expect("live add");
+            assert!(
+                journal
+                    .append(&SequencerEvent::<()> {
+                        sequence_num: u64::try_from(seq).expect("seq"),
+                        timestamp_ns: 0,
+                        command: SequencerCommand::AddOrder(ord),
+                        result: SequencerResult::OrderAdded { order_id: ord.id() },
+                    })
+                    .is_ok()
+            );
+        }
+        (live, journal)
+    }
+
+    /// #248: a partial live eviction (one expired order refused by its
+    /// level) replays faithfully: replay evicts exactly the journaled ids,
+    /// so the order the live sweep failed to evict keeps resting.
+    #[test]
+    fn test_replay_partial_eviction_matches_live_book() {
+        let (live, journal) = partial_eviction_fixture();
+        let now = TimestampMs::new(5_000);
+        let swept = live.evict_expired_orders(now).expect("sweep ran");
+        assert_eq!(
+            swept.evicted_order_ids(),
+            &[Id::from_u64(1), Id::from_u64(3)]
+        );
+        assert!(swept.has_failures());
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 3,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::EvictExpiredOrders { now_ms: now },
+                    result: SequencerResult::MassCancelled {
+                        result: swept.into_mass_cancel_result(),
+                    },
+                })
+                .is_ok()
+        );
+
+        // The replay book has no fault hook: re-running the sweep would
+        // evict id 2 as well.
+        let clock: Arc<dyn Clock> = Arc::new(StubClock::starting_at(0));
+        let (replayed, last_seq) =
+            ReplayEngine::<()>::replay_from_with_clock(&journal, 0, "PEVICT", clock)
+                .expect("replay must succeed");
+        assert_eq!(last_seq, 3);
+        let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+        let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
+        assert!(snapshots_match(&live_snap, &replayed_snap));
+        assert!(replayed.get_order(Id::from_u64(2)).is_some());
+        assert!(replayed.get_order(Id::from_u64(1)).is_none());
+    }
+
+    /// #248: a journaled eviction naming an order the replay book does not
+    /// hold is a divergence, reported instead of skipped.
+    #[test]
+    fn test_replay_eviction_of_missing_order_is_reported() {
+        let (_live, journal) = partial_eviction_fixture();
+        let claimed = MassCancelResult::new(2, vec![Id::from_u64(1), Id::from_u64(77)]);
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 3,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::EvictExpiredOrders {
+                        now_ms: TimestampMs::new(5_000),
+                    },
+                    result: SequencerResult::MassCancelled { result: claimed },
+                })
+                .is_ok()
+        );
+        let clock: Arc<dyn Clock> = Arc::new(StubClock::starting_at(0));
+        match ReplayEngine::<()>::replay_from_with_clock(&journal, 0, "PEVICT", clock) {
+            Err(ReplayError::OrderBookError {
+                sequence_num: 3,
+                source: OrderBookError::OrderNotFound(id),
+            }) => assert_eq!(id, Id::from_u64(77).to_string()),
+            Err(other) => panic!("expected OrderNotFound, got {other:?}"),
+            Ok(_) => panic!("a diverged eviction must not replay silently"),
+        }
     }
 
     /// A mass cancel journaled as refused cancelled nothing live, so replay

@@ -23,7 +23,7 @@ use tracing::trace;
 
 /// A failure recorded by a mass cancel operation instead of being swallowed.
 ///
-/// Two kinds of failure exist, and they mean different things for the book:
+/// Three kinds of failure exist, and they mean different things for the book:
 ///
 /// - [`Self::LevelUnreadable`] is a **refusal**. Every mass cancel that
 ///   walks price levels (`cancel_all_orders`, `cancel_orders_by_side`,
@@ -40,6 +40,9 @@ use tracing::trace;
 ///   order state), the failure is recorded here, and the call carries on
 ///   with the next order. Such a result can therefore carry cancelled ids
 ///   **and** failures.
+/// - [`Self::LevelFaultAfterRemoval`] is a per-order **fault report**: the
+///   level removed the order and then failed. The order was cancelled, is
+///   listed in the cancelled ids, and the book completed its removal.
 ///
 /// Failures are recorded in the call's deterministic traversal order, the
 /// same order as [`MassCancelResult::cancelled_order_ids`].
@@ -70,6 +73,17 @@ pub enum MassCancelFailure {
         /// The error the single-order cancel path returned.
         error: PriceLevelError,
     },
+    /// The level removed `order_id` and then reported `error` (#248; see
+    /// [`OrderBookError::OrderRemovedWithLevelFault`]). The order **was**
+    /// cancelled: it is listed in
+    /// [`MassCancelResult::cancelled_order_ids`] and the book completed the
+    /// removal. This entry reports that the level is now faulty.
+    LevelFaultAfterRemoval {
+        /// The order that was removed.
+        order_id: Id,
+        /// The failure the level reported after the removal.
+        error: PriceLevelError,
+    },
 }
 
 impl MassCancelFailure {
@@ -80,6 +94,12 @@ impl MassCancelFailure {
             MassCancelFailure::LevelUnreadable { error, .. }
             | MassCancelFailure::OrderCancelFailed { error, .. } => {
                 OrderBookError::PriceLevelError(error.clone())
+            }
+            MassCancelFailure::LevelFaultAfterRemoval { order_id, error } => {
+                OrderBookError::OrderRemovedWithLevelFault {
+                    order_id: *order_id,
+                    source: Box::new(error.clone()),
+                }
             }
         }
     }
@@ -116,6 +136,12 @@ impl std::fmt::Display for MassCancelFailure {
             MassCancelFailure::OrderCancelFailed { order_id, error } => {
                 write!(f, "order {order_id} not cancelled: {error}")
             }
+            MassCancelFailure::LevelFaultAfterRemoval { order_id, error } => {
+                write!(
+                    f,
+                    "order {order_id} cancelled but its price level then failed: {error}"
+                )
+            }
         }
     }
 }
@@ -133,9 +159,10 @@ impl std::fmt::Display for MassCancelFailure {
 ///
 /// `failures` was added in 0.14.0 with `#[serde(default)]`: JSON written by
 /// earlier releases (for example a journaled `MassCancelled` entry) decodes
-/// with an empty failure list. The `order_cancel_failed` failure variant is
-/// also new in 0.14.0; a 0.14.0 reader decodes JSON carrying only
-/// `level_unreadable` failures unchanged. Positional encodings (bincode)
+/// with an empty failure list. The `order_cancel_failed` and
+/// `level_fault_after_removal` failure variants are also new in 0.14.0
+/// (#248); JSON carrying only `level_unreadable` failures decodes
+/// unchanged. Positional encodings (bincode)
 /// written by earlier releases do not decode.
 ///
 /// Fields are intentionally private to prevent external mutation of what
@@ -225,6 +252,16 @@ impl MassCancelResult {
         self.failures.iter().any(MassCancelFailure::is_refusal)
     }
 
+    /// Returns the ids of the orders the operation failed to cancel, which
+    /// are still resting ([`MassCancelFailure::OrderCancelFailed`]), in
+    /// traversal order.
+    pub fn failed_order_ids(&self) -> impl Iterator<Item = Id> + '_ {
+        self.failures.iter().filter_map(|failure| match failure {
+            MassCancelFailure::OrderCancelFailed { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+    }
+
     /// Returns the number of orders successfully cancelled.
     #[must_use]
     #[inline]
@@ -265,6 +302,116 @@ impl std::fmt::Display for MassCancelResult {
                 self.failures.len()
             )
         }
+    }
+}
+
+/// Result of [`OrderBook::evict_expired_orders`] (#248).
+///
+/// Carries the evicted orders' bodies and a [`MassCancelResult`] with the
+/// evicted ids and every per-order failure, both in the sweep's
+/// deterministic order. Journal the eviction with
+/// [`Self::mass_cancel_result`] (as `SequencerResult::MassCancelled`) so
+/// replay reproduces exactly the orders the live sweep evicted.
+///
+/// [`Self::evicted_orders`] can be shorter than
+/// [`Self::evicted_order_ids`]: an order whose level removed it and then
+/// failed ([`MassCancelFailure::LevelFaultAfterRemoval`]) was evicted, but
+/// the level returned no body for it.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct EvictionResult<T> {
+    /// Bodies of the evicted orders, in sweep order.
+    evicted: Vec<Arc<OrderType<T>>>,
+    /// Evicted ids and per-order failures, in sweep order.
+    result: MassCancelResult,
+}
+
+impl<T> Default for EvictionResult<T> {
+    fn default() -> Self {
+        Self {
+            evicted: Vec::new(),
+            result: MassCancelResult::default(),
+        }
+    }
+}
+
+impl<T> EvictionResult<T> {
+    /// The evicted orders, in sweep order.
+    #[must_use]
+    #[inline]
+    pub fn evicted_orders(&self) -> &[Arc<OrderType<T>>] {
+        &self.evicted
+    }
+
+    /// Iterates over the evicted orders, in sweep order.
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'_, Arc<OrderType<T>>> {
+        self.evicted.iter()
+    }
+
+    /// Consumes the result, returning the evicted orders.
+    #[must_use]
+    #[inline]
+    pub fn into_evicted_orders(self) -> Vec<Arc<OrderType<T>>> {
+        self.evicted
+    }
+
+    /// The ids of every evicted order, in sweep order.
+    #[must_use]
+    #[inline]
+    pub fn evicted_order_ids(&self) -> &[Id] {
+        self.result.cancelled_order_ids()
+    }
+
+    /// Number of evicted orders.
+    #[must_use]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.result.cancelled_count()
+    }
+
+    /// Returns `true` if nothing was evicted. A sweep with failures can be
+    /// empty too; see [`Self::has_failures`].
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.result.is_empty()
+    }
+
+    /// Per-order failures, in sweep order.
+    #[must_use]
+    #[inline]
+    pub fn failures(&self) -> &[MassCancelFailure] {
+        self.result.failures()
+    }
+
+    /// Returns `true` if the sweep recorded at least one failure.
+    #[must_use]
+    #[inline]
+    pub fn has_failures(&self) -> bool {
+        self.result.has_failures()
+    }
+
+    /// The eviction as a [`MassCancelResult`] (ids and failures), the shape
+    /// to journal as `SequencerResult::MassCancelled`.
+    #[inline]
+    pub fn mass_cancel_result(&self) -> &MassCancelResult {
+        &self.result
+    }
+
+    /// Consumes the result, returning the [`MassCancelResult`].
+    #[inline]
+    pub fn into_mass_cancel_result(self) -> MassCancelResult {
+        self.result
+    }
+}
+
+impl<'a, T> IntoIterator for &'a EvictionResult<T> {
+    type Item = &'a Arc<OrderType<T>>;
+    type IntoIter = std::slice::Iter<'a, Arc<OrderType<T>>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.evicted.iter()
     }
 }
 
@@ -790,7 +937,7 @@ where
     ///
     /// # Determinism contract
     ///
-    /// The returned vector — and the [`PriceLevelChangedEvent`] and
+    /// The returned [`EvictionResult`] — and the [`PriceLevelChangedEvent`] and
     /// `Cancelled { reason: TimeInForceExpired }` state transitions emitted as a
     /// side effect — follow one fixed, replay-stable order:
     ///
@@ -811,13 +958,22 @@ where
     ///
     /// # Idempotence
     ///
-    /// A second sweep at the same `now_ms` returns an empty vector: the expired
-    /// orders are already gone.
+    /// A second sweep at the same `now_ms` returns an empty result: the
+    /// expired orders are already gone.
     ///
     /// # Returns
     ///
-    /// The evicted orders as `Arc<OrderType<T>>`, in the deterministic order
-    /// above. Empty when nothing was expired.
+    /// An [`EvictionResult`] with the evicted orders and their ids, in the
+    /// deterministic order above (empty when nothing was expired), plus any
+    /// per-order failure (#248). The sweep does not stop at a failure: every
+    /// other expired order is still evicted, with its usual events.
+    /// [`MassCancelFailure::OrderCancelFailed`] marks an order that is still
+    /// resting and fully tracked (a later sweep retries it);
+    /// [`MassCancelFailure::LevelFaultAfterRemoval`] marks one that was
+    /// evicted but whose level then failed. Journal the outcome with
+    /// [`EvictionResult::mass_cancel_result`] as
+    /// `SequencerResult::MassCancelled`: replay then reproduces exactly the
+    /// journaled evictions.
     ///
     /// # Errors
     ///
@@ -826,15 +982,6 @@ where
     /// fallible since pricelevel 0.10). The read phase runs before any
     /// eviction, so on this `Err` nothing was evicted and the book is
     /// unchanged.
-    ///
-    /// Returns [`OrderBookError::EvictionIncomplete`] when at least one
-    /// expired order's price level refused its removal (#248). The sweep
-    /// does not stop at the failure: every other expired order is still
-    /// evicted, with its usual events, and every failed order stays resting
-    /// and fully tracked. The error names the first failed order in sweep
-    /// order and counts the evicted and failed orders; the evicted orders
-    /// themselves were reported through the price-level and order-state
-    /// listeners. A later sweep retries the failed orders.
     ///
     /// # Concurrency
     ///
@@ -875,7 +1022,7 @@ where
     pub fn evict_expired_orders(
         &self,
         now_ms: TimestampMs,
-    ) -> Result<Vec<Arc<OrderType<T>>>, OrderBookError> {
+    ) -> Result<EvictionResult<T>, OrderBookError> {
         // #248: exclusive submit gate. The scope is collected first and
         // cancelled id by id afterwards; under the shared side an id could be
         // cancelled and re-admitted out of scope in between (other side,
@@ -930,64 +1077,79 @@ where
         }
 
         if expired_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(EvictionResult::default());
         }
 
         // Phase 2: cancel each expired order through the shared single-order
         // path, preserving the collection order. This is what keeps the caches,
         // trackers, and emitted events consistent and in the documented order.
         //
-        // #248: a per-order failure is not swallowed. The failed order stays
-        // resting and tracked, the sweep carries on with the next expired
-        // order (each removal is independent), and the call ends in
-        // `EvictionIncomplete` naming the first failure.
+        // #248: a per-order failure is not swallowed: it is recorded in the
+        // result and the sweep carries on with the next expired order (each
+        // removal is independent).
         let mut evicted = Vec::with_capacity(expired_ids.len());
-        // Ids only (no arithmetic): the count is the length.
-        let mut failed_ids: Vec<Id> = Vec::new();
-        let mut first_failure: Option<(Id, OrderBookError)> = None;
-        for order_id in expired_ids {
-            match self.cancel_order_with_reason(order_id, CancelReason::TimeInForceExpired) {
-                Ok(Some(order)) => evicted.push(order),
-                // Absent: under the exclusive gate only an index
-                // inconsistency gets here; nothing to evict.
-                Ok(None) => self.note_order_not_in_book(order_id),
-                Err(error) => {
-                    failed_ids.push(order_id);
-                    if first_failure.is_none() {
-                        first_failure = Some((order_id, error));
-                    }
-                }
-            }
-        }
+        let result = self.cancel_batch(
+            &expired_ids,
+            CancelReason::TimeInForceExpired,
+            Some(&mut evicted),
+        );
 
         trace!(
             symbol = %self.symbol,
             now_ms = now,
-            evicted = evicted.len(),
-            failed = failed_ids.len(),
+            evicted = result.cancelled_count(),
+            failed = result.failures().len(),
             "expired orders evicted"
         );
 
-        match first_failure {
-            None => Ok(evicted),
-            Some((order_id, error)) => {
-                Err(self.eviction_incomplete(now, evicted.len(), failed_ids.len(), order_id, error))
-            }
-        }
+        Ok(EvictionResult { evicted, result })
+    }
+
+    /// Replays a journaled eviction: removes exactly `order_ids` as
+    /// [`CancelReason::TimeInForceExpired`], in the given order, under the
+    /// exclusive submit gate (#248).
+    ///
+    /// Replay applies the journaled identities instead of re-running the
+    /// sweep, so an order the live sweep failed to evict is not evicted on
+    /// replay either. The caller compares the returned ids with `order_ids`.
+    pub(crate) fn evict_orders_by_id(&self, order_ids: &[Id]) -> MassCancelResult {
+        let _gate = self.submit_gate_write();
+        self.cancel_batch(order_ids, CancelReason::TimeInForceExpired, None)
     }
 
     /// Internal helper: cancel a batch of orders by their IDs with a reason.
     ///
-    /// Calls [`Self::cancel_order_with_reason`] for each ID, in the given
-    /// order. A successful cancel is reported in the result's ids; a failed
-    /// one is recorded as [`MassCancelFailure::OrderCancelFailed`] (the order
-    /// stays resting and tracked) and the batch carries on. An id that is no
-    /// longer resting is skipped and logged: callers hold the exclusive
-    /// submit gate, so only an index inconsistency gets there.
+    /// See [`Self::cancel_batch`].
     fn cancel_order_batch_with_reason(
         &self,
         order_ids: &[Id],
         reason: CancelReason,
+    ) -> MassCancelResult {
+        self.cancel_batch(order_ids, reason, None)
+    }
+
+    /// Cancels `order_ids` one by one through
+    /// [`Self::cancel_order_with_reason`], in the given order, and pushes the
+    /// removed bodies into `bodies` when given.
+    ///
+    /// Outcomes per id:
+    /// - cancelled: listed in the result's ids;
+    /// - the level refused the removal: recorded as
+    ///   [`MassCancelFailure::OrderCancelFailed`]; the order stays resting
+    ///   and tracked;
+    /// - the level removed the order, then failed
+    ///   ([`OrderBookError::OrderRemovedWithLevelFault`]): listed in the ids
+    ///   (it is gone and the book completed the removal) **and** recorded as
+    ///   [`MassCancelFailure::LevelFaultAfterRemoval`]; no body exists for it;
+    /// - no longer resting: skipped and logged (callers hold the exclusive
+    ///   submit gate, so only an index inconsistency gets there).
+    ///
+    /// The batch always carries on with the next id.
+    fn cancel_batch(
+        &self,
+        order_ids: &[Id],
+        reason: CancelReason,
+        mut bodies: Option<&mut Vec<Arc<OrderType<T>>>>,
     ) -> MassCancelResult {
         let mut cancelled_ids = Vec::with_capacity(order_ids.len());
         let mut failures = Vec::new();
@@ -997,8 +1159,20 @@ where
             // order cleanup, empty level removal, order_locations / user_orders
             // cleanup, risk release and state tracking.
             match self.cancel_order_with_reason(order_id, reason) {
-                Ok(Some(_)) => cancelled_ids.push(order_id),
+                Ok(Some(order)) => {
+                    cancelled_ids.push(order_id);
+                    if let Some(bodies) = bodies.as_deref_mut() {
+                        bodies.push(order);
+                    }
+                }
                 Ok(None) => self.note_order_not_in_book(order_id),
+                Err(OrderBookError::OrderRemovedWithLevelFault { order_id, source }) => {
+                    cancelled_ids.push(order_id);
+                    failures.push(MassCancelFailure::LevelFaultAfterRemoval {
+                        order_id,
+                        error: *source,
+                    });
+                }
                 Err(error) => {
                     let failure = MassCancelFailure::order_cancel_failed(order_id, error);
                     tracing::warn!(
@@ -1052,35 +1226,6 @@ where
             %order_id,
             "mass cancel: order in scope is not resting at its indexed location; index inconsistency, skipped"
         );
-    }
-
-    /// Logs an incomplete eviction and builds its error.
-    #[cold]
-    #[inline(never)]
-    fn eviction_incomplete(
-        &self,
-        now_ms: u64,
-        evicted_count: usize,
-        failed_count: usize,
-        order_id: Id,
-        error: OrderBookError,
-    ) -> OrderBookError {
-        let source = cancel_error_source(error);
-        tracing::warn!(
-            symbol = %self.symbol,
-            now_ms,
-            evicted_count,
-            failed_count,
-            %order_id,
-            %source,
-            "expired-order eviction incomplete: orders could not be removed and stay resting"
-        );
-        OrderBookError::EvictionIncomplete {
-            evicted_count,
-            failed_count,
-            order_id,
-            source: Box::new(source),
-        }
     }
 
     /// Collect all order IDs on a given side by iterating price levels in the
@@ -1796,7 +1941,7 @@ mod tests {
             .evict_expired_orders(TimestampMs::new(1_000))
             .expect("evict");
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].id(), gtd);
+        assert_eq!(evicted.evicted_orders()[0].id(), gtd);
         assert_eq!(book.best_bid(), None);
         assert!(!book.order_locations.contains_key(&gtd));
 
@@ -1822,7 +1967,7 @@ mod tests {
             .evict_expired_orders(TimestampMs::new(2_000))
             .expect("evict");
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].id(), gtd_past);
+        assert_eq!(evicted.evicted_orders()[0].id(), gtd_past);
 
         assert!(book.order_locations.contains_key(&gtc));
         assert!(book.order_locations.contains_key(&gtd_future));
@@ -1850,7 +1995,7 @@ mod tests {
             .evict_expired_orders(TimestampMs::new(1_000))
             .expect("evict");
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].id(), id);
+        assert_eq!(evicted.evicted_orders()[0].id(), id);
     }
 
     #[test]
@@ -1872,7 +2017,7 @@ mod tests {
             .evict_expired_orders(TimestampMs::new(2_000))
             .expect("evict");
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].id(), day);
+        assert_eq!(evicted.evicted_orders()[0].id(), day);
     }
 
     #[test]
