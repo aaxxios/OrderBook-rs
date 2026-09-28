@@ -9,11 +9,11 @@
 #
 # rule ids: assert, assert_eq, assert_ne, debug_assert, debug_assert_eq,
 # debug_assert_ne, panic_macro, todo_macro, unimplemented_macro,
-# unreachable_macro, panic_any, resume_unwind, unwrap, unwrap_err,
-# expect, expect_err, get_unwrap, process_exit, process_abort,
+# unreachable_macro, panic_any, resume_unwind, catch_unwind, unwrap,
+# unwrap_err, expect, expect_err, get_unwrap, process_exit, process_abort,
 # saturating_wrapping, indexing_slicing.
 
-src/orderbook/book.rs:saturating_wrapping:27
+src/orderbook/book.rs:saturating_wrapping:26
 src/orderbook/iterators.rs:saturating_wrapping:2
 src/orderbook/market_impact.rs:saturating_wrapping:2
 src/orderbook/matching.rs:debug_assert:3
@@ -24,8 +24,6 @@ src/orderbook/nats.rs:saturating_wrapping:1
 src/orderbook/nats_book_change.rs:saturating_wrapping:1
 src/orderbook/order_state.rs:saturating_wrapping:2
 src/orderbook/repricing.rs:saturating_wrapping:7
-src/orderbook/risk.rs:debug_assert_eq:1
-src/orderbook/risk.rs:saturating_wrapping:16
 src/orderbook/sequencer/file_journal.rs:saturating_wrapping:2
 src/orderbook/snapshot.rs:saturating_wrapping:7
 src/orderbook/statistics.rs:saturating_wrapping:1

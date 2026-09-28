@@ -639,4 +639,173 @@ mod tests_risk_layer {
         book.add_limit_order_with_user(new_id(), 103, 1, Side::Buy, TimeInForce::Gtc, acct, None)
             .expect("re-admitted after cancel_all_orders");
     }
+
+    // ───────────────────────────────────────────────────────────────
+    // Checked notional arithmetic (#243)
+    // ───────────────────────────────────────────────────────────────
+
+    /// Price whose double does not fit in `u128`.
+    const HALF_PLUS_ONE: u128 = u128::MAX / 2 + 1;
+
+    /// #243: two resting orders whose notional sum overflows `u128` must not
+    /// wrap the account counter and bypass the limit. Before the fix the
+    /// second admission passed (`saturating_add` compared equal to the
+    /// `u128::MAX` limit) and `fetch_add` wrapped the counter to zero.
+    #[test]
+    fn notional_limit_holds_when_sum_overflows_u128() {
+        let mut book = new_book();
+        book.set_risk_config(RiskConfig::new().with_max_notional_per_account(u128::MAX));
+        let acct = account(60);
+
+        let first = new_id();
+        book.add_limit_order_with_user(
+            first,
+            HALF_PLUS_ONE,
+            1,
+            Side::Buy,
+            TimeInForce::Gtc,
+            acct,
+            None,
+        )
+        .expect("first order fits in u128");
+
+        let second = new_id();
+        let result = book.add_limit_order_with_user(
+            second,
+            HALF_PLUS_ONE + 1,
+            1,
+            Side::Buy,
+            TimeInForce::Gtc,
+            acct,
+            None,
+        );
+        assert!(
+            matches!(result, Err(OrderBookError::RiskMaxNotional { limit, .. }) if limit == u128::MAX),
+            "overflowing sum must reject, got {result:?}"
+        );
+        assert!(book.get_order(first).is_some());
+        assert!(
+            book.get_order(second).is_none(),
+            "rejected order never rests"
+        );
+
+        // Still rejected afterwards: the counter did not wrap.
+        assert!(matches!(
+            book.add_limit_order_with_user(
+                new_id(),
+                HALF_PLUS_ONE,
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+                acct,
+                None
+            ),
+            Err(OrderBookError::RiskMaxNotional { .. })
+        ));
+        assert_eq!(book.risk_accounting_anomalies(), 0);
+
+        // Releasing the first order frees the account exactly.
+        assert!(book.cancel_order(first).expect("cancel").is_some());
+        book.add_limit_order_with_user(
+            new_id(),
+            HALF_PLUS_ONE,
+            1,
+            Side::Buy,
+            TimeInForce::Gtc,
+            acct,
+            None,
+        )
+        .expect("admitted again after the release");
+    }
+
+    /// #243: with a config installed but no notional limit, an exposure the
+    /// counters cannot represent is still rejected (typed, `limit = u128::MAX`)
+    /// rather than wrapping the tracked value.
+    #[test]
+    fn unrepresentable_notional_rejects_without_notional_limit() {
+        let mut book = new_book();
+        book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(100));
+        let acct = account(61);
+
+        book.add_limit_order_with_user(
+            new_id(),
+            HALF_PLUS_ONE,
+            1,
+            Side::Buy,
+            TimeInForce::Gtc,
+            acct,
+            None,
+        )
+        .expect("first order fits");
+        let result = book.add_limit_order_with_user(
+            new_id(),
+            HALF_PLUS_ONE + 1,
+            1,
+            Side::Buy,
+            TimeInForce::Gtc,
+            acct,
+            None,
+        );
+        assert!(
+            matches!(result, Err(OrderBookError::RiskMaxNotional { limit, .. }) if limit == u128::MAX),
+            "got {result:?}"
+        );
+    }
+
+    /// #243 / #250: a snapshot whose per-account risk aggregates overflow is
+    /// rejected by the restore's prepare phase with a typed error, and the
+    /// target book is left untouched.
+    #[test]
+    fn restore_rejects_overflowing_risk_aggregates_before_mutation() {
+        let acct = account(62);
+        // Rest both orders before the config exists (no admission check),
+        // then install the config so the package carries it.
+        let mut original = new_book();
+        original
+            .add_limit_order_with_user(
+                new_id(),
+                HALF_PLUS_ONE,
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+                acct,
+                None,
+            )
+            .expect("first");
+        original
+            .add_limit_order_with_user(
+                new_id(),
+                HALF_PLUS_ONE + 1,
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+                acct,
+                None,
+            )
+            .expect("second");
+        original.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(10));
+        let json = original.snapshot_to_json(10).expect("serialize");
+
+        let mut target = new_book();
+        let keep = new_id();
+        target
+            .add_limit_order_with_user(
+                keep,
+                100,
+                1,
+                Side::Sell,
+                TimeInForce::Gtc,
+                account(63),
+                None,
+            )
+            .expect("pre-existing order");
+
+        let result = target.restore_from_snapshot_json(&json);
+        assert!(
+            matches!(result, Err(OrderBookError::RiskMaxNotional { account: a, limit, .. }) if a == acct && limit == u128::MAX),
+            "got {result:?}"
+        );
+        assert!(target.get_order(keep).is_some(), "live book untouched");
+        assert!(target.risk_config().is_none(), "config untouched");
+    }
 }

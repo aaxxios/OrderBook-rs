@@ -22,8 +22,6 @@ src/orderbook/nats.rs:arithmetic_side_effects:12
 src/orderbook/nats_book_change.rs:arithmetic_side_effects:12
 src/orderbook/repricing.rs:arithmetic_side_effects:4
 src/orderbook/repricing.rs:cast_sign_loss:4
-src/orderbook/risk.rs:arithmetic_side_effects:6
-src/orderbook/risk.rs:cast_possible_truncation:2
 src/orderbook/sequencer/file_journal.rs:arithmetic_side_effects:20
 src/orderbook/sequencer/file_journal.rs:cast_possible_truncation:4
 src/orderbook/sequencer/file_journal.rs:indexing_slicing:126

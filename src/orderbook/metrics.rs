@@ -28,6 +28,12 @@
 //!   `pricelevel` performs when a depleted non-replenishing maker leaves
 //!   its level. The matching `INFO` trace carries a `path` field
 //!   (`"taker"` / `"maker"`) so the two are distinguishable.
+//! - `orderbook_risk_accounting_anomalies_total` — counter, incremented
+//!   whenever the pre-trade risk layer detects an accounting anomaly
+//!   (#243): a release larger than an account counter (double release),
+//!   a fill larger than the maker's tracked remainder, or a post-trade
+//!   counter increment that would overflow. Each one is also logged and
+//!   counted in `RiskState::accounting_anomalies`.
 //!
 //! # Determinism
 //!
@@ -61,6 +67,9 @@ pub const RESERVE_DISCARDS_TOTAL: &str = "orderbook_reserve_discards_total";
 /// Counter name: hidden quantity dropped by those discards (#230),
 /// counted in quantity units.
 pub const RESERVE_HIDDEN_DISCARDED_TOTAL: &str = "orderbook_reserve_hidden_discarded_total";
+
+/// Counter name: pre-trade risk accounting anomalies (#243).
+pub const RISK_ACCOUNTING_ANOMALIES_TOTAL: &str = "orderbook_risk_accounting_anomalies_total";
 
 /// Record an order rejection.
 ///
@@ -148,6 +157,22 @@ pub fn record_reserve_hidden_discarded(quantity: u64) {
 #[cfg(not(feature = "metrics"))]
 pub fn record_reserve_hidden_discarded(_quantity: u64) {}
 
+/// Record one pre-trade risk accounting anomaly (#243).
+///
+/// Increments `orderbook_risk_accounting_anomalies_total` by 1. Called
+/// from the risk layer's cold anomaly path only. Compiles to a no-op
+/// when the `metrics` feature is disabled.
+#[inline]
+#[cfg(feature = "metrics")]
+pub fn record_risk_accounting_anomaly() {
+    metrics::counter!(RISK_ACCOUNTING_ANOMALIES_TOTAL).increment(1);
+}
+
+/// No-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(not(feature = "metrics"))]
+pub fn record_risk_accounting_anomaly() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +190,6 @@ mod tests {
         record_trades(4);
         record_reserve_hidden_discarded(0);
         record_reserve_hidden_discarded(20);
+        record_risk_accounting_anomaly();
     }
 }

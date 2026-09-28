@@ -2394,6 +2394,33 @@ where
                 Side::Sell => &self.asks,
             };
 
+            // Pre-trade risk hook (#243): reserve the resting remainder's
+            // contribution to the per-account counters BEFORE the order is
+            // placed on its level, so a reservation that cannot be
+            // represented (only reachable when concurrent admissions on the
+            // same account raced past the pre-trade check) rejects the
+            // remainder instead of resting it untracked. Checked and
+            // all-or-nothing; released below if the placement fails. No-op
+            // when no `RiskConfig` is installed.
+            if let Err(err) = self.risk_state.on_admission(
+                order.id(),
+                order.user_id(),
+                price,
+                match_result.remaining_quantity().as_u64(),
+            ) {
+                if filled_qty == 0 {
+                    self.reject_with_risk(order.id(), &err);
+                }
+                tracing::error!(
+                    order_id = %order.id(),
+                    price,
+                    executed_quantity = filled_qty,
+                    error = %err,
+                    "risk reservation for the resting remainder failed; remainder not rested"
+                );
+                return Err(err);
+            }
+
             let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
             let level = price_level.value();
 
@@ -2410,6 +2437,9 @@ where
             let unit_order_arc = match price_level.value().add_order(unit_order) {
                 Ok(admitted) => admitted,
                 Err(err) => {
+                    // Release the risk reservation taken above: the
+                    // order does not rest.
+                    self.risk_state.on_cancel(order.id());
                     if level.order_count() == 0 {
                         price_levels.remove(&price);
                     }
@@ -2448,17 +2478,6 @@ where
             // way the gauge reflects current state. No-op when the
             // `metrics` feature is disabled.
             self.record_depth_metric();
-
-            // Pre-trade risk hook: register the resting order with
-            // the risk state so per-account counters are updated and
-            // future checks see the new contribution. No-op when no
-            // `RiskConfig` is installed.
-            self.risk_state.on_admission(
-                unit_order_arc.id(),
-                order.user_id(),
-                price,
-                match_result.remaining_quantity().as_u64(),
-            );
 
             // Track the order in the user_orders index
             self.track_user_order(order.user_id(), unit_order_arc.id());
