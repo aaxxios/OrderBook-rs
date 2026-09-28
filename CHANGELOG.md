@@ -318,6 +318,44 @@ change.
   it. Results for valid inputs are unchanged. The IV files leave the
   panic-policy ratchet (`scripts/clippy_ratchet.txt` loses its two
   `implied_volatility` entries).
+- **NATS publishers validate configuration and surface task failures
+  (#253).** Applies to `NatsTradePublisher` and `NatsBookChangePublisher`.
+  - `shutdown()` returns `Result<(), NatsPublisherError>` instead of `()`.
+    The new `#[non_exhaustive]` `NatsPublisherError` (re-exported at the
+    root, in the prelude and from `orderbook::nats`) has `TaskPanicked {
+    message }` (for example a panicking caller-supplied serializer, or a
+    runtime without the time driver) and `TaskCancelled` (the runtime shut
+    down first). It converts into `OrderBookError::NatsPublishError`. Only
+    the call that joins the task reports the outcome; repeated calls return
+    `Ok(())`. Callers add `?` or handle the result.
+  - Builder values are clamped with a `tracing::warn!` instead of panicking
+    later: `with_batch_window_ms` and `with_min_publish_interval_ms` to
+    60,000 ms (`MAX_BATCH_WINDOW_MS`, `MAX_MIN_PUBLISH_INTERVAL_MS`),
+    `with_max_batch_size` into `1..=65_536` (`MAX_BATCH_SIZE`) and
+    `with_channel_capacity` into `1..=MAX_CHANNEL_CAPACITY` (Tokio's
+    `Semaphore::MAX_PERMITS`). Configurations inside those ranges behave
+    as before. `max_batch_size(0)` previously dropped buffered events on
+    shutdown; it now means `1`.
+  - Retries use capped exponential backoff with jitter: retry `n` waits a
+    delay in `[c / 2, c]` with `c = min(10 ms * 2^n, 5 s)`
+    (`BASE_RETRY_DELAY_MS`, `MAX_RETRY_DELAY_MS`); the old delay doubled
+    without a cap (up to `u64::MAX` ms). The jitter is a hash of a
+    per-publisher seed, the message sequence and the retry index; no new
+    dependency.
+  - Shutdown is observed while a batch window is open (not only when
+    idle), closes the channel before draining so the drain terminates, and
+    skips the publish throttle. Events sent after shutdown, or after the
+    task died, are counted in `dropped_events`; a closed channel logs one
+    `WARN` instead of one per event, and a full channel one `WARN` per
+    overload episode.
+  - Counters and sequences never wrap: a sequence that would overflow
+    refuses the publish (counted in `error_count`, logged at `ERROR`).
+    Poisoned task-lifecycle locks are recovered instead of detaching the
+    task. Connect / disconnect transitions of the publish path are logged
+    at `INFO`.
+  - The runtime handed to `new` must have its time driver enabled; this is
+    now documented (module docs, `doc/panic-boundaries.md`).
+  - Wire format and subjects are unchanged.
 
 ### Changed
 

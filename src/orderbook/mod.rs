@@ -62,6 +62,10 @@ pub mod nats;
 #[cfg(feature = "nats")]
 pub mod nats_book_change;
 
+/// Shared NATS publisher plumbing: limits, backoff, task lifecycle.
+#[cfg(feature = "nats")]
+mod nats_common;
+
 /// Re-pricing logic for special order types (PeggedOrder and TrailingStop).
 #[cfg(feature = "special_orders")]
 pub mod repricing;
@@ -81,7 +85,7 @@ pub use iterators::LevelInfo;
 pub use market_impact::{MarketImpact, OrderSimulation};
 pub use mass_cancel::{MassCancelFailure, MassCancelResult};
 #[cfg(feature = "nats")]
-pub use nats::NatsTradePublisher;
+pub use nats::{NatsPublisherError, NatsTradePublisher};
 #[cfg(feature = "nats")]
 pub use nats_book_change::{BookChangeBatch, BookChangeEntry, NatsBookChangePublisher};
 pub use order_state::{CancelReason, OrderStateListener, OrderStateTracker, OrderStatus};

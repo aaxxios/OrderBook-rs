@@ -99,6 +99,12 @@
 //!   applies to submits recorded through `*_with_committed` /
 //!   `SequencerResult::from_submit_failure`, and aborted updates are
 //!   reconciled by code only. See `doc/panic-boundaries.md`.
+//! - **NATS publishers validate their configuration (#253).** Builder values
+//!   are clamped with a `warn!` instead of panicking later (batch window and
+//!   publish interval at 60 s, batch size to `1..=65_536`, channel capacity
+//!   to Tokio's limit); retries use capped exponential backoff (5 s) with
+//!   jitter; `shutdown()` returns `Result<(), NatsPublisherError>` so a
+//!   panicked or cancelled background task is reported.
 //!
 //! ### Migration from 0.13
 //!
@@ -122,6 +128,7 @@
 //! | `solve_iv` / `solve_iv_bisection` / `implied_volatility*` accept any config | reject an invalid config with `IVError::InvalidConfig` |
 //! | sweep stopped by a level failure: `Err(PriceLevelError)` (prefix unreported) | `Err(MatchAborted { .. })`, prefix published |
 //! | `CancelReason` (8 variants) | adds `MatchAborted` (exhaustive matches need an arm) |
+//! | `Nats{Trade,BookChange}Publisher::shutdown() -> ()` | `-> Result<(), NatsPublisherError>` |
 //!
 //! Re-exported pricelevel items change with pricelevel 0.10:
 //! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
@@ -131,7 +138,8 @@
 //! `CounterExhausted`, `EntropyUnavailable`). Callers of the snapshot
 //! functions add `?` (or handle the error); callers of `evict_expired_orders`
 //! do the same; code that treated an empty `MassCancelResult` as "nothing
-//! to cancel" should also check `has_failures()`.
+//! to cancel" should also check `has_failures()`. NATS users handle the
+//! `Result` now returned by `shutdown()`.
 //!
 //! ## What's New in Version 0.13.0
 //!
@@ -1253,8 +1261,6 @@ pub mod wire;
 
 #[cfg(feature = "journal")]
 pub use orderbook::FileJournal;
-#[cfg(feature = "nats")]
-pub use orderbook::NatsTradePublisher;
 pub use orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChangedListener};
 pub use orderbook::clock::{Clock, MonotonicClock, StubClock};
 pub use orderbook::implied_volatility::{
@@ -1291,6 +1297,8 @@ pub use orderbook::{
     FeeOverflow, FeeSchedule, ManagerError, MassCancelFailure, MassCancelResult, OrderBook,
     OrderBookError, OrderBookSnapshot,
 };
+#[cfg(feature = "nats")]
+pub use orderbook::{NatsPublisherError, NatsTradePublisher};
 pub use utils::current_time_millis;
 #[cfg(feature = "alloc-counters")]
 pub use utils::{AllocSnapshot, CountingAllocator};
