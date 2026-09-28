@@ -209,6 +209,17 @@ This order book engine is built with the following design principles:
   the sweep with its committed prefix. `OrderBook::peek_match` returns
   `Result<u64, OrderBookError>` and reports a level whose depth overflows
   `u64` instead of reading it as empty. Valid inputs trade identically.
+- **Hardened journals and identity replay of mass cancels (#252).**
+  `FileJournal` never truncates an existing segment on rotation
+  (`create_new`, `JournalError::SegmentExists`), both journals refuse
+  non-increasing sequences (`JournalError::NonMonotonicSequence`), a
+  malformed entry header is an error instead of a silent end of data,
+  reopen zeroes a torn tail and refuses mid-segment corruption, and a
+  poisoned lock is `MutexPoisoned` everywhere. `Journal::last_sequence`
+  returns `Result<Option<u64>, JournalError>`. Replay compares a
+  journaled `MassCancelled` with the replayed result by order ids, in
+  order, and failure outcomes (`ReplayError::MassCancelMismatch`). No
+  on-disk format change.
 
 #### Migration from 0.13
 
@@ -273,6 +284,11 @@ This order book engine is built with the following design principles:
 | `DistributionBin::width() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
 | `OrderBookError` (no analytics overflow variant) | adds `ArithmeticOverflow { operation }`, `AllocationFailed { operation, requested }` (wire code `Other(0)`) |
 | `OrderBook::peek_match(side, qty, limit) -> u64` (overflowing level read as empty) | `-> Result<u64, OrderBookError>` (`PriceLevelError` for an overflowing level) |
+| `Journal::last_sequence() -> Option<u64>` | `-> Result<Option<u64>, JournalError>` |
+| `InMemoryJournal::with_capacity(n) -> Self`; `len() -> usize`; `is_empty() -> bool` | `-> Result<Self, JournalError>`; `-> Result<usize, JournalError>`; `-> Result<bool, JournalError>` |
+| `Journal::append` accepts any sequence; rotation truncates an existing segment | non-increasing sequence → `JournalError::NonMonotonicSequence`; existing segment → `SegmentExists` |
+| `JournalError` (hand-written `Display`) | `thiserror`; adds `NonMonotonicSequence`, `SegmentExists`, `AllocationFailed` |
+| journaled `MassCancelled` checked by refusal / failures only | reconciled by ids and failure outcomes; `ReplayError::MassCancelMismatch` (`MassCancelDivergence`) |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

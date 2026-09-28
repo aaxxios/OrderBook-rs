@@ -329,6 +329,45 @@ pub enum ReplayError {
         from_sequence: u64,
     },
 
+    /// A replayed mass cancel or eviction did not reproduce, by identity,
+    /// the outcome the journal recorded for it (#252).
+    ///
+    /// Mass cancels are reconciled by **identity**, not by count: equal
+    /// counts can hide different cancelled orders. For `CancelAll`,
+    /// `CancelBySide`, `CancelByUser` and `CancelByPriceRange` journaled as
+    /// a non-refused [`SequencerResult::MassCancelled`], replay re-executes
+    /// the command and requires the replayed
+    /// [`MassCancelResult::cancelled_order_ids`] to equal the journaled ones
+    /// **in order**, the orders left resting by per-order failures
+    /// ([`MassCancelResult::failed_order_ids`]) to equal the journaled ones
+    /// in order, and the replay not to refuse. For an `EvictExpiredOrders`
+    /// journaled as `MassCancelled`, replay evicts exactly the journaled ids
+    /// and requires every one of them to be evicted, in order.
+    ///
+    /// [`MassCancelFailure::LevelFaultAfterRemoval`] entries are fault
+    /// reports about the live price level, not book outcomes (the order was
+    /// cancelled either way), and are not compared. A live mass cancel that
+    /// recorded per-order failures ([`MassCancelFailure::OrderCancelFailed`])
+    /// normally stops replay here **by design**: a fresh replay book does
+    /// not reproduce the level fault, so it cancels the orders the live
+    /// book kept, and the reconstructed book would diverge silently
+    /// otherwise.
+    #[error(
+        "replay diverged at sequence {sequence_num}: mass cancel {divergence} (journal recorded {}, replay produced {})",
+        .recorded,
+        .replayed
+    )]
+    MassCancelMismatch {
+        /// The sequence number of the mass cancel / eviction event.
+        sequence_num: u64,
+        /// What disagreed.
+        divergence: MassCancelDivergence,
+        /// The result the journal recorded.
+        recorded: Box<MassCancelResult>,
+        /// The result the replay produced.
+        replayed: Box<MassCancelResult>,
+    },
+
     /// The replayed state does not match the expected snapshot.
     #[error("snapshot mismatch: replayed state diverges from expected snapshot")]
     SnapshotMismatch,
@@ -336,6 +375,80 @@ pub enum ReplayError {
     /// Journal read error during replay.
     #[error("journal error during replay: {0}")]
     JournalError(#[from] JournalError),
+}
+
+/// What a replayed mass cancel disagreed on with the journal; carried by
+/// [`ReplayError::MassCancelMismatch`] (#252).
+///
+/// Positions index the ordered id lists; when one list is a prefix of the
+/// other, `position` is the length of the shorter one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MassCancelDivergence {
+    /// One side refused the whole call
+    /// ([`MassCancelResult::is_refused`]) and the other did not.
+    Refusal {
+        /// Whether the journaled result was a refusal.
+        recorded: bool,
+        /// Whether the replayed result was a refusal.
+        replayed: bool,
+    },
+    /// The cancelled order ids differ (identity or order).
+    CancelledIds {
+        /// First index at which the id lists differ.
+        position: usize,
+        /// Number of ids the journal recorded as cancelled.
+        recorded_count: usize,
+        /// Number of ids the replay cancelled.
+        replayed_count: usize,
+    },
+    /// The orders left resting by per-order failures differ (identity or
+    /// order).
+    FailedIds {
+        /// First index at which the failed-id lists differ.
+        position: usize,
+        /// Number of per-order failures the journal recorded.
+        recorded_count: usize,
+        /// Number of per-order failures the replay produced.
+        replayed_count: usize,
+    },
+}
+
+impl std::fmt::Display for MassCancelDivergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MassCancelDivergence::Refusal { recorded, replayed } => write!(
+                f,
+                "refusal differs (journal refused: {recorded}, replay refused: {replayed})"
+            ),
+            MassCancelDivergence::CancelledIds {
+                position,
+                recorded_count,
+                replayed_count,
+            } => write!(
+                f,
+                "cancelled ids differ at position {position} ({recorded_count} recorded, {replayed_count} replayed)"
+            ),
+            MassCancelDivergence::FailedIds {
+                position,
+                recorded_count,
+                replayed_count,
+            } => write!(
+                f,
+                "orders left resting differ at position {position} ({recorded_count} recorded, {replayed_count} replayed)"
+            ),
+        }
+    }
+}
+
+/// First index at which two ordered id lists differ, or `None` when equal.
+#[must_use]
+fn first_difference<I: PartialEq>(recorded: &[I], replayed: &[I]) -> Option<usize> {
+    match recorded.iter().zip(replayed).position(|(a, b)| a != b) {
+        Some(position) => Some(position),
+        None if recorded.len() == replayed.len() => None,
+        None => Some(recorded.len().min(replayed.len())),
+    }
 }
 
 /// Renders the replay side of an [`ReplayError::OutcomeMismatch`].
@@ -433,8 +546,14 @@ where
     ///   `EvictExpiredOrders` are the exceptions with their own
     ///   reconciliation: they never fail after mutating (a partial outcome
     ///   is an `Ok` result carrying per-order failures, journaled as
-    ///   `MassCancelled` and replayed by identity for eviction), and their
-    ///   only `Err` is a refusal that changed nothing.
+    ///   `MassCancelled`), and their only `Err` is a refusal that changed
+    ///   nothing.
+    /// - A mass cancel journaled as a refused `MassCancelled` is skipped.
+    ///   Any other journaled `MassCancelled` is reconciled by **identity**
+    ///   (#252): a re-executed mass cancel must cancel the same ids in the
+    ///   same order and leave the same orders resting, and a replayed
+    ///   eviction evicts exactly the journaled ids. A disagreement is
+    ///   [`ReplayError::MassCancelMismatch`].
     ///
     /// Skipped events do not advance the applied sequence or the applied
     /// count; a re-executed rejection does, whether or not it traded. Both
@@ -516,7 +635,8 @@ where
     /// - [`ReplayError::OrderBookError`] if a command fails unexpectedly during replay
     /// - [`ReplayError::OutcomeMismatch`] if a re-executed rejected submit reaches a different verdict than the journal recorded
     /// - [`ReplayError::StpModeMismatch`] if a journaled STP rejection records a different [`STPMode`] than the replay book uses
-    /// - [`ReplayError::JournalError`] if reading from the journal fails
+    /// - [`ReplayError::MassCancelMismatch`] if a journaled mass cancel or eviction does not replay to the same ids
+    /// - [`ReplayError::JournalError`] if reading from the journal fails, including its last sequence
     #[must_use = "replay result carries the reconstructed book and the last applied sequence"]
     pub fn replay_from(
         journal: &impl Journal<T>,
@@ -554,17 +674,7 @@ where
         symbol: &str,
         progress: impl Fn(u64, u64),
     ) -> Result<(OrderBook<T>, u64), ReplayError> {
-        let last_seq = match journal.last_sequence() {
-            Some(seq) => seq,
-            None => return Err(ReplayError::EmptyJournal),
-        };
-
-        if from_sequence > last_seq {
-            return Err(ReplayError::InvalidSequence {
-                from_sequence,
-                last_sequence: last_seq,
-            });
-        }
+        Self::check_replay_range(journal, from_sequence)?;
 
         let book = OrderBook::new(symbol);
         let last_applied_seq = Self::replay_into(&book, journal, from_sequence, progress)?;
@@ -606,17 +716,7 @@ where
         symbol: &str,
         config: &ReplayBookConfig,
     ) -> Result<(OrderBook<T>, u64), ReplayError> {
-        let last_seq = match journal.last_sequence() {
-            Some(seq) => seq,
-            None => return Err(ReplayError::EmptyJournal),
-        };
-
-        if from_sequence > last_seq {
-            return Err(ReplayError::InvalidSequence {
-                from_sequence,
-                last_sequence: last_seq,
-            });
-        }
+        Self::check_replay_range(journal, from_sequence)?;
 
         Self::check_namespace_full_replay(from_sequence, config)?;
 
@@ -697,17 +797,7 @@ where
         clock: Arc<dyn Clock>,
         progress: impl Fn(u64, u64),
     ) -> Result<(OrderBook<T>, u64), ReplayError> {
-        let last_seq = match journal.last_sequence() {
-            Some(seq) => seq,
-            None => return Err(ReplayError::EmptyJournal),
-        };
-
-        if from_sequence > last_seq {
-            return Err(ReplayError::InvalidSequence {
-                from_sequence,
-                last_sequence: last_seq,
-            });
-        }
+        Self::check_replay_range(journal, from_sequence)?;
 
         let book = OrderBook::with_clock(symbol, clock);
         let last_applied_seq = Self::replay_into(&book, journal, from_sequence, progress)?;
@@ -752,17 +842,7 @@ where
         clock: Arc<dyn Clock>,
         config: &ReplayBookConfig,
     ) -> Result<(OrderBook<T>, u64), ReplayError> {
-        let last_seq = match journal.last_sequence() {
-            Some(seq) => seq,
-            None => return Err(ReplayError::EmptyJournal),
-        };
-
-        if from_sequence > last_seq {
-            return Err(ReplayError::InvalidSequence {
-                from_sequence,
-                last_sequence: last_seq,
-            });
-        }
+        Self::check_replay_range(journal, from_sequence)?;
 
         Self::check_namespace_full_replay(from_sequence, config)?;
 
@@ -770,6 +850,28 @@ where
         config.apply_to(&mut book);
         let last_applied_seq = Self::replay_into(&book, journal, from_sequence, |_, _| {})?;
         Ok((book, last_applied_seq))
+    }
+
+    /// The `EmptyJournal` / `InvalidSequence` pre-checks shared by every
+    /// public entry point.
+    ///
+    /// A journal whose last sequence cannot be read (for example a poisoned
+    /// lock) is [`ReplayError::JournalError`], never reported as empty
+    /// (#252).
+    fn check_replay_range(
+        journal: &impl Journal<T>,
+        from_sequence: u64,
+    ) -> Result<(), ReplayError> {
+        let Some(last_seq) = journal.last_sequence()? else {
+            return Err(ReplayError::EmptyJournal);
+        };
+        if from_sequence > last_seq {
+            return Err(ReplayError::InvalidSequence {
+                from_sequence,
+                last_sequence: last_seq,
+            });
+        }
+        Ok(())
     }
 
     /// Rejects a namespace-carrying config on a suffix replay.
@@ -877,6 +979,7 @@ where
     ///   sequence)
     /// - [`ReplayError::OutcomeMismatch`] if a re-executed rejected submit reaches a different verdict than the journal recorded
     /// - [`ReplayError::StpModeMismatch`] if a journaled STP rejection records a different [`STPMode`] than the replay book uses
+    /// - [`ReplayError::MassCancelMismatch`] if a journaled mass cancel or eviction does not replay to the same ids
     /// - [`ReplayError::JournalError`] if reading from the journal fails
     pub fn verify(
         journal: &impl Journal<T>,
@@ -1040,22 +1143,22 @@ where
             | SequencerCommand::CancelByPriceRange { .. }
                 if Self::recorded_mass_cancel_refused(event) => {}
             SequencerCommand::CancelAll => {
-                Self::ensure_mass_cancel_complete(event, &book.cancel_all_orders())?;
+                Self::reconcile_mass_cancel(event, book.cancel_all_orders())?;
             }
             SequencerCommand::CancelBySide { side } => {
-                Self::ensure_mass_cancel_complete(event, &book.cancel_orders_by_side(*side))?;
+                Self::reconcile_mass_cancel(event, book.cancel_orders_by_side(*side))?;
             }
             SequencerCommand::CancelByUser { user_id } => {
-                Self::ensure_mass_cancel_complete(event, &book.cancel_orders_by_user(*user_id))?;
+                Self::reconcile_mass_cancel(event, book.cancel_orders_by_user(*user_id))?;
             }
             SequencerCommand::CancelByPriceRange {
                 side,
                 min_price,
                 max_price,
             } => {
-                Self::ensure_mass_cancel_complete(
+                Self::reconcile_mass_cancel(
                     event,
-                    &book.cancel_orders_by_price_range(*side, *min_price, *max_price),
+                    book.cancel_orders_by_price_range(*side, *min_price, *max_price),
                 )?;
             }
             SequencerCommand::EvictExpiredOrders { now_ms } => match &event.result {
@@ -1066,7 +1169,7 @@ where
                 // failed to evict must keep resting on replay too.
                 SequencerResult::MassCancelled { result } => {
                     let replayed = book.evict_orders_by_id(result.cancelled_order_ids());
-                    Self::ensure_same_evictions(event, result, &replayed)?;
+                    Self::ensure_same_evictions(event, result, replayed)?;
                 }
                 // No journaled outcome to follow: apply the journaled cutoff,
                 // never the replay clock. A refused or partial sweep diverges
@@ -1078,7 +1181,7 @@ where
                             source,
                         }
                     })?;
-                    Self::ensure_mass_cancel_complete(event, replayed.mass_cancel_result())?;
+                    Self::ensure_replay_complete(event, replayed.mass_cancel_result())?;
                 }
             },
         }
@@ -1091,8 +1194,8 @@ where
     /// A refusal ([`MassCancelResult::is_refused`]) cancelled nothing on
     /// the live book, so replay must not re-execute it. A result carrying
     /// only per-order failures (#248) is partial, not refused: its listed
-    /// ids were cancelled live, so replay re-executes it (see
-    /// [`Self::ensure_mass_cancel_complete`]).
+    /// ids were cancelled live, so replay re-executes it and reconciles it
+    /// by identity (see [`Self::reconcile_mass_cancel`]).
     fn recorded_mass_cancel_refused(event: &SequencerEvent<T>) -> bool {
         matches!(
             &event.result,
@@ -1100,28 +1203,75 @@ where
         )
     }
 
-    /// Fails replay when a re-executed mass cancel recorded a failure, or
-    /// when the journal recorded one for it.
+    /// Reconciles a re-executed scoped mass cancel against the journal by
+    /// identity (#252; see [`ReplayError::MassCancelMismatch`]).
     ///
-    /// A refused mass cancel cancels nothing and a partial one leaves orders
-    /// resting (see
-    /// [`MassCancelFailure`]),
-    /// so continuing would leave the replayed book diverged from the live one
-    /// without any signal. Likewise, a live mass cancel journaled with
-    /// per-order failures left those orders resting, and a replay that
-    /// cancels them diverges; until replay reconciles mass cancels by
-    /// identity (#252) such an event is always reported. The first failure
-    /// (the replay's own, else the journal's) is reported as
-    /// [`ReplayError::OrderBookError`] at the event's sequence number.
-    fn ensure_mass_cancel_complete(
+    /// The journaled [`SequencerResult::MassCancelled`] result is the
+    /// reference: the replayed cancelled ids and the replayed per-order
+    /// failure ids must equal the journaled ones in order, and the replay
+    /// must not refuse (a journaled refusal never gets here, see
+    /// [`Self::recorded_mass_cancel_refused`]). An event journaled with any
+    /// other success result carries no ids to compare against, so replay
+    /// only requires the re-execution to complete
+    /// ([`Self::ensure_replay_complete`]).
+    fn reconcile_mass_cancel(
+        event: &SequencerEvent<T>,
+        replayed: MassCancelResult,
+    ) -> Result<(), ReplayError> {
+        let SequencerResult::MassCancelled { result: recorded } = &event.result else {
+            return Self::ensure_replay_complete(event, &replayed);
+        };
+        let recorded_failed: Vec<_> = recorded.failed_order_ids().collect();
+        let replayed_failed: Vec<_> = replayed.failed_order_ids().collect();
+        let divergence = if recorded.is_refused() != replayed.is_refused() {
+            Some(MassCancelDivergence::Refusal {
+                recorded: recorded.is_refused(),
+                replayed: replayed.is_refused(),
+            })
+        } else if let Some(position) = first_difference(
+            recorded.cancelled_order_ids(),
+            replayed.cancelled_order_ids(),
+        ) {
+            Some(MassCancelDivergence::CancelledIds {
+                position,
+                recorded_count: recorded.cancelled_order_ids().len(),
+                replayed_count: replayed.cancelled_order_ids().len(),
+            })
+        } else {
+            first_difference(&recorded_failed, &replayed_failed).map(|position| {
+                MassCancelDivergence::FailedIds {
+                    position,
+                    recorded_count: recorded_failed.len(),
+                    replayed_count: replayed_failed.len(),
+                }
+            })
+        };
+        match divergence {
+            None => Ok(()),
+            Some(divergence) => Err(Self::mass_cancel_mismatch(
+                event, divergence, recorded, replayed,
+            )),
+        }
+    }
+
+    /// Fails replay when a re-executed mass cancel or sweep with no
+    /// journaled result to compare against recorded a failure other than a
+    /// level fault report.
+    ///
+    /// A refused call cancels nothing and a partial one leaves orders
+    /// resting (see [`MassCancelFailure`]), so continuing would leave the
+    /// replayed book diverged from the live one without any signal. The
+    /// first such failure is reported as [`ReplayError::OrderBookError`] at
+    /// the event's sequence number.
+    fn ensure_replay_complete(
         event: &SequencerEvent<T>,
         result: &MassCancelResult,
     ) -> Result<(), ReplayError> {
-        let recorded = match &event.result {
-            SequencerResult::MassCancelled { result } => result.failures().first(),
-            _ => None,
-        };
-        match result.failures().first().or(recorded) {
+        match result
+            .failures()
+            .iter()
+            .find(|failure| !matches!(failure, MassCancelFailure::LevelFaultAfterRemoval { .. }))
+        {
             None => Ok(()),
             Some(failure) => Err(ReplayError::OrderBookError {
                 sequence_num: event.sequence_num,
@@ -1131,40 +1281,57 @@ where
     }
 
     /// Fails replay unless a journaled eviction removed exactly the
-    /// journaled ids on the replay book (#248).
+    /// journaled ids, in order, on the replay book (#248, #252).
     ///
     /// `replayed` comes from evicting the recorded ids by identity, so any
     /// disagreement means the replay book no longer holds an order the live
-    /// sweep evicted (or its level refused it). Reported as
-    /// [`ReplayError::OrderBookError`] carrying the replay's own failure, or
-    /// [`OrderBookError::OrderNotFound`] for the first journaled id that was
-    /// not evicted.
+    /// sweep evicted (or its level refused it). The orders the live sweep
+    /// failed to evict are not attempted, so they keep resting and there is
+    /// no failure list to compare. Reported as
+    /// [`ReplayError::MassCancelMismatch`].
     fn ensure_same_evictions(
         event: &SequencerEvent<T>,
         recorded: &MassCancelResult,
-        replayed: &MassCancelResult,
+        replayed: MassCancelResult,
     ) -> Result<(), ReplayError> {
-        if replayed.cancelled_order_ids() == recorded.cancelled_order_ids() {
-            return Ok(());
+        match first_difference(
+            recorded.cancelled_order_ids(),
+            replayed.cancelled_order_ids(),
+        ) {
+            None => Ok(()),
+            Some(position) => Err(Self::mass_cancel_mismatch(
+                event,
+                MassCancelDivergence::CancelledIds {
+                    position,
+                    recorded_count: recorded.cancelled_order_ids().len(),
+                    replayed_count: replayed.cancelled_order_ids().len(),
+                },
+                recorded,
+                replayed,
+            )),
         }
-        let source = match replayed
-            .failures()
-            .iter()
-            .find(|failure| !matches!(failure, MassCancelFailure::LevelFaultAfterRemoval { .. }))
-        {
-            Some(failure) => failure.to_order_book_error(),
-            None => {
-                let missing = recorded
-                    .cancelled_order_ids()
-                    .iter()
-                    .find(|id| !replayed.cancelled_order_ids().contains(id));
-                OrderBookError::OrderNotFound(missing.map(ToString::to_string).unwrap_or_default())
-            }
-        };
-        Err(ReplayError::OrderBookError {
+    }
+
+    /// Builds (and logs) a [`ReplayError::MassCancelMismatch`].
+    #[cold]
+    #[inline(never)]
+    fn mass_cancel_mismatch(
+        event: &SequencerEvent<T>,
+        divergence: MassCancelDivergence,
+        recorded: &MassCancelResult,
+        replayed: MassCancelResult,
+    ) -> ReplayError {
+        tracing::error!(
+            sequence_num = event.sequence_num,
+            %divergence,
+            "replay diverged: mass cancel outcome differs from the journal"
+        );
+        ReplayError::MassCancelMismatch {
             sequence_num: event.sequence_num,
-            source,
-        })
+            divergence,
+            recorded: Box::new(recorded.clone()),
+            replayed: Box::new(replayed),
+        }
     }
 
     /// Whether a submit journaled as rejected under `code` is re-executed
@@ -2492,11 +2659,27 @@ mod tests {
         );
         let clock: Arc<dyn Clock> = Arc::new(StubClock::starting_at(0));
         match ReplayEngine::<()>::replay_from_with_clock(&journal, 0, "PEVICT", clock) {
-            Err(ReplayError::OrderBookError {
+            Err(ReplayError::MassCancelMismatch {
                 sequence_num: 3,
-                source: OrderBookError::OrderNotFound(id),
-            }) => assert_eq!(id, Id::from_u64(77).to_string()),
-            Err(other) => panic!("expected OrderNotFound, got {other:?}"),
+                divergence,
+                recorded,
+                replayed,
+            }) => {
+                assert_eq!(
+                    divergence,
+                    MassCancelDivergence::CancelledIds {
+                        position: 1,
+                        recorded_count: 2,
+                        replayed_count: 1,
+                    }
+                );
+                assert_eq!(
+                    recorded.cancelled_order_ids(),
+                    &[Id::from_u64(1), Id::from_u64(77)]
+                );
+                assert_eq!(replayed.cancelled_order_ids(), &[Id::from_u64(1)]);
+            }
+            Err(other) => panic!("expected MassCancelMismatch, got {other:?}"),
             Ok(_) => panic!("a diverged eviction must not replay silently"),
         }
     }
@@ -2564,10 +2747,10 @@ mod tests {
         );
     }
 
-    /// #248: a mass cancel journaled with per-order failures is partial,
-    /// not refused. Replay must not skip it (its listed ids were cancelled
-    /// live) and, until #252 reconciles by identity, must not accept it
-    /// silently either: replay reports the recorded failure.
+    /// #248 / #252: a mass cancel journaled with per-order failures is
+    /// partial, not refused. Replay must not skip it (its listed ids were
+    /// cancelled live) and reconciles it by identity: the fresh replay book
+    /// cancels the order the live level refused, so the ids diverge.
     #[test]
     fn test_replay_reports_mass_cancel_recorded_as_partial() {
         use crate::orderbook::mass_cancel::MassCancelFailure;
@@ -2603,13 +2786,362 @@ mod tests {
         );
 
         match ReplayEngine::<()>::replay_from(&journal, 0, symbol) {
-            Err(ReplayError::OrderBookError {
+            Err(ReplayError::MassCancelMismatch {
                 sequence_num,
-                source: OrderBookError::PriceLevelError(_),
-            }) => assert_eq!(sequence_num, 2),
-            Err(other) => panic!("expected the recorded failure, got {other:?}"),
+                divergence,
+                ..
+            }) => {
+                assert_eq!(sequence_num, 2);
+                assert_eq!(
+                    divergence,
+                    MassCancelDivergence::CancelledIds {
+                        position: 1,
+                        recorded_count: 1,
+                        replayed_count: 2,
+                    }
+                );
+            }
+            Err(other) => panic!("expected MassCancelMismatch, got {other:?}"),
             Ok(_) => panic!("a partial mass cancel must not replay silently"),
         }
+    }
+
+    // --- mass cancel identity reconciliation (#252) -------------------------
+
+    /// Journal (and live book) holding bids 1 @ 100, 2 @ 100 and 3 @ 101.
+    fn three_bids_fixture(symbol: &str) -> (OrderBook<()>, InMemoryJournal<()>) {
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let live = OrderBook::<()>::new(symbol);
+        for (seq, (id, price)) in [(1u64, 100u128), (2, 100), (3, 101)]
+            .into_iter()
+            .enumerate()
+        {
+            let ev = make_add_event(
+                u64::try_from(seq).expect("seq"),
+                Id::from_u64(id),
+                price,
+                5,
+                Side::Buy,
+            );
+            if let SequencerCommand::AddOrder(order) = &ev.command {
+                live.add_order(*order).expect("live add");
+            }
+            assert!(journal.append(&ev).is_ok());
+        }
+        (live, journal)
+    }
+
+    fn append_mass_cancel(
+        journal: &InMemoryJournal<()>,
+        seq: u64,
+        command: SequencerCommand<()>,
+        result: MassCancelResult,
+    ) {
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: seq,
+                    timestamp_ns: 0,
+                    command,
+                    result: SequencerResult::MassCancelled { result },
+                })
+                .is_ok()
+        );
+    }
+
+    /// #252: equal counts can hide different cancelled orders. A journaled
+    /// result naming the right number of orders but the wrong ones (or the
+    /// right ones in the wrong order) is a mismatch, not a success.
+    #[test]
+    fn test_replay_mass_cancel_equal_count_different_ids_is_mismatch() {
+        for (claimed, position) in [
+            // Same count, one foreign id.
+            (vec![Id::from_u64(1), Id::from_u64(2), Id::from_u64(99)], 2),
+            // Same ids, different order.
+            (vec![Id::from_u64(2), Id::from_u64(1), Id::from_u64(3)], 0),
+        ] {
+            let (_live, journal) = three_bids_fixture("IDENT");
+            append_mass_cancel(
+                &journal,
+                3,
+                SequencerCommand::CancelBySide { side: Side::Buy },
+                MassCancelResult::new(3, claimed),
+            );
+            match ReplayEngine::<()>::replay_from(&journal, 0, "IDENT") {
+                Err(ReplayError::MassCancelMismatch {
+                    sequence_num: 3,
+                    divergence,
+                    ..
+                }) => assert_eq!(
+                    divergence,
+                    MassCancelDivergence::CancelledIds {
+                        position,
+                        recorded_count: 3,
+                        replayed_count: 3,
+                    }
+                ),
+                Err(other) => panic!("expected MassCancelMismatch, got {other:?}"),
+                Ok(_) => panic!("an identity mismatch must not replay silently"),
+            }
+        }
+    }
+
+    /// #252: a journal that recorded fewer cancelled orders than the replay
+    /// cancels (the historical `MassCancelResult::default()` placeholder) is
+    /// a mismatch.
+    #[test]
+    fn test_replay_mass_cancel_recorded_empty_but_replay_cancels_is_mismatch() {
+        let (_live, journal) = three_bids_fixture("EMPTYREC");
+        append_mass_cancel(
+            &journal,
+            3,
+            SequencerCommand::CancelAll,
+            MassCancelResult::default(),
+        );
+        let err = ReplayEngine::<()>::replay_from(&journal, 0, "EMPTYREC")
+            .err()
+            .expect("must diverge");
+        assert!(matches!(
+            err,
+            ReplayError::MassCancelMismatch {
+                divergence: MassCancelDivergence::CancelledIds {
+                    position: 0,
+                    recorded_count: 0,
+                    replayed_count: 3,
+                },
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("cancelled ids differ at position 0")
+        );
+    }
+
+    /// #252: the live result of every scoped mass cancel replays cleanly by
+    /// identity, and the reconstructed book passes `snapshots_match`.
+    #[test]
+    fn test_replay_mass_cancel_identity_matches_live_results() {
+        let (live, journal) = three_bids_fixture("LIVEID");
+        let by_range = live.cancel_orders_by_price_range(Side::Buy, 101, 101);
+        assert_eq!(by_range.cancelled_order_ids(), &[Id::from_u64(3)]);
+        append_mass_cancel(
+            &journal,
+            3,
+            SequencerCommand::CancelByPriceRange {
+                side: Side::Buy,
+                min_price: 101,
+                max_price: 101,
+            },
+            by_range,
+        );
+        let by_user = live.cancel_orders_by_user(Hash32::zero());
+        assert_eq!(by_user.cancelled_count(), 2);
+        append_mass_cancel(
+            &journal,
+            4,
+            SequencerCommand::CancelByUser {
+                user_id: Hash32::zero(),
+            },
+            by_user,
+        );
+        assert_replay_matches(&live, &journal, "LIVEID");
+    }
+
+    /// #252: a level fault reported after the removal is not a book
+    /// outcome: the order was cancelled live and on replay, so the fault
+    /// report alone does not make the replay diverge.
+    #[test]
+    fn test_replay_mass_cancel_ignores_level_fault_reports() {
+        let (live, journal) = level_fault_fixture("LFMASS");
+        let result = live.cancel_orders_by_side(Side::Buy);
+        assert!(result.has_failures() && !result.is_refused());
+        assert_eq!(result.cancelled_count(), 2, "both removed");
+        append_mass_cancel(
+            &journal,
+            2,
+            SequencerCommand::CancelBySide { side: Side::Buy },
+            result,
+        );
+        assert_replay_matches(&live, &journal, "LFMASS");
+    }
+
+    /// #252: failure outcomes are compared too. A replay book whose level
+    /// refuses the same order the live one refused reproduces the partial
+    /// result exactly and is accepted; one that refuses a different order
+    /// diverges on the failed ids.
+    #[test]
+    fn test_replay_mass_cancel_compares_failure_outcomes() {
+        use crate::orderbook::book::CancelFault;
+        use crate::orderbook::mass_cancel::MassCancelFailure;
+
+        let refuse = |order: u64| {
+            move |id: Id| {
+                (id == Id::from_u64(order)).then(|| {
+                    CancelFault::Refuse(pricelevel::PriceLevelError::InvalidOperation {
+                        message: "refused".to_string(),
+                    })
+                })
+            }
+        };
+        let (_live, journal) = three_bids_fixture("FAILID");
+        let recorded = MassCancelResult::with_failures(
+            vec![Id::from_u64(1), Id::from_u64(3)],
+            vec![MassCancelFailure::OrderCancelFailed {
+                order_id: Id::from_u64(2),
+                error: pricelevel::PriceLevelError::InvalidOperation {
+                    message: "refused".to_string(),
+                },
+            }],
+        );
+        let event = SequencerEvent::<()> {
+            sequence_num: 3,
+            timestamp_ns: 0,
+            command: SequencerCommand::CancelBySide { side: Side::Buy },
+            result: SequencerResult::MassCancelled { result: recorded },
+        };
+
+        let rebuild = |hook_order: u64| {
+            let mut book = OrderBook::<()>::new("FAILID");
+            book.cancel_fault_hook = Some(Arc::new(refuse(hook_order)));
+            for entry in journal.read_from(0).expect("read") {
+                let ev = entry.expect("entry").event;
+                ReplayEngine::<()>::apply_event(&book, &ev).expect("add replays");
+            }
+            book
+        };
+
+        // Same refused order: the partial result reproduces exactly.
+        let book = rebuild(2);
+        assert!(ReplayEngine::<()>::apply_event(&book, &event).is_ok());
+        assert!(book.get_order(Id::from_u64(2)).is_some(), "still resting");
+
+        // A different refused order: the ids diverge first.
+        let book = rebuild(3);
+        match ReplayEngine::<()>::apply_event(&book, &event) {
+            Err(ReplayError::MassCancelMismatch { divergence, .. }) => assert_eq!(
+                divergence,
+                MassCancelDivergence::CancelledIds {
+                    position: 1,
+                    recorded_count: 2,
+                    replayed_count: 2,
+                }
+            ),
+            other => panic!("expected MassCancelMismatch, got {other:?}"),
+        }
+    }
+
+    /// #252: identical cancelled ids but a recorded order left resting that
+    /// the replay does not leave resting diverge on the failed ids.
+    #[test]
+    fn test_replay_mass_cancel_failed_ids_divergence() {
+        use crate::orderbook::mass_cancel::MassCancelFailure;
+
+        let (_live, journal) = three_bids_fixture("FAILONLY");
+        append_mass_cancel(
+            &journal,
+            3,
+            SequencerCommand::CancelBySide { side: Side::Buy },
+            MassCancelResult::with_failures(
+                vec![Id::from_u64(1), Id::from_u64(2), Id::from_u64(3)],
+                vec![MassCancelFailure::OrderCancelFailed {
+                    order_id: Id::from_u64(99),
+                    error: pricelevel::PriceLevelError::InvalidOperation {
+                        message: "refused".to_string(),
+                    },
+                }],
+            ),
+        );
+        match ReplayEngine::<()>::replay_from(&journal, 0, "FAILONLY") {
+            Err(ReplayError::MassCancelMismatch { divergence, .. }) => assert_eq!(
+                divergence,
+                MassCancelDivergence::FailedIds {
+                    position: 0,
+                    recorded_count: 1,
+                    replayed_count: 0,
+                }
+            ),
+            Err(other) => panic!("expected MassCancelMismatch, got {other:?}"),
+            Ok(_) => panic!("a failure-outcome mismatch must not replay silently"),
+        }
+    }
+
+    /// #252 review: a fill must not reorder a user's resting orders.
+    /// `untrack_order_by_id` used `swap_remove`, so filling the user's first
+    /// order moved their last one to the front and `cancel_orders_by_user`
+    /// no longer followed admission order. The live result is now in
+    /// admission order and replay reconciles it by identity.
+    #[test]
+    fn test_fill_keeps_user_order_admission_order_for_by_user_cancel() {
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let live = OrderBook::<()>::new("FILLUSER");
+        let bids = [(1u64, 100u128), (2, 99), (3, 98), (4, 97)];
+        for (seq, (id, price)) in bids.into_iter().enumerate() {
+            let ev = make_add_event(
+                u64::try_from(seq).expect("seq"),
+                Id::from_u64(id),
+                price,
+                5,
+                Side::Buy,
+            );
+            if let SequencerCommand::AddOrder(order) = &ev.command {
+                live.add_order(*order).expect("live add");
+            }
+            assert!(journal.append(&ev).is_ok());
+        }
+
+        // Fill the user's first (best) bid completely.
+        let taker = Id::from_u64(50);
+        let fill = live
+            .submit_market_order(taker, 5, Side::Sell)
+            .expect("live fill");
+        assert!(
+            live.get_order(Id::from_u64(1)).is_none(),
+            "first bid filled"
+        );
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 4,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::MarketOrder {
+                        id: taker,
+                        quantity: 5,
+                        side: Side::Sell,
+                    },
+                    result: SequencerResult::TradeExecuted {
+                        trade_result: TradeResult::new("FILLUSER".to_string(), fill)
+                            .expect("trade result"),
+                    },
+                })
+                .is_ok()
+        );
+
+        let by_user = live.cancel_orders_by_user(Hash32::zero());
+        assert_eq!(
+            by_user.cancelled_order_ids(),
+            &[Id::from_u64(2), Id::from_u64(3), Id::from_u64(4)],
+            "admission order survives the fill"
+        );
+        append_mass_cancel(
+            &journal,
+            5,
+            SequencerCommand::CancelByUser {
+                user_id: Hash32::zero(),
+            },
+            by_user,
+        );
+        assert_replay_matches(&live, &journal, "FILLUSER");
+    }
+
+    #[test]
+    fn test_first_difference_positions() {
+        assert_eq!(first_difference::<u8>(&[], &[]), None);
+        assert_eq!(first_difference(&[1, 2], &[1, 2]), None);
+        assert_eq!(first_difference(&[1, 2], &[1, 3]), Some(1));
+        assert_eq!(first_difference(&[1, 2], &[1]), Some(1));
+        assert_eq!(first_difference(&[1], &[1, 2]), Some(1));
+        assert_eq!(first_difference(&[], &[1]), Some(0));
     }
 
     // --- trade-ID namespace through replay (#200) ---------------------------

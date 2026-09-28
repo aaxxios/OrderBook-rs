@@ -81,12 +81,23 @@ format.
   backing file, which `memmap2` cannot prevent). This crate does not add its
   own `unsafe` on top; it mitigates by pre-allocating (not truncating)
   segment files and by not sharing the mapped file with another writer.
-  `SIGBUS` from a corrupted external truncation is a process-level fault,
-  not a Rust panic, and is explicitly out of the Production Panic Policy's
-  scope (irreducible OS-level risk of memory-mapped I/O). CRC32 checksums
-  detect a truncated/corrupted segment on the read/replay path and return
-  `ReplayError`, never panic, for anything short of the kernel-level fault
-  above.
+  Since #252 segments are created with `create_new` (rotation onto an
+  existing file is `JournalError::SegmentExists`, never a truncation of a
+  file a reader may have mapped), appends refuse non-increasing sequences
+  before touching disk (`NonMonotonicSequence`), and the old segment is
+  never shrunk after rotation. `SIGBUS` from a corrupted external
+  truncation is a process-level fault, not a Rust panic, and is explicitly
+  out of the Production Panic Policy's scope (irreducible OS-level risk of
+  memory-mapped I/O). Journal bytes are untrusted: every length, offset and
+  header field is decoded with checked access (`get`, `first_chunk`,
+  `try_from`), a non-zero bad header is `JournalError::InvalidEntryHeader`
+  (only a zero `entry_length` ends the data), CRC32 checksums detect a
+  truncated/corrupted segment, and readers never read past the committed
+  write position of the active segment. Reopen zeroes the torn tail with
+  safe slice writes, and refuses (does not truncate) corruption followed by
+  valid entries. The read/replay path returns `JournalError` /
+  `ReplayError`, never panics, for anything short of the kernel-level
+  fault above.
 
 **To be completed by #260:** confirm there is no second `unsafe` introduced
 by a dependency's own `build.rs`/proc-macro that this crate re-exercises
@@ -107,7 +118,7 @@ boundary's limits instead of promising to prevent every external panic."
 | `OrderStateListener` (`Arc<dyn Fn(Id, &OrderStatus, &OrderStatus) + Send + Sync>`, `src/orderbook/order_state.rs`) | Invoked on order lifecycle transitions | Same as `TradeListener` | Same commit-then-notify discipline |
 | `PriceLevelChangedListener` (`Arc<dyn Fn(PriceLevelChangedEvent) + Send + Sync>`, `src/orderbook/book_change_event.rs`) | Invoked on book-level change events (feeds `NatsBookChangePublisher`) | Same as `TradeListener` | Same commit-then-notify discipline |
 | `EventSerializer` impls (`src/orderbook/serialization.rs`) | Journal entry encoding, NATS payload encoding | Must return a typed error rather than panicking on an unencodable value | Crate-provided JSON/Bincode impls follow this; a caller-supplied impl is not re-certified. On the NATS path it runs in the publisher's background task with no lock held; a panic there stops the task and is reported by `shutdown()` as `NatsPublisherError::TaskPanicked` |
-| `Journal<T>` impls (`src/orderbook/sequencer/journal.rs`) | Append/read of sequencer events (`InMemoryJournal`, `FileJournal`, or a caller's own impl) | Must return `JournalError`/`ReplayError` rather than panicking; must not silently drop or reorder entries | Crate-provided impls follow this end-to-end; a caller-supplied `Journal<T>` is not re-certified |
+| `Journal<T>` impls (`src/orderbook/sequencer/journal.rs`) | Append/read of sequencer events (`InMemoryJournal`, `FileJournal`, or a caller's own impl) | Must return `JournalError`/`ReplayError` rather than panicking; must not silently drop or reorder entries; must refuse a non-increasing `append` with `NonMonotonicSequence`, and report an unreadable `last_sequence` as `Err`, never `Ok(None)` (#252) | Crate-provided impls follow this end-to-end (poisoned locks are `MutexPoisoned`, `InMemoryJournal` clones `T` outside its write lock); a caller-supplied `Journal<T>` is not re-certified |
 | `Clock` impls (`src/orderbook/clock.rs`) | Timestamp generation for the book and sequencer | Must not panic; must be monotonic if used with `ReplayEngine`'s determinism guarantee | `MonotonicClock` is crate-provided and compliant; a caller-supplied `Clock` breaking monotonicity is a correctness bug in the caller, not a crate panic |
 | Replay progress callbacks (`replay_from_with_progress`, `replay_from_with_clock_and_progress`, `src/orderbook/sequencer/replay.rs`) | Invoked per applied journal entry during replay | Must not panic; must return quickly | Runs after each entry is applied to the in-memory book, not while any lock is held |
 | `metrics` recorder (feature `metrics`, `src/orderbook/metrics.rs`) | The process-installed global `metrics` recorder, invoked synchronously from `record_reject` / `record_depth` / `record_trades` / `record_reserve_hidden_discarded` / `record_risk_accounting_anomaly` on the calling thread (including the matching path, after the book mutation that triggered the metric) | Must not panic on a recorded metric; must return quickly; owns its own counter overflow semantics for `increment(n)` | The crate never installs its own recorder (`rules/global_rules.md`'s Logging & Observability rule against installing a global subscriber applies by the same reasoning to a metrics recorder); with none installed the `metrics` crate's no-op recorder is used. The helpers do no integer arithmetic themselves (issue #254); the `u64` to `f64` gauge casts are exact below 2^53 and cannot panic |

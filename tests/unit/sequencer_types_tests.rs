@@ -376,7 +376,7 @@ mod tests_sequencer_types {
                 );
             }
 
-            assert_eq!(journal.last_sequence(), Some(4));
+            assert_eq!(journal.last_sequence().expect("last_sequence"), Some(4));
 
             // Read back and verify
             let iter = journal.read_from(1).expect("read_from should succeed");
@@ -458,6 +458,7 @@ mod tests_sequencer_types {
     // ── Replay apply_event coverage for mass cancel commands ─────────────
 
     mod replay_mass_cancel_tests {
+        use orderbook_rs::OrderBook;
         use orderbook_rs::orderbook::mass_cancel::MassCancelResult;
         use orderbook_rs::orderbook::sequencer::replay::ReplayEngine;
         use orderbook_rs::orderbook::sequencer::{
@@ -486,28 +487,58 @@ mod tests_sequencer_types {
             }
         }
 
-        fn make_mass_cancel_event(seq: u64, command: SequencerCommand<()>) -> SequencerEvent<()> {
+        /// Applies a journaled add to the live book too, the way a
+        /// sequencer executes before it journals.
+        fn live_add(live: &OrderBook<()>, event: SequencerEvent<()>) -> SequencerEvent<()> {
+            if let SequencerCommand::AddOrder(order) = &event.command {
+                live.add_order(*order).expect("live add");
+            }
+            event
+        }
+
+        /// Executes `command` on the live book and journals the result it
+        /// returned: replay reconciles mass cancels by identity (#252), so
+        /// the journaled ids must be the ones the live book cancelled.
+        fn make_mass_cancel_event(
+            seq: u64,
+            command: SequencerCommand<()>,
+            live: &OrderBook<()>,
+        ) -> SequencerEvent<()> {
+            let result: MassCancelResult = match &command {
+                SequencerCommand::CancelAll => live.cancel_all_orders(),
+                SequencerCommand::CancelBySide { side } => live.cancel_orders_by_side(*side),
+                SequencerCommand::CancelByUser { user_id } => live.cancel_orders_by_user(*user_id),
+                SequencerCommand::CancelByPriceRange {
+                    side,
+                    min_price,
+                    max_price,
+                } => live.cancel_orders_by_price_range(*side, *min_price, *max_price),
+                other => panic!("not a mass cancel: {other:?}"),
+            };
             SequencerEvent {
                 sequence_num: seq,
                 timestamp_ns: 1_000_000_000u64.saturating_add(seq),
                 command,
-                result: SequencerResult::MassCancelled {
-                    result: MassCancelResult::default(),
-                },
+                result: SequencerResult::MassCancelled { result },
             }
         }
 
         #[test]
         fn replay_cancel_all_clears_book() {
             let journal = InMemoryJournal::<()>::new();
+            let live = OrderBook::<()>::new("TEST");
             journal
-                .append(&make_add_event(1, 100, Side::Buy))
+                .append(&live_add(&live, make_add_event(1, 100, Side::Buy)))
                 .expect("append");
             journal
-                .append(&make_add_event(2, 200, Side::Sell))
+                .append(&live_add(&live, make_add_event(2, 200, Side::Sell)))
                 .expect("append");
             journal
-                .append(&make_mass_cancel_event(3, SequencerCommand::CancelAll))
+                .append(&make_mass_cancel_event(
+                    3,
+                    SequencerCommand::CancelAll,
+                    &live,
+                ))
                 .expect("append");
 
             let result = ReplayEngine::replay_from(&journal, 1, "TEST");
@@ -521,16 +552,18 @@ mod tests_sequencer_types {
         #[test]
         fn replay_cancel_by_side_removes_one_side() {
             let journal = InMemoryJournal::<()>::new();
+            let live = OrderBook::<()>::new("TEST");
             journal
-                .append(&make_add_event(1, 100, Side::Buy))
+                .append(&live_add(&live, make_add_event(1, 100, Side::Buy)))
                 .expect("append");
             journal
-                .append(&make_add_event(2, 200, Side::Sell))
+                .append(&live_add(&live, make_add_event(2, 200, Side::Sell)))
                 .expect("append");
             journal
                 .append(&make_mass_cancel_event(
                     3,
                     SequencerCommand::CancelBySide { side: Side::Buy },
+                    &live,
                 ))
                 .expect("append");
 
@@ -544,8 +577,9 @@ mod tests_sequencer_types {
         #[test]
         fn replay_cancel_by_user_removes_user_orders() {
             let journal = InMemoryJournal::<()>::new();
+            let live = OrderBook::<()>::new("TEST");
             journal
-                .append(&make_add_event(1, 100, Side::Buy))
+                .append(&live_add(&live, make_add_event(1, 100, Side::Buy)))
                 .expect("append");
             journal
                 .append(&make_mass_cancel_event(
@@ -553,6 +587,7 @@ mod tests_sequencer_types {
                     SequencerCommand::CancelByUser {
                         user_id: Hash32::zero(),
                     },
+                    &live,
                 ))
                 .expect("append");
 
@@ -568,14 +603,15 @@ mod tests_sequencer_types {
         #[test]
         fn replay_cancel_by_price_range() {
             let journal = InMemoryJournal::<()>::new();
+            let live = OrderBook::<()>::new("TEST");
             journal
-                .append(&make_add_event(1, 100, Side::Buy))
+                .append(&live_add(&live, make_add_event(1, 100, Side::Buy)))
                 .expect("append");
             journal
-                .append(&make_add_event(2, 150, Side::Buy))
+                .append(&live_add(&live, make_add_event(2, 150, Side::Buy)))
                 .expect("append");
             journal
-                .append(&make_add_event(3, 200, Side::Buy))
+                .append(&live_add(&live, make_add_event(3, 200, Side::Buy)))
                 .expect("append");
             journal
                 .append(&make_mass_cancel_event(
@@ -585,6 +621,7 @@ mod tests_sequencer_types {
                         min_price: 100,
                         max_price: 150,
                     },
+                    &live,
                 ))
                 .expect("append");
 

@@ -38,6 +38,31 @@ fn make_add_event(seq: u64, id: Id, price: u128, qty: u64, side: Side) -> Sequen
     }
 }
 
+/// Runs `command` on a live book holding `adds` and returns the result it
+/// produced, so the journal records the ids replay reconciles against (#252).
+fn live_mass_cancel(
+    adds: &[&SequencerEvent<()>],
+    command: &SequencerCommand<()>,
+) -> MassCancelResult {
+    let live = orderbook_rs::OrderBook::<()>::new("TEST");
+    for ev in adds {
+        if let SequencerCommand::AddOrder(order) = &ev.command {
+            live.add_order(*order).expect("live add");
+        }
+    }
+    match command {
+        SequencerCommand::CancelAll => live.cancel_all_orders(),
+        SequencerCommand::CancelBySide { side } => live.cancel_orders_by_side(*side),
+        SequencerCommand::CancelByUser { user_id } => live.cancel_orders_by_user(*user_id),
+        SequencerCommand::CancelByPriceRange {
+            side,
+            min_price,
+            max_price,
+        } => live.cancel_orders_by_price_range(*side, *min_price, *max_price),
+        other => panic!("not a mass cancel: {other:?}"),
+    }
+}
+
 fn make_cancel_event(seq: u64, id: Id) -> SequencerEvent<()> {
     SequencerEvent {
         sequence_num: seq,
@@ -209,17 +234,74 @@ fn replay_with_progress_callback() {
     assert_eq!(calls[1], (2, 1));
 }
 
+/// Journals `command` with the result it produced on a live book holding
+/// one bid at 100, then replays.
+fn replay_single_mass_cancel(
+    command: SequencerCommand<()>,
+) -> Result<(orderbook_rs::OrderBook<()>, u64), ReplayError> {
+    let journal: InMemoryJournal<()> = InMemoryJournal::new();
+    let add = make_add_event(0, new_id(), 100, 10, Side::Buy);
+    journal.append(&add).expect("append add");
+    let result = live_mass_cancel(&[&add], &command);
+    let event = SequencerEvent {
+        sequence_num: 1,
+        timestamp_ns: 0,
+        command,
+        result: SequencerResult::MassCancelled { result },
+    };
+    journal.append(&event).expect("append mass cancel");
+    ReplayEngine::<()>::replay_from(&journal, 0, "TEST")
+}
+
 #[test]
 fn replay_cancel_all_command() {
+    let (book, _) = replay_single_mass_cancel(SequencerCommand::CancelAll).expect("replay");
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
+    assert!(snap.bids.is_empty());
+}
+
+#[test]
+fn replay_cancel_by_side_command() {
+    let (book, _) = replay_single_mass_cancel(SequencerCommand::CancelBySide { side: Side::Buy })
+        .expect("replay");
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
+    assert!(snap.bids.is_empty());
+}
+
+#[test]
+fn replay_cancel_by_user_command() {
+    let (book, _) = replay_single_mass_cancel(SequencerCommand::CancelByUser {
+        user_id: Hash32::from([42u8; 32]),
+    })
+    .expect("replay");
+    // A foreign user owns nothing: the bid keeps resting.
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
+    assert_eq!(snap.bids.len(), 1);
+}
+
+#[test]
+fn replay_cancel_by_price_range_command() {
+    let (book, _) = replay_single_mass_cancel(SequencerCommand::CancelByPriceRange {
+        side: Side::Buy,
+        min_price: 50,
+        max_price: 150,
+    })
+    .expect("replay");
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
+    assert!(snap.bids.is_empty());
+}
+
+/// #252: a journaled placeholder result (`MassCancelResult::default()`) for
+/// a mass cancel that cancelled an order is an identity mismatch.
+#[test]
+fn replay_cancel_all_with_placeholder_result_is_mismatch() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = new_id();
     assert!(
         journal
-            .append(&make_add_event(0, id, 100, 10, Side::Buy))
+            .append(&make_add_event(0, new_id(), 100, 10, Side::Buy))
             .is_ok()
     );
-
-    let cancel_all_event = SequencerEvent {
+    let event = SequencerEvent {
         sequence_num: 1,
         timestamp_ns: 0,
         command: SequencerCommand::CancelAll,
@@ -227,92 +309,14 @@ fn replay_cancel_all_command() {
             result: MassCancelResult::default(),
         },
     };
-    assert!(journal.append(&cancel_all_event).is_ok());
-
-    let result = ReplayEngine::<()>::replay_from(&journal, 0, "TEST");
-    assert!(result.is_ok());
-    let (book, _) = result.unwrap();
-    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
-    assert!(snap.bids.is_empty());
-}
-
-#[test]
-fn replay_cancel_by_side_command() {
-    let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = new_id();
-    assert!(
-        journal
-            .append(&make_add_event(0, id, 100, 10, Side::Buy))
-            .is_ok()
-    );
-
-    let cancel_side_event = SequencerEvent {
-        sequence_num: 1,
-        timestamp_ns: 0,
-        command: SequencerCommand::CancelBySide { side: Side::Buy },
-        result: SequencerResult::MassCancelled {
-            result: MassCancelResult::default(),
-        },
-    };
-    assert!(journal.append(&cancel_side_event).is_ok());
-
-    let result = ReplayEngine::<()>::replay_from(&journal, 0, "TEST");
-    assert!(result.is_ok());
-    let (book, _) = result.unwrap();
-    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
-    assert!(snap.bids.is_empty());
-}
-
-#[test]
-fn replay_cancel_by_user_command() {
-    let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = new_id();
-
-    let add_event = make_add_event(0, id, 100, 10, Side::Buy);
-    assert!(journal.append(&add_event).is_ok());
-
-    let cancel_user_event = SequencerEvent {
-        sequence_num: 1,
-        timestamp_ns: 0,
-        command: SequencerCommand::CancelByUser {
-            user_id: Hash32::from([42u8; 32]),
-        },
-        result: SequencerResult::MassCancelled {
-            result: MassCancelResult::default(),
-        },
-    };
-    assert!(journal.append(&cancel_user_event).is_ok());
-
-    let result = ReplayEngine::<()>::replay_from(&journal, 0, "TEST");
-    assert!(result.is_ok());
-}
-
-#[test]
-fn replay_cancel_by_price_range_command() {
-    let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = new_id();
-    assert!(
-        journal
-            .append(&make_add_event(0, id, 100, 10, Side::Buy))
-            .is_ok()
-    );
-
-    let cancel_range_event = SequencerEvent {
-        sequence_num: 1,
-        timestamp_ns: 0,
-        command: SequencerCommand::CancelByPriceRange {
-            side: Side::Buy,
-            min_price: 50,
-            max_price: 150,
-        },
-        result: SequencerResult::MassCancelled {
-            result: MassCancelResult::default(),
-        },
-    };
-    assert!(journal.append(&cancel_range_event).is_ok());
-
-    let result = ReplayEngine::<()>::replay_from(&journal, 0, "TEST");
-    assert!(result.is_ok());
+    assert!(journal.append(&event).is_ok());
+    assert!(matches!(
+        ReplayEngine::<()>::replay_from(&journal, 0, "TEST"),
+        Err(ReplayError::MassCancelMismatch {
+            sequence_num: 1,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -456,22 +460,22 @@ fn snapshots_match_different_ask_count_returns_false() {
 #[test]
 fn in_memory_journal_new_is_empty() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    assert!(journal.is_empty());
-    assert_eq!(journal.len(), 0);
-    assert_eq!(journal.last_sequence(), None);
+    assert!(journal.is_empty().expect("is_empty"));
+    assert_eq!(journal.len().expect("len"), 0);
+    assert_eq!(journal.last_sequence().expect("last_sequence"), None);
 }
 
 #[test]
 fn in_memory_journal_default_is_empty() {
     let journal: InMemoryJournal<()> = InMemoryJournal::default();
-    assert!(journal.is_empty());
+    assert!(journal.is_empty().expect("is_empty"));
 }
 
 #[test]
 fn in_memory_journal_with_capacity() {
-    let journal: InMemoryJournal<()> = InMemoryJournal::with_capacity(100);
-    assert!(journal.is_empty());
-    assert_eq!(journal.len(), 0);
+    let journal: InMemoryJournal<()> = InMemoryJournal::with_capacity(100).expect("with_capacity");
+    assert!(journal.is_empty().expect("is_empty"));
+    assert_eq!(journal.len().expect("len"), 0);
 }
 
 #[test]
@@ -480,9 +484,9 @@ fn in_memory_journal_append_and_len() {
     let id = new_id();
     let event = make_add_event(0, id, 100, 10, Side::Buy);
     assert!(journal.append(&event).is_ok());
-    assert!(!journal.is_empty());
-    assert_eq!(journal.len(), 1);
-    assert_eq!(journal.last_sequence(), Some(0));
+    assert!(!journal.is_empty().expect("is_empty"));
+    assert_eq!(journal.len().expect("len"), 1);
+    assert_eq!(journal.last_sequence().expect("last_sequence"), Some(0));
 }
 
 #[test]

@@ -53,8 +53,13 @@ mod tests_filejournal_edge_cases {
     // 1. Crash Recovery / Partial Write
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// #252: a file cut in the middle of its last entry (a crash while the
+    /// entry was being written) is a torn tail: reopen truncates to the last
+    /// good entry and zeroes the torn bytes, so integrity holds and appends
+    /// resume. Truncation inside an earlier segment is still reported (see
+    /// the co-located `file_journal` tests).
     #[test]
-    fn crash_recovery_truncated_last_entry_detected_by_verify() {
+    fn crash_recovery_truncated_last_entry_is_recovered_on_reopen() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let journal: FileJournal<()> = FileJournal::open(dir.path()).expect("open journal");
 
@@ -97,14 +102,40 @@ mod tests_filejournal_edge_cases {
         let truncated_len = used_len.saturating_sub(10).max(1);
         fs::write(&seg_path, &data[..truncated_len]).expect("write truncated");
 
-        // Re-open and verify — should detect the truncation
+        // Re-open: the torn last entry (seq 4) is dropped and zeroed.
         let journal2: FileJournal<()> = FileJournal::open(dir.path()).expect("reopen");
-        let integrity = journal2.verify_integrity();
-        // Should detect corruption or truncation
+        assert_eq!(journal2.last_sequence().expect("last_sequence"), Some(3));
+        assert!(journal2.verify_integrity().is_ok());
+        let after = fs::read(&seg_path).expect("read segment");
+        let good_end = {
+            let mut off = 0usize;
+            for _ in 0..4 {
+                let el = u32::from_le_bytes([
+                    after[off],
+                    after[off + 1],
+                    after[off + 2],
+                    after[off + 3],
+                ]) as usize;
+                off += 4 + el;
+            }
+            off
+        };
         assert!(
-            integrity.is_err(),
-            "verify_integrity should detect truncated entry"
+            after[good_end..].iter().all(|b| *b == 0),
+            "torn bytes zeroed"
         );
+
+        // Replay sees exactly the four good entries, and appends resume.
+        let seqs: Vec<u64> = journal2
+            .read_from(0)
+            .expect("read_from")
+            .map(|e| e.expect("entry decodes").event.sequence_num)
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3]);
+        journal2
+            .append(&make_event(4))
+            .expect("append after recovery");
+        assert!(journal2.verify_integrity().is_ok());
     }
 
     #[test]
@@ -149,7 +180,7 @@ mod tests_filejournal_edge_cases {
 
         // Re-open — should see only 2 entries and allow appending
         let journal2: FileJournal<()> = FileJournal::open(dir.path()).expect("reopen");
-        assert_eq!(journal2.last_sequence(), Some(1));
+        assert_eq!(journal2.last_sequence().expect("last_sequence"), Some(1));
 
         // Append new entries starting from seq 2
         journal2
@@ -158,7 +189,7 @@ mod tests_filejournal_edge_cases {
         journal2
             .append(&make_event(3))
             .expect("append after recovery");
-        assert_eq!(journal2.last_sequence(), Some(3));
+        assert_eq!(journal2.last_sequence().expect("last_sequence"), Some(3));
 
         // Read all entries — should have 4
         let entries: Vec<_> = journal2
@@ -185,7 +216,10 @@ mod tests_filejournal_edge_cases {
             journal.append(&make_event(i)).expect("append");
         }
 
-        assert_eq!(journal.last_sequence(), Some(count - 1));
+        assert_eq!(
+            journal.last_sequence().expect("last_sequence"),
+            Some(count - 1)
+        );
 
         // Should have many segment files
         let segs = list_segments(dir.path());
@@ -239,7 +273,7 @@ mod tests_filejournal_edge_cases {
         for i in 0..100 {
             journal.append(&make_event(i)).expect("append");
             assert_eq!(
-                journal.last_sequence(),
+                journal.last_sequence().expect("last_sequence"),
                 Some(i),
                 "last_sequence wrong after append #{i}"
             );
@@ -403,7 +437,7 @@ mod tests_filejournal_edge_cases {
         let dir = tempfile::tempdir().expect("create temp dir");
         let journal: FileJournal<()> = FileJournal::open(dir.path()).expect("open journal");
 
-        assert_eq!(journal.last_sequence(), None);
+        assert_eq!(journal.last_sequence().expect("last_sequence"), None);
     }
 
     #[test]
@@ -556,13 +590,16 @@ mod tests_filejournal_edge_cases {
         let journal2: FileJournal<()> =
             FileJournal::open_with_segment_size(dir.path(), 400).expect("reopen");
 
-        let last = journal2.last_sequence();
+        let last = journal2.last_sequence().expect("last_sequence");
         assert!(last.is_some());
 
         let next_seq = last.expect("has last") + 1;
         journal2
             .append(&make_event(next_seq))
             .expect("append after reopen");
-        assert_eq!(journal2.last_sequence(), Some(next_seq));
+        assert_eq!(
+            journal2.last_sequence().expect("last_sequence"),
+            Some(next_seq)
+        );
     }
 }
