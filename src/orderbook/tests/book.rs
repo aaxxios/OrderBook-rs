@@ -1148,9 +1148,9 @@ mod test_book_specific {
     #[test]
     fn test_next_engine_seq_starts_at_zero_and_advances_by_one() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        assert_eq!(book.next_engine_seq(), 0);
-        assert_eq!(book.next_engine_seq(), 1);
-        assert_eq!(book.next_engine_seq(), 2);
+        assert_eq!(book.next_engine_seq().expect("mint"), 0);
+        assert_eq!(book.next_engine_seq().expect("mint"), 1);
+        assert_eq!(book.next_engine_seq().expect("mint"), 2);
         assert_eq!(book.engine_seq(), 3);
     }
 
@@ -1169,7 +1169,7 @@ mod test_book_specific {
             handles.push(thread::spawn(move || {
                 let mut local = Vec::with_capacity(per_thread);
                 for _ in 0..per_thread {
-                    local.push(b.next_engine_seq());
+                    local.push(b.next_engine_seq().expect("mint"));
                 }
                 local
             }));

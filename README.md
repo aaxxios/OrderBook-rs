@@ -220,6 +220,22 @@ This order book engine is built with the following design principles:
   journaled `MassCancelled` with the replayed result by order ids, in
   order, and failure outcomes (`ReplayError::MassCancelMismatch`). No
   on-disk format change.
+- **Checked counters and untrusted-restore validation (#250).**
+  `next_engine_seq()` returns `Result` and refuses with
+  `OrderBookError::EngineSeqExhausted` instead of wrapping; the engine's
+  emission paths suppress (and latch, `engine_seq_exhausted()`) an event
+  they cannot stamp, and the book keeps matching. Restore rejects, before
+  touching the live book, a crossed or locked snapshot (new
+  `OrderBookError::SnapshotCrossed`), an order whose `visible + hidden`
+  overflows `u64`, and a package whose `engine_seq` is `u64::MAX`; tick /
+  lot alignment is deliberately not enforced, so a book holding orders
+  from a previous tick or lot size still round-trips.
+  `OrderBookSnapshotPackage::new` propagates a failed aggregate refresh.
+  `spread()` / `spread_bps()` return `None` for a crossed read. The
+  strandable-maker count, `StubClock` (pinned at its ceiling,
+  `is_exhausted()`), repricing counters and the order-state tracker's
+  purge use checked forms; the tracker recovers a poisoned eviction queue
+  and evicts with `DashMap::remove_if`.
 
 #### Migration from 0.13
 
@@ -289,6 +305,11 @@ This order book engine is built with the following design principles:
 | `Journal::append` accepts any sequence; rotation truncates an existing segment | non-increasing sequence → `JournalError::NonMonotonicSequence`; existing segment → `SegmentExists` |
 | `JournalError` (hand-written `Display`) | `thiserror`; adds `NonMonotonicSequence`, `SegmentExists`, `AllocationFailed` |
 | journaled `MassCancelled` checked by refusal / failures only | reconciled by ids and failure outcomes; `ReplayError::MassCancelMismatch` (`MassCancelDivergence`) |
+| `OrderBook::next_engine_seq() -> u64` (wraps at `u64::MAX`) | `-> Result<u64, OrderBookError>`; `EngineSeqExhausted` at `u64::MAX` |
+| `OrderBookSnapshot::refresh_aggregates()` (errors ignored) | `-> Result<(), OrderBookError>` |
+| `OrderBookError` (no counter-exhaustion / crossed-restore variant) | adds `EngineSeqExhausted { engine_seq }`, `SnapshotCrossed { best_bid, best_ask }` (wire code `Other(0)`) |
+| restore of a crossed / locked snapshot or a package with `engine_seq == u64::MAX`: accepted | rejected before any live state is touched |
+| `OrderBook::spread()` / `spread_bps()` / `OrderBookSnapshot::spread()` on a crossed read: `Some(0)` | `None` |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

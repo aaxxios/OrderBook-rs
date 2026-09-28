@@ -41,14 +41,26 @@ pub struct OrderBookSnapshot {
 
 impl OrderBookSnapshot {
     /// Recomputes aggregate values for all included price levels.
-    pub fn refresh_aggregates(&mut self) {
-        for level in &mut self.bids {
-            let _ = level.refresh_aggregates();
+    ///
+    /// Stops at the first level whose aggregates cannot be recomputed;
+    /// levels before it are refreshed, the failing level and the ones
+    /// after it keep their previous aggregates. Every caller that
+    /// checksums or restores the snapshot treats the error as fatal, so a
+    /// partially refreshed snapshot is never checksummed or installed.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::PriceLevelError`] when a level's aggregates do not
+    /// fit their integer types (for example a visible or hidden quantity
+    /// sum that overflows `u64`). Previously the error was ignored and the
+    /// level kept stale aggregates that were then checksummed (#250).
+    pub fn refresh_aggregates(&mut self) -> Result<(), OrderBookError> {
+        for level in self.bids.iter_mut().chain(self.asks.iter_mut()) {
+            level
+                .refresh_aggregates()
+                .map_err(OrderBookError::PriceLevelError)?;
         }
-
-        for level in &mut self.asks {
-            let _ = level.refresh_aggregates();
-        }
+        Ok(())
     }
 
     /// Get the best bid price and quantity
@@ -85,12 +97,16 @@ impl OrderBookSnapshot {
         mid_price
     }
 
-    /// Get the spread (best ask - best bid)
+    /// Get the spread (best ask - best bid), in price ticks.
+    ///
+    /// Returns `None` when either side is empty or when the snapshot is
+    /// crossed (best ask below best bid): such a snapshot is malformed —
+    /// restore rejects it with [`OrderBookError::SnapshotCrossed`] — and its
+    /// negative difference is not a spread. It used to be clamped to `0`
+    /// (#250). A locked snapshot (equal prices) returns `Some(0)`.
     pub fn spread(&self) -> Option<u128> {
         let spread = match (self.best_bid(), self.best_ask()) {
-            (Some((bid_price, _)), Some((ask_price, _))) => {
-                Some(ask_price.saturating_sub(bid_price))
-            }
+            (Some((bid_price, _)), Some((ask_price, _))) => ask_price.checked_sub(bid_price),
             _ => None,
         };
         trace!("spread: {:?}", spread);
@@ -328,8 +344,19 @@ pub struct OrderBookSnapshotPackage {
 
 impl OrderBookSnapshotPackage {
     /// Creates a new snapshot package computing the checksum of the snapshot contents.
+    ///
+    /// The level aggregates are refreshed first, and the checksum covers the
+    /// refreshed snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::PriceLevelError`] when a level's aggregates cannot
+    /// be recomputed (see [`OrderBookSnapshot::refresh_aggregates`]; since
+    /// #250 this is propagated instead of checksumming stale aggregates),
+    /// and [`OrderBookError::SerializationError`] when the checksum payload
+    /// cannot be encoded.
     pub fn new(mut snapshot: OrderBookSnapshot) -> Result<Self, OrderBookError> {
-        snapshot.refresh_aggregates();
+        snapshot.refresh_aggregates()?;
 
         let checksum = Self::compute_checksum(&snapshot)?;
 

@@ -4,7 +4,6 @@
 //! via [`crate::STPMode`]. When STP is disabled (`STPMode::None`, the default),
 //! the matching hot path is unchanged with zero overhead.
 
-use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::pool::MatchingPool;
 use crate::orderbook::reject_reason::RejectReason;
@@ -1733,15 +1732,7 @@ where
             }
 
             // Notify price level changes
-            if let Some(listener) = &self.price_level_changed_listener {
-                let engine_seq = self.next_engine_seq();
-                listener(PriceLevelChangedEvent {
-                    side: side.opposite(),
-                    price: price_level.price(),
-                    quantity: price_level.visible_quantity(),
-                    engine_seq,
-                });
-            }
+            self.emit_level_changed(side.opposite(), price_level);
         }
 
         // Collect fully-consumed makers for batch removal, each with its true

@@ -13,7 +13,6 @@
 //! see [`MassCancelFailure`] (#248).
 
 use super::book::OrderBook;
-use super::book_change_event::PriceLevelChangedEvent;
 use super::error::OrderBookError;
 use super::order_state::{CancelReason, OrderStatus};
 use pricelevel::{Hash32, Id, OrderType, PriceLevel, PriceLevelError, Side, TimestampMs};
@@ -428,7 +427,7 @@ where
     ///    drains both bid/ask SkipMaps, cleans up the special-order tracker
     ///    (pegged / trailing stop) and releases every order's pre-trade risk
     ///    contribution.
-    /// 3. Only then emits a [`PriceLevelChangedEvent`] (quantity → 0) for every
+    /// 3. Only then emits a [`PriceLevelChangedEvent`](super::book_change_event::PriceLevelChangedEvent) (quantity → 0) for every
     ///    affected price level and a `Cancelled { MassCancelAll }` order-state
     ///    transition for every cancelled order, so a listener never observes
     ///    an event for a mutation that has not happened yet.
@@ -582,15 +581,9 @@ where
         // per cleared level, then one Cancelled transition per order, both in
         // the collection order (the same level-then-state order the
         // single-order cancel path emits).
-        if let Some(ref listener) = self.price_level_changed_listener {
+        if self.price_level_changed_listener.is_some() {
             for &(side, price) in &cleared_levels {
-                let engine_seq = self.next_engine_seq();
-                listener(PriceLevelChangedEvent {
-                    side,
-                    price,
-                    quantity: 0,
-                    engine_seq,
-                });
+                self.emit_price_level_changed(side, price, 0);
             }
         }
         for &order_id in &cancelled_order_ids {
@@ -939,7 +932,7 @@ where
     ///
     /// # Determinism contract
     ///
-    /// The returned [`EvictionResult`] — and the [`PriceLevelChangedEvent`] and
+    /// The returned [`EvictionResult`] — and the [`PriceLevelChangedEvent`](super::book_change_event::PriceLevelChangedEvent) and
     /// `Cancelled { reason: TimeInForceExpired }` state transitions emitted as a
     /// side effect — follow one fixed, replay-stable order:
     ///

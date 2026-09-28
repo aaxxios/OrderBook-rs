@@ -464,7 +464,13 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::ChecksumMismatch { .. }
         // Read-only analytics failures (#245): never raised by a submit.
         | OrderBookError::ArithmeticOverflow { .. }
-        | OrderBookError::AllocationFailed { .. } => false,
+        | OrderBookError::AllocationFailed { .. }
+        // #250: `engine_seq` exhaustion is raised only by the public
+        // `next_engine_seq` and the snapshot restore; submit paths suppress
+        // the post-commit emission instead of returning it. A crossed
+        // snapshot is a restore-only error.
+        | OrderBookError::EngineSeqExhausted { .. }
+        | OrderBookError::SnapshotCrossed { .. } => false,
         #[cfg(feature = "nats")]
         OrderBookError::NatsPublishError { .. } | OrderBookError::NatsSerializationError { .. } => {
             false

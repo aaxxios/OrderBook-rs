@@ -1,4 +1,3 @@
-use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::{OrderBook, OrderBookError};
 use pricelevel::{OrderType, PriceLevel, Side, TimeInForce};
 use std::sync::Arc;
@@ -93,15 +92,7 @@ where
         let _added_order = price_level.add_order(unit_order)?;
 
         // notify price level changes
-        if let Some(ref listener) = self.price_level_changed_listener {
-            let engine_seq = self.next_engine_seq();
-            listener(PriceLevelChangedEvent {
-                side,
-                price: price_level.price(),
-                quantity: price_level.visible_quantity(),
-                engine_seq,
-            })
-        }
+        self.emit_level_changed(side, &price_level);
         // The location is stored as (price, side) for efficient retrieval in cancel_order
         self.order_locations.insert(order_id, (price, side));
 

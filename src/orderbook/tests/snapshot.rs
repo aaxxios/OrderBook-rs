@@ -697,7 +697,7 @@ mod test_snapshot_engine_seq {
         );
 
         // Next mint returns 5 (the resumed value) and advances to 6.
-        let next = restored.next_engine_seq();
+        let next = restored.next_engine_seq().expect("mint");
         assert_eq!(next, 5, "next_engine_seq returns the resumed value");
         assert_eq!(
             restored.engine_seq(),

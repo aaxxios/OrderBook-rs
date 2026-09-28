@@ -417,22 +417,78 @@ impl OrderStateTracker {
         }
     }
 
+    /// Lock the terminal-id eviction queue, recovering it if poisoned
+    /// (#250).
+    ///
+    /// The queue is only an eviction *hint*: a `VecDeque<Id>` of terminal
+    /// ids in arrival order. Every id popped from it is re-checked against
+    /// `states` (see [`Self::evict_if_terminal`]) before anything is
+    /// removed, and no caller-supplied code runs while the guard is held.
+    /// A thread that panicked while holding the lock could therefore only
+    /// have left an id pushed or popped — at worst one entry is retained a
+    /// little longer or evicted in a slightly different order — never an
+    /// active order removed or a structurally broken queue. Recovering with
+    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) and
+    /// clearing the poison keeps retention bounded; skipping the eviction
+    /// on poison (the previous behaviour) let the tracker grow without
+    /// bound.
+    fn lock_terminal_queue(&self) -> std::sync::MutexGuard<'_, VecDeque<Id>> {
+        match self.terminal_queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "order-state terminal queue mutex was poisoned; recovering (the queue is an eviction hint, re-checked per id)"
+                );
+                self.terminal_queue.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Remove `order_id`'s state and history only if its state is still
+    /// terminal (#250).
+    ///
+    /// The check and the removal are one atomic [`DashMap::remove_if`] on
+    /// `states`, so a concurrent [`Self::transition`] that re-activates the
+    /// id (an id reused after a terminal state) can never be evicted
+    /// between a separate "is it terminal?" read and the removal — the
+    /// get / drop / remove sequence this replaces had exactly that window.
+    ///
+    /// The history is then removed with its own atomic `remove_if`, only
+    /// while its last entry is still terminal. `transition` inserts the new
+    /// state before appending to the history, so a concurrent
+    /// re-activation that has already appended keeps its history; one that
+    /// has not yet appended starts a fresh history (its `or_default`),
+    /// losing only the evicted lifecycle's entries. Each map is locked on
+    /// its own — no guard of one is held while taking the other — so this
+    /// cannot deadlock against `transition` or `purge_terminal_older_than`.
+    ///
+    /// Returns `true` when the state entry was removed.
+    fn evict_if_terminal(&self, order_id: &Id) -> bool {
+        let removed = self
+            .states
+            .remove_if(order_id, |_, status| status.is_terminal())
+            .is_some();
+        if removed {
+            self.history.remove_if(order_id, |_, history| {
+                history
+                    .last()
+                    .is_none_or(|(_, status)| status.is_terminal())
+            });
+        }
+        removed
+    }
+
     /// Add a terminal order ID to the eviction queue and evict if needed.
     fn enqueue_terminal(&self, order_id: Id) {
-        if let Ok(mut queue) = self.terminal_queue.lock() {
-            queue.push_back(order_id);
-            while queue.len() > self.retention_capacity {
-                if let Some(evicted_id) = queue.pop_front() {
-                    // Only evict if still in terminal state (not overwritten)
-                    if let Some(entry) = self.states.get(&evicted_id)
-                        && entry.value().is_terminal()
-                    {
-                        drop(entry);
-                        self.states.remove(&evicted_id);
-                        self.history.remove(&evicted_id);
-                    }
-                }
-            }
+        let mut queue = self.lock_terminal_queue();
+        queue.push_back(order_id);
+        while queue.len() > self.retention_capacity {
+            let Some(evicted_id) = queue.pop_front() else {
+                break;
+            };
+            // Only evict if still in terminal state (not overwritten).
+            self.evict_if_terminal(&evicted_id);
         }
     }
 
@@ -497,12 +553,24 @@ impl OrderStateTracker {
     /// # Returns
     ///
     /// The number of entries purged.
+    ///
+    /// When `older_than` reaches back before timestamp `0` of the installed
+    /// clock (or does not fit `u64` milliseconds), no entry can be that old
+    /// and nothing is purged. The cutoff used to be clamped to `0` instead
+    /// (#250), which purged entries stamped at exactly `0`.
+    ///
+    /// Each removal re-checks the entry is still terminal atomically (a
+    /// `DashMap::remove_if`), so an id re-activated concurrently is kept and
+    /// not counted.
     pub fn purge_terminal_older_than(&self, older_than: Duration) -> usize {
         let now_ms = self.clock.now_millis().as_u64();
-        let cutoff =
-            now_ms.saturating_sub(u64::try_from(older_than.as_millis()).unwrap_or(u64::MAX));
+        let Some(cutoff) = u64::try_from(older_than.as_millis())
+            .ok()
+            .and_then(|older_ms| now_ms.checked_sub(older_ms))
+        else {
+            return 0;
+        };
 
-        let mut purged = 0usize;
         // Collect IDs to remove (avoid holding DashMap iterators during mutation)
         let to_remove: Vec<Id> = self
             .states
@@ -527,22 +595,20 @@ impl OrderStateTracker {
             })
             .collect();
 
-        for id in to_remove {
-            self.states.remove(&id);
-            self.history.remove(&id);
-            purged = purged.saturating_add(1);
-        }
-
-        purged
+        // Counted without arithmetic: at most `to_remove.len()` removals.
+        to_remove
+            .iter()
+            .filter(|id| self.evict_if_terminal(id))
+            .count()
     }
 
     /// Remove all tracked states. Useful for testing or book reset.
     pub fn clear(&self) {
         self.states.clear();
         self.history.clear();
-        if let Ok(mut queue) = self.terminal_queue.lock() {
-            queue.clear();
-        }
+        // #250: a poisoned queue is recovered and cleared too, rather than
+        // left holding stale ids (see `lock_terminal_queue`).
+        self.lock_terminal_queue().clear();
     }
 }
 
@@ -975,5 +1041,153 @@ mod tests {
             assert!(decoded.is_ok());
             assert_eq!(&decoded.unwrap_or(CancelReason::UserRequested), reason);
         }
+    }
+
+    /// #250: a poisoned terminal-queue mutex is recovered, so eviction keeps
+    /// bounding retention (it used to be skipped for good) and `clear`
+    /// still empties the queue.
+    #[test]
+    fn test_tracker_poisoned_queue_still_evicts() {
+        let tracker = Arc::new(OrderStateTracker::with_capacity(2));
+        let poisoner = Arc::clone(&tracker);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner.terminal_queue.lock();
+            panic!("poison the terminal queue");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoning thread panicked");
+        assert!(tracker.terminal_queue.is_poisoned(), "mutex is poisoned");
+
+        for _ in 0..6 {
+            tracker.transition(new_id(), OrderStatus::Filled { filled_quantity: 1 });
+        }
+        assert_eq!(tracker.len(), 2, "retention still bounded after poison");
+        assert!(
+            !tracker.terminal_queue.is_poisoned(),
+            "the poison is cleared on recovery"
+        );
+
+        tracker.clear();
+        assert!(tracker.is_empty());
+        assert!(
+            tracker.lock_terminal_queue().is_empty(),
+            "clear empties the recovered queue"
+        );
+    }
+
+    /// #250: eviction removes a queued id only while its state is still
+    /// terminal, and keeps the history of a re-activated id.
+    #[test]
+    fn test_tracker_evict_if_terminal_keeps_reactivated_id() {
+        let tracker = OrderStateTracker::with_capacity(10);
+        let id = new_id();
+        tracker.transition(
+            id,
+            OrderStatus::Cancelled {
+                filled_quantity: 0,
+                reason: CancelReason::UserRequested,
+            },
+        );
+        tracker.transition(id, OrderStatus::Open);
+
+        assert!(!tracker.evict_if_terminal(&id), "an active id is kept");
+        assert_eq!(tracker.get(id), Some(OrderStatus::Open));
+        assert_eq!(
+            tracker.get_history(id).map(|history| history.len()),
+            Some(2),
+            "history kept"
+        );
+
+        tracker.transition(id, OrderStatus::Filled { filled_quantity: 3 });
+        assert!(tracker.evict_if_terminal(&id), "a terminal id is evicted");
+        assert_eq!(tracker.get(id), None);
+        assert_eq!(tracker.get_history(id), None, "terminal history removed");
+    }
+
+    /// #250: concurrent re-activation vs eviction of the same id. With the
+    /// former get / drop / remove sequence the evictor could remove the id
+    /// after the re-activating `transition` had overwritten its terminal
+    /// state; `remove_if` makes the check and the removal atomic, so the
+    /// final `Open` always survives.
+    #[test]
+    fn test_tracker_eviction_never_removes_reactivated_state_under_contention() {
+        use std::sync::Barrier;
+
+        const ROUNDS: usize = 20_000;
+        let tracker = Arc::new(OrderStateTracker::with_capacity(1));
+        let id = new_id();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let reactivator = {
+            let tracker = Arc::clone(&tracker);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                // Only this thread transitions `id`, so right after its
+                // `Open` returns the id must be present and active: the
+                // evictor may only ever remove a terminal state.
+                let mut lost = 0usize;
+                for _ in 0..ROUNDS {
+                    tracker.transition(id, OrderStatus::Filled { filled_quantity: 1 });
+                    tracker.transition(id, OrderStatus::Open);
+                    if tracker.get(id) != Some(OrderStatus::Open) {
+                        lost += 1;
+                    }
+                }
+                lost
+            })
+        };
+        let evictor = {
+            let tracker = Arc::clone(&tracker);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ROUNDS {
+                    tracker.transition(new_id(), OrderStatus::Filled { filled_quantity: 1 });
+                }
+            })
+        };
+        let lost = reactivator.join().expect("reactivator finished");
+        assert_eq!(lost, 0, "an active state was evicted {lost} times");
+        assert!(evictor.join().is_ok(), "evictor finished");
+
+        assert_eq!(
+            tracker.get(id),
+            Some(OrderStatus::Open),
+            "the re-activated id is never evicted"
+        );
+        let last = tracker
+            .get_history(id)
+            .and_then(|history| history.last().map(|(_, status)| status.clone()));
+        assert_eq!(last, Some(OrderStatus::Open), "its latest history survives");
+    }
+
+    /// #250: a retention window reaching back before the clock's epoch
+    /// purges nothing; it used to clamp the cutoff to `0` and purge entries
+    /// stamped at exactly `0`.
+    #[test]
+    fn test_tracker_purge_window_before_epoch_purges_nothing() {
+        use super::super::clock::StubClock;
+
+        let tracker = OrderStateTracker::with_clock(Arc::new(StubClock::starting_at(0)));
+        let id = new_id();
+        tracker.transition(id, OrderStatus::Filled { filled_quantity: 1 });
+        assert_eq!(
+            tracker.purge_terminal_older_than(Duration::from_millis(10)),
+            0,
+            "nothing is older than a cutoff before the epoch"
+        );
+        assert!(tracker.get(id).is_some());
+        assert_eq!(
+            tracker.purge_terminal_older_than(Duration::from_secs(u64::MAX)),
+            0,
+            "a window that does not fit u64 ms purges nothing"
+        );
+        assert_eq!(
+            tracker.purge_terminal_older_than(Duration::ZERO),
+            1,
+            "a zero window still purges every terminal entry"
+        );
+        assert!(tracker.get(id).is_none());
     }
 }
