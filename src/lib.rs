@@ -1308,7 +1308,6 @@ pub use orderbook::{
 };
 #[cfg(feature = "nats")]
 pub use orderbook::{NatsPublisherError, NatsTradePublisher};
-pub use utils::current_time_millis;
 #[cfg(feature = "alloc-counters")]
 pub use utils::{AllocSnapshot, CountingAllocator};
 pub use utils::{TimeError, current_time_millis, try_current_time_millis};
