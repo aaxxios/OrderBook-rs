@@ -1,8 +1,9 @@
 mod time;
 
+#[cfg(test)]
 mod tests;
 
-pub use time::current_time_millis;
+pub use time::{TimeError, current_time_millis, try_current_time_millis};
 
 #[cfg(feature = "alloc-counters")]
 pub mod counting_allocator;

@@ -110,7 +110,9 @@ fn main() {
     }
 
     let after = GLOBAL.snapshot();
-    let delta = after.since(before);
+    let delta = after
+        .since(before)
+        .expect("allocation counters are monotonic");
 
     let allocs_per_op = delta.allocs as f64 / MEASURED_OPS as f64;
     let bytes_per_op = delta.bytes_allocated as f64 / MEASURED_OPS as f64;

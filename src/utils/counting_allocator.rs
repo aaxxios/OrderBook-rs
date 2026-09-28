@@ -55,19 +55,24 @@ pub struct AllocSnapshot {
 }
 
 impl AllocSnapshot {
-    /// Return the per-event delta from `earlier` to `self` (e.g.
+    /// Return the per-counter delta from `earlier` to `self` (e.g.
     /// "allocs after warmup → allocs at end of measurement window").
+    ///
+    /// The counters are monotonic, so a valid `earlier` snapshot never
+    /// exceeds `self` in any field. Returns `None` when it does (snapshots
+    /// passed in the wrong order, or taken from different allocators)
+    /// instead of silently clamping the delta to zero.
     #[inline]
-    #[must_use]
-    pub fn since(self, earlier: Self) -> Self {
-        Self {
-            allocs: self.allocs.saturating_sub(earlier.allocs),
-            deallocs: self.deallocs.saturating_sub(earlier.deallocs),
-            bytes_allocated: self.bytes_allocated.saturating_sub(earlier.bytes_allocated),
+    #[must_use = "the delta is returned; `None` means the snapshots are out of order"]
+    pub fn since(self, earlier: Self) -> Option<Self> {
+        Some(Self {
+            allocs: self.allocs.checked_sub(earlier.allocs)?,
+            deallocs: self.deallocs.checked_sub(earlier.deallocs)?,
+            bytes_allocated: self.bytes_allocated.checked_sub(earlier.bytes_allocated)?,
             bytes_deallocated: self
                 .bytes_deallocated
-                .saturating_sub(earlier.bytes_deallocated),
-        }
+                .checked_sub(earlier.bytes_deallocated)?,
+        })
     }
 }
 
@@ -182,5 +187,44 @@ unsafe impl<Inner: GlobalAlloc> GlobalAlloc for CountingAllocator<Inner> {
         // SAFETY: forwarded `ptr` / `layout` / `new_size` are caller's
         // — the inner allocator's contract is the same.
         unsafe { self.inner.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+mod tests {
+    use super::AllocSnapshot;
+
+    fn snap(a: u64, d: u64, ba: u64, bd: u64) -> AllocSnapshot {
+        AllocSnapshot {
+            allocs: a,
+            deallocs: d,
+            bytes_allocated: ba,
+            bytes_deallocated: bd,
+        }
+    }
+
+    #[test]
+    fn since_returns_delta_in_order() {
+        let before = snap(1, 2, 30, 40);
+        let after = snap(4, 6, 100, 90);
+        assert_eq!(after.since(before), Some(snap(3, 4, 70, 50)));
+        assert_eq!(after.since(after), Some(AllocSnapshot::default()));
+    }
+
+    #[test]
+    fn since_rejects_reversed_snapshots() {
+        let before = snap(1, 2, 30, 40);
+        let after = snap(4, 6, 100, 90);
+        assert_eq!(before.since(after), None);
+    }
+
+    #[test]
+    fn since_rejects_any_single_field_going_backwards() {
+        let base = snap(10, 10, 10, 10);
+        assert_eq!(base.since(snap(11, 0, 0, 0)), None);
+        assert_eq!(base.since(snap(0, 11, 0, 0)), None);
+        assert_eq!(base.since(snap(0, 0, 11, 0)), None);
+        assert_eq!(base.since(snap(0, 0, 0, 11)), None);
     }
 }

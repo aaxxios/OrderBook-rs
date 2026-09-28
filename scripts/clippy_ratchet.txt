@@ -22,7 +22,6 @@ src/orderbook/sequencer/file_journal.rs:arithmetic_side_effects:20
 src/orderbook/sequencer/file_journal.rs:cast_possible_truncation:4
 src/orderbook/sequencer/file_journal.rs:indexing_slicing:126
 src/orderbook/snapshot.rs:arithmetic_side_effects:2
-src/utils/time.rs:cast_possible_truncation:2
 src/wire/inbound/new_order.rs:cast_sign_loss:2
 src/wire/outbound/book_update.rs:arithmetic_side_effects:4
 src/wire/outbound/exec_report.rs:arithmetic_side_effects:6

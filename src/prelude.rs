@@ -83,7 +83,7 @@ pub use crate::orderbook::sequencer::{
 };
 
 // Utility functions
-pub use crate::utils::current_time_millis;
+pub use crate::utils::{TimeError, current_time_millis, try_current_time_millis};
 
 // Type aliases for common use cases
 pub use crate::{DefaultOrderBook, DefaultOrderType, LegacyOrderBook, LegacyOrderType};
