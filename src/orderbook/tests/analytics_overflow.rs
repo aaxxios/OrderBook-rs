@@ -385,6 +385,81 @@ mod tests {
         }
     }
 
+    /// Every bin `depth_distribution` produces is contiguous, non-inverted
+    /// (`width()` is `Ok`), and the volume and level totals are preserved.
+    fn assert_well_formed(bins: &[crate::DistributionBin], volume: u64, levels: usize) {
+        for bin in bins {
+            assert!(bin.min_price <= bin.max_price, "inverted bin {bin:?}");
+            assert!(bin.width().is_ok(), "width must be Ok for {bin:?}");
+        }
+        for pair in bins.windows(2) {
+            assert_eq!(pair[0].max_price, pair[1].min_price, "contiguous bins");
+        }
+        assert_eq!(bins.iter().map(|b| b.volume).sum::<u64>(), volume);
+        assert_eq!(bins.iter().map(|b| b.level_count).sum::<usize>(), levels);
+    }
+
+    #[test]
+    fn test_depth_distribution_single_level_more_bins_than_span_not_inverted() {
+        let book = OrderBook::<()>::new("DIST");
+        book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None)
+            .expect("bid");
+        let bins = book.depth_distribution(Side::Buy, 3).expect("bins");
+        assert_eq!(bins.len(), 3);
+        assert_well_formed(&bins, 50, 1);
+        assert_eq!((bins[0].min_price, bins[0].max_price), (100, 101));
+        assert_eq!(bins[0].volume, 50);
+        for surplus in &bins[1..] {
+            assert_eq!((surplus.min_price, surplus.max_price), (101, 101));
+            assert_eq!(surplus.width().expect("ok"), 0);
+            assert_eq!(surplus.volume, 0);
+        }
+    }
+
+    #[test]
+    fn test_depth_distribution_span_smaller_than_bins_not_inverted() {
+        let book = OrderBook::<()>::new("DIST");
+        for (price, qty) in [(100u128, 10u64), (101, 20), (102, 30)] {
+            book.add_limit_order(new_id(), price, qty, Side::Sell, TimeInForce::Gtc, None)
+                .expect("ask");
+        }
+        // Span 2 (three prices), 7 bins.
+        let bins = book.depth_distribution(Side::Sell, 7).expect("bins");
+        assert_eq!(bins.len(), 7);
+        assert_well_formed(&bins, 60, 3);
+        assert_eq!(bins.first().map(|b| b.min_price), Some(100));
+        assert_eq!(bins.last().map(|b| b.max_price), Some(103));
+        // Each price lands in its own unit-width bin.
+        assert_eq!(bins[0].volume, 10);
+        assert_eq!(bins[1].volume, 20);
+        assert_eq!(bins[2].volume, 30);
+
+        // Capped request against a tiny span stays well formed too.
+        let capped = book
+            .depth_distribution(Side::Sell, usize::MAX)
+            .expect("bins");
+        assert_well_formed(&capped, 60, 3);
+    }
+
+    #[test]
+    fn test_depth_distribution_bins_well_formed_near_u128_max() {
+        // `bin_min + bin_width` would overflow u128 for the surplus bins;
+        // they clamp to `max_price + 1` instead of erroring.
+        let book = OrderBook::<()>::new("DIST");
+        book.add_limit_order(
+            new_id(),
+            u128::MAX - 1,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        )
+        .expect("ask");
+        let bins = book.depth_distribution(Side::Sell, 4).expect("bins");
+        assert_well_formed(&bins, 5, 1);
+        assert_eq!(bins.last().map(|b| b.max_price), Some(u128::MAX));
+    }
+
     // ---- integer midpoint -----------------------------------------------
 
     #[test]

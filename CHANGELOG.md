@@ -678,6 +678,11 @@ change.
     that observed band, and indexes with `get_mut`. A level at `u128::MAX`
     (whose exclusive last-bin bound `u128::MAX + 1` is not representable)
     returns `ArithmeticOverflow`.
+    Bin bounds are clamped to `max_price + 1`, so bins are contiguous and
+    never inverted (`DistributionBin::width` is always `Ok` for them): when
+    `bins` exceeds the observed price span, the surplus trailing bins are
+    empty zero-width bins at `max_price + 1` (0.13 let them run past the
+    range, ending with an inverted last bin).
   - Pegged orders referencing `MidPrice` (feature `special_orders`) use the
     exact integer midpoint (`u128::midpoint`, rounded down) instead of
     `mid_price() as u128`, which lost precision above 2^53. The `Mid` risk

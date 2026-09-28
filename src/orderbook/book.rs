@@ -5306,8 +5306,12 @@ where
     ///
     /// # Returns
     /// Vector of `DistributionBin` containing price ranges and volumes.
-    /// Returns an empty vector if bins is 0 or no levels exist. Each bin's
-    /// `max_price` is exclusive; the last bin ends at `max_level_price + 1`.
+    /// Returns an empty vector if bins is 0 or no levels exist. Bins are
+    /// contiguous and never inverted (`min_price <= max_price`, so
+    /// [`DistributionBin::width`] is always `Ok`). Each bin's `max_price` is
+    /// exclusive; the last bin ends at `max_level_price + 1`. When `bins`
+    /// exceeds the observed price span, the surplus trailing bins are empty
+    /// zero-width bins at `max_level_price + 1`.
     ///
     /// # Errors
     /// - [`OrderBookError::PriceLevelError`] when a level's
@@ -5388,15 +5392,25 @@ where
                 operation: "depth distribution bins",
                 requested: bins,
             })?;
+        // Exclusive upper bound of the whole histogram: the last bin is
+        // inclusive of the highest level. Every bin bound is clamped to it,
+        // so when `bins` exceeds the observed price span the surplus bins
+        // are empty, zero-width `[upper, upper)` bins instead of running
+        // past the range (and never inverted).
+        let upper = max_price
+            .checked_add(1)
+            .ok_or_else(|| analytics_overflow("depth distribution bin bound"))?;
         let mut bin_min = min_price;
         for i in 0..bins {
             let bin_max = if i == last_index {
-                // Make last bin inclusive of the highest level.
-                max_price.checked_add(1)
+                upper
             } else {
-                bin_min.checked_add(bin_width)
-            }
-            .ok_or_else(|| analytics_overflow("depth distribution bin bound"))?;
+                // A `bin_min + bin_width` that overflows `u128` is past
+                // `upper` too, so clamping it to `upper` is exact.
+                bin_min
+                    .checked_add(bin_width)
+                    .map_or(upper, |end| end.min(upper))
+            };
 
             distribution.push(DistributionBin {
                 min_price: bin_min,
@@ -5406,7 +5420,7 @@ where
             });
 
             if i != last_index {
-                // `bin_min + bin_width` was just checked as this bin's max.
+                // Bins are contiguous: the next one starts where this ends.
                 bin_min = bin_max;
             }
         }
