@@ -267,6 +267,7 @@ impl From<&OrderBookError> for RejectReason {
                 Self::ReserveResidualWouldBeDiscarded
             }
             OrderBookError::MatchAborted { .. } => Self::MatchAborted,
+            OrderBookError::OrderRemovedWithLevelFault { .. } => Self::Other(0),
             OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded { .. }) => {
                 Self::CapacityExceeded
             }

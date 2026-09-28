@@ -315,6 +315,28 @@ pub enum OrderBookError {
         source: Box<PriceLevelError>,
     },
 
+    /// A cancel whose price level removed the order and then reported a
+    /// failure (#248): pricelevel can commit a removal and then find a
+    /// broken level invariant, poisoning the level.
+    ///
+    /// The order **is gone**. The book completed the removal exactly like a
+    /// successful cancel (price-level event, `Cancelled` order state,
+    /// location, user index, risk release, special-order tracking), so its
+    /// indices agree with the level; the error only reports that the level
+    /// is now faulty (later mutations on it will likely be refused;
+    /// reconstruct it from a snapshot). Mass cancels list such an order as
+    /// cancelled and also record the fault.
+    ///
+    /// Carries primitive and upstream types only, so this module stays a
+    /// leaf.
+    OrderRemovedWithLevelFault {
+        /// The order that was removed.
+        order_id: pricelevel::Id,
+        /// The failure the level reported after the removal. Boxed so the
+        /// variant does not widen every `Result<_, OrderBookError>`.
+        source: Box<PriceLevelError>,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -497,6 +519,12 @@ impl fmt::Display for OrderBookError {
                     "match aborted: taker {order_id} stopped by a price level failure after executing {executed_quantity} in {trade_count} trades; remainder cancelled: {source}"
                 )
             }
+            OrderBookError::OrderRemovedWithLevelFault { order_id, source } => {
+                write!(
+                    f,
+                    "order {order_id} was removed but its price level then failed: {source}"
+                )
+            }
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { message } => {
                 write!(f, "nats publish error: {message}")
@@ -512,7 +540,8 @@ impl fmt::Display for OrderBookError {
 impl std::error::Error for OrderBookError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            OrderBookError::MatchAborted { source, .. } => Some(source.as_ref()),
+            OrderBookError::MatchAborted { source, .. }
+            | OrderBookError::OrderRemovedWithLevelFault { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

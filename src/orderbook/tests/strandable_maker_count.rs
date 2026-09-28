@@ -417,8 +417,10 @@ mod tests {
                     assert_eq!(removed.cancelled_count(), 1, "{label}: one order cancelled");
                 }
                 _ => {
-                    book.evict_expired_orders(TimestampMs::new(EXPIRY_DEADLINE_MS + 1))
+                    let evicted = book
+                        .evict_expired_orders(TimestampMs::new(EXPIRY_DEADLINE_MS + 1))
                         .expect("evict");
+                    assert_eq!(evicted.len(), 1, "{label}: one order evicted");
                 }
             }
 

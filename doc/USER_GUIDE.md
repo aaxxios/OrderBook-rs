@@ -721,7 +721,8 @@ points pass a single book-level gate, which is taken in one of two modes:
 
 | Operation | Gate mode |
 |---|---|
-| Ordinary submit, cancel, `UpdateQuantity`, mass cancel | shared |
+| Ordinary submit, cancel, `UpdateQuantity` | shared |
+| Mass cancel (all, by side, by user, by price range) and `evict_expired_orders` | exclusive |
 | Fill-or-kill submit | exclusive |
 | Identified submit (any kind except post-only) or market sweep with STP enabled | exclusive |
 | Post-only submit, any STP mode (never runs the STP scan) | shared |
@@ -746,7 +747,7 @@ makers whose hidden depth it would strand, so nothing may cancel, admit or
 replace an order inside that sweep's capture window; otherwise the sweep
 could consume a maker it never captured, or report a captured maker's hidden
 quantity after a cancel freed its id for an unrelated order. Post-only
-submits, `UpdateQuantity`, cancels and mass cancels keep the shared side and
+submits, `UpdateQuantity` and single cancels keep the shared side and
 never consult the count: they are excluded by the sweep's hold, not by
 taking the exclusive side themselves. Those books serialize their sweeps, as
 STP books do; books holding no such reserve are unchanged. Enabling STP therefore serializes every identified submit

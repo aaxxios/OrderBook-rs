@@ -429,7 +429,9 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::InsufficientLiquidityNotional { .. }
         | OrderBookError::SelfTradePrevented { .. }
         | OrderBookError::PriceLevelError(_)
-        | OrderBookError::MatchAborted { .. } => true,
+        | OrderBookError::MatchAborted { .. }
+        // A cancel whose level removed the order, then failed (#248).
+        | OrderBookError::OrderRemovedWithLevelFault { .. } => true,
         // Admission and shape checks (all evaluated before the sweep), the
         // operational gates, and the non-reject internal errors. The
         // post-sweep post-only rejection is here too: `pricelevel`
@@ -489,9 +491,21 @@ fn recorded_stp_mode(err: &OrderBookError) -> Option<STPMode> {
 /// so replay can check its own configuration against the source book's.
 /// This impl is the intended way to build the variant; the fields are
 /// public for decoding, not for hand-assembly.
+///
+/// One error is **not** a rejection:
+/// [`OrderBookError::OrderRemovedWithLevelFault`] (#248) means the order was
+/// removed and the book completed the removal; only its level reported a
+/// fault afterwards. It is recorded as the outcome the book actually took,
+/// [`SequencerResult::OrderCancelled`], so replay removes the order too
+/// instead of skipping a rejected non-submit.
 impl From<&OrderBookError> for SequencerResult {
     #[inline]
     fn from(err: &OrderBookError) -> Self {
+        if let OrderBookError::OrderRemovedWithLevelFault { order_id, .. } = err {
+            return Self::OrderCancelled {
+                order_id: *order_id,
+            };
+        }
         Self::RejectedWithCode {
             reason: err.to_string(),
             code: RejectReason::from(err),
