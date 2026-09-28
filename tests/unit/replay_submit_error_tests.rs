@@ -108,8 +108,8 @@ fn replay(
 fn assert_books_match(replayed: &OrderBook<()>, live: &OrderBook<()>) {
     assert!(
         snapshots_match(
-            &replayed.create_snapshot(usize::MAX),
-            &live.create_snapshot(usize::MAX)
+            &replayed.create_snapshot(usize::MAX).expect("snapshot"),
+            &live.create_snapshot(usize::MAX).expect("snapshot")
         ),
         "replayed book diverged from the live book"
     );
@@ -1002,8 +1002,8 @@ fn an_unrecorded_stp_mode_leaves_the_divergence_to_snapshots_match() {
     );
     assert!(
         !snapshots_match(
-            &replayed.create_snapshot(usize::MAX),
-            &live.create_snapshot(usize::MAX)
+            &replayed.create_snapshot(usize::MAX).expect("snapshot"),
+            &live.create_snapshot(usize::MAX).expect("snapshot")
         ),
         "snapshots_match is what exposes the divergence the code hid"
     );

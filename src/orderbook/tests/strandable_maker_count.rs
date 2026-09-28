@@ -417,7 +417,8 @@ mod tests {
                     assert_eq!(removed.cancelled_count(), 1, "{label}: one order cancelled");
                 }
                 _ => {
-                    book.evict_expired_orders(TimestampMs::new(EXPIRY_DEADLINE_MS + 1));
+                    book.evict_expired_orders(TimestampMs::new(EXPIRY_DEADLINE_MS + 1))
+                        .expect("evict");
                 }
             }
 
@@ -525,7 +526,7 @@ mod tests {
     fn test_direct_restore_rejects_a_zero_visible_non_auto_reserve() {
         let ghost_id = new_id();
         let source = book_holding_a_ghost("GHOST-DIRECT", ghost_id);
-        let snapshot = source.create_snapshot(usize::MAX);
+        let snapshot = source.create_snapshot(usize::MAX).expect("snapshot");
 
         let survivor = new_id();
         let destination = destination_with_state("GHOST-DIRECT", survivor);

@@ -34,7 +34,9 @@ fn expired_gtd_is_evicted_and_no_longer_matchable() {
     book.add_limit_order(gtd, 100, 10, Side::Sell, TimeInForce::Gtd(1_000), None)
         .expect("add gtd");
 
-    let evicted = book.evict_expired_orders(TimestampMs::new(1_000));
+    let evicted = book
+        .evict_expired_orders(TimestampMs::new(1_000))
+        .expect("evict");
     assert_eq!(evicted.len(), 1);
     assert_eq!(evicted[0].id(), gtd);
     assert_eq!(book.best_ask(), None);
@@ -54,7 +56,9 @@ fn unexpired_gtd_and_gtc_are_untouched() {
     book.add_limit_order(gtd_future, 99, 5, Side::Buy, TimeInForce::Gtd(10_000), None)
         .expect("gtd future");
 
-    let evicted = book.evict_expired_orders(TimestampMs::new(5_000));
+    let evicted = book
+        .evict_expired_orders(TimestampMs::new(5_000))
+        .expect("evict");
     assert!(evicted.is_empty());
     assert_eq!(book.best_bid(), Some(100));
 }
@@ -67,9 +71,18 @@ fn boundary_deadline_equals_now_is_expired() {
         .expect("add");
 
     // deadline - 1: not expired.
-    assert!(book.evict_expired_orders(TimestampMs::new(999)).is_empty());
+    assert!(
+        book.evict_expired_orders(TimestampMs::new(999))
+            .expect("evict")
+            .is_empty()
+    );
     // deadline exactly: expired (matches is_expired's `now >= deadline`).
-    assert_eq!(book.evict_expired_orders(TimestampMs::new(1_000)).len(), 1);
+    assert_eq!(
+        book.evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -97,6 +110,7 @@ fn deterministic_order_bids_then_asks_ascending_fifo() {
 
     let ids: Vec<Id> = book
         .evict_expired_orders(TimestampMs::new(2_000))
+        .expect("evict")
         .iter()
         .map(|o| o.id())
         .collect();
@@ -112,9 +126,15 @@ fn second_sweep_at_same_now_is_idempotent() {
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
-    assert_eq!(book.evict_expired_orders(TimestampMs::new(1_000)).len(), 1);
+    assert_eq!(
+        book.evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict")
+            .len(),
+        1
+    );
     assert!(
         book.evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict")
             .is_empty()
     );
 }
@@ -136,7 +156,12 @@ fn eviction_fires_book_change_event_for_touched_level() {
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
-    assert_eq!(book.evict_expired_orders(TimestampMs::new(1_000)).len(), 1);
+    assert_eq!(
+        book.evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict")
+            .len(),
+        1
+    );
 
     let recorded = events.lock().expect("lock");
     assert!(
@@ -158,7 +183,12 @@ fn order_tracker_records_time_in_force_expired() {
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
-    assert_eq!(book.evict_expired_orders(TimestampMs::new(1_000)).len(), 1);
+    assert_eq!(
+        book.evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict")
+            .len(),
+        1
+    );
 
     let status = book
         .order_state_tracker()
@@ -201,7 +231,8 @@ fn manager_std_per_symbol_and_all_books_parity() {
     // Per-symbol pass-through.
     let btc_evicted = mgr
         .evict_expired_orders("BTC/USD", TimestampMs::new(1_000))
-        .expect("BTC managed");
+        .expect("BTC managed")
+        .expect("BTC evict");
     assert_eq!(btc_evicted.len(), 1);
     assert_eq!(btc_evicted[0].id(), btc_id);
     // Unknown symbol -> None.
@@ -212,9 +243,15 @@ fn manager_std_per_symbol_and_all_books_parity() {
 
     // All-books variant covers the remaining book.
     let all = mgr.evict_expired_across_books(TimestampMs::new(1_000));
-    assert_eq!(all.get("ETH/USD").map(|v| v.len()), Some(1));
+    assert_eq!(
+        all.get("ETH/USD").map(|v| v.as_ref().expect("evict").len()),
+        Some(1)
+    );
     // BTC was already swept, so nothing left there.
-    assert_eq!(all.get("BTC/USD").map(|v| v.len()), Some(0));
+    assert_eq!(
+        all.get("BTC/USD").map(|v| v.as_ref().expect("evict").len()),
+        Some(0)
+    );
 }
 
 #[test]
@@ -234,10 +271,14 @@ fn manager_tokio_per_symbol_and_all_books_parity() {
 
     let evicted = mgr
         .evict_expired_orders("BTC/USD", TimestampMs::new(1_000))
-        .expect("managed");
+        .expect("managed")
+        .expect("evict");
     assert_eq!(evicted.len(), 1);
 
     // Idempotent across the all-books variant too.
     let all = mgr.evict_expired_across_books(TimestampMs::new(1_000));
-    assert_eq!(all.get("BTC/USD").map(|v| v.len()), Some(0));
+    assert_eq!(
+        all.get("BTC/USD").map(|v| v.as_ref().expect("evict").len()),
+        Some(0)
+    );
 }

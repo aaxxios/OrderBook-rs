@@ -247,8 +247,8 @@ fn metrics_do_not_affect_order_semantics() {
         let _ = book_b.add_limit_order(id, price, qty, side, TimeInForce::Gtc, None);
     }
 
-    let snap_a = book_a.create_snapshot(10);
-    let snap_b = book_b.create_snapshot(10);
+    let snap_a = book_a.create_snapshot(10).expect("snapshot");
+    let snap_b = book_b.create_snapshot(10).expect("snapshot");
 
     // Compare the matched book *structure*, not the per-level `statistics`.
     // Those statistics carry `pricelevel` wall-clock fields (first_arrival_time,

@@ -57,7 +57,7 @@ fn replay_once(
     let outcome = ReplayEngine::<()>::replay_from_with_clock(journal, 1, symbol, clock);
     let (book, _last_seq) =
         outcome.expect("replay_from_with_clock should succeed on a well-formed journal");
-    book.create_snapshot(usize::MAX)
+    book.create_snapshot(usize::MAX).expect("snapshot")
 }
 
 // ─── Example-based regression test ──────────────────────────────────────────
@@ -108,8 +108,8 @@ fn replay_with_different_stub_clocks_still_snapshots_match() {
     let (book_b, _) = ReplayEngine::<()>::replay_from_with_clock(&journal, 1, "ETH-USD", clock_b)
         .expect("replay B succeeds");
 
-    let snap_a = book_a.create_snapshot(usize::MAX);
-    let snap_b = book_b.create_snapshot(usize::MAX);
+    let snap_a = book_a.create_snapshot(usize::MAX).expect("snapshot");
+    let snap_b = book_b.create_snapshot(usize::MAX).expect("snapshot");
     assert!(
         snapshots_match(&snap_a, &snap_b),
         "snapshots_match must hold regardless of clock start value"
@@ -164,8 +164,8 @@ proptest! {
 
         prop_assert_eq!(seq_a, seq_b, "last-applied sequence diverged");
 
-        let snap_a = book_a.create_snapshot(usize::MAX);
-        let snap_b = book_b.create_snapshot(usize::MAX);
+        let snap_a = book_a.create_snapshot(usize::MAX).expect("snapshot");
+        let snap_b = book_b.create_snapshot(usize::MAX).expect("snapshot");
         prop_assert!(
             snapshots_match(&snap_a, &snap_b),
             "snapshots_match contract violated"

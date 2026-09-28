@@ -48,17 +48,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // t = 999: nothing has expired yet (expiry boundary is `now >= deadline`).
-    sweep(&book, 999);
+    sweep(&book, 999)?;
 
     // t = 1_500: the two GTD orders with deadline 1_000 expire; the DAY order
     // (market close 3_000) and the GTD at 5_000 and the GTC survive.
-    sweep(&book, 1_500);
+    sweep(&book, 1_500)?;
 
     // t = 3_000: the DAY order expires at market close.
-    sweep(&book, 3_000);
+    sweep(&book, 3_000)?;
 
     // t = 5_000: the last GTD expires; only the GTC remains.
-    sweep(&book, 5_000);
+    sweep(&book, 5_000)?;
 
     info!(
         "Final book: best_bid={:?} best_ask={:?} (the GTC order remains)",
@@ -82,8 +82,8 @@ fn seed(book: &OrderBook<()>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn sweep(book: &OrderBook<()>, now_ms: u64) {
-    let evicted = book.evict_expired_orders(TimestampMs::new(now_ms));
+fn sweep(book: &OrderBook<()>, now_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let evicted = book.evict_expired_orders(TimestampMs::new(now_ms))?;
     info!("--- sweep at t={now_ms} ms: {} evicted ---", evicted.len());
     // Evicted orders are returned in the deterministic contract order.
     for order in &evicted {
@@ -95,4 +95,5 @@ fn sweep(book: &OrderBook<()>, now_ms: u64) {
             order.time_in_force(),
         );
     }
+    Ok(())
 }

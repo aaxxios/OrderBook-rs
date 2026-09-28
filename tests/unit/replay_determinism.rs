@@ -65,8 +65,8 @@ mod inner {
             .expect("second replay should succeed");
 
         // Snapshots should match structurally (via snapshots_match oracle).
-        let snap1 = book1.create_snapshot(usize::MAX);
-        let snap2 = book2.create_snapshot(usize::MAX);
+        let snap1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+        let snap2 = book2.create_snapshot(usize::MAX).expect("snapshot");
         assert!(
             snapshots_match(&snap1, &snap2),
             "replayed snapshots should match"
@@ -107,8 +107,8 @@ mod inner {
                 .expect("second replay should succeed");
 
             // Snapshots must match.
-            let snap1 = book1.create_snapshot(usize::MAX);
-            let snap2 = book2.create_snapshot(usize::MAX);
+            let snap1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+            let snap2 = book2.create_snapshot(usize::MAX).expect("snapshot");
             assert!(snapshots_match(&snap1, &snap2), "prop: replayed snapshots should be identical");
         }
     }

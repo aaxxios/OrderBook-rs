@@ -11,8 +11,8 @@ mod tests {
         let namespace = Uuid::new_v4();
         let generator = UuidGenerator::new(namespace);
 
-        let id1 = generator.next();
-        let id2 = generator.next();
+        let id1 = generator.try_next().expect("uuid");
+        let id2 = generator.try_next().expect("uuid");
 
         assert_ne!(id1, id2, "Sequential UUIDs should be different");
     }
@@ -26,13 +26,13 @@ mod tests {
         let generator2 = UuidGenerator::new(namespace);
 
         assert_eq!(
-            generator1.next(),
-            generator2.next(),
+            generator1.try_next().expect("uuid"),
+            generator2.try_next().expect("uuid"),
             "First UUIDs should match with same namespace"
         );
         assert_eq!(
-            generator1.next(),
-            generator2.next(),
+            generator1.try_next().expect("uuid"),
+            generator2.try_next().expect("uuid"),
             "Second UUIDs should match with same namespace"
         );
     }
@@ -46,8 +46,8 @@ mod tests {
         let generator2 = UuidGenerator::new(namespace2);
 
         assert_ne!(
-            generator1.next(),
-            generator2.next(),
+            generator1.try_next().expect("uuid"),
+            generator2.try_next().expect("uuid"),
             "UUIDs from different namespaces should differ"
         );
     }
@@ -77,7 +77,7 @@ mod tests {
 
                 let mut local_ids = Vec::with_capacity(ids_per_thread);
                 for _ in 0..ids_per_thread {
-                    local_ids.push(thread_generator.next());
+                    local_ids.push(thread_generator.try_next().expect("uuid"));
                 }
 
                 // Add to shared collection
@@ -109,7 +109,7 @@ mod tests {
         let namespace = Uuid::new_v4();
         let generator = UuidGenerator::new(namespace);
 
-        let id = generator.next();
+        let id = generator.try_next().expect("uuid");
 
         // Check UUID version (should be v5, SHA1-based)
         assert_eq!(

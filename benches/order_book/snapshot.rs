@@ -32,7 +32,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             &order_count,
             |b, &count| {
                 let book = make_populated_book(count);
-                b.iter(|| black_box(book.create_snapshot(usize::MAX)));
+                b.iter(|| black_box(book.create_snapshot(usize::MAX).expect("snapshot")));
             },
         );
     }
@@ -44,7 +44,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             &order_count,
             |b, &count| {
                 let book = make_populated_book(count);
-                let snap = book.create_snapshot(usize::MAX);
+                let snap = book.create_snapshot(usize::MAX).expect("snapshot");
                 b.iter_with_setup(
                     || snap.clone(),
                     |snapshot| {
@@ -67,7 +67,10 @@ pub fn register_benchmarks(c: &mut Criterion) {
             |b, &count| {
                 let book = make_populated_book(count);
                 b.iter(|| {
-                    black_box(book.enriched_snapshot_with_metrics(usize::MAX, MetricFlags::ALL))
+                    black_box(
+                        book.enriched_snapshot_with_metrics(usize::MAX, MetricFlags::ALL)
+                            .expect("enriched snapshot"),
+                    )
                 });
             },
         );
@@ -82,7 +85,8 @@ pub fn register_benchmarks(c: &mut Criterion) {
                 let book = make_populated_book(count);
                 b.iter(|| {
                     black_box(
-                        book.enriched_snapshot_with_metrics(usize::MAX, MetricFlags::MID_PRICE),
+                        book.enriched_snapshot_with_metrics(usize::MAX, MetricFlags::MID_PRICE)
+                            .expect("enriched snapshot"),
                     )
                 });
             },
@@ -96,7 +100,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             &order_count,
             |b, &count| {
                 let book = make_populated_book(count);
-                let snap = book.create_snapshot(usize::MAX);
+                let snap = book.create_snapshot(usize::MAX).expect("snapshot");
                 b.iter(|| {
                     let json = serde_json::to_vec(black_box(&snap))
                         .expect("json serialization must succeed");

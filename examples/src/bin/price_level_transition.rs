@@ -36,7 +36,13 @@ fn main() {
         setup_orders_for_test(&order_book, price_levels, min_orders);
 
         // Verify book state
-        let snapshot = order_book.create_snapshot(price_levels as usize);
+        let snapshot = match order_book.create_snapshot(price_levels as usize) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::error!(%err, "snapshot failed");
+                return;
+            }
+        };
         info!(
             "Pre-populated with {} bid levels and {} ask levels",
             snapshot.bids.len(),

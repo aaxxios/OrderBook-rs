@@ -11,17 +11,78 @@
 
 use super::book::OrderBook;
 use super::book_change_event::PriceLevelChangedEvent;
+use super::error::OrderBookError;
 use super::order_state::{CancelReason, OrderStatus};
-use pricelevel::{Hash32, Id, OrderType, Side, TimestampMs};
+use pricelevel::{Hash32, Id, OrderType, PriceLevel, PriceLevelError, Side, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::trace;
 
+/// A failure recorded by a mass cancel operation instead of being swallowed.
+///
+/// Every mass cancel that walks price levels (`cancel_all_orders`,
+/// `cancel_orders_by_side`, `cancel_orders_by_price_range`) reads each level's
+/// resting orders through the fallible `PriceLevel::snapshot_by_seq_into`
+/// (pricelevel 0.10). The read phase runs before any order is cancelled, and
+/// a level that cannot be read makes the whole call cancel **nothing**: a
+/// partial bulk cancel whose skipped orders are invisible in the journaled
+/// payload would be worse than a refused one. The unreadable level is
+/// reported here so the caller can observe the refusal and retry.
+///
+/// The enum is `#[non_exhaustive]`: later releases add variants (for example
+/// per-order cancel failures), so match it with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MassCancelFailure {
+    /// The resting orders of the price level at `price` on `side` could not
+    /// be read; the mass cancel was refused and nothing was cancelled.
+    LevelUnreadable {
+        /// Side of the unreadable level.
+        side: Side,
+        /// Price of the unreadable level, in price ticks.
+        price: u128,
+        /// The error pricelevel returned for the read.
+        error: PriceLevelError,
+    },
+}
+
+impl MassCancelFailure {
+    /// Converts the recorded failure into the equivalent [`OrderBookError`].
+    #[must_use]
+    pub fn to_order_book_error(&self) -> OrderBookError {
+        match self {
+            MassCancelFailure::LevelUnreadable { error, .. } => {
+                OrderBookError::PriceLevelError(error.clone())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MassCancelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MassCancelFailure::LevelUnreadable { side, price, error } => {
+                write!(f, "price level {side} {price} unreadable: {error}")
+            }
+        }
+    }
+}
+
 /// Result of a mass cancel operation.
 ///
 /// Contains the count and identifiers of all orders that were successfully
-/// cancelled. This struct is returned by every mass cancel method and should
-/// always be inspected by the caller.
+/// cancelled, plus any [`MassCancelFailure`] that made the call refuse part or
+/// all of its work. This struct is returned by every mass cancel method and
+/// should always be inspected by the caller: check [`Self::has_failures`]
+/// before treating an empty result as "nothing to cancel".
+///
+/// # Serialization
+///
+/// `failures` was added in 0.14.0 with `#[serde(default)]`: JSON written by
+/// earlier releases (for example a journaled `MassCancelled` entry) decodes
+/// with an empty failure list. Positional encodings (bincode) written by
+/// earlier releases do not decode.
 ///
 /// Fields are intentionally private to prevent external mutation of what
 /// should be an immutable result type. Use the accessor methods instead.
@@ -42,6 +103,9 @@ pub struct MassCancelResult {
     cancelled_count: usize,
     /// IDs of all cancelled orders, in the order they were processed.
     cancelled_order_ids: Vec<Id>,
+    /// Failures that made the call refuse work, in traversal order.
+    #[serde(default)]
+    failures: Vec<MassCancelFailure>,
 }
 
 impl MassCancelResult {
@@ -50,7 +114,36 @@ impl MassCancelResult {
         Self {
             cancelled_count,
             cancelled_order_ids,
+            failures: Vec::new(),
         }
+    }
+
+    /// Creates a result for a mass cancel refused by `failure`: nothing was
+    /// cancelled.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn refused(failure: MassCancelFailure) -> Self {
+        Self {
+            cancelled_count: 0,
+            cancelled_order_ids: Vec::new(),
+            failures: vec![failure],
+        }
+    }
+
+    /// Returns the failures recorded by the operation, in traversal order.
+    ///
+    /// Empty when the operation completed its whole scope.
+    #[must_use]
+    #[inline]
+    pub fn failures(&self) -> &[MassCancelFailure] {
+        &self.failures
+    }
+
+    /// Returns `true` if the operation recorded at least one failure.
+    #[must_use]
+    #[inline]
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
     }
 
     /// Returns the number of orders successfully cancelled.
@@ -68,6 +161,8 @@ impl MassCancelResult {
     }
 
     /// Returns `true` if no orders were cancelled.
+    ///
+    /// An empty result can also be a refused one; see [`Self::has_failures`].
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -77,11 +172,20 @@ impl MassCancelResult {
 
 impl std::fmt::Display for MassCancelResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "MassCancelResult {{ cancelled: {} }}",
-            self.cancelled_count
-        )
+        if self.failures.is_empty() {
+            write!(
+                f,
+                "MassCancelResult {{ cancelled: {} }}",
+                self.cancelled_count
+            )
+        } else {
+            write!(
+                f,
+                "MassCancelResult {{ cancelled: {}, failures: {} }}",
+                self.cancelled_count,
+                self.failures.len()
+            )
+        }
     }
 }
 
@@ -164,16 +268,24 @@ where
         // `DashMap` iteration order must NOT be used here or replay would diverge
         // across processes (its hasher is seeded per-instance). One scratch buffer
         // is reused across levels to avoid a per-level allocation.
+        //
+        // The collection runs before any mutation: a level whose orders
+        // cannot be read refuses the whole call (nothing is cancelled and the
+        // level is reported in `failures`), because the bulk clear below would
+        // otherwise remove orders that neither the result nor the journal names.
         let mut cancelled_order_ids: Vec<Id> = Vec::new();
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
-        for entry in self.bids.iter() {
-            entry.value().snapshot_by_seq_into(&mut level_orders);
-            for order in &level_orders {
-                cancelled_order_ids.push(order.id());
+        let sides = self
+            .bids
+            .iter()
+            .map(|entry| (entry, Side::Buy))
+            .chain(self.asks.iter().map(|entry| (entry, Side::Sell)));
+        for (entry, side) in sides {
+            if let Err(failure) =
+                read_level_orders(entry.value(), side, *entry.key(), &mut level_orders)
+            {
+                return self.refuse_mass_cancel(failure);
             }
-        }
-        for entry in self.asks.iter() {
-            entry.value().snapshot_by_seq_into(&mut level_orders);
             for order in &level_orders {
                 cancelled_order_ids.push(order.id());
             }
@@ -181,10 +293,7 @@ where
         let cancelled_count = cancelled_order_ids.len();
 
         if cancelled_count == 0 {
-            return MassCancelResult {
-                cancelled_count: 0,
-                cancelled_order_ids: Vec::new(),
-            };
+            return MassCancelResult::default();
         }
 
         // 2. Emit PriceLevelChangedEvent (qty → 0) for every affected level
@@ -254,10 +363,7 @@ where
         // Refresh the depth gauges; both sides are now empty.
         self.record_depth_metric();
 
-        MassCancelResult {
-            cancelled_count,
-            cancelled_order_ids,
-        }
+        MassCancelResult::new(cancelled_count, cancelled_order_ids)
     }
 
     /// Cancel all resting orders on a specific side (bids or asks).
@@ -319,8 +425,12 @@ where
             self.symbol, side
         );
 
-        let order_ids = self.collect_order_ids_by_side(side);
-        self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelBySide)
+        match self.collect_order_ids_by_side(side) {
+            Ok(order_ids) => {
+                self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelBySide)
+            }
+            Err(failure) => self.refuse_mass_cancel(failure),
+        }
     }
 
     /// Cancel all resting orders belonging to a specific user.
@@ -489,10 +599,17 @@ where
         // non-deterministic `iter_orders` view, which would make the journaled
         // `MassCancelled` payload diverge across processes. One scratch buffer is
         // reused across levels.
+        //
+        // Every level in range is read before any cancel runs; an unreadable
+        // level refuses the whole call (see `MassCancelFailure`).
         let mut order_ids = Vec::new();
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
         for entry in price_levels.range(min_price..=max_price) {
-            entry.value().snapshot_by_seq_into(&mut level_orders);
+            if let Err(failure) =
+                read_level_orders(entry.value(), side, *entry.key(), &mut level_orders)
+            {
+                return self.refuse_mass_cancel(failure);
+            }
             for order in &level_orders {
                 order_ids.push(order.id());
             }
@@ -552,6 +669,13 @@ where
     /// The evicted orders as `Arc<OrderType<T>>`, in the deterministic order
     /// above. Empty when nothing was expired.
     ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookError::PriceLevelError`] when a price level's
+    /// resting orders cannot be read (`PriceLevel::snapshot_by_seq_into` is
+    /// fallible since pricelevel 0.10). The read phase runs before any
+    /// eviction, so on `Err` nothing was evicted and the book is unchanged.
+    ///
     /// # Examples
     ///
     /// ```
@@ -570,19 +694,22 @@ where
     /// book.add_limit_order(gtd, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)?;
     ///
     /// // Nothing expired yet at t = 999.
-    /// assert!(book.evict_expired_orders(TimestampMs::new(999)).is_empty());
+    /// assert!(book.evict_expired_orders(TimestampMs::new(999))?.is_empty());
     ///
     /// // At the deadline the order is evicted and no longer rests.
-    /// let evicted = book.evict_expired_orders(TimestampMs::new(1_000));
+    /// let evicted = book.evict_expired_orders(TimestampMs::new(1_000))?;
     /// assert_eq!(evicted.len(), 1);
     /// assert_eq!(book.best_bid(), None);
     ///
     /// // Idempotent: a second sweep at the same instant evicts nothing.
-    /// assert!(book.evict_expired_orders(TimestampMs::new(1_000)).is_empty());
+    /// assert!(book.evict_expired_orders(TimestampMs::new(1_000))?.is_empty());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> Vec<Arc<OrderType<T>>> {
+    pub fn evict_expired_orders(
+        &self,
+        now_ms: TimestampMs,
+    ) -> Result<Vec<Arc<OrderType<T>>>, OrderBookError> {
         // #209: shared submit gate (see `cancel_all_orders`).
         let _gate = self.submit_gate_read();
         let now = now_ms.as_u64();
@@ -601,18 +728,29 @@ where
         // per-level allocation. Expiry uses `tif_expired_at` — the same
         // definition admission uses — so the boundary case (deadline == now)
         // can never diverge.
+        //
+        // Phase 1 mutates nothing, so a level that cannot be read returns the
+        // error before any order is evicted (all-or-nothing, like the mass
+        // cancels' `MassCancelFailure::LevelUnreadable`).
         let mut expired_ids: Vec<Id> = Vec::new();
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
-        for entry in self.bids.iter() {
-            entry.value().snapshot_by_seq_into(&mut level_orders);
-            for order in &level_orders {
-                if self.tif_expired_at(order.time_in_force(), now) {
-                    expired_ids.push(order.id());
-                }
+        let sides = self
+            .bids
+            .iter()
+            .map(|entry| (entry, Side::Buy))
+            .chain(self.asks.iter().map(|entry| (entry, Side::Sell)));
+        for (entry, side) in sides {
+            if let Err(failure) =
+                read_level_orders(entry.value(), side, *entry.key(), &mut level_orders)
+            {
+                tracing::warn!(
+                    symbol = %self.symbol,
+                    now_ms = now,
+                    %failure,
+                    "expired-order eviction refused: price level unreadable"
+                );
+                return Err(failure.to_order_book_error());
             }
-        }
-        for entry in self.asks.iter() {
-            entry.value().snapshot_by_seq_into(&mut level_orders);
             for order in &level_orders {
                 if self.tif_expired_at(order.time_in_force(), now) {
                     expired_ids.push(order.id());
@@ -621,7 +759,7 @@ where
         }
 
         if expired_ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Phase 2: cancel each expired order through the shared single-order
@@ -643,7 +781,7 @@ where
             "expired orders evicted"
         );
 
-        evicted
+        Ok(evicted)
     }
 
     /// Internal helper: cancel a batch of orders by their IDs with a reason.
@@ -679,7 +817,10 @@ where
     /// deliberately avoided so the resulting id sequence (which lands in the
     /// journaled `MassCancelled` payload) is replay-stable across processes. One
     /// scratch buffer is reused across levels to avoid a per-level allocation.
-    fn collect_order_ids_by_side(&self, side: Side) -> Vec<Id> {
+    ///
+    /// Stops at the first level whose orders cannot be read and returns it as
+    /// a [`MassCancelFailure`]; nothing has been cancelled at that point.
+    fn collect_order_ids_by_side(&self, side: Side) -> Result<Vec<Id>, MassCancelFailure> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
@@ -688,13 +829,43 @@ where
         let mut ids = Vec::new();
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
         for entry in price_levels.iter() {
-            entry.value().snapshot_by_seq_into(&mut level_orders);
+            read_level_orders(entry.value(), side, *entry.key(), &mut level_orders)?;
             for order in &level_orders {
                 ids.push(order.id());
             }
         }
-        ids
+        Ok(ids)
     }
+
+    /// Logs a refused mass cancel and builds its result: nothing cancelled,
+    /// `failure` recorded.
+    #[cold]
+    #[inline(never)]
+    fn refuse_mass_cancel(&self, failure: MassCancelFailure) -> MassCancelResult {
+        tracing::warn!(
+            symbol = %self.symbol,
+            %failure,
+            "mass cancel refused: price level unreadable, nothing cancelled"
+        );
+        MassCancelResult::refused(failure)
+    }
+}
+
+/// Reads `level`'s resting orders into `buf` in ascending insertion sequence
+/// (the sweep order), mapping a pricelevel failure to the
+/// [`MassCancelFailure`] a mass cancel records. On `Err` pricelevel leaves
+/// `buf` untouched, so it still holds the previous level's orders and must
+/// not be consumed.
+#[inline]
+fn read_level_orders(
+    level: &PriceLevel,
+    side: Side,
+    price: u128,
+    buf: &mut Vec<Arc<OrderType<()>>>,
+) -> Result<(), MassCancelFailure> {
+    level
+        .snapshot_by_seq_into(buf)
+        .map_err(|error| MassCancelFailure::LevelUnreadable { side, price, error })
 }
 
 #[cfg(test)]
@@ -719,6 +890,83 @@ mod tests {
     fn test_mass_cancel_result_display() {
         let result = MassCancelResult::new(5, vec![]);
         assert_eq!(result.to_string(), "MassCancelResult { cancelled: 5 }");
+    }
+
+    fn unreadable_level() -> MassCancelFailure {
+        MassCancelFailure::LevelUnreadable {
+            side: Side::Sell,
+            price: 101,
+            error: PriceLevelError::CapacityExceeded {
+                resource: pricelevel::CapacityResource::OrderSnapshot,
+                additional: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_result_refused_reports_failure_and_cancels_nothing() {
+        let result = MassCancelResult::refused(unreadable_level());
+        assert!(result.is_empty());
+        assert_eq!(result.cancelled_count(), 0);
+        assert!(result.cancelled_order_ids().is_empty());
+        assert!(result.has_failures());
+        assert_eq!(result.failures(), &[unreadable_level()]);
+        assert_eq!(
+            result.to_string(),
+            "MassCancelResult { cancelled: 0, failures: 1 }"
+        );
+        assert!(matches!(
+            result.failures()[0].to_order_book_error(),
+            OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+                additional: 3,
+                ..
+            })
+        ));
+        assert!(
+            result.failures()[0]
+                .to_string()
+                .starts_with("price level SELL 101 unreadable")
+        );
+    }
+
+    #[test]
+    fn test_mass_cancel_result_failures_round_trip_json() {
+        let result = MassCancelResult::refused(unreadable_level());
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"level_unreadable\""), "{json}");
+        let decoded: MassCancelResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.failures(), result.failures());
+    }
+
+    /// JSON written before 0.14 (no `failures` key) decodes with an empty
+    /// failure list.
+    #[test]
+    fn test_mass_cancel_result_legacy_json_without_failures_decodes() {
+        let legacy = r#"{"cancelled_count":1,"cancelled_order_ids":["00000000-0000-0007-0000-000000000000"]}"#;
+        let decoded: MassCancelResult = serde_json::from_str(legacy).expect("legacy json");
+        assert_eq!(decoded.cancelled_count(), 1);
+        assert_eq!(decoded.cancelled_order_ids(), &[Id::from_u64(7)]);
+        assert!(!decoded.has_failures());
+    }
+
+    #[test]
+    fn test_mass_cancels_complete_without_failures() {
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add bid");
+        book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None)
+            .expect("add ask");
+        assert!(
+            !book
+                .cancel_orders_by_price_range(Side::Buy, 0, 200)
+                .has_failures()
+        );
+        assert!(!book.cancel_orders_by_side(Side::Sell).has_failures());
+        book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add bid");
+        let all = book.cancel_all_orders();
+        assert!(!all.has_failures());
+        assert_eq!(all.cancelled_count(), 1);
     }
 
     #[test]
@@ -1153,6 +1401,7 @@ mod tests {
         let book = expiring_book();
         assert!(
             book.evict_expired_orders(TimestampMs::new(10_000))
+                .expect("evict")
                 .is_empty()
         );
     }
@@ -1165,11 +1414,17 @@ mod tests {
             .expect("add gtd");
 
         // Before the deadline: untouched.
-        assert!(book.evict_expired_orders(TimestampMs::new(999)).is_empty());
+        assert!(
+            book.evict_expired_orders(TimestampMs::new(999))
+                .expect("evict")
+                .is_empty()
+        );
         assert_eq!(book.best_bid(), Some(100));
 
         // At the deadline (>=): evicted.
-        let evicted = book.evict_expired_orders(TimestampMs::new(1_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict");
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id(), gtd);
         assert_eq!(book.best_bid(), None);
@@ -1193,7 +1448,9 @@ mod tests {
         book.add_limit_order(gtd_past, 98, 5, Side::Buy, TimeInForce::Gtd(1_000), None)
             .expect("gtd past");
 
-        let evicted = book.evict_expired_orders(TimestampMs::new(2_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(2_000))
+            .expect("evict");
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id(), gtd_past);
 
@@ -1213,9 +1470,15 @@ mod tests {
             .expect("add");
 
         // 999 -> not expired.
-        assert!(book.evict_expired_orders(TimestampMs::new(999)).is_empty());
+        assert!(
+            book.evict_expired_orders(TimestampMs::new(999))
+                .expect("evict")
+                .is_empty()
+        );
         // Exactly at the deadline -> evicted.
-        let evicted = book.evict_expired_orders(TimestampMs::new(1_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict");
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id(), id);
     }
@@ -1231,10 +1494,13 @@ mod tests {
         // Before close: untouched.
         assert!(
             book.evict_expired_orders(TimestampMs::new(1_999))
+                .expect("evict")
                 .is_empty()
         );
         // At/after close: evicted.
-        let evicted = book.evict_expired_orders(TimestampMs::new(2_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(2_000))
+            .expect("evict");
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id(), day);
     }
@@ -1262,7 +1528,9 @@ mod tests {
         book.add_limit_order(a110, 110, 1, Side::Sell, TimeInForce::Gtd(1_000), None)
             .expect("a110");
 
-        let evicted = book.evict_expired_orders(TimestampMs::new(2_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(2_000))
+            .expect("evict");
         let ids: Vec<Id> = evicted.iter().map(|o| o.id()).collect();
 
         // Contract: bids ascending (90, then 95 FIFO), then asks ascending.
@@ -1276,9 +1544,13 @@ mod tests {
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
             .expect("add");
 
-        let first = book.evict_expired_orders(TimestampMs::new(1_000));
+        let first = book
+            .evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict");
         assert_eq!(first.len(), 1);
-        let second = book.evict_expired_orders(TimestampMs::new(1_000));
+        let second = book
+            .evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict");
         assert!(second.is_empty());
     }
 
@@ -1300,7 +1572,9 @@ mod tests {
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
             .expect("add");
 
-        let evicted = book.evict_expired_orders(TimestampMs::new(1_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict");
         assert_eq!(evicted.len(), 1);
 
         let recorded = events.lock().expect("lock");
@@ -1323,7 +1597,9 @@ mod tests {
         book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
             .expect("add");
 
-        let evicted = book.evict_expired_orders(TimestampMs::new(1_000));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(1_000))
+            .expect("evict");
         assert_eq!(evicted.len(), 1);
 
         let status = book

@@ -290,7 +290,7 @@ mod integration_tests {
         assert_eq!(book.fee_schedule(), Some(schedule));
 
         // Verify the book state
-        let snapshot = book.create_snapshot(10);
+        let snapshot = book.create_snapshot(10).expect("snapshot");
         assert_eq!(snapshot.bids.len(), 1); // Remaining bid quantity
         assert_eq!(snapshot.asks.len(), 0); // Ask fully consumed
     }
@@ -320,7 +320,7 @@ mod integration_tests {
         assert_eq!(book.fee_schedule(), Some(schedule));
 
         // Fee schedule should persist through operations
-        let snapshot = book.create_snapshot(10);
+        let snapshot = book.create_snapshot(10).expect("snapshot");
         assert!(!snapshot.bids.is_empty() || !snapshot.asks.is_empty());
         assert_eq!(book.fee_schedule(), Some(schedule));
     }

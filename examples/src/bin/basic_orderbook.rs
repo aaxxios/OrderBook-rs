@@ -204,7 +204,13 @@ fn demo_order_lookup(book: &crate::OrderBook) {
     }
 
     // Create a snapshot of the order book
-    let snapshot = book.create_snapshot(5); // Get top 5 price levels
+    let snapshot = match book.create_snapshot(5) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::error!(%err, "snapshot failed");
+            return;
+        }
+    }; // Top 5 price levels
 
     info!("OrderBook snapshot:");
     info!("  Symbol: {}", snapshot.symbol);
@@ -424,7 +430,13 @@ fn display_orderbook_state(book: &crate::OrderBook) {
     }
 
     // Create a detailed snapshot
-    let snapshot = book.create_snapshot(3); // Top 3 levels
+    let snapshot = match book.create_snapshot(3) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::error!(%err, "snapshot failed");
+            return;
+        }
+    }; // Top 3 levels
 
     info!("Bids:");
     for (i, level) in snapshot.bids.iter().enumerate() {

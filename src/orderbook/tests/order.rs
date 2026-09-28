@@ -238,7 +238,8 @@ mod tests {
         };
 
         let (refreshed_order, used_hidden) = iceberg_order
-            .refresh_iceberg(std::num::NonZeroU64::new(refresh_amount).expect("nonzero"));
+            .refresh_iceberg(std::num::NonZeroU64::new(refresh_amount).expect("nonzero"))
+            .expect("refresh");
 
         match refreshed_order {
             OrderType::IcebergOrder {
@@ -282,8 +283,9 @@ mod tests {
             extra_fields: (),
         };
 
-        let (consumed, updated_order, hidden_reduced, remaining) =
-            order.match_against(incoming_quantity);
+        let (consumed, updated_order, hidden_reduced, remaining) = order
+            .match_against(incoming_quantity)
+            .expect("match_against");
 
         assert_eq!(
             Quantity::new(consumed),
@@ -315,8 +317,9 @@ mod tests {
             extra_fields: (),
         };
 
-        let (consumed, updated_order, hidden_reduced, remaining) =
-            order.match_against(incoming_quantity);
+        let (consumed, updated_order, hidden_reduced, remaining) = order
+            .match_against(incoming_quantity)
+            .expect("match_against");
 
         assert_eq!(
             consumed, incoming_quantity,
@@ -357,8 +360,9 @@ mod tests {
             extra_fields: (),
         };
 
-        let (consumed, updated_order, hidden_reduced, remaining) =
-            order.match_against(incoming_quantity);
+        let (consumed, updated_order, hidden_reduced, remaining) = order
+            .match_against(incoming_quantity)
+            .expect("match_against");
 
         assert_eq!(
             Quantity::new(consumed),

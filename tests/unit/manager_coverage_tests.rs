@@ -60,7 +60,7 @@ fn std_get_book_mut_allows_modification() {
     mgr.add_book("ETH/USD").expect("add book");
     let book = mgr.get_book_mut("ETH/USD").expect("book must exist");
     let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap.bids.len(), 1);
 }
 
@@ -126,12 +126,14 @@ fn std_add_order_and_cancel_across_books() {
     let btc_snap = mgr
         .get_book("BTC/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(btc_snap.bids.is_empty());
     let eth_snap = mgr
         .get_book("ETH/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(eth_snap.asks.is_empty());
 }
 
@@ -156,7 +158,8 @@ fn std_cancel_by_user_across_books() {
     let snap = mgr
         .get_book("BTC/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(snap.bids.is_empty());
 }
 
@@ -174,7 +177,8 @@ fn std_cancel_by_side_across_books() {
     let snap = mgr
         .get_book("BTC/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(snap.bids.is_empty());
     assert_eq!(snap.asks.len(), 1);
 }
@@ -244,7 +248,8 @@ fn tokio_cancel_all_across_books() {
     let snap = mgr
         .get_book("BTC/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(snap.bids.is_empty());
 }
 
@@ -268,7 +273,8 @@ fn tokio_cancel_by_user_across_books() {
     let snap = mgr
         .get_book("BTC/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(snap.bids.is_empty());
 }
 
@@ -284,7 +290,8 @@ fn tokio_cancel_by_side_across_books() {
     let snap = mgr
         .get_book("BTC/USD")
         .expect("book")
-        .create_snapshot(usize::MAX);
+        .create_snapshot(usize::MAX)
+        .expect("snapshot");
     assert!(snap.asks.is_empty());
 }
 

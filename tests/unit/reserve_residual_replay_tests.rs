@@ -130,7 +130,7 @@ mod tests_reserve_residual_replay {
             live_executed, VISIBLE,
             "the live session executes exactly the visible tranche"
         );
-        let live_snapshot = live.create_snapshot(usize::MAX);
+        let live_snapshot = live.create_snapshot(usize::MAX).expect("snapshot");
 
         // Replay into a fresh book under the same clock.
         let (replayed, sequence) =
@@ -165,7 +165,7 @@ mod tests_reserve_residual_replay {
         );
 
         // The oracle: live and replayed books are replay-equal.
-        let replayed_snapshot = replayed.create_snapshot(usize::MAX);
+        let replayed_snapshot = replayed.create_snapshot(usize::MAX).expect("snapshot");
         assert!(
             snapshots_match(&live_snapshot, &replayed_snapshot),
             "replayed book must match the live one that recorded the journal"

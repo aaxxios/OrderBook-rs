@@ -152,7 +152,7 @@ fn measure_concurrent_mixed_operations(thread_count: usize, iterations: u64) -> 
                     }
                     _ => {
                         // Create a snapshot
-                        thread_order_book.create_snapshot(5);
+                        thread_order_book.create_snapshot(5).expect("snapshot");
                     }
                 }
             }

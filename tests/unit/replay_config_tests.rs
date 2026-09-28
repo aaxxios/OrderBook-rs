@@ -228,14 +228,14 @@ fn lot_size_replay_without_config_diverges() {
     })
     .expect("seed ask");
     let _ = live.match_market_order_by_amount(Id::from_u64(LOT_TAKER_ID), 700, Side::Buy);
-    let live_snap = live.create_snapshot(usize::MAX);
+    let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
 
     // Replay WITHOUT config — fresh book has no lot_size, so it takes 7 (not 5).
     let (replayed, seq) =
         ReplayEngine::<()>::replay_from_with_clock(&journal, 0, "TEST", stub_clock())
             .expect("plain replay should succeed");
     assert_eq!(seq, last_seq);
-    let replayed_snap = replayed.create_snapshot(usize::MAX);
+    let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
 
     assert!(
         !snapshots_match(&live_snap, &replayed_snap),
@@ -265,7 +265,7 @@ fn lot_size_replay_with_config_matches() {
     })
     .expect("seed ask");
     let _ = live.match_market_order_by_amount(Id::from_u64(LOT_TAKER_ID), 700, Side::Buy);
-    let live_snap = live.create_snapshot(usize::MAX);
+    let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
 
     // Replay WITH the matching config.
     let config = ReplayBookConfig {
@@ -281,7 +281,7 @@ fn lot_size_replay_with_config_matches() {
     )
     .expect("config replay should succeed");
     assert_eq!(seq, last_seq);
-    let replayed_snap = replayed.create_snapshot(usize::MAX);
+    let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
 
     assert!(
         snapshots_match(&live_snap, &replayed_snap),
@@ -359,7 +359,7 @@ fn stp_prevented_order_recorded_rejected_is_skipped_on_replay() {
         timestamp: TimestampMs::new(0),
         extra_fields: (),
     });
-    let live_snap = live.create_snapshot(usize::MAX);
+    let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
 
     // Replaying WITH the matching STP config skips the Rejected buy and rebuilds
     // the resting ask, matching the live book.
@@ -379,7 +379,7 @@ fn stp_prevented_order_recorded_rejected_is_skipped_on_replay() {
         seq, 0,
         "only the ask (seq 0) is applied; the buy is skipped"
     );
-    let replayed_snap = replayed.create_snapshot(usize::MAX);
+    let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
 
     assert!(
         snapshots_match(&live_snap, &replayed_snap),
@@ -416,7 +416,7 @@ fn full_config_injection_preserves_lot_size_parity() {
     })
     .expect("seed ask");
     let _ = live.match_market_order_by_amount(Id::from_u64(LOT_TAKER_ID), 700, Side::Buy);
-    let live_snap = live.create_snapshot(usize::MAX);
+    let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
 
     let config = ReplayBookConfig::new(
         Some(fee),
@@ -435,7 +435,7 @@ fn full_config_injection_preserves_lot_size_parity() {
     )
     .expect("config replay should succeed");
     assert_eq!(seq, last_seq);
-    let replayed_snap = replayed.create_snapshot(usize::MAX);
+    let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
 
     assert!(
         snapshots_match(&live_snap, &replayed_snap),
@@ -532,8 +532,8 @@ fn test_replay_with_namespace_config_reproduces_live_trade_ids() {
     assert_eq!(last_seq, seq);
 
     // Structure matches...
-    let live_snap = live.create_snapshot(usize::MAX);
-    let replayed_snap = replayed.create_snapshot(usize::MAX);
+    let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+    let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
     assert!(
         snapshots_match(&live_snap, &replayed_snap),
         "replayed structure must match live"

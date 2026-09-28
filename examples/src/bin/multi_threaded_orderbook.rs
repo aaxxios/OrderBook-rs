@@ -290,7 +290,13 @@ fn print_orderbook_state(book: &OrderBook) {
     info!("Number of ask price levels: {}", ask_volumes.len());
 
     // Top bid/ask levels
-    let snapshot = book.create_snapshot(3);
+    let snapshot = match book.create_snapshot(3) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::error!(%err, "snapshot failed");
+            return;
+        }
+    };
 
     info!("\nTop Bid Levels:");
     for level in snapshot.bids {

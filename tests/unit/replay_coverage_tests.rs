@@ -136,7 +136,7 @@ fn replay_single_add_order() {
     assert!(result.is_ok());
     let (book, last_seq) = result.unwrap();
     assert_eq!(last_seq, 0);
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap.bids.len(), 1);
 }
 
@@ -155,7 +155,7 @@ fn replay_add_then_cancel() {
     assert!(result.is_ok());
     let (book, last_seq) = result.unwrap();
     assert_eq!(last_seq, 1);
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snap.bids.is_empty());
     assert!(snap.asks.is_empty());
 }
@@ -177,7 +177,7 @@ fn replay_skips_rejected_events() {
     // The add at seq 0 is applied, the rejected event at seq 1 is skipped
     // and therefore does not advance `last_applied_seq`.
     assert_eq!(last_seq, 0);
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap.bids.len(), 1);
 }
 
@@ -232,7 +232,7 @@ fn replay_cancel_all_command() {
     let result = ReplayEngine::<()>::replay_from(&journal, 0, "TEST");
     assert!(result.is_ok());
     let (book, _) = result.unwrap();
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snap.bids.is_empty());
 }
 
@@ -259,7 +259,7 @@ fn replay_cancel_by_side_command() {
     let result = ReplayEngine::<()>::replay_from(&journal, 0, "TEST");
     assert!(result.is_ok());
     let (book, _) = result.unwrap();
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snap.bids.is_empty());
 }
 
@@ -360,7 +360,7 @@ fn replay_verify_matching_snapshot() {
 
     // Replay to get the expected state
     let (book, _) = ReplayEngine::<()>::replay_from(&journal, 0, "TEST").unwrap();
-    let snapshot = book.create_snapshot(usize::MAX);
+    let snapshot = book.create_snapshot(usize::MAX).expect("snapshot");
 
     let result = ReplayEngine::<()>::verify(&journal, &snapshot);
     assert!(result.is_ok());
@@ -380,7 +380,7 @@ fn replay_verify_mismatched_snapshot() {
     // Create a snapshot from a different book
     let other_book = orderbook_rs::OrderBook::<()>::new("TEST");
     let _ = other_book.add_limit_order(new_id(), 999, 99, Side::Sell, TimeInForce::Gtc, None);
-    let wrong_snapshot = other_book.create_snapshot(usize::MAX);
+    let wrong_snapshot = other_book.create_snapshot(usize::MAX).expect("snapshot");
 
     let result = ReplayEngine::<()>::verify(&journal, &wrong_snapshot);
     assert!(result.is_ok());
@@ -394,8 +394,8 @@ fn snapshots_match_identical_books() {
     let book = orderbook_rs::OrderBook::<()>::new("TEST");
     let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let _ = book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
-    let s1 = book.create_snapshot(usize::MAX);
-    let s2 = book.create_snapshot(usize::MAX);
+    let s1 = book.create_snapshot(usize::MAX).expect("snapshot");
+    let s2 = book.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snapshots_match(&s1, &s2));
 }
 
@@ -403,8 +403,8 @@ fn snapshots_match_identical_books() {
 fn snapshots_match_different_symbols_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("BTC");
     let book2 = orderbook_rs::OrderBook::<()>::new("ETH");
-    let s1 = book1.create_snapshot(usize::MAX);
-    let s2 = book2.create_snapshot(usize::MAX);
+    let s1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+    let s2 = book2.create_snapshot(usize::MAX).expect("snapshot");
     assert!(!snapshots_match(&s1, &s2));
 }
 
@@ -414,8 +414,8 @@ fn snapshots_match_different_bids_returns_false() {
     let _ = book1.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
     let _ = book2.add_limit_order(new_id(), 200, 20, Side::Buy, TimeInForce::Gtc, None);
-    let s1 = book1.create_snapshot(usize::MAX);
-    let s2 = book2.create_snapshot(usize::MAX);
+    let s1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+    let s2 = book2.create_snapshot(usize::MAX).expect("snapshot");
     assert!(!snapshots_match(&s1, &s2));
 }
 
@@ -425,8 +425,8 @@ fn snapshots_match_different_asks_returns_false() {
     let _ = book1.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
     let _ = book2.add_limit_order(new_id(), 200, 20, Side::Sell, TimeInForce::Gtc, None);
-    let s1 = book1.create_snapshot(usize::MAX);
-    let s2 = book2.create_snapshot(usize::MAX);
+    let s1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+    let s2 = book2.create_snapshot(usize::MAX).expect("snapshot");
     assert!(!snapshots_match(&s1, &s2));
 }
 
@@ -435,8 +435,8 @@ fn snapshots_match_different_bid_count_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("TEST");
     let _ = book1.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let s1 = book1.create_snapshot(usize::MAX);
-    let s2 = book2.create_snapshot(usize::MAX);
+    let s1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+    let s2 = book2.create_snapshot(usize::MAX).expect("snapshot");
     assert!(!snapshots_match(&s1, &s2));
 }
 
@@ -445,8 +445,8 @@ fn snapshots_match_different_ask_count_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("TEST");
     let _ = book1.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let s1 = book1.create_snapshot(usize::MAX);
-    let s2 = book2.create_snapshot(usize::MAX);
+    let s1 = book1.create_snapshot(usize::MAX).expect("snapshot");
+    let s2 = book2.create_snapshot(usize::MAX).expect("snapshot");
     assert!(!snapshots_match(&s1, &s2));
 }
 

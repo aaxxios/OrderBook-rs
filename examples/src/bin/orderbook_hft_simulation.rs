@@ -272,7 +272,13 @@ fn print_order_book_state(order_book: &OrderBook<OrderMetadata>) {
     let mut total_ask_visible = 0;
     let mut total_ask_hidden = 0;
 
-    let snapshot = order_book.create_snapshot(100); // Get a deep snapshot
+    let snapshot = match order_book.create_snapshot(100) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::error!(%err, "snapshot failed");
+            return;
+        }
+    }; // Deep snapshot
 
     for level in &snapshot.bids {
         total_bid_visible += level.visible_quantity().as_u64();
