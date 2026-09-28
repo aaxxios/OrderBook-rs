@@ -1342,9 +1342,11 @@ where
 /// Statistics comparison covers the deterministic counters — orders added /
 /// removed / executed, quantity executed, value executed, and the sticky
 /// `stats_degraded` flag. Intentionally excluded:
-/// - `first_arrival_time` — pricelevel derives it from a raw
-///   `SystemTime::now()` at level creation, outside the injectable `Clock`,
-///   so it can never match between two runs;
+/// - `first_arrival_time` — before pricelevel 0.10 it came from a raw
+///   `SystemTime::now()` at level creation; since 0.10 it starts at `0` and
+///   is stamped from order timestamps, so it is deterministic, but it stays
+///   excluded because snapshots written by older versions carry wall-clock
+///   values;
 /// - `last_execution_time` / `sum_waiting_time` — clock-derived, but live
 ///   ingestion and replay consume different clock-tick budgets by design
 ///   (the live submission API stamps each order with a fresh tick; replay
