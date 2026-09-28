@@ -70,7 +70,11 @@ mod tests {
     }
 
     /// Assert the validation failed with `InvalidLotSize` on `quantity`.
-    fn assert_invalid_lot(result: Result<(), OrderBookError>, quantity: u64, lot: u64) {
+    fn assert_invalid_lot<V: std::fmt::Debug>(
+        result: Result<V, OrderBookError>,
+        quantity: u64,
+        lot: u64,
+    ) {
         match result {
             Err(OrderBookError::InvalidLotSize {
                 quantity: reported,
@@ -352,7 +356,7 @@ mod tests {
             }
 
             match (&iceberg_verdict, &reserve_verdict) {
-                (Ok(()), Ok(())) => {}
+                (Ok(_), Ok(_)) => {}
                 (
                     Err(OrderBookError::InvalidLotSize {
                         quantity: iceberg_quantity,

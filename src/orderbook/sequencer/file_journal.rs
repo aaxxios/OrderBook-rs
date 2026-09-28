@@ -1496,4 +1496,68 @@ mod tests {
             other => panic!("expected EvictExpiredOrders, got {other:?}"),
         }
     }
+
+    /// #240: a `MatchAborted` result with its committed prefix survives a
+    /// full `FileJournal` append/read cycle, in parity with `InMemoryJournal`.
+    #[test]
+    fn test_match_aborted_result_file_journal_roundtrip() {
+        use crate::orderbook::reject_reason::RejectReason;
+        use crate::orderbook::sequencer::types::{CommittedPrefix, CommittedTrade};
+        use pricelevel::{Price, Quantity, Side};
+
+        let dir = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+        let journal = FileJournal::<()>::open(dir.path()).unwrap_or_else(|_| panic!("open"));
+
+        let committed = CommittedPrefix {
+            executed_quantity: 7,
+            trades: vec![
+                CommittedTrade {
+                    trade_id: new_id(),
+                    maker_order_id: new_id(),
+                    price: Price::new(100),
+                    quantity: Quantity::new(4),
+                },
+                CommittedTrade {
+                    trade_id: new_id(),
+                    maker_order_id: new_id(),
+                    price: Price::new(101),
+                    quantity: Quantity::new(3),
+                },
+            ],
+        };
+        let event = SequencerEvent::<()> {
+            sequence_num: 0,
+            timestamp_ns: 0,
+            command: SequencerCommand::MarketOrder {
+                id: new_id(),
+                quantity: 10,
+                side: Side::Buy,
+            },
+            result: SequencerResult::MatchAborted {
+                reason: "match aborted".to_string(),
+                code: RejectReason::MatchAborted,
+                committed: committed.clone(),
+            },
+        };
+        assert!(journal.append(&event).is_ok());
+        assert!(journal.verify_integrity().is_ok());
+
+        let decoded = journal
+            .read_from(0)
+            .unwrap_or_else(|_| panic!("read_from"))
+            .next()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| panic!("decode"));
+        match decoded.event.result {
+            SequencerResult::MatchAborted {
+                code,
+                committed: decoded,
+                ..
+            } => {
+                assert_eq!(code, RejectReason::MatchAborted);
+                assert_eq!(decoded, committed);
+            }
+            other => panic!("expected MatchAborted, got {other:?}"),
+        }
+    }
 }

@@ -20,6 +20,7 @@
 //! mass_cancel_*                    → Cancelled { MassCancel* }
 //! STP                              → Cancelled { SelfTradePrevention }
 //! IOC/FOK insufficient liquidity   → Cancelled { InsufficientLiquidity }
+//! sweep aborted by a level failure → Cancelled { MatchAborted } (filled = committed prefix)
 //! ```
 
 use super::clock::{Clock, MonotonicClock};
@@ -55,6 +56,12 @@ pub enum CancelReason {
     MassCancelByPriceRange,
     /// IOC or FOK order could not be fully filled.
     InsufficientLiquidity,
+    /// The taker's matching sweep stopped at a price level that reported a
+    /// failure (#240, `OrderBookError::MatchAborted`). `filled_quantity` is
+    /// the committed prefix; the remainder was cancelled, never rested.
+    /// Appended last so the positional (bincode) index of every earlier
+    /// variant is unchanged.
+    MatchAborted,
 }
 
 impl std::fmt::Display for CancelReason {
@@ -68,6 +75,7 @@ impl std::fmt::Display for CancelReason {
             Self::MassCancelByUser => write!(f, "mass cancel by user"),
             Self::MassCancelByPriceRange => write!(f, "mass cancel by price range"),
             Self::InsufficientLiquidity => write!(f, "insufficient liquidity"),
+            Self::MatchAborted => write!(f, "match aborted"),
         }
     }
 }

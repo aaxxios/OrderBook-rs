@@ -18,10 +18,11 @@ use super::risk::{ReferencePriceSource, RiskConfig, RiskRebuild, RiskState};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
 use crate::orderbook::book_change_event::PriceLevelChangedListener;
+use crate::orderbook::matching::MatchOutcome;
 #[cfg(feature = "special_orders")]
 use crate::orderbook::repricing::SpecialOrderTracker;
 use crate::orderbook::stp::STPMode;
-use crate::orderbook::trade::{TradeListener, TradeResult};
+use crate::orderbook::trade::{SubmitFailure, TradeListener, TradeResult};
 use crossbeam::atomic::AtomicCell;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
@@ -29,7 +30,7 @@ use either::Either;
 use pricelevel::OrderUpdate;
 use pricelevel::{
     Hash32, Id, MatchResult, OrderType, PriceLevel, PriceLevelError, PriceLevelSnapshot, Side,
-    UuidGenerator,
+    TakerKind, UuidGenerator,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -3231,7 +3232,10 @@ where
     /// # Errors
     /// Returns [`OrderBookError::InsufficientLiquidity`] when no liquidity
     /// is available, or [`OrderBookError::SelfTradePrevented`] when STP
-    /// cancels the taker before any fills occur.
+    /// cancels the taker before any fills occur. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a price
+    /// level that reported a failure (#240); the trades committed before it
+    /// have already reached the trade listener, exactly like a partial fill.
     pub fn match_market_order_with_user(
         &self,
         order_id: Id,
@@ -3239,32 +3243,106 @@ where
         side: Side,
         user_id: Hash32,
     ) -> Result<MatchResult, OrderBookError> {
+        self.match_market_order_committed(order_id, quantity, side, user_id, false)
+            .map_err(SubmitFailure::into_error)
+    }
+
+    /// Shared body of the base-quantity market sweep: match, then publish
+    /// the trades (including an aborted sweep's committed prefix, #240).
+    /// `want_committed` builds the committed `TradeResult` for the caller
+    /// even when no trade listener is installed.
+    #[allow(
+        clippy::result_large_err,
+        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
+    )]
+    pub(crate) fn match_market_order_committed(
+        &self,
+        order_id: Id,
+        quantity: u64,
+        side: Side,
+        user_id: Hash32,
+        want_committed: bool,
+    ) -> Result<MatchResult, SubmitFailure> {
         trace!(
             "Order book {}: Matching market order {} for {} at side {:?}",
             self.symbol, order_id, quantity, side
         );
-        let match_result =
-            OrderBook::<T>::match_order_with_user(self, order_id, side, quantity, None, user_id)?;
+        let outcome = {
+            // #209 / #225: same gate as `match_order_with_user`, released
+            // before the trades are published, as before.
+            let _gate = self.acquire_coherent_submit_gate(
+                self.submit_needs_exclusive_gate(false, user_id, false, false),
+            );
+            self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                None,
+                user_id,
+                TakerKind::Standard,
+                0,
+            )?
+        };
+        self.publish_match_outcome(outcome, want_committed)
+    }
 
-        // Emit trade-count metric and trigger trade listener if any
-        // transactions printed. The metric is independent of whether
-        // a listener is configured; the listener emission still gates
-        // on `Some(ref listener)`.
-        let trades_emitted = match_result.trades().len() as u64;
-        if trades_emitted > 0 {
-            super::metrics::record_trades(trades_emitted);
-            if let Some(ref listener) = self.trade_listener {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                listener(&trade_result);
-            }
+    /// Publish a sweep's trades and resolve its outcome (#240).
+    ///
+    /// Emits the trade-count metric and, when a listener is installed, the
+    /// `TradeResult` for every trade the sweep committed — for an aborted
+    /// sweep that is the committed prefix, published exactly like a partial
+    /// fill. Then returns the `MatchResult`, or the abort wrapped with that
+    /// same `TradeResult` (built when `want_committed` even without a
+    /// listener).
+    ///
+    /// # Errors
+    ///
+    /// [`SubmitFailure`] carrying [`OrderBookError::MatchAborted`] when the
+    /// outcome was aborted.
+    #[allow(
+        clippy::result_large_err,
+        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
+    )]
+    pub(crate) fn publish_match_outcome(
+        &self,
+        outcome: MatchOutcome,
+        want_committed: bool,
+    ) -> Result<MatchResult, SubmitFailure> {
+        let want_result = want_committed && outcome.aborted.is_some();
+        let committed = self.publish_trades(&outcome.result, want_result);
+        match outcome.aborted {
+            Some(error) => Err(SubmitFailure::with_committed(error, committed)),
+            None => Ok(outcome.result),
         }
+    }
 
-        Ok(match_result)
+    /// Emit the trade-count metric and the trade listener for
+    /// `match_result`'s trades. Returns the emitted `TradeResult` when
+    /// `want_result` is set or a listener consumed it; `None` when there
+    /// were no trades. Every emission consumes one `engine_seq` tick.
+    pub(crate) fn publish_trades(
+        &self,
+        match_result: &MatchResult,
+        want_result: bool,
+    ) -> Option<TradeResult> {
+        let trades_emitted = u64::try_from(match_result.trades().len()).unwrap_or(u64::MAX);
+        if trades_emitted == 0 {
+            return None;
+        }
+        // The metric is independent of whether a listener is configured;
+        // the `TradeResult` is only built when someone consumes it.
+        super::metrics::record_trades(trades_emitted);
+        let listener = self.trade_listener.as_ref();
+        if !want_result && listener.is_none() {
+            return None;
+        }
+        let mut trade_result =
+            TradeResult::with_fees(self.symbol.clone(), match_result.clone(), self.fee_schedule);
+        trade_result.engine_seq = self.next_engine_seq();
+        if let Some(listener) = listener {
+            listener(&trade_result);
+        }
+        Some(trade_result)
     }
 
     /// Match a market order specified by quote-notional amount.
@@ -3338,7 +3416,10 @@ where
     ///
     /// Returns [`OrderBookError::InsufficientLiquidityNotional`] when no
     /// liquidity is available, or [`OrderBookError::SelfTradePrevented`]
-    /// when STP cancels the taker before any fills occur.
+    /// when STP cancels the taker before any fills occur. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a price
+    /// level that reported a failure (#240); the committed prefix has
+    /// already reached the trade listener.
     pub fn match_market_order_by_amount_with_user(
         &self,
         order_id: Id,
@@ -3346,6 +3427,24 @@ where
         side: Side,
         user_id: Hash32,
     ) -> Result<MatchResult, OrderBookError> {
+        self.match_market_order_by_amount_committed(order_id, amount, side, user_id, false)
+            .map_err(SubmitFailure::into_error)
+    }
+
+    /// Shared body of the quote-notional market sweep; see
+    /// [`Self::match_market_order_committed`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "SubmitFailure is OrderBookError plus a boxed prefix; boxing the error would allocate on every rejection"
+    )]
+    pub(crate) fn match_market_order_by_amount_committed(
+        &self,
+        order_id: Id,
+        amount: u128,
+        side: Side,
+        user_id: Hash32,
+        want_committed: bool,
+    ) -> Result<MatchResult, SubmitFailure> {
         trace!(
             "Order book {}: Matching notional market order {} for {} at side {:?}",
             self.symbol, order_id, amount, side
@@ -3358,24 +3457,9 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
-        let match_result =
+        let outcome =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
-
-        let trades_emitted = match_result.trades().len() as u64;
-        if trades_emitted > 0 {
-            super::metrics::record_trades(trades_emitted);
-            if let Some(ref listener) = self.trade_listener {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                listener(&trade_result);
-            }
-        }
-
-        Ok(match_result)
+        self.publish_match_outcome(outcome, want_committed)
     }
 
     /// Attempts to match a limit order in the order book.
@@ -3416,7 +3500,10 @@ where
     ///
     /// # Errors
     /// Returns [`OrderBookError::SelfTradePrevented`] when STP cancels the
-    /// taker before any fills occur.
+    /// taker before any fills occur. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a price
+    /// level that reported a failure (#240); the committed prefix has
+    /// already reached the trade listener.
     pub fn match_limit_order_with_user(
         &self,
         order_id: Id,
@@ -3429,34 +3516,24 @@ where
             "Order book {}: Matching limit order {} for {} at side {:?} with limit price {}",
             self.symbol, order_id, quantity, side, limit_price
         );
-        let match_result = OrderBook::<T>::match_order_with_user(
-            self,
-            order_id,
-            side,
-            quantity,
-            Some(limit_price),
-            user_id,
-        )?;
-
-        // Emit trade-count metric and trigger trade listener if any
-        // transactions printed. The metric is independent of whether
-        // a listener is configured; the listener emission still gates
-        // on `Some(ref listener)`.
-        let trades_emitted = match_result.trades().len() as u64;
-        if trades_emitted > 0 {
-            super::metrics::record_trades(trades_emitted);
-            if let Some(ref listener) = self.trade_listener {
-                let mut trade_result = TradeResult::with_fees(
-                    self.symbol.clone(),
-                    match_result.clone(),
-                    self.fee_schedule,
-                );
-                trade_result.engine_seq = self.next_engine_seq();
-                listener(&trade_result);
-            }
-        }
-
-        Ok(match_result)
+        let outcome = {
+            // #209 / #225: same gate as `match_order_with_user`, released
+            // before the trades are published, as before.
+            let _gate = self.acquire_coherent_submit_gate(
+                self.submit_needs_exclusive_gate(false, user_id, false, false),
+            );
+            self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                Some(limit_price),
+                user_id,
+                TakerKind::Standard,
+                0,
+            )?
+        };
+        self.publish_match_outcome(outcome, false)
+            .map_err(SubmitFailure::into_error)
     }
 
     /// Create a snapshot of the current order book state, up to `depth`

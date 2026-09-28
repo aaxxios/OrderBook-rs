@@ -46,4 +46,6 @@ pub use journal::{
     ENTRY_CRC_SIZE, ENTRY_HEADER_SIZE, ENTRY_OVERHEAD, Journal, JournalEntry, JournalReadIter,
 };
 pub use replay::{ReplayBookConfig, ReplayEngine, ReplayError, snapshots_match};
-pub use types::{SequencerCommand, SequencerEvent, SequencerResult};
+pub use types::{
+    CommittedPrefix, CommittedTrade, SequencerCommand, SequencerEvent, SequencerResult,
+};

@@ -20,6 +20,7 @@
 //! [`RejectReason`] is the stable public contract.
 
 use crate::orderbook::error::OrderBookError;
+use pricelevel::PriceLevelError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Closed taxonomy of reasons an order may be rejected at admission.
@@ -54,6 +55,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `DuplicateOrderId`       | 12  |
 /// | `InsufficientLiquidity`  | 13  |
 /// | `ReserveResidualWouldBeDiscarded` | 14 |
+/// | `MatchAborted`           | 15  |
+/// | `CapacityExceeded`       | 16  |
+/// | `CounterExhausted`       | 17  |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -92,6 +96,20 @@ pub enum RejectReason {
     /// would exhaust a non-auto-replenishing reserve's visible tranche and
     /// discard its hidden remainder (#230).
     ReserveResidualWouldBeDiscarded = 14,
+    /// A matching sweep stopped at a price level that reported a failure
+    /// after committing a (possibly empty) prefix of trades (#240). The
+    /// committed trades are real; the remainder was cancelled, never
+    /// rested. Carried by `OrderBookError::MatchAborted`.
+    MatchAborted = 15,
+    /// A `pricelevel` resource could not grow or advance
+    /// (`PriceLevelError::CapacityExceeded`): a refused allocation or an
+    /// exhausted id sequence, raised before the book changed (for example
+    /// by the fill-or-kill preflight, #240).
+    CapacityExceeded = 16,
+    /// A `pricelevel` monotonic counter has no headroom left
+    /// (`PriceLevelError::CounterExhausted`), raised before the book
+    /// changed.
+    CounterExhausted = 17,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -122,6 +140,9 @@ impl RejectReason {
             Self::DuplicateOrderId => 12,
             Self::InsufficientLiquidity => 13,
             Self::ReserveResidualWouldBeDiscarded => 14,
+            Self::MatchAborted => 15,
+            Self::CapacityExceeded => 16,
+            Self::CounterExhausted => 17,
             Self::Other(code) => code,
         }
     }
@@ -148,6 +169,9 @@ impl RejectReason {
             12 => Self::DuplicateOrderId,
             13 => Self::InsufficientLiquidity,
             14 => Self::ReserveResidualWouldBeDiscarded,
+            15 => Self::MatchAborted,
+            16 => Self::CapacityExceeded,
+            17 => Self::CounterExhausted,
             other => Self::Other(other),
         }
     }
@@ -199,6 +223,9 @@ impl std::fmt::Display for RejectReason {
             Self::ReserveResidualWouldBeDiscarded => {
                 write!(f, "reserve residual would be discarded")
             }
+            Self::MatchAborted => write!(f, "match aborted"),
+            Self::CapacityExceeded => write!(f, "capacity exceeded"),
+            Self::CounterExhausted => write!(f, "counter exhausted"),
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -239,6 +266,13 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::ReserveResidualWouldBeDiscarded { .. } => {
                 Self::ReserveResidualWouldBeDiscarded
             }
+            OrderBookError::MatchAborted { .. } => Self::MatchAborted,
+            OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded { .. }) => {
+                Self::CapacityExceeded
+            }
+            OrderBookError::PriceLevelError(PriceLevelError::CounterExhausted { .. }) => {
+                Self::CounterExhausted
+            }
             OrderBookError::PriceLevelError(_) => Self::Other(0),
             OrderBookError::OrderNotFound(_) => Self::Other(0),
             OrderBookError::InvalidOperation { .. } => Self::Other(0),
@@ -265,7 +299,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 14] {
+    fn named_variants() -> [RejectReason; 17] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -281,6 +315,9 @@ mod tests {
             RejectReason::DuplicateOrderId,
             RejectReason::InsufficientLiquidity,
             RejectReason::ReserveResidualWouldBeDiscarded,
+            RejectReason::MatchAborted,
+            RejectReason::CapacityExceeded,
+            RejectReason::CounterExhausted,
         ]
     }
 
@@ -300,6 +337,9 @@ mod tests {
         assert_eq!(RejectReason::DuplicateOrderId.as_u16(), 12);
         assert_eq!(RejectReason::InsufficientLiquidity.as_u16(), 13);
         assert_eq!(RejectReason::ReserveResidualWouldBeDiscarded.as_u16(), 14);
+        assert_eq!(RejectReason::MatchAborted.as_u16(), 15);
+        assert_eq!(RejectReason::CapacityExceeded.as_u16(), 16);
+        assert_eq!(RejectReason::CounterExhausted.as_u16(), 17);
     }
 
     /// #230: both new errors map to a wire code, and the new code 14 round
@@ -597,5 +637,48 @@ mod tests {
             .expect("decode Other(42)");
         assert_eq!(decoded, other);
         assert_eq!(n, bytes.len());
+    }
+
+    /// #240: the abort and the two pre-mutation `pricelevel` resource
+    /// failures carry dedicated codes instead of `Other(0)`, and the new
+    /// codes round-trip through `from_u16` with readable `Display` text.
+    #[test]
+    fn test_from_order_book_error_maps_match_abort_and_resource_failures() {
+        use pricelevel::{CapacityResource, ExhaustedCounter};
+
+        let aborted = OrderBookError::MatchAborted {
+            order_id: Id::from_u64(9),
+            executed_quantity: 5,
+            trade_count: 1,
+            source: PriceLevelError::CounterExhausted {
+                counter: ExhaustedCounter::MutationEpoch,
+            },
+        };
+        assert_eq!(RejectReason::from(&aborted), RejectReason::MatchAborted);
+
+        let capacity = OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+            resource: CapacityResource::IdSequence,
+            additional: 3,
+        });
+        assert_eq!(
+            RejectReason::from(&capacity),
+            RejectReason::CapacityExceeded
+        );
+
+        let counter = OrderBookError::PriceLevelError(PriceLevelError::CounterExhausted {
+            counter: ExhaustedCounter::QueueSequence,
+        });
+        assert_eq!(RejectReason::from(&counter), RejectReason::CounterExhausted);
+
+        for (code, text) in [
+            (15u16, "match aborted"),
+            (16, "capacity exceeded"),
+            (17, "counter exhausted"),
+        ] {
+            let reason = RejectReason::from_u16(code);
+            assert!(!matches!(reason, RejectReason::Other(_)), "{code} is named");
+            assert_eq!(reason.as_u16(), code);
+            assert_eq!(reason.to_string(), text);
+        }
     }
 }

@@ -3,6 +3,7 @@
    Email: jb@taunais.com
    Date: 2/10/25
 ******************************************************************************/
+use crate::orderbook::error::OrderBookError;
 use crate::orderbook::fees::FeeSchedule;
 use pricelevel::MatchResult;
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,88 @@ fn compute_quote_notional(match_result: &MatchResult) -> u128 {
 /// event off to a queue or channel instead and mutate from another
 /// context.
 pub type TradeListener = Arc<dyn Fn(&TradeResult) + Send + Sync>;
+
+/// A submit that failed, together with the trades it committed first.
+///
+/// Returned by the `*_with_committed` submit entry points
+/// ([`OrderBook::add_order_with_committed`](crate::OrderBook::add_order_with_committed),
+/// [`OrderBook::submit_market_order_with_committed`](crate::OrderBook::submit_market_order_with_committed),
+/// [`OrderBook::submit_market_order_by_amount_with_committed`](crate::OrderBook::submit_market_order_by_amount_with_committed)).
+/// A submit can execute real trades and *then* fail: an aborted sweep
+/// ([`OrderBookError::MatchAborted`], #240), an unfillable IOC / market
+/// remainder, a taker self-trade prevention cancels after non-self fills.
+/// [`OrderBookError`] is a leaf type and cannot carry the trades, so this
+/// wrapper hands them to a caller that has to record them, typically a
+/// sequencer building
+/// [`SequencerResult::from_submit_failure`](crate::SequencerResult::from_submit_failure).
+///
+/// `committed` is the very `TradeResult` the trade listener received for
+/// the same call (same trades, fees and `engine_seq`), or `None` when the
+/// submit failed before any trade.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SubmitFailure {
+    /// The typed error the plain submit API returns for the same call.
+    pub error: OrderBookError,
+    /// Trades the submit committed before it failed; `None` when none.
+    /// Boxed so the failure path does not inflate every submit's `Result`.
+    pub committed: Option<Box<TradeResult>>,
+}
+
+impl SubmitFailure {
+    /// Wrap an error raised before any trade was committed.
+    #[must_use]
+    #[inline]
+    pub fn new(error: OrderBookError) -> Self {
+        Self {
+            error,
+            committed: None,
+        }
+    }
+
+    /// Wrap an error raised after `committed` trades were executed.
+    #[must_use]
+    #[inline]
+    pub fn with_committed(error: OrderBookError, committed: Option<TradeResult>) -> Self {
+        Self {
+            error,
+            committed: committed.map(Box::new),
+        }
+    }
+
+    /// Drop the committed trades and keep the typed error.
+    #[must_use]
+    #[inline]
+    pub fn into_error(self) -> OrderBookError {
+        self.error
+    }
+}
+
+impl From<OrderBookError> for SubmitFailure {
+    #[inline]
+    fn from(error: OrderBookError) -> Self {
+        Self::new(error)
+    }
+}
+
+impl From<SubmitFailure> for OrderBookError {
+    #[inline]
+    fn from(failure: SubmitFailure) -> Self {
+        failure.error
+    }
+}
+
+impl std::fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for SubmitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// A trade event that includes additional metadata for processing
 #[derive(Debug, Clone)]

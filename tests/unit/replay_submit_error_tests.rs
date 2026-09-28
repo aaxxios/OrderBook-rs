@@ -95,6 +95,9 @@ fn sequence(
     outcome.map(|_| ())
 }
 
+// #240: `OrderBookError` gained `MatchAborted`, which pushes `ReplayError`
+// (it embeds an `Option<OrderBookError>`) past clippy's 128-byte threshold.
+#[allow(clippy::result_large_err)]
 fn replay(
     journal: &InMemoryJournal<()>,
     config: &ReplayBookConfig,

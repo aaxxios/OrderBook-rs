@@ -7,12 +7,13 @@
 
 use super::error::JournalError;
 use super::journal::Journal;
-use super::types::{SequencerCommand, SequencerEvent, SequencerResult};
+use super::types::{CommittedPrefix, SequencerCommand, SequencerEvent, SequencerResult};
 use crate::orderbook::clock::Clock;
 use crate::orderbook::fees::FeeSchedule;
 use crate::orderbook::mass_cancel::MassCancelResult;
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::stp::STPMode;
+use crate::orderbook::trade::SubmitFailure;
 use crate::orderbook::{OrderBook, OrderBookError, OrderBookSnapshot};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -249,6 +250,15 @@ pub enum ReplayError {
     /// does not match the source book, a journal that does not start at
     /// the book's origin, or state the journal cannot carry (a market
     /// order's user identity).
+    ///
+    /// Also raised for an event journaled as
+    /// [`SequencerResult::MatchAborted`] (#240) whose re-execution does not
+    /// abort with the recorded committed prefix: it succeeded, failed under
+    /// another code, or aborted after committing different fills (`actual`
+    /// then carries the replayed `MatchAborted`, and the first divergent
+    /// trade is logged at `ERROR`). An update journaled as
+    /// `RejectedWithCode` under [`RejectReason::MatchAborted`] is
+    /// re-executed and reconciled by code the same way.
     #[error(
         "replay diverged at sequence {sequence_num}: journal recorded rejection `{recorded}`, replay {}",
         describe_outcome(.actual)
@@ -382,6 +392,20 @@ where
     ///   so the re-execution normally rests the residual and the verdict
     ///   disagreement surfaces as [`ReplayError::OutcomeMismatch`] — a
     ///   loud stop instead of a silently wrong book.
+    /// - A submit journaled as [`SequencerResult::MatchAborted`] (#240) is
+    ///   re-executed and must abort again with the **same committed
+    ///   prefix** — the same makers, prices and quantities in order, and
+    ///   the same executed quantity. A replay that succeeds, fails
+    ///   differently or commits different fills is
+    ///   [`ReplayError::OutcomeMismatch`]. Aborts come from exhausted
+    ///   resources (trade-id sequence, level counters, allocation) that a
+    ///   fresh replay book does not normally reproduce, so in practice a
+    ///   journaled abort stops replay loudly rather than letting the
+    ///   reconstructed book trade past the point where the live one
+    ///   stopped. An `UpdateOrder` journaled as `RejectedWithCode` under
+    ///   [`RejectReason::MatchAborted`] (its re-add aborted after the
+    ///   original was cancelled) is likewise re-executed and reconciled by
+    ///   code.
     /// - A submit journaled as the string-only [`SequencerResult::Rejected`]
     ///   is skipped, as it always was: without a code replay cannot tell a
     ///   pure rejection from one that traded first, so such a journal keeps
@@ -895,6 +919,10 @@ where
                 | SequencerCommand::MarketOrder { .. }
                 | SequencerCommand::MarketOrderByAmount { .. }
         );
+        // #240: an update whose re-add aborted mid-sweep after the original
+        // was cancelled changed the book although it failed, so it is
+        // re-executed like a submit and reconciled by code.
+        let is_update = matches!(event.command, SequencerCommand::UpdateOrder(_));
         // The reject code the journal recorded for a submit replay
         // re-executes; `None` for a journaled success.
         let recorded = match &event.result {
@@ -906,7 +934,22 @@ where
                 ..
             } => {
                 Self::check_stp_mode(book, event, *stp_mode)?;
-                if !is_submit || !Self::replays_rejection(*code, *may_have_mutated) {
+                let replays_update = is_update && *code == RejectReason::MatchAborted;
+                if !(is_submit || replays_update)
+                    || !Self::replays_rejection(*code, *may_have_mutated)
+                {
+                    return Ok(false);
+                }
+                Some(*code)
+            }
+            SequencerResult::MatchAborted {
+                code, committed, ..
+            } => {
+                if is_submit {
+                    Self::replay_aborted_submit(book, event, committed)?;
+                    return Ok(true);
+                }
+                if !is_update {
                     return Ok(false);
                 }
                 Some(*code)
@@ -926,11 +969,10 @@ where
                     })?;
             }
             SequencerCommand::UpdateOrder(update) => {
-                book.update_order(*update)
-                    .map_err(|e| ReplayError::OrderBookError {
-                        sequence_num: event.sequence_num,
-                        source: e,
-                    })?;
+                // Only a journaled `MatchAborted` rejection reaches here
+                // with `recorded` set (see above); a journaled success is
+                // reconciled exactly as before.
+                Self::reconcile_submit(event, recorded, book.update_order(*update).map(|_| ()))?;
             }
             SequencerCommand::MarketOrder { id, quantity, side } => {
                 Self::reconcile_submit(
@@ -1121,6 +1163,97 @@ where
             sequence_num: event.sequence_num,
             recorded,
             actual,
+        })
+    }
+
+    /// Re-executes a submit journaled as [`SequencerResult::MatchAborted`]
+    /// and checks that it aborts again with the recorded committed prefix
+    /// (#240).
+    ///
+    /// Dispatched through the `*_with_committed` submit entry points, the
+    /// only ones that return the committed trades together with the error.
+    /// A market command carries no user identity, so it replays through the
+    /// STP-less path, as the other market replays do.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::OutcomeMismatch`] when the re-execution succeeds,
+    /// fails under another code, or aborts with different fills;
+    /// [`ReplayError::OrderBookError`] when the replayed prefix cannot be
+    /// recorded for the comparison.
+    #[cold]
+    #[inline(never)]
+    fn replay_aborted_submit(
+        book: &OrderBook<T>,
+        event: &SequencerEvent<T>,
+        recorded: &CommittedPrefix,
+    ) -> Result<(), ReplayError> {
+        let outcome: Result<(), SubmitFailure> = match &event.command {
+            SequencerCommand::AddOrder(order) => {
+                book.add_order_with_committed(order.clone()).map(|_| ())
+            }
+            SequencerCommand::MarketOrder { id, quantity, side } => book
+                .submit_market_order_with_committed(*id, *quantity, *side)
+                .map(|_| ()),
+            SequencerCommand::MarketOrderByAmount { id, amount, side } => book
+                .submit_market_order_by_amount_with_committed(*id, *amount, *side)
+                .map(|_| ()),
+            // `apply_event` only routes submits here.
+            _ => return Ok(()),
+        };
+        let failure = match outcome {
+            Ok(()) => {
+                return Err(ReplayError::OutcomeMismatch {
+                    sequence_num: event.sequence_num,
+                    recorded: RejectReason::MatchAborted,
+                    actual: None,
+                });
+            }
+            Err(failure) => failure,
+        };
+        if !matches!(failure.error, OrderBookError::MatchAborted { .. }) {
+            return Err(ReplayError::OutcomeMismatch {
+                sequence_num: event.sequence_num,
+                recorded: RejectReason::MatchAborted,
+                actual: Some(failure.error),
+            });
+        }
+        let replayed = match &failure.committed {
+            Some(trade_result) => CommittedPrefix::try_from_match_result(
+                &trade_result.match_result,
+            )
+            .map_err(|source| ReplayError::OrderBookError {
+                sequence_num: event.sequence_num,
+                source,
+            })?,
+            None => CommittedPrefix::default(),
+        };
+        if recorded.same_fills(&replayed) {
+            return Ok(());
+        }
+        let first_divergent_trade =
+            recorded
+                .trades
+                .iter()
+                .zip(&replayed.trades)
+                .position(|(a, b)| {
+                    a.maker_order_id != b.maker_order_id
+                        || a.price != b.price
+                        || a.quantity != b.quantity
+                });
+        tracing::error!(
+            sequence_num = event.sequence_num,
+            recorded_trades = recorded.trades.len(),
+            replayed_trades = replayed.trades.len(),
+            recorded_executed = recorded.executed_quantity,
+            replayed_executed = replayed.executed_quantity,
+            first_divergent_trade = ?first_divergent_trade,
+            "replay diverged: aborted submit committed a different prefix"
+        );
+        Err(ReplayError::OutcomeMismatch {
+            sequence_num: event.sequence_num,
+            recorded: RejectReason::MatchAborted,
+            actual: Some(failure.error),
         })
     }
 
@@ -2257,5 +2390,231 @@ mod tests {
             probe_next_trade_id(&b),
             "default config must keep per-replay random namespaces"
         );
+    }
+
+    // --- #240: aborted sweeps in the journal ---------------------------
+
+    /// A trade-id generator that can still mint exactly `remaining` ids,
+    /// restored through serde like a persisted generator state.
+    fn generator_with_remaining(remaining: u64) -> pricelevel::UuidGenerator {
+        let counter = u64::MAX.checked_sub(remaining).expect("remaining ids");
+        let json = format!(
+            r#"{{"namespace":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","counter":{counter}}}"#
+        );
+        serde_json::from_str(&json).expect("restore generator")
+    }
+
+    fn book_with_remaining_ids(remaining: u64) -> OrderBook<()> {
+        let mut book = OrderBook::<()>::new("TEST");
+        book.transaction_id_generator = generator_with_remaining(remaining);
+        book
+    }
+
+    fn standard(id: u64, price: u128, qty: u64, side: Side) -> OrderType<()> {
+        OrderType::Standard {
+            id: Id::from_u64(id),
+            price: Price::new(price),
+            quantity: Quantity::new(qty),
+            side,
+            time_in_force: TimeInForce::Gtc,
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(0),
+            extra_fields: (),
+        }
+    }
+
+    /// Executes `commands` on `live`, journaling each outcome the way a
+    /// sequencer is expected to: submits through `add_order_with_committed`
+    /// and `SequencerResult::from_submit_failure`, updates through
+    /// `From<&OrderBookError>`.
+    fn run_live(live: &OrderBook<()>, commands: Vec<SequencerCommand<()>>) -> InMemoryJournal<()> {
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        for (seq, command) in commands.into_iter().enumerate() {
+            let result = match &command {
+                SequencerCommand::AddOrder(order) => match live.add_order_with_committed(*order) {
+                    Ok((order, _)) => SequencerResult::OrderAdded {
+                        order_id: order.id(),
+                    },
+                    Err(failure) => {
+                        SequencerResult::from_submit_failure(&failure).expect("record failure")
+                    }
+                },
+                SequencerCommand::UpdateOrder(update) => match live.update_order(*update) {
+                    Ok(_) => SequencerResult::OrderUpdated {
+                        order_id: match update {
+                            pricelevel::OrderUpdate::UpdatePriceAndQuantity {
+                                order_id, ..
+                            } => *order_id,
+                            other => panic!("unsupported update in fixture: {other:?}"),
+                        },
+                    },
+                    Err(err) => SequencerResult::from(&err),
+                },
+                other => panic!("unsupported command in fixture: {other:?}"),
+            };
+            let event = SequencerEvent {
+                sequence_num: u64::try_from(seq).expect("seq"),
+                timestamp_ns: 0,
+                command,
+                result,
+            };
+            journal.append(&event).expect("append");
+        }
+        journal
+    }
+
+    /// Asks A 5@100, B 5@101, C 5@101, D 5@102, then a GTC buy of 20 @102.
+    fn aborted_sweep_commands() -> Vec<SequencerCommand<()>> {
+        vec![
+            SequencerCommand::AddOrder(standard(1, 100, 5, Side::Sell)),
+            SequencerCommand::AddOrder(standard(2, 101, 5, Side::Sell)),
+            SequencerCommand::AddOrder(standard(3, 101, 5, Side::Sell)),
+            SequencerCommand::AddOrder(standard(4, 102, 5, Side::Sell)),
+            SequencerCommand::AddOrder(standard(100, 102, 20, Side::Buy)),
+        ]
+    }
+
+    fn replay_onto(book: &OrderBook<()>, journal: &InMemoryJournal<()>) -> Result<(), ReplayError> {
+        for entry in journal.read_from(0).expect("read") {
+            let entry = entry.expect("entry");
+            ReplayEngine::<()>::apply_event(book, &entry.event)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_replay_match_aborted_journal_records_the_prefix() {
+        let live = book_with_remaining_ids(2);
+        let journal = run_live(&live, aborted_sweep_commands());
+        let last = journal
+            .read_from(4)
+            .expect("read")
+            .next()
+            .expect("event")
+            .expect("entry");
+        match &last.event.result {
+            SequencerResult::MatchAborted {
+                code, committed, ..
+            } => {
+                assert_eq!(*code, RejectReason::MatchAborted);
+                assert_eq!(committed.executed_quantity, 10);
+                let makers: Vec<Id> = committed.trades.iter().map(|t| t.maker_order_id).collect();
+                assert_eq!(makers, vec![Id::from_u64(1), Id::from_u64(2)]);
+            }
+            other => panic!("expected MatchAborted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replay_match_aborted_reproduces_the_committed_prefix() {
+        let live = book_with_remaining_ids(2);
+        let journal = run_live(&live, aborted_sweep_commands());
+
+        // Same resource state as the live book: the abort reproduces.
+        let replayed = book_with_remaining_ids(2);
+        replay_onto(&replayed, &journal).expect("replay reproduces the abort");
+        let expected = live.create_snapshot(usize::MAX).expect("live snapshot");
+        let actual = replayed
+            .create_snapshot(usize::MAX)
+            .expect("replay snapshot");
+        assert!(snapshots_match(&actual, &expected));
+        assert_eq!(replayed.best_bid(), None, "the remainder never rests");
+    }
+
+    #[test]
+    fn test_replay_match_aborted_detects_a_replay_that_fills_further() {
+        let live = book_with_remaining_ids(2);
+        let journal = run_live(&live, aborted_sweep_commands());
+
+        // A fresh replay book has its whole id sequence: the taker fills
+        // past the recorded prefix, which must not pass silently.
+        match ReplayEngine::<()>::replay_from(&journal, 0, "TEST") {
+            Err(ReplayError::OutcomeMismatch {
+                sequence_num,
+                recorded,
+                actual,
+            }) => {
+                assert_eq!(sequence_num, 4);
+                assert_eq!(recorded, RejectReason::MatchAborted);
+                assert!(actual.is_none(), "replay succeeded: {actual:?}");
+            }
+            Err(other) => panic!("expected OutcomeMismatch, got {other:?}"),
+            Ok(_) => panic!("expected OutcomeMismatch, replay succeeded"),
+        }
+    }
+
+    #[test]
+    fn test_replay_match_aborted_detects_a_different_prefix() {
+        let live = book_with_remaining_ids(2);
+        let journal = run_live(&live, aborted_sweep_commands());
+
+        // One more id: the replay aborts too, but after three trades.
+        let replayed = book_with_remaining_ids(3);
+        match replay_onto(&replayed, &journal) {
+            Err(ReplayError::OutcomeMismatch {
+                sequence_num,
+                recorded,
+                actual: Some(OrderBookError::MatchAborted { trade_count, .. }),
+            }) => {
+                assert_eq!(sequence_num, 4);
+                assert_eq!(recorded, RejectReason::MatchAborted);
+                assert_eq!(trade_count, 3);
+            }
+            other => panic!("expected OutcomeMismatch on the prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replay_aborted_update_is_reexecuted_and_reconciled() {
+        let commands = vec![
+            SequencerCommand::AddOrder(standard(1, 100, 5, Side::Sell)),
+            SequencerCommand::AddOrder(standard(2, 101, 5, Side::Sell)),
+            SequencerCommand::AddOrder(standard(50, 99, 5, Side::Buy)),
+            SequencerCommand::UpdateOrder(pricelevel::OrderUpdate::UpdatePriceAndQuantity {
+                order_id: Id::from_u64(50),
+                new_price: Price::new(101),
+                new_quantity: Quantity::new(10),
+            }),
+        ];
+        let live = book_with_remaining_ids(1);
+        let journal = run_live(&live, commands);
+        let last = journal
+            .read_from(3)
+            .expect("read")
+            .next()
+            .expect("event")
+            .expect("entry");
+        assert!(
+            matches!(
+                last.event.result,
+                SequencerResult::RejectedWithCode {
+                    code: RejectReason::MatchAborted,
+                    may_have_mutated: true,
+                    ..
+                }
+            ),
+            "the re-add of the update aborted: {:?}",
+            last.event.result
+        );
+
+        // Reproduced: same book.
+        let replayed = book_with_remaining_ids(1);
+        replay_onto(&replayed, &journal).expect("aborted update reproduces");
+        let expected = live.create_snapshot(usize::MAX).expect("live snapshot");
+        let actual = replayed
+            .create_snapshot(usize::MAX)
+            .expect("replay snapshot");
+        assert!(snapshots_match(&actual, &expected));
+
+        // Not reproduced: loud, never skipped.
+        match ReplayEngine::<()>::replay_from(&journal, 0, "TEST") {
+            Err(ReplayError::OutcomeMismatch {
+                sequence_num: 3,
+                recorded: RejectReason::MatchAborted,
+                actual: None,
+            }) => {}
+            Err(other) => panic!("expected OutcomeMismatch, got {other:?}"),
+            Ok(_) => panic!("expected OutcomeMismatch, replay succeeded"),
+        }
     }
 }
