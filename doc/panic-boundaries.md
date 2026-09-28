@@ -290,9 +290,12 @@ unreachable for the trades it commits:
   and be priced exactly by both fee legs, or the taker is rejected
   untouched with `OrderBookError::FeeOverflow` (reject code 18) or
   `NotionalOverflow` (19), state `Rejected`. The worst-case notional is
-  the worst reachable price × quantity (limit buy: the limit, else the
-  highest resting ask capped by it; market buy: the highest ask; sell: the
-  best bid) or, for a `*_by_amount` order, the amount. A taker that cannot
+  the worst reachable price × quantity (limit buy: the limit when it
+  passes; other buys: the highest ask reached by walking the asks from the
+  best one until their visible quantity covers the order, capped by the
+  limit, so an absurd ask the order cannot reach never rejects it; sell:
+  the best bid, the highest price a sell can trade at) or, for a
+  `*_by_amount` order, the amount. A taker that cannot
   trade (empty opposite side, non-crossing limit, post-only) passes. It
   runs on every submission API (`add_order*`, `submit_market_order*`,
   `submit_market_order_by_amount*`, `match_market_order*`,
@@ -302,7 +305,10 @@ unreachable for the trades it commits:
   mutation: right after the #240 trade-id check on the `match_*` /
   `submit_market*` paths, and inside `validate_order_shape` (after the
   exhausted-generator check, before the fill-or-kill preflight) on the
-  `add_order*` / modify paths.
+  `add_order*` / modify paths. A validate-first modify runs it once,
+  before the original is cancelled; the re-add takes it as done, so a
+  `FeeOverflow` / `NotionalOverflow` never follows a cancel (a worse maker
+  admitted in between is left to the backstop below).
 - **Shared-gate limit.** Exact under the exclusive gate and for a single
   writer; best effort under the shared gate, like the #240 trade-id check:
   a maker admitted concurrently at a worse price than the pre-check saw
@@ -316,7 +322,14 @@ unreachable for the trades it commits:
   taker `Cancelled { MatchAborted }`), never `FeeOverflow`. The sequencer
   therefore classifies it as may-have-mutated, as it does every
   `MatchAborted`; `FeeOverflow` / `NotionalOverflow` are only raised
-  before mutation.
+  before mutation. The backstop is seeded with the highest price the
+  pre-check verified, so levels at or below it cost one comparison; it
+  also covers makers the pre-check's visible-depth walk counts but the
+  sweep skips without filling (self-trade prevention, no-progress makers).
+  A backstop abort caused by a concurrent maker under the shared gate is
+  not reproducible from the journal and replays as
+  `ReplayError::OutcomeMismatch` by design; a sequencer feeding a single
+  writer never hits it.
 - **Residual.** With the pre-check and the backstop, building the
   `TradeResult` of a committed sweep cannot fail. It is handled rather than
   assumed: on failure the book logs at `ERROR`, emits no `TradeResult`, and

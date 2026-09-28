@@ -3550,7 +3550,7 @@ where
             // #240: under the same gate the sweep holds, before any mutation.
             self.check_trade_id_headroom(order_id, side, None)?;
             // #244: worst-case notional / fee representability, same place.
-            self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
+            let verified = self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
             self.match_order_with_user_outcome(
                 order_id,
                 side,
@@ -3559,6 +3559,7 @@ where
                 user_id,
                 TakerKind::Standard,
                 0,
+                verified,
             )?
         };
         self.publish_match_outcome(outcome, want_committed)
@@ -3613,24 +3614,36 @@ where
     /// Worst-case trade arithmetic preflight (#244).
     ///
     /// Before a base-quantity taker touches the book, bound the notional its
-    /// sweep can reach — the worst price it can trade at times `quantity` —
+    /// sweep can reach — the worst price it can **reach** times `quantity` —
     /// and verify that the notional fits `u128` and that both legs of the
     /// configured [`FeeSchedule`] price it exactly. Every committed trade of
     /// the sweep then has a representable notional, `quote_notional` and
     /// fees (the per-trade fees and their sums are bounded by the fee on the
     /// bound), so the `TradeResult` is built without clamping.
     ///
-    /// The worst price is:
+    /// The worst reachable price is:
     ///
-    /// - **Buy**: the limit price when it alone passes (no skiplist read),
-    ///   else the highest resting ask, capped by the limit.
-    /// - **Sell**: the best bid (cache), since a sell only trades at or
-    ///   below it.
+    /// - **Buy with a limit that passes**: the limit (no level read).
+    /// - **Other buys**: asks are walked from the best one, accumulating
+    ///   their visible quantity until `quantity` is covered (or the limit
+    ///   is passed, or the side ends); the highest price visited is the
+    ///   bound. A single far-away ask that the taker cannot reach never
+    ///   rejects it, so a maker resting an absurd price cannot block
+    ///   ordinary market buys. A market buy covered by the best level reads
+    ///   one level.
+    /// - **Sell**: the best bid (cache). A sell walks bids downward, so the
+    ///   best bid is the highest price it can trade at, and fees grow with
+    ///   price.
+    ///
+    /// Visible quantity is a lower bound on what a level fills (hidden
+    /// iceberg / reserve depth at the same price only shortens the walk), so
+    /// the walk never stops before a level the sweep reaches — except for
+    /// makers the sweep skips without filling (self-trade prevention, a
+    /// maker set aside for making no progress), for which the sweep's
+    /// per-level backstop aborts instead.
     ///
     /// A taker that cannot trade (empty opposite side, a limit that does
-    /// not cross) always passes. Cost on the common path: one or two cached
-    /// best-price reads and one to three checked multiplications; a market
-    /// buy adds one `SkipMap::back` read. No allocation.
+    /// not cross) always passes. No allocation.
     ///
     /// Callers run it under the submit gate the sweep holds, before any
     /// mutation, next to [`Self::check_trade_id_headroom`]. Like that check
@@ -3638,6 +3651,12 @@ where
     /// best-effort under the shared one: a maker admitted concurrently at a
     /// worse price is caught by the sweep's per-level backstop, which aborts
     /// with [`OrderBookError::MatchAborted`] before touching that level.
+    ///
+    /// # Returns
+    ///
+    /// The highest price verified: every price at or below it prices
+    /// `quantity` exactly. The sweep seeds its backstop with it, so levels at
+    /// or below cost one comparison. `0` when the taker cannot trade.
     ///
     /// # Errors
     ///
@@ -3650,36 +3669,69 @@ where
         side: Side,
         quantity: u64,
         limit_price: Option<u128>,
-    ) -> Result<(), OrderBookError> {
+    ) -> Result<u128, OrderBookError> {
         let schedule = self.active_fee_schedule();
-        let worst_price = match side {
+        match side {
             Side::Buy => {
                 let Some(best_ask) = self.best_ask() else {
-                    return Ok(());
+                    return Ok(0);
                 };
                 if let Some(limit) = limit_price {
                     if limit < best_ask {
-                        return Ok(());
+                        return Ok(0);
                     }
                     // A limit bounds every buy trade price.
                     if Self::check_notional_bound(schedule, limit, quantity).is_ok() {
-                        return Ok(());
+                        return Ok(limit);
                     }
                 }
-                let max_ask = self.asks.back().map_or(best_ask, |entry| *entry.key());
-                limit_price.map_or(max_ask, |limit| limit.min(max_ask))
+                self.reachable_ask_bound(schedule, quantity, limit_price)
             }
             Side::Sell => {
                 let Some(best_bid) = self.best_bid() else {
-                    return Ok(());
+                    return Ok(0);
                 };
                 if limit_price.is_some_and(|limit| limit > best_bid) {
-                    return Ok(());
+                    return Ok(0);
                 }
-                best_bid
+                Self::check_notional_bound(schedule, best_bid, quantity)?;
+                Ok(best_bid)
             }
-        };
-        Self::check_notional_bound(schedule, worst_price, quantity)
+        }
+    }
+
+    /// Walk the asks a buy of `quantity` can reach (capped at `limit_price`)
+    /// and verify each new highest price; see
+    /// [`Self::check_trade_arithmetic`]. Returns the highest price verified.
+    ///
+    /// # Errors
+    ///
+    /// The first reachable price whose bound fails.
+    #[inline]
+    fn reachable_ask_bound(
+        &self,
+        schedule: Option<FeeSchedule>,
+        quantity: u64,
+        limit_price: Option<u128>,
+    ) -> Result<u128, OrderBookError> {
+        let mut remaining = quantity;
+        let mut verified: u128 = 0;
+        for entry in self.asks.iter() {
+            let price = *entry.key();
+            if limit_price.is_some_and(|limit| price > limit) {
+                break;
+            }
+            if price > verified {
+                Self::check_notional_bound(schedule, price, quantity)?;
+                verified = price;
+            }
+            match remaining.checked_sub(entry.value().visible_quantity()) {
+                Some(left) if left > 0 => remaining = left,
+                // Covered by this level: nothing deeper is reachable.
+                _ => break,
+            }
+        }
+        Ok(verified)
     }
 
     /// Quote-notional preflight (#244): a `*_by_amount` sweep consumes at
@@ -3745,7 +3797,8 @@ where
     /// [`Self::check_trade_arithmetic`] for the `match_*` / `submit_market*`
     /// entry points: a failure is recorded as a terminal
     /// `Rejected { FeeOverflow | NotionalOverflow }` with the reject metric,
-    /// like every other untouched rejection.
+    /// like every other untouched rejection. Returns the verified price the
+    /// sweep seeds its backstop with.
     ///
     /// # Errors
     ///
@@ -3757,7 +3810,7 @@ where
         side: Side,
         quantity: u64,
         limit_price: Option<u128>,
-    ) -> Result<(), OrderBookError> {
+    ) -> Result<u128, OrderBookError> {
         self.check_trade_arithmetic(side, quantity, limit_price)
             .map_err(|err| self.reject_arithmetic_untouched(order_id, err))
     }
@@ -4067,7 +4120,8 @@ where
             // mutation; only a limit that actually crosses is refused.
             self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
             // #244: worst-case notional / fee representability.
-            self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
+            let verified =
+                self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
             self.match_order_with_user_outcome(
                 order_id,
                 side,
@@ -4076,6 +4130,7 @@ where
                 user_id,
                 TakerKind::Standard,
                 0,
+                verified,
             )?
         };
         self.publish_match_outcome(outcome, false)

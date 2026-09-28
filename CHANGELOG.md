@@ -102,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `executed_quantity()` as `0`. Every one of them is now checked and
   typed. Fee representability is validated **before** the book is
   touched: each taker's worst-case notional (worst reachable price ×
-  quantity; for a limit buy the limit, else the highest resting ask; for a
+  quantity; for a limit buy the limit, else the highest ask it can reach; for a
   sell the best bid; for a `*_by_amount` order the amount) must fit `u128`
   and be priced exactly by both fee legs, or the taker is rejected
   untouched with `OrderBookError::FeeOverflow` (reject code 18) or
@@ -115,10 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trade listener. Under the shared submit gate it is best effort, like the
   #240 check: a maker admitted concurrently at a worse price is caught by a
   per-level backstop in the sweep, which aborts with `MatchAborted` before
-  touching that level. Cost on the common path: one or two cached best-price
-  reads and up to three checked multiplications (a market buy adds one
-  `SkipMap::back` read); no allocation. A non-crossing or post-only order
-  is never checked against its notional.
+  touching that level. The bound is the worst **reachable** price: a buy
+  walks the asks from the best one until their visible quantity covers
+  its size, so an absurd ask resting far behind the touch cannot make
+  ordinary buys fail. Cost on the common path: one or two cached best-price
+  reads, one level read for a buy that fails the limit fast path, and one
+  or two checked multiplications; no allocation. The sweep's backstop is
+  seeded with the verified price, so levels at or below it cost one
+  comparison. A non-crossing or post-only order is never checked against
+  its notional.
 - **`FeeSchedule::with_maker_rebate(i32::MIN, _)` no longer panics
   (#244).** `-maker_rebate_bps.abs()` overflowed; the maker rate is now
   `-|x|`, which is representable for every `i32`.
@@ -224,6 +229,10 @@ change.
     A journal recorded by 0.13 in which such a clamped trade was accepted
     replays as a `FeeOverflow` / `NotionalOverflow` rejection
     (`ReplayError::OutcomeMismatch`).
+  - Replay: because the fee schedule now decides verdicts (code 18),
+    `ReplayBookConfig::fee_schedule` must match the source book's schedule;
+    replaying with a different one can flip a fill into a rejection or the
+    reverse and stops with `ReplayError::OutcomeMismatch`.
 
 - **pricelevel upgraded to 0.10 (#239).** The crate version moves to
   0.14.0. pricelevel 0.10 makes level snapshots, queue views, dry runs and

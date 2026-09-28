@@ -451,8 +451,10 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::QuantityOverflow { .. }
         | OrderBookError::ZeroVisibleTranche { .. }
         | OrderBookError::ReserveResidualWouldBeDiscarded { .. }
-        // #244: the fee / notional preflight runs before any mutation; a
-        // sweep that trips the in-sweep backstop reports `MatchAborted`.
+        // #244: the fee / notional preflight runs before any mutation,
+        // including on a validate-first modify (before the original is
+        // cancelled; the re-add does not re-run it). A sweep that trips the
+        // in-sweep backstop reports `MatchAborted`, classified above.
         | OrderBookError::FeeOverflow { .. }
         | OrderBookError::NotionalOverflow { .. }
         | OrderBookError::OrderNotFound(_)

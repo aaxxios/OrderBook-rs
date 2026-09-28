@@ -231,7 +231,8 @@ impl FeeSchedule {
     /// too, and the sum of the fees of trades whose notionals add up to at
     /// most `notional` is representable as well. The trade path runs this on
     /// every taker's worst-case notional before it touches the book (#244).
-    /// Two checked multiplications, no allocation.
+    /// One checked multiplication by the larger rate magnitude, no
+    /// allocation; which leg failed is only worked out on the error path.
     ///
     /// # Errors
     ///
@@ -239,15 +240,31 @@ impl FeeSchedule {
     /// overflow.
     #[inline]
     pub fn check_notional(&self, notional: u128) -> Result<(), FeeOverflow> {
-        for bps in [self.taker_fee_bps, self.maker_fee_bps] {
-            if notional
-                .checked_mul(u128::from(bps.unsigned_abs()))
-                .is_none()
-            {
-                return Err(FeeOverflow::new(notional, bps));
-            }
+        let max_bps = self
+            .taker_fee_bps
+            .unsigned_abs()
+            .max(self.maker_fee_bps.unsigned_abs());
+        match notional.checked_mul(u128::from(max_bps)) {
+            Some(_) => Ok(()),
+            None => Err(self.overflowing_leg(notional)),
         }
-        Ok(())
+    }
+
+    /// The leg whose rate overflows at `notional`: the taker's when it does,
+    /// else the maker's (the larger magnitude, since the caller saw the
+    /// maximum overflow). Cold: only reached on a rejection.
+    #[cold]
+    #[inline(never)]
+    fn overflowing_leg(&self, notional: u128) -> FeeOverflow {
+        let taker_fits = notional
+            .checked_mul(u128::from(self.taker_fee_bps.unsigned_abs()))
+            .is_some();
+        let bps = if taker_fits {
+            self.maker_fee_bps
+        } else {
+            self.taker_fee_bps
+        };
+        FeeOverflow::new(notional, bps)
     }
 
     /// Largest notional whose fee at `bps` is guaranteed exact

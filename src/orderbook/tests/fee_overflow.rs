@@ -176,9 +176,10 @@ mod tests {
             Api::MatchLimitWithUser => book
                 .match_limit_order_with_user(id, quantity, side, price, user)
                 .map(drop),
-            Api::MatchOrder => book.match_order(id, side, quantity, Some(price)).map(drop),
+            // The raw family: one market, one limit sweep.
+            Api::MatchOrder => book.match_order(id, side, quantity, None).map(drop),
             Api::MatchOrderWithUser => book
-                .match_order_with_user(id, side, quantity, None, user)
+                .match_order_with_user(id, side, quantity, Some(price), user)
                 .map(drop),
         }
     }
@@ -410,6 +411,7 @@ mod tests {
                 Hash32::zero(),
                 pricelevel::TakerKind::Standard,
                 0,
+                0,
             )
             .expect("sweep outcome");
         let aborted = outcome.aborted.clone().expect("aborted");
@@ -507,9 +509,9 @@ mod tests {
                     .match_limit_order_with_user(id, 10, Side::Buy, 1_000, user)
                     .map(drop),
                 // The raw family publishes nothing; it must still match.
-                Api::MatchOrder => book.match_order(id, Side::Buy, 10, Some(1_000)).map(drop),
+                Api::MatchOrder => book.match_order(id, Side::Buy, 10, None).map(drop),
                 Api::MatchOrderWithUser => book
-                    .match_order_with_user(id, Side::Buy, 10, None, user)
+                    .match_order_with_user(id, Side::Buy, 10, Some(1_000), user)
                     .map(drop),
             };
             res.unwrap_or_else(|err| panic!("{api:?}: {err:?}"));
@@ -524,5 +526,126 @@ mod tests {
                 assert_eq!(trades[0].quote_notional, 10_000, "{api:?}");
             }
         }
+    }
+
+    /// A book with a normal ask and one absurd far ask behind it.
+    fn book_with_far_ask() -> (OrderBook<()>, Trades) {
+        let mut book = OrderBook::<()>::new("FAR");
+        book.set_order_state_tracker(OrderStateTracker::new());
+        book.set_fee_schedule(Some(FeeSchedule::new(-2, 5)));
+        let trades: Trades = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&trades);
+        book.set_trade_listener(Arc::new(move |tr: &TradeResult| {
+            sink.lock().expect("trade sink").push(tr.clone());
+        }));
+        book.add_limit_order(Id::from_u64(1), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("normal ask");
+        // 10^37 × 11 × 5 bps overflows u128.
+        book.add_limit_order(
+            Id::from_u64(2),
+            FAR_ASK,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        )
+        .expect("absurd ask");
+        (book, trades)
+    }
+
+    const FAR_ASK: u128 = 10_u128.pow(37);
+
+    /// Review P2-01: the bound is the worst **reachable** ask, so a maker
+    /// resting an absurd price far behind the touch cannot make ordinary
+    /// buys fail with `FeeOverflow`.
+    #[test]
+    fn test_far_absurd_ask_does_not_block_a_buy_that_cannot_reach_it() {
+        let (book, trades) = book_with_far_ask();
+        book.submit_market_order(Id::from_u64(TAKER), 4, Side::Buy)
+            .expect("market buy within the best level");
+        book.match_market_order(Id::from_u64(TAKER + 1), 3, Side::Buy)
+            .expect("match_market_order within the best level");
+        // A limit far above the book fails the limit fast path and walks.
+        book.add_order(limit(TAKER + 2, u128::MAX / 2, 3, Side::Buy))
+            .expect("limit buy within the best level");
+        assert_eq!(trades.lock().expect("sink").len(), 3);
+        assert_eq!(book.best_ask(), Some(FAR_ASK));
+        assert_eq!(
+            book.get_order(Id::from_u64(2))
+                .expect("far ask rests")
+                .visible_quantity()
+                .as_u64(),
+            10
+        );
+    }
+
+    #[test]
+    fn test_buy_that_reaches_the_absurd_ask_is_rejected_untouched() {
+        let (book, trades) = book_with_far_ask();
+        let err = book
+            .submit_market_order(Id::from_u64(TAKER), 11, Side::Buy)
+            .expect_err("reaches the far ask");
+        match err {
+            OrderBookError::FeeOverflow { notional, bps, .. } => {
+                assert_eq!(notional, FAR_ASK * 11);
+                assert_eq!(bps, 5);
+            }
+            other => panic!("expected FeeOverflow, got {other:?}"),
+        }
+        let err = book
+            .add_order(limit(TAKER + 1, u128::MAX / 2, 11, Side::Buy))
+            .expect_err("limit buy reaching the far ask");
+        assert!(
+            matches!(err, OrderBookError::FeeOverflow { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(book.best_ask(), Some(100), "best level untouched");
+        assert_eq!(
+            book.get_order(Id::from_u64(1))
+                .expect("best ask rests")
+                .visible_quantity()
+                .as_u64(),
+            10
+        );
+        assert!(trades.lock().expect("sink").is_empty());
+        // A limit below the far ask caps the walk: it trades.
+        book.add_order(limit(TAKER + 2, FAR_ASK - 1, 11, Side::Buy))
+            .expect("limit capped below the far ask");
+        assert_eq!(trades.lock().expect("sink").len(), 1);
+    }
+
+    #[test]
+    fn test_preflight_returns_the_highest_verified_price() {
+        let (book, _trades) = book_with_far_ask();
+        let verified = |side, quantity, limit| {
+            book.check_trade_arithmetic(side, quantity, limit)
+                .expect("priceable")
+        };
+        assert_eq!(verified(Side::Buy, 4, None), 100);
+        // A limit that passes is the bound.
+        assert_eq!(verified(Side::Buy, 4, Some(1_000)), 1_000);
+        assert_eq!(verified(Side::Buy, 4, Some(99)), 0, "does not cross");
+        assert_eq!(verified(Side::Sell, 4, None), 0, "no bids");
+        // Covering the best level exactly never reaches the next one.
+        assert_eq!(verified(Side::Buy, 10, None), 100);
+    }
+
+    /// Copilot review on #280: the re-add of a validate-first modify takes
+    /// the arithmetic preflight as done (it ran before the cancel), so it
+    /// cannot fail with `FeeOverflow` after the original is gone; a worse
+    /// maker admitted concurrently is left to the sweep's backstop.
+    #[test]
+    fn test_modify_re_add_does_not_rerun_the_arithmetic_preflight() {
+        let (book, _trades) = book(Some(FeeSchedule::new(-2, 5)), false);
+        let crossing = limit(TAKER, ASK_PRICE, ASK_QTY, Side::Buy);
+        assert!(matches!(
+            book.validate_order_shape(&crossing),
+            Err(OrderBookError::FeeOverflow { .. })
+        ));
+        let verdict = book
+            .validate_order_shape_with(&crossing, Some(42))
+            .expect("preverified: the arithmetic check is skipped");
+        assert_eq!(verdict.arithmetic_verified_price, 42);
+        assert_eq!(verdict.fok, None);
     }
 }

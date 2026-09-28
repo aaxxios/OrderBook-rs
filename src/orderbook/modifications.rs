@@ -4,8 +4,8 @@
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::error::OrderBookError;
-use crate::orderbook::matching::FokFeasibility;
 use crate::orderbook::matching::MatchOutcome;
+use crate::orderbook::matching::ShapeVerdict;
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::trade::{SubmitFailure, TradeResult};
@@ -595,7 +595,7 @@ where
                     // order + the opposite book side, so evaluating them
                     // while the same-side original still rests yields the
                     // same verdict as after cancel.
-                    self.validate_order_shape(&new_order)?;
+                    let verdict = self.validate_order_shape(&new_order)?;
                     self.check_risk_modify_admission(
                         order_id,
                         new_order.user_id(),
@@ -635,7 +635,16 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false, false)?.0;
+                    // #244: the arithmetic preflight already ran above,
+                    // before the cancel; the re-add must not fail it again.
+                    let result = self
+                        .add_order_inner(
+                            new_order,
+                            false,
+                            false,
+                            Some(verdict.arithmetic_verified_price),
+                        )?
+                        .0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Order not found
@@ -829,7 +838,7 @@ where
                     // order's shape and run the modify-aware risk check
                     // *before* removing the original. On any rejection the
                     // original order is never cancelled.
-                    self.validate_order_shape(&new_order)?;
+                    let verdict = self.validate_order_shape(&new_order)?;
                     self.check_risk_modify_admission(
                         order_id,
                         new_order.user_id(),
@@ -867,7 +876,16 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false, false)?.0;
+                    // #244: the arithmetic preflight already ran above,
+                    // before the cancel; the re-add must not fail it again.
+                    let result = self
+                        .add_order_inner(
+                            new_order,
+                            false,
+                            false,
+                            Some(verdict.arithmetic_verified_price),
+                        )?
+                        .0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Order not found
@@ -1037,7 +1055,7 @@ where
                     // *before* removing the original. On any rejection the
                     // original order is never cancelled — no book mutation,
                     // no events, no trades.
-                    self.validate_order_shape(&new_order)?;
+                    let verdict = self.validate_order_shape(&new_order)?;
                     self.check_risk_modify_admission(
                         order_id,
                         new_order.user_id(),
@@ -1075,7 +1093,16 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false, false)?.0;
+                    // #244: the arithmetic preflight already ran above,
+                    // before the cancel; the re-add must not fail it again.
+                    let result = self
+                        .add_order_inner(
+                            new_order,
+                            false,
+                            false,
+                            Some(verdict.arithmetic_verified_price),
+                        )?
+                        .0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Original order not found
@@ -1525,7 +1552,26 @@ where
     pub(super) fn validate_order_shape(
         &self,
         order: &OrderType<T>,
-    ) -> Result<Option<FokFeasibility>, OrderBookError> {
+    ) -> Result<ShapeVerdict, OrderBookError> {
+        self.validate_order_shape_with(order, None)
+    }
+
+    /// [`Self::validate_order_shape`] with the trade arithmetic preflight
+    /// (#244) optionally taken as already done: `Some(price)` is the verified
+    /// price a validate-first modify measured before it cancelled the
+    /// original, and the check is not re-run. The re-add therefore cannot
+    /// fail with `FeeOverflow` / `NotionalOverflow` after the cancel; a maker
+    /// admitted concurrently under the shared gate at a worse price is
+    /// caught by the sweep's backstop instead (`MatchAborted`, which replay
+    /// reconciles as a may-have-mutated outcome).
+    ///
+    /// # Errors
+    /// Returns the first failing check's typed [`OrderBookError`].
+    pub(super) fn validate_order_shape_with(
+        &self,
+        order: &OrderType<T>,
+        preverified_arithmetic: Option<u128>,
+    ) -> Result<ShapeVerdict, OrderBookError> {
         // Two-tranche total representability (#210): an Iceberg / Reserve
         // whose visible + hidden overflows u64 cannot be tracked by any of
         // the engine's quantity arithmetic — reject it before every other
@@ -1711,13 +1757,17 @@ where
         // trade can carry a clamped or dropped fee. Post-only takers never
         // trade and are exempt; a non-crossing order passes. Runs before
         // the original is cancelled on the modify path.
-        if !order.is_post_only() {
+        let arithmetic_verified_price = if order.is_post_only() {
+            0
+        } else if let Some(verified) = preverified_arithmetic {
+            verified
+        } else {
             self.check_trade_arithmetic(
                 order.side(),
                 order.total_quantity(),
                 Some(order.price().as_u128()),
-            )?;
-        }
+            )?
+        };
 
         //
         // Fill-or-kill preflight (#240): a later level can fail after earlier
@@ -1752,10 +1802,16 @@ where
                     },
                 ));
             }
-            return Ok(Some(feasibility));
+            return Ok(ShapeVerdict {
+                fok: Some(feasibility),
+                arithmetic_verified_price,
+            });
         }
 
-        Ok(None)
+        Ok(ShapeVerdict {
+            fok: None,
+            arithmetic_verified_price,
+        })
     }
 
     /// STP self-cross pre-check for the validate-first atomic modify (#168).
@@ -2247,7 +2303,7 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, false, false)
+        self.add_order_inner(order, false, false, None)
             .map(|(order, _)| order)
             .map_err(SubmitFailure::into_error)
     }
@@ -2307,7 +2363,7 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true, false)
+        self.add_order_inner(order, true, false, None)
             .map_err(SubmitFailure::into_error)
     }
 
@@ -2341,7 +2397,7 @@ where
             order.is_post_only(),
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true, true)
+        self.add_order_inner(order, true, true, None)
     }
 
     /// Shared implementation behind [`Self::add_order`] and
@@ -2354,11 +2410,17 @@ where
     /// caller drops it, so the failure paths that follow real fills (IOC
     /// remainder, STP taker cancel, residual admission, abort) do not box a
     /// `TradeResult` just to discard it.
+    ///
+    /// `preverified_arithmetic` is `Some` only for the re-add of a
+    /// validate-first modify, which ran the trade arithmetic preflight
+    /// (#244) before cancelling the original; see
+    /// [`Self::validate_order_shape_with`].
     fn add_order_inner(
         &self,
         mut order: OrderType<T>,
         want_result: bool,
         want_committed: bool,
+        preverified_arithmetic: Option<u128>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
         let committed = |trade_result: Option<TradeResult>| {
             if want_committed { trade_result } else { None }
@@ -2436,8 +2498,11 @@ where
         // `fok` is the fill-or-kill preflight measured by the feasibility
         // walk (#240): trade-id headroom already checked, buffer
         // reservation handed to the sweep below.
-        let fok = match self.validate_order_shape(&order) {
-            Ok(fok) => fok,
+        let ShapeVerdict {
+            fok,
+            arithmetic_verified_price,
+        } = match self.validate_order_shape_with(&order, preverified_arithmetic) {
+            Ok(verdict) => verdict,
             Err(err) => {
                 self.record_shape_rejection(&order, &err);
                 return Err(err.into());
@@ -2530,6 +2595,7 @@ where
             order.user_id(),
             taker_kind,
             fok.map_or(0, |fok| fok.maker_steps),
+            arithmetic_verified_price,
         )?;
 
         // #209: the sweep reached a crossable level with a post-only taker.
