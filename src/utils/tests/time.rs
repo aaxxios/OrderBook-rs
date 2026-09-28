@@ -68,8 +68,9 @@ mod tests {
     fn test_try_current_time_millis_matches_wrapper() {
         let checked = try_current_time_millis().expect("clock is after the epoch");
         let wrapped = current_time_millis();
-        assert!(wrapped >= checked);
-        assert!(wrapped - checked <= 10);
+        // The wall clock is not monotonic (NTP or manual adjustments), so
+        // compare the distance without assuming a direction.
+        assert!(wrapped.abs_diff(checked) <= 10_000);
     }
 
     #[test]
