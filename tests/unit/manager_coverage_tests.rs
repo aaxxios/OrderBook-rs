@@ -84,26 +84,23 @@ fn std_remove_book_returns_none_when_missing() {
 #[test]
 fn std_start_trade_processor_ok_first_time() {
     let mut mgr: BookManagerStd<()> = BookManagerStd::new();
-    let handle = mgr
-        .start_trade_processor()
+    mgr.start_trade_processor()
         .expect("should succeed first time");
-    drop(mgr);
-    handle
-        .join()
+    mgr.stop_trade_processor()
         .expect("trade processor thread should join cleanly");
 }
 
 #[test]
 fn std_start_trade_processor_fails_second_time() {
     let mut mgr: BookManagerStd<()> = BookManagerStd::new();
-    let handle = mgr
-        .start_trade_processor()
+    mgr.start_trade_processor()
         .expect("should succeed first time");
     let result = mgr.start_trade_processor();
-    assert!(result.is_err());
-    drop(mgr);
-    handle
-        .join()
+    assert!(matches!(
+        result,
+        Err(orderbook_rs::ManagerError::ProcessorAlreadyStarted)
+    ));
+    mgr.stop_trade_processor()
         .expect("trade processor thread should join cleanly");
 }
 

@@ -31,6 +31,7 @@ mod implied_volatility_tests;
 mod integration_workflow_tests;
 mod kill_switch_tests;
 mod manager_coverage_tests;
+mod manager_lifecycle_tests;
 mod market_order_by_amount_tests;
 mod mass_cancel_determinism_tests;
 mod mass_cancel_tests;

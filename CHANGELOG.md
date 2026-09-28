@@ -404,6 +404,50 @@ change.
   - The runtime handed to `new` must have its time driver enabled; this is
     now documented (module docs, `doc/panic-boundaries.md`).
   - Wire format and subjects are unchanged.
+- **Book managers are runtime-safe, stoppable and observable (#255).**
+  `BookManagerTokio::start_trade_processor` called `tokio::spawn`, which
+  panics outside a Tokio runtime, and `BookManagerStd` used
+  `std::thread::spawn`, which panics if the OS refuses a thread. Neither
+  processor had a shutdown path and a failed trade-event send was only
+  logged, once per event. Both managers, in parity:
+  - `start_trade_processor()` now returns `Result<(), ManagerError>`
+    instead of handing out the thread / task `JoinHandle`; the manager
+    keeps it. `BookManagerTokio` uses `Handle::try_current()` and returns
+    `ManagerError::NoRuntime` outside a runtime; `BookManagerStd` spawns a
+    named thread (`orderbook-trade-processor`) through
+    `std::thread::Builder` and returns `ManagerError::ThreadSpawn { kind,
+    message }` if the OS refuses. A failed start consumes nothing and can
+    be retried.
+  - New `start_trade_processor_with(handler)` runs a caller-supplied
+    `FnMut(TradeEvent)` for every trade event instead of the built-in
+    `INFO` logger; `BookManagerTokio::start_trade_processor_on(&Handle,
+    handler)` starts it from any thread on an explicit runtime.
+  - New `stop_trade_processor()` (blocking on `BookManagerStd`, `async` on
+    `BookManagerTokio`) signals the processor, lets it handle every event
+    already queued, then joins the thread / awaits the task. A panicked
+    processor is `ManagerError::ProcessorPanicked { message }`, a cancelled
+    Tokio task `ManagerError::ProcessorCancelled`, and a call with nothing
+    running `ManagerError::ProcessorNotRunning`. A stopped processor cannot
+    be restarted (`ProcessorAlreadyStarted`).
+  - New `dropped_trade_events()` counts trade events a listener could not
+    deliver because the processor is gone; with the `metrics` feature each
+    one also increments `orderbook_manager_trade_events_dropped_total`. The
+    first drop is logged at `ERROR` once per manager, not once per event.
+  - `ManagerError` (already `#[non_exhaustive]`) gains `NoRuntime`,
+    `ThreadSpawn`, `ProcessorNotRunning`, `ProcessorPanicked` and
+    `ProcessorCancelled`.
+
+  Compatibility: code that bound or joined the returned handle (`let h =
+  mgr.start_trade_processor()?; ... h.join()` / `h.await`) calls
+  `mgr.stop_trade_processor()` (`.await` on Tokio) instead; code that
+  ignored the handle compiles unchanged. Calling `start_trade_processor`
+  on `BookManagerTokio` outside a runtime is an `Err` instead of a panic.
+  Dropping a manager without stopping still ends the processor once every
+  book's listener is dropped, as before. The default processor's log lines
+  now use structured fields (`symbol`, `trades`, `executed_quantity`;
+  `quantity`, `price`, `trade_id`) instead of formatted messages. No
+  change to matching, trade events or snapshots. `manager.rs` had no
+  panic-policy ratchet entries.
 
 - **Wire encoders return `Result`; wire and metrics leave the panic
   ratchet (#254).** `encode_exec_report`, `encode_trade_print` and
