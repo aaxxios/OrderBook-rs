@@ -266,6 +266,56 @@ pub struct NatsBookChangePublisher {
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
+/// Sequence numbers assigned to one flushed batch, one per published
+/// subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchSequences {
+    /// Sequence of the `{prefix}.{symbol}.changes` publish.
+    changes: u64,
+    /// Sequence of the `{prefix}.{symbol}.bid` publish, if the batch has
+    /// bid-side changes.
+    bid: Option<u64>,
+    /// Sequence of the `{prefix}.{symbol}.ask` publish, if the batch has
+    /// ask-side changes.
+    ask: Option<u64>,
+}
+
+/// Reserves, in a single atomic checked update, one sequence number per
+/// subject the batch publishes to (`changes`, plus `bid` / `ask` when
+/// present), and assigns them in publish order.
+///
+/// Returns `None`, leaving `counter` unchanged, when the reservation would
+/// overflow `u64`: the caller then refuses the whole batch instead of
+/// emitting it on only some subjects.
+#[must_use]
+fn reserve_batch_sequences(
+    counter: &AtomicU64,
+    has_bid: bool,
+    has_ask: bool,
+) -> Option<BatchSequences> {
+    let subjects = 1u64
+        .checked_add(u64::from(has_bid))?
+        .checked_add(u64::from(has_ask))?;
+    let first = checked_reserve(counter, subjects)?;
+    // The reservation covers `first..first + subjects`, so these additions
+    // stay in range; they are still checked.
+    let bid = if has_bid {
+        Some(first.checked_add(1)?)
+    } else {
+        None
+    };
+    let ask = if has_ask {
+        Some(first.checked_add(1)?.checked_add(u64::from(has_bid))?)
+    } else {
+        None
+    };
+    Some(BatchSequences {
+        changes: first,
+        bid,
+        ask,
+    })
+}
+
 impl NatsBookChangePublisher {
     /// Create a new NATS book change publisher.
     ///
@@ -639,7 +689,9 @@ impl NatsBookChangePublisher {
     /// - `{prefix}.{symbol}.ask` — ask-side changes only
     ///
     /// Side-specific subjects are only published if the batch contains events
-    /// for that side.
+    /// for that side. Every sequence number the batch needs is reserved in one
+    /// atomic step before anything is published, so a batch is either emitted
+    /// on all of its subjects or refused as a whole (never partially).
     async fn flush_batch(
         publisher: &Arc<Self>,
         batch: &mut Vec<BookChangeEntry>,
@@ -650,17 +702,25 @@ impl NatsBookChangePublisher {
             return;
         }
 
-        let Some(seq) = checked_reserve(&publisher.sequence, 1) else {
-            // No unique batch sequence left: refuse to publish rather than
-            // wrap and collide with earlier batches.
+        let changes: Vec<BookChangeEntry> = std::mem::take(batch);
+        let has_bid = changes.iter().any(|c| c.side == Side::Buy);
+        let has_ask = changes.iter().any(|c| c.side == Side::Sell);
+
+        let Some(BatchSequences {
+            changes: seq,
+            bid: bid_seq,
+            ask: ask_seq,
+        }) = reserve_batch_sequences(&publisher.sequence, has_bid, has_ask)
+        else {
+            // Not enough unique sequences left for every subject of this
+            // batch: refuse the whole batch rather than wrap or emit it on
+            // only some subjects.
             counter_exhausted("sequence");
             increment_metric(&publisher.error_count, "error_count");
-            batch.clear();
             throttle(last_publish, min_interval).await;
             return;
         };
         let timestamp_ms = crate::utils::current_time_millis();
-        let changes: Vec<BookChangeEntry> = std::mem::take(batch);
 
         let all_batch = BookChangeBatch {
             symbol: publisher.symbol.clone(),
@@ -675,51 +735,45 @@ impl NatsBookChangePublisher {
         let all_ok = Self::publish_batch(publisher, &changes_subject, &all_batch, seq).await;
 
         // Publish bid-side subject if there are bid changes
-        let bid_changes: Vec<BookChangeEntry> = changes
-            .iter()
-            .filter(|c| c.side == Side::Buy)
-            .cloned()
-            .collect();
-        let bid_ok = if bid_changes.is_empty() {
-            true
-        } else if let Some(bid_seq) = checked_reserve(&publisher.sequence, 1) {
-            let bid_batch = BookChangeBatch {
-                symbol: publisher.symbol.clone(),
-                sequence: bid_seq,
-                timestamp_ms,
-                event_count: bid_changes.len(),
-                changes: bid_changes,
-            };
-            let bid_subject = format!("{}.{}.bid", publisher.subject_prefix, publisher.symbol);
-            Self::publish_batch(publisher, &bid_subject, &bid_batch, bid_seq).await
-        } else {
-            counter_exhausted("sequence");
-            increment_metric(&publisher.error_count, "error_count");
-            false
+        let bid_ok = match bid_seq {
+            Some(bid_seq) => {
+                let bid_changes: Vec<BookChangeEntry> = changes
+                    .iter()
+                    .filter(|c| c.side == Side::Buy)
+                    .cloned()
+                    .collect();
+                let bid_batch = BookChangeBatch {
+                    symbol: publisher.symbol.clone(),
+                    sequence: bid_seq,
+                    timestamp_ms,
+                    event_count: bid_changes.len(),
+                    changes: bid_changes,
+                };
+                let bid_subject = format!("{}.{}.bid", publisher.subject_prefix, publisher.symbol);
+                Self::publish_batch(publisher, &bid_subject, &bid_batch, bid_seq).await
+            }
+            None => true,
         };
 
         // Publish ask-side subject if there are ask changes
-        let ask_changes: Vec<BookChangeEntry> = changes
-            .iter()
-            .filter(|c| c.side == Side::Sell)
-            .cloned()
-            .collect();
-        let ask_ok = if ask_changes.is_empty() {
-            true
-        } else if let Some(ask_seq) = checked_reserve(&publisher.sequence, 1) {
-            let ask_batch = BookChangeBatch {
-                symbol: publisher.symbol.clone(),
-                sequence: ask_seq,
-                timestamp_ms,
-                event_count: ask_changes.len(),
-                changes: ask_changes,
-            };
-            let ask_subject = format!("{}.{}.ask", publisher.subject_prefix, publisher.symbol);
-            Self::publish_batch(publisher, &ask_subject, &ask_batch, ask_seq).await
-        } else {
-            counter_exhausted("sequence");
-            increment_metric(&publisher.error_count, "error_count");
-            false
+        let ask_ok = match ask_seq {
+            Some(ask_seq) => {
+                let ask_changes: Vec<BookChangeEntry> = changes
+                    .iter()
+                    .filter(|c| c.side == Side::Sell)
+                    .cloned()
+                    .collect();
+                let ask_batch = BookChangeBatch {
+                    symbol: publisher.symbol.clone(),
+                    sequence: ask_seq,
+                    timestamp_ms,
+                    event_count: ask_changes.len(),
+                    changes: ask_changes,
+                };
+                let ask_subject = format!("{}.{}.ask", publisher.subject_prefix, publisher.symbol);
+                Self::publish_batch(publisher, &ask_subject, &ask_batch, ask_seq).await
+            }
+            None => true,
         };
 
         if all_ok && bid_ok && ask_ok {
@@ -912,6 +966,78 @@ mod tests {
         // After shutdown the listener drops (and counts) events, never panics.
         listener(event(Side::Buy, 3));
         assert_eq!(handle.dropped_events(), 1);
+    }
+
+    #[test]
+    fn test_reserve_batch_sequences_assigns_consecutive_numbers() {
+        let counter = AtomicU64::new(10);
+        assert_eq!(
+            reserve_batch_sequences(&counter, true, true),
+            Some(BatchSequences {
+                changes: 10,
+                bid: Some(11),
+                ask: Some(12)
+            })
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 13);
+        assert_eq!(
+            reserve_batch_sequences(&counter, false, true),
+            Some(BatchSequences {
+                changes: 13,
+                bid: None,
+                ask: Some(14)
+            })
+        );
+        assert_eq!(
+            reserve_batch_sequences(&counter, true, false),
+            Some(BatchSequences {
+                changes: 15,
+                bid: Some(16),
+                ask: None
+            })
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 17);
+    }
+
+    #[test]
+    fn test_reserve_batch_sequences_near_max_is_all_or_nothing() {
+        // Three subjects need three sequences: with only two left the whole
+        // batch is refused and the counter is untouched.
+        let counter = AtomicU64::new(u64::MAX - 2);
+        assert_eq!(reserve_batch_sequences(&counter, true, true), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX - 2);
+
+        // A one-sided batch needs two and still fits exactly.
+        assert_eq!(
+            reserve_batch_sequences(&counter, true, false),
+            Some(BatchSequences {
+                changes: u64::MAX - 2,
+                bid: Some(u64::MAX - 1),
+                ask: None
+            })
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(reserve_batch_sequences(&counter, false, false), None);
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_sequence_refuses_whole_batch() {
+        let publisher = publisher().await.with_max_retries(0);
+        publisher.sequence.store(u64::MAX - 2, Ordering::Relaxed);
+        let (handle, listener) = publisher.into_listener();
+        listener(event(Side::Buy, 1));
+        listener(event(Side::Sell, 2));
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())));
+        // Either one two-sided batch (refused whole) or two one-sided batches
+        // (the first fits exactly, the second is refused). Never a partial
+        // emission that leaves the counter between the two.
+        let sequence = handle.sequence();
+        assert!(
+            sequence == u64::MAX - 2 || sequence == u64::MAX,
+            "unexpected sequence {sequence}"
+        );
+        assert_eq!(handle.publish_count(), 0);
     }
 
     #[tokio::test]

@@ -349,7 +349,10 @@ change.
     `WARN` instead of one per event, and a full channel one `WARN` per
     overload episode.
   - Counters and sequences never wrap: a sequence that would overflow
-    refuses the publish (counted in `error_count`, logged at `ERROR`).
+    refuses the publish (counted in `error_count`, logged at `ERROR`). A
+    book-change batch reserves the sequences for all of its subjects
+    (`changes`, `bid`, `ask`) in one step, so it is published on every
+    subject or refused whole, never partially.
     Poisoned task-lifecycle locks are recovered instead of detaching the
     task. Connect / disconnect transitions of the publish path are logged
     at `INFO`.
