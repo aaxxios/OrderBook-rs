@@ -1575,7 +1575,10 @@ where
         // least one trade id, and none is left, so its sweep would abort at
         // the first level. Reject it untouched here instead — for the modify
         // path this runs before the original is cancelled, so the original
-        // keeps resting. Post-only takers never trade and are exempt.
+        // keeps resting. Post-only takers never trade and are exempt. It runs
+        // under the submit / modify gate the sweep holds; exact under the
+        // exclusive gate, best-effort under the shared one (see
+        // `check_trade_id_headroom` in book.rs).
         if !order.is_post_only()
             && self.transaction_id_generator.is_exhausted()
             && self.will_cross_market(order.price().as_u128(), order.side())

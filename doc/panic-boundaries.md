@@ -183,8 +183,16 @@ Residuals, stated precisely:
   `orderbook_trade_ids_exhausted_total`) and rejects every crossing submit,
   crossing modify (before the original is cancelled) and publishing
   `match_*` call untouched with `CapacityExceeded`. The raw `match_order*`
-  family still aborts with an empty prefix. No kill switch is engaged
-  automatically; replace the generator with `set_trade_id_namespace`.
+  family still aborts with an empty prefix. A limit taker counts as
+  crossing only when its price crosses the best opposite price. No kill
+  switch is engaged automatically; replace the generator with
+  `set_trade_id_namespace`. The check runs under the submit gate the sweep
+  holds, before any mutation, and is exact under the exclusive gate or a
+  single writer. Under the shared gate it is best-effort: pricelevel 0.10
+  exposes no public atomic id reservation, so concurrent takers racing for
+  the last ids can all pass it, and the losers abort inside the sweep with
+  `MatchAborted` (their prefix published, possibly empty) instead of the
+  untouched rejection.
 
 ## Ratchet
 

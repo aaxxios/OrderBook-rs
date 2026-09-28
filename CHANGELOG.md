@@ -259,7 +259,11 @@ change.
   before the original is cancelled, which keeps resting) is rejected
   untouched with `PriceLevelError(CapacityExceeded { IdSequence })`, code
   16, once the book's trade-id generator is exhausted; post-only and
-  non-crossing orders are unaffected. New `OrderBook::match_aborts()`,
+  non-crossing orders (a limit that does not cross the best opposite price)
+  are unaffected. The check runs under the gate the sweep holds and is exact
+  under the exclusive gate or a single writer; under the shared gate,
+  concurrent takers racing for the last ids may still abort with
+  `MatchAborted` (pricelevel 0.10 has no public atomic id reservation). New `OrderBook::match_aborts()`,
   `OrderBook::match_fold_failures()` and `OrderBook::trade_ids_exhausted()`
   (latched on the first exhaustion, logged once at `ERROR`, cleared by
   `set_trade_id_namespace`); with `metrics`, the counters

@@ -482,6 +482,27 @@ mod tests {
     }
 
     #[test]
+    fn test_exhausted_generator_lets_a_non_crossing_limit_match_through() {
+        let (book, streams) = aborting_book(0);
+        // Best ask is 100: a buy limited at 99 does not cross, so it needs
+        // no trade id and must not be rejected.
+        let result = book
+            .match_limit_order(Id::from_u64(TAKER), 20, Side::Buy, 99)
+            .expect("a non-crossing limit is not refused");
+        assert!(result.trades().as_vec().is_empty());
+        assert_eq!(result.remaining_quantity().as_u64(), 20);
+        assert!(streams.trades.lock().expect("trade sink").is_empty());
+        assert_eq!(book.order_status(Id::from_u64(TAKER)), None);
+        assert!(!book.trade_ids_exhausted(), "nothing tried to mint an id");
+
+        // The same limit at the best ask crosses and is refused untouched.
+        let err = book
+            .match_limit_order(Id::from_u64(TAKER + 1), 20, Side::Buy, 100)
+            .expect_err("a crossing limit needs a trade id");
+        assert_rejected_untouched_for_ids(&book, &streams, &err);
+    }
+
+    #[test]
     fn test_exhausted_generator_keeps_the_original_on_a_crossing_modify() {
         let (book, streams) = aborting_book(0);
         book.add_limit_order_with_user(

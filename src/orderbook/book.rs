@@ -3351,13 +3351,14 @@ where
             "Order book {}: Matching market order {} for {} at side {:?}",
             self.symbol, order_id, quantity, side
         );
-        self.check_trade_id_headroom(order_id, side)?;
         let outcome = {
             // #209 / #225: same gate as `match_order_with_user`, released
             // before the trades are published, as before.
             let _gate = self.acquire_coherent_submit_gate(
                 self.submit_needs_exclusive_gate(false, user_id, false, false),
             );
+            // #240: under the same gate the sweep holds, before any mutation.
+            self.check_trade_id_headroom(order_id, side, None)?;
             self.match_order_with_user_outcome(
                 order_id,
                 side,
@@ -3372,10 +3373,20 @@ where
     }
 
     /// Reject a taker untouched when the trade-id generator is exhausted
-    /// and the opposite side holds liquidity it would trade with (#240):
-    /// its sweep could not mint a single trade id. Records
-    /// `Rejected { CapacityExceeded }` and latches
-    /// [`Self::trade_ids_exhausted`].
+    /// and the taker would trade (#240): its sweep could not mint a single
+    /// trade id. A market taker (`limit_price == None`) trades whenever the
+    /// opposite side holds liquidity; a limit taker only when its price
+    /// crosses the best opposite price. Records `Rejected { CapacityExceeded }`
+    /// and latches [`Self::trade_ids_exhausted`].
+    ///
+    /// Callers run it while holding the submit gate the sweep holds, before
+    /// any mutation. It is exact under the exclusive gate (and for a single
+    /// writer). Under the shared gate it is best-effort: pricelevel 0.10
+    /// exposes no public atomic reservation on the generator, so concurrent
+    /// takers racing for the last ids can all pass this check, and the ones
+    /// that lose the race abort inside the sweep with
+    /// [`OrderBookError::MatchAborted`] (their committed prefix published,
+    /// possibly empty) instead of this untouched rejection.
     ///
     /// # Errors
     ///
@@ -3385,15 +3396,19 @@ where
         &self,
         order_id: Id,
         side: Side,
+        limit_price: Option<u128>,
     ) -> Result<(), OrderBookError> {
         if !self.transaction_id_generator.is_exhausted() {
             return Ok(());
         }
-        let opposite_empty = match side {
-            Side::Buy => self.asks.is_empty(),
-            Side::Sell => self.bids.is_empty(),
+        let crosses = match limit_price {
+            Some(price) => self.will_cross_market(price, side),
+            None => match side {
+                Side::Buy => !self.asks.is_empty(),
+                Side::Sell => !self.bids.is_empty(),
+            },
         };
-        if opposite_empty {
+        if !crosses {
             return Ok(());
         }
         let source = PriceLevelError::CapacityExceeded {
@@ -3571,7 +3586,8 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
-        self.check_trade_id_headroom(order_id, side)?;
+        // #240: under the gate the sweep holds, before any mutation.
+        self.check_trade_id_headroom(order_id, side, None)?;
         let outcome =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
         self.publish_match_outcome(outcome, want_committed)
@@ -3631,13 +3647,15 @@ where
             "Order book {}: Matching limit order {} for {} at side {:?} with limit price {}",
             self.symbol, order_id, quantity, side, limit_price
         );
-        self.check_trade_id_headroom(order_id, side)?;
         let outcome = {
             // #209 / #225: same gate as `match_order_with_user`, released
             // before the trades are published, as before.
             let _gate = self.acquire_coherent_submit_gate(
                 self.submit_needs_exclusive_gate(false, user_id, false, false),
             );
+            // #240: under the same gate the sweep holds, before any
+            // mutation; only a limit that actually crosses is refused.
+            self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
             self.match_order_with_user_outcome(
                 order_id,
                 side,
