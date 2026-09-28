@@ -172,6 +172,16 @@ This order book engine is built with the following design principles:
   a removal the level committed before failing), and
   `evict_expired_orders` returns an `EvictionResult` with the evicted
   orders and per-order failures, which replay reproduces by identity.
+- **Checked fee and notional arithmetic (#244).** A taker whose
+  worst-case notional (worst reachable price × quantity, or its amount)
+  overflows `u128` or cannot be priced exactly by the `FeeSchedule` is
+  rejected before the book is touched with `OrderBookError::FeeOverflow`
+  (code 18) or `NotionalOverflow` (code 19), on every submission API and
+  with or without a listener. Fees and `quote_notional` are never
+  clamped or dropped: `FeeSchedule::calculate_fee`, `TradeResult::new` /
+  `with_fees` / `total_fees` and `TradeInfo::from_trade_result` return
+  `Result` (`TradeArithmeticError`). `with_maker_rebate(i32::MIN, _)` and
+  a pegged offset of `i64::MIN` no longer panic.
 
 #### Migration from 0.13
 
@@ -207,6 +217,12 @@ This order book engine is built with the following design principles:
 | sweep stopped by a level failure: `Err(PriceLevelError)` (prefix unreported) | `Err(MatchAborted { .. })`, prefix published |
 | `CancelReason` (8 variants) | adds `MatchAborted` (exhaustive matches need an arm) |
 | `Nats{Trade,BookChange}Publisher::shutdown() -> ()` | `-> Result<(), NatsPublisherError>` |
+| `FeeSchedule::calculate_fee(n, maker) -> i128` (clamps) | `-> Result<i128, FeeOverflow>`; `try_calculate_fee` deprecated |
+| `TradeResult::new(symbol, mr) -> TradeResult` | `-> Result<TradeResult, TradeArithmeticError>` |
+| `TradeResult::with_fees(symbol, mr, schedule) -> TradeResult` | `-> Result<TradeResult, TradeArithmeticError>` |
+| `TradeResult::total_fees() -> i128` (clamps) | `-> Result<i128, TradeArithmeticError>` |
+| `TradeInfo::from_trade_result(tr, schedule) -> TradeInfo` | `-> Result<TradeInfo, TradeArithmeticError>` |
+| taker with an unpriceable worst-case notional: trades with a clamped fee | rejected untouched: `FeeOverflow` (18) / `NotionalOverflow` (19) |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
