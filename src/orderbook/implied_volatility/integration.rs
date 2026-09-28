@@ -3,9 +3,6 @@
 //! This module provides methods on the OrderBook struct to calculate
 //! implied volatility from order book prices.
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
 use super::black_scholes::BlackScholes;
 use super::error::IVError;
 use super::solver::{SolverConfig, solve_iv};
@@ -68,6 +65,33 @@ impl IVConfig {
         self.solver = solver;
         self
     }
+
+    /// Validates the configuration.
+    ///
+    /// Constraints: `price_scale` finite and `> 0`, `max_spread_bps` finite
+    /// and `>= 0`, and [`SolverConfig::validate`] for `solver`.
+    ///
+    /// # Errors
+    ///
+    /// [`IVError::InvalidConfig`] naming the first offending field.
+    pub fn validate(&self) -> Result<(), IVError> {
+        if !(self.price_scale.is_finite() && self.price_scale > 0.0) {
+            return Err(IVError::invalid_config(
+                "price_scale",
+                format!("must be finite and positive, got {}", self.price_scale),
+            ));
+        }
+        if !(self.max_spread_bps.is_finite() && self.max_spread_bps >= 0.0) {
+            return Err(IVError::invalid_config(
+                "max_spread_bps",
+                format!(
+                    "must be finite and non-negative, got {}",
+                    self.max_spread_bps
+                ),
+            ));
+        }
+        self.solver.validate()
+    }
 }
 
 impl<T> OrderBook<T>
@@ -93,6 +117,7 @@ where
     /// [`implied_volatility_with_config`](Self::implied_volatility_with_config),
     /// to which this delegates with the default [`IVConfig`]:
     /// [`IVError::NoPriceAvailable`], [`IVError::CrossedBook`],
+    /// [`IVError::PriceLevel`], [`IVError::NonFiniteResult`],
     /// [`IVError::SpreadTooWide`], [`IVError::PriceBelowIntrinsic`], and any
     /// solver error ([`IVError::InvalidParams`], [`IVError::TimeToExpiryTooSmall`],
     /// [`IVError::VolatilityOutOfBounds`], [`IVError::ConvergenceFailure`]).
@@ -139,8 +164,14 @@ where
     ///
     /// # Errors
     ///
+    /// - [`IVError::InvalidConfig`] if `config` fails [`IVConfig::validate`]
+    ///   (checked before the book is read).
     /// - [`IVError::NoPriceAvailable`] if the book has neither a usable price nor
     ///   a last trade to derive one from.
+    /// - [`IVError::PriceLevel`] if a best-level quantity cannot be read
+    ///   ([`PriceSource::WeightedMid`] only).
+    /// - [`IVError::NonFiniteResult`] if the scaled price or spread is not
+    ///   finite.
     /// - [`IVError::CrossedBook`] if the book is crossed or locked (no meaningful mid).
     /// - [`IVError::SpreadTooWide`] if the bid/ask spread exceeds
     ///   `config.max_spread_bps`.
@@ -156,8 +187,20 @@ where
         price_source: PriceSource,
         config: &IVConfig,
     ) -> Result<IVResult, IVError> {
+        // Validate the whole configuration before reading the book: a bad
+        // `price_scale` would poison every scaled price, a NaN
+        // `max_spread_bps` would silently disable the spread gate, and a bad
+        // solver config would reach `f64::clamp` with invalid bounds.
+        config.validate()?;
+
         // Extract price from order book
         let (price, spread_bps) = self.extract_price_for_iv(price_source, config.price_scale)?;
+        if !price.is_finite() {
+            return Err(IVError::non_finite("scaled market price", price));
+        }
+        if !spread_bps.is_finite() {
+            return Err(IVError::non_finite("spread_bps", spread_bps));
+        }
 
         // Check spread threshold
         if spread_bps > config.max_spread_bps {
@@ -191,6 +234,13 @@ where
     /// # Returns
     /// - `Ok((price, spread_bps))`: Extracted price and spread in basis points
     /// - `Err(IVError::NoPriceAvailable)`: If no valid price can be extracted
+    /// - `Err(IVError::CrossedBook)`: If the book is crossed or locked
+    /// - `Err(IVError::PriceLevel)` / `Err(IVError::ArithmeticOverflow)`: from
+    ///   the weighted-mid quantity read
+    ///
+    /// `u128 as f64` price casts round to the nearest representable `f64`
+    /// (53-bit mantissa); prices above 2^53 lose low-order digits, which is
+    /// negligible for IV purposes.
     fn extract_price_for_iv(
         &self,
         source: PriceSource,
@@ -225,7 +275,7 @@ where
                 let price = match source {
                     PriceSource::MidPrice => mid,
                     PriceSource::WeightedMid => {
-                        self.weighted_mid_price_for_iv(bid, ask, price_scale)
+                        self.weighted_mid_price_for_iv(bid, ask, price_scale)?
                     }
                     PriceSource::LastTrade => self
                         .last_trade_price()
@@ -253,38 +303,68 @@ where
     ///
     /// Weights the mid price by the quantities available at best bid and ask.
     /// This gives more weight to the side with more liquidity.
-    fn weighted_mid_price_for_iv(&self, bid: u128, ask: u128, price_scale: f64) -> f64 {
+    ///
+    /// The two `u64` quantities are summed in `u128` (cannot overflow; the
+    /// `checked_add` is kept so no integer arithmetic is unchecked). The
+    /// `as f64` casts round to 53 bits of mantissa, which only perturbs the
+    /// weights in the last bits for quantities above 2^53.
+    ///
+    /// # Errors
+    ///
+    /// [`IVError::PriceLevel`] if a level's total quantity cannot be read,
+    /// [`IVError::ArithmeticOverflow`] if the quantity sum overflows.
+    fn weighted_mid_price_for_iv(
+        &self,
+        bid: u128,
+        ask: u128,
+        price_scale: f64,
+    ) -> Result<f64, IVError> {
         let bid_f = bid as f64 / price_scale;
         let ask_f = ask as f64 / price_scale;
 
         // Get quantities at best bid and ask
-        let bid_qty = self.quantity_at_price(bid, Side::Buy);
-        let ask_qty = self.quantity_at_price(ask, Side::Sell);
+        let bid_qty = self.quantity_at_price(bid, Side::Buy)?;
+        let ask_qty = self.quantity_at_price(ask, Side::Sell)?;
 
-        let total_qty = bid_qty + ask_qty;
+        let total_qty = u128::from(bid_qty).checked_add(u128::from(ask_qty)).ok_or(
+            IVError::ArithmeticOverflow {
+                operation: "weighted mid total quantity",
+            },
+        )?;
 
         if total_qty == 0 {
             // Fall back to simple mid if no quantities
-            (bid_f + ask_f) / 2.0
+            Ok((bid_f + ask_f) / 2.0)
         } else {
             // Weight by quantities: more weight to the side with more liquidity
-            let bid_weight = ask_qty as f64 / total_qty as f64;
-            let ask_weight = bid_qty as f64 / total_qty as f64;
-            bid_f * bid_weight + ask_f * ask_weight
+            let total_f = total_qty as f64;
+            let bid_weight = ask_qty as f64 / total_f;
+            let ask_weight = bid_qty as f64 / total_f;
+            Ok(bid_f * bid_weight + ask_f * ask_weight)
         }
     }
 
     /// Gets the total quantity at a specific price level.
-    fn quantity_at_price(&self, price: u128, side: Side) -> u64 {
+    ///
+    /// A level that is absent (removed between the best-price read and this
+    /// lookup) contributes `0`, which makes the weighted mid fall back towards
+    /// the other side or the simple mid. A level whose quantity cannot be read
+    /// is an error, not a silent zero.
+    ///
+    /// # Errors
+    ///
+    /// [`IVError::PriceLevel`] if `total_quantity` fails (for example
+    /// `visible + hidden` overflows `u64`).
+    fn quantity_at_price(&self, price: u128, side: Side) -> Result<u64, IVError> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
 
-        price_levels
-            .get(&price)
-            .and_then(|entry| entry.value().total_quantity().ok())
-            .unwrap_or(0)
+        match price_levels.get(&price) {
+            Some(entry) => Ok(entry.value().total_quantity()?),
+            None => Ok(0),
+        }
     }
 
     /// Calculates the theoretical option price using Black-Scholes.
@@ -298,8 +378,15 @@ where
     ///
     /// # Returns
     /// Theoretical option price
-    #[must_use]
-    pub fn theoretical_price(params: &IVParams, volatility: f64) -> f64 {
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`BlackScholes::price`]: [`IVError::InvalidParams`] for
+    /// out-of-domain inputs (non-finite, `spot` / `strike` not positive,
+    /// negative time or volatility) and [`IVError::NonFiniteResult`] if the
+    /// result is not finite.
+    #[must_use = "the price value (or error) must be handled"]
+    pub fn theoretical_price(params: &IVParams, volatility: f64) -> Result<f64, IVError> {
         BlackScholes::price(params, volatility)
     }
 
@@ -311,8 +398,15 @@ where
     ///
     /// # Returns
     /// Vega value (change in price per unit change in volatility)
-    #[must_use]
-    pub fn option_vega(params: &IVParams, volatility: f64) -> f64 {
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`BlackScholes::vega`]: [`IVError::InvalidParams`] for
+    /// out-of-domain inputs (non-finite, `spot` / `strike` not positive,
+    /// negative time or volatility) and [`IVError::NonFiniteResult`] if the
+    /// result is not finite.
+    #[must_use = "the vega value (or error) must be handled"]
+    pub fn option_vega(params: &IVParams, volatility: f64) -> Result<f64, IVError> {
         BlackScholes::vega(params, volatility)
     }
 
@@ -324,8 +418,15 @@ where
     ///
     /// # Returns
     /// Delta value
-    #[must_use]
-    pub fn option_delta(params: &IVParams, volatility: f64) -> f64 {
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`BlackScholes::delta`]: [`IVError::InvalidParams`] for
+    /// out-of-domain inputs (non-finite, `spot` / `strike` not positive,
+    /// negative time or volatility) and [`IVError::NonFiniteResult`] if the
+    /// result is not finite.
+    #[must_use = "the delta value (or error) must be handled"]
+    pub fn option_delta(params: &IVParams, volatility: f64) -> Result<f64, IVError> {
         BlackScholes::delta(params, volatility)
     }
 
@@ -337,8 +438,15 @@ where
     ///
     /// # Returns
     /// Gamma value
-    #[must_use]
-    pub fn option_gamma(params: &IVParams, volatility: f64) -> f64 {
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`BlackScholes::gamma`]: [`IVError::InvalidParams`] for
+    /// out-of-domain inputs (non-finite, `spot` / `strike` not positive,
+    /// negative time or volatility) and [`IVError::NonFiniteResult`] if the
+    /// result is not finite.
+    #[must_use = "the gamma value (or error) must be handled"]
+    pub fn option_gamma(params: &IVParams, volatility: f64) -> Result<f64, IVError> {
         BlackScholes::gamma(params, volatility)
     }
 
@@ -350,8 +458,15 @@ where
     ///
     /// # Returns
     /// Theta value (daily time decay, negative for long positions)
-    #[must_use]
-    pub fn option_theta(params: &IVParams, volatility: f64) -> f64 {
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`BlackScholes::theta`]: [`IVError::InvalidParams`] for
+    /// out-of-domain inputs (non-finite, `spot` / `strike` not positive,
+    /// negative time or volatility) and [`IVError::NonFiniteResult`] if the
+    /// result is not finite.
+    #[must_use = "the theta value (or error) must be handled"]
+    pub fn option_theta(params: &IVParams, volatility: f64) -> Result<f64, IVError> {
         BlackScholes::theta(params, volatility)
     }
 }
@@ -567,7 +682,7 @@ mod tests {
     #[test]
     fn test_theoretical_price() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
-        let price = OrderBook::<()>::theoretical_price(&params, 0.25);
+        let price = OrderBook::<()>::theoretical_price(&params, 0.25).unwrap();
 
         // ATM call with 25% vol should be around 5-6
         assert!(price > 4.0 && price < 7.0);
@@ -578,10 +693,10 @@ mod tests {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
         let vol = 0.25;
 
-        let delta = OrderBook::<()>::option_delta(&params, vol);
-        let gamma = OrderBook::<()>::option_gamma(&params, vol);
-        let vega = OrderBook::<()>::option_vega(&params, vol);
-        let theta = OrderBook::<()>::option_theta(&params, vol);
+        let delta = OrderBook::<()>::option_delta(&params, vol).unwrap();
+        let gamma = OrderBook::<()>::option_gamma(&params, vol).unwrap();
+        let vega = OrderBook::<()>::option_vega(&params, vol).unwrap();
+        let theta = OrderBook::<()>::option_theta(&params, vol).unwrap();
 
         // ATM call delta should be around 0.5
         assert!(delta > 0.4 && delta < 0.6);
@@ -621,5 +736,197 @@ mod tests {
 
         assert!((price - 4.70).abs() < 0.01);
         assert!((spread_bps - 10_000.0).abs() < 1.0); // 100% spread indicator
+    }
+
+    #[test]
+    fn test_iv_config_validate() {
+        assert!(IVConfig::default().validate().is_ok());
+        let cases = [
+            ("price_scale", IVConfig::default().with_price_scale(0.0)),
+            ("price_scale", IVConfig::default().with_price_scale(-100.0)),
+            (
+                "price_scale",
+                IVConfig::default().with_price_scale(f64::NAN),
+            ),
+            (
+                "price_scale",
+                IVConfig::default().with_price_scale(f64::INFINITY),
+            ),
+            ("max_spread_bps", IVConfig::default().with_max_spread(-1.0)),
+            (
+                "max_spread_bps",
+                IVConfig::default().with_max_spread(f64::NAN),
+            ),
+            (
+                "max_spread_bps",
+                IVConfig::default().with_max_spread(f64::INFINITY),
+            ),
+            (
+                "min_iv",
+                IVConfig::default().with_solver(SolverConfig::default().with_bounds(2.0, 1.0)),
+            ),
+            (
+                "tolerance",
+                IVConfig::default().with_solver(SolverConfig::default().with_tolerance(0.0)),
+            ),
+        ];
+        let book = create_test_book();
+        let params = IVParams::call(5.0, 5.0, 0.25, 0.05);
+        for (field, config) in cases {
+            match config.validate() {
+                Err(IVError::InvalidConfig { field: got, .. }) => assert_eq!(got, field),
+                other => panic!("{config:?}: expected InvalidConfig, got {other:?}"),
+            }
+            for source in [
+                PriceSource::MidPrice,
+                PriceSource::WeightedMid,
+                PriceSource::LastTrade,
+            ] {
+                let result = book.implied_volatility_with_config(&params, source, &config);
+                assert!(
+                    matches!(result, Err(IVError::InvalidConfig { .. })),
+                    "{config:?}: got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_config_checked_before_empty_book() {
+        // Config errors take precedence over book state.
+        let book = OrderBook::<()>::new("EMPTY");
+        let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
+        let config = IVConfig::default().with_price_scale(0.0);
+        let result = book.implied_volatility_with_config(&params, PriceSource::MidPrice, &config);
+        assert!(matches!(result, Err(IVError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn test_weighted_mid_near_u64_max_quantities() {
+        let book = OrderBook::<()>::new("TEST-OPT");
+        book.add_limit_order(new_id(), 450, u64::MAX, Side::Buy, TimeInForce::Gtc, None)
+            .unwrap();
+        book.add_limit_order(
+            new_id(),
+            470,
+            u64::MAX - 1,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        )
+        .unwrap();
+
+        // bid_qty + ask_qty overflows u64; the u128 sum must not.
+        let price = book.weighted_mid_price_for_iv(450, 470, 100.0).unwrap();
+        assert!(price.is_finite());
+        assert!((price - 4.60).abs() < 0.01, "got {price}");
+
+        let (price, _) = book
+            .extract_price_for_iv(PriceSource::WeightedMid, 100.0)
+            .unwrap();
+        assert!((price - 4.60).abs() < 0.01, "got {price}");
+    }
+
+    #[test]
+    fn test_weighted_mid_missing_level_falls_back_to_mid() {
+        let book = OrderBook::<()>::new("TEST-OPT");
+        // No levels at these prices: both quantities read as 0 -> simple mid.
+        let price = book.weighted_mid_price_for_iv(450, 470, 100.0).unwrap();
+        assert!((price - 4.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_quantity_at_price_maps_level_error() {
+        let book = OrderBook::<()>::new("TEST-OPT");
+        // Each order fits in u64 on its own, but the level's visible + hidden
+        // aggregate overflows, so the level's total_quantity errors.
+        let half = u64::MAX / 2 + 1;
+        book.add_limit_order(new_id(), 450, half, Side::Buy, TimeInForce::Gtc, None)
+            .unwrap();
+        book.add_iceberg_order(new_id(), 450, 1, half, Side::Buy, TimeInForce::Gtc, None)
+            .unwrap();
+        let result = book.quantity_at_price(450, Side::Buy);
+        assert!(
+            matches!(result, Err(IVError::PriceLevel(_))),
+            "got {result:?}"
+        );
+
+        // End to end: WeightedMid surfaces the level error instead of
+        // silently treating the level as empty.
+        book.add_limit_order(new_id(), 470, 100, Side::Sell, TimeInForce::Gtc, None)
+            .unwrap();
+        let params = IVParams::call(4.6, 4.6, 0.25, 0.0);
+        let config = IVConfig::default().with_price_scale(100.0);
+        let result =
+            book.implied_volatility_with_config(&params, PriceSource::WeightedMid, &config);
+        assert!(
+            matches!(result, Err(IVError::PriceLevel(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_greeks_return_err_on_invalid_inputs() {
+        let bad = [
+            IVParams::call(f64::NAN, 100.0, 0.25, 0.05),
+            IVParams::call(0.0, 100.0, 0.25, 0.05),
+            IVParams::call(100.0, 0.0, 0.25, 0.05),
+            IVParams::call(100.0, 100.0, f64::INFINITY, 0.05),
+        ];
+        for params in &bad {
+            assert!(OrderBook::<()>::theoretical_price(params, 0.25).is_err());
+            assert!(OrderBook::<()>::option_vega(params, 0.25).is_err());
+            assert!(OrderBook::<()>::option_delta(params, 0.25).is_err());
+            assert!(OrderBook::<()>::option_gamma(params, 0.25).is_err());
+            assert!(OrderBook::<()>::option_theta(params, 0.25).is_err());
+        }
+        let good = IVParams::call(100.0, 100.0, 0.25, 0.05);
+        for vol in [f64::NAN, f64::INFINITY, -0.25] {
+            assert!(OrderBook::<()>::theoretical_price(&good, vol).is_err());
+            assert!(OrderBook::<()>::option_vega(&good, vol).is_err());
+            assert!(OrderBook::<()>::option_delta(&good, vol).is_err());
+            assert!(OrderBook::<()>::option_gamma(&good, vol).is_err());
+            assert!(OrderBook::<()>::option_theta(&good, vol).is_err());
+        }
+    }
+
+    #[test]
+    fn test_implied_volatility_edge_floats_never_panic() {
+        let book = create_test_book();
+        let edge = [
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+        ];
+        for &a in &edge {
+            for &b in &edge {
+                let params = IVParams::call(a, 4.6, b, 0.0);
+                let config = IVConfig {
+                    solver: SolverConfig::default().with_bounds(a, b),
+                    max_spread_bps: b,
+                    price_scale: a,
+                };
+                for source in [
+                    PriceSource::MidPrice,
+                    PriceSource::WeightedMid,
+                    PriceSource::LastTrade,
+                ] {
+                    for r in [
+                        book.implied_volatility_with_config(&params, source, &config),
+                        book.implied_volatility(&params, source),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        assert!(r.iv.is_finite() && r.price_used.is_finite());
+                    }
+                }
+            }
+        }
     }
 }

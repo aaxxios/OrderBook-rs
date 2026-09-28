@@ -187,6 +187,50 @@ change.
   failure are not reported on this path (tracked in #240). Fill-or-kill
   feasibility and modify self-trade checks refuse the order when the dry run
   fails instead of guessing.
+- **Implied-volatility inputs are validated; Black-Scholes and Greeks
+  return `Result` (#256).** `f64::clamp(min_iv, max_iv)` in the solver
+  panicked when `min_iv > max_iv` or a bound was NaN, reachable through the
+  public `SolverConfig` fields and `with_bounds`. New
+  `SolverConfig::validate()` (all fields finite, `0 < min_iv <= max_iv`,
+  `tolerance > 0`, `min_vega >= 0`, `max_iterations > 0`) and
+  `IVConfig::validate()` (`price_scale` finite and `> 0`, `max_spread_bps`
+  finite and `>= 0`, plus the solver check) run at the top of `solve_iv`,
+  `solve_iv_bisection`, `OrderBook::implied_volatility` and
+  `implied_volatility_with_config`, before the book is read. Signature
+  changes (callers add `?` or handle the error):
+  - `BlackScholes::{price, vega, delta, gamma, theta}(params, vol)`,
+    `BlackScholes::d1(..)` and `BlackScholes::d2(..)`: `f64` →
+    `Result<f64, IVError>`. Inputs must be finite with `spot > 0` and
+    `strike > 0`; `time_to_expiry` and `vol` must be `>= 0` (zero selects
+    the documented degenerate limit) and `> 0` for `d1` / `d2`. A
+    non-finite output from in-domain input (for example an overflowing
+    discount factor) is `IVError::NonFiniteResult`. `erf`, `norm_cdf` and
+    `norm_pdf` stay infallible: they are total on finite input.
+  - `OrderBook::{theoretical_price, option_vega, option_delta,
+    option_gamma, option_theta}`: `f64` → `Result<f64, IVError>`.
+  - `IVError` is `#[non_exhaustive]` (exhaustive matches outside the crate
+    need a wildcard arm), is now derived with `thiserror` (Display strings
+    unchanged), and gains `InvalidConfig { field, message }`,
+    `NonFiniteResult { operation, value }`, `ArithmeticOverflow { operation }`
+    and `PriceLevel(PriceLevelError)`.
+
+  Behaviour changes: a configuration that used to panic or silently
+  misbehave (NaN `max_spread_bps` disabled the spread gate; a zero or NaN
+  `price_scale` produced inf / NaN prices) now returns
+  `IVError::InvalidConfig`. `PriceSource::WeightedMid` sums the two
+  best-level quantities in `u128` (the `u64` sum could overflow), and a
+  level whose `total_quantity()` fails now returns `IVError::PriceLevel`
+  instead of being treated as empty; a level that disappears between the
+  best-price read and the quantity read still counts as `0`. With
+  `vol == 0` and `time_to_expiry > 0`, `theta` returns the carry term of
+  the discounted intrinsic value instead of `0.0`, and `delta` is the step
+  on spot versus the discounted strike (previously NaN exactly at the
+  forward). A Black-Scholes overflow mid-iteration surfaces as
+  `NonFiniteResult` instead of `InvalidParams`. `IVParams::is_atm` returns
+  `false` for a non-finite or non-positive strike instead of dividing by
+  it. Results for valid inputs are unchanged. The IV files leave the
+  panic-policy ratchet (`scripts/clippy_ratchet.txt` loses its two
+  `implied_volatility` entries).
 
 ### Changed
 
