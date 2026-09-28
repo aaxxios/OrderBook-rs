@@ -383,3 +383,102 @@ fn test_tokio_dropped_manager_keeps_processing_removed_book_until_it_drops() {
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
     ));
 }
+
+// ─── Stop overlapping concurrent trading: nothing is lost (#255 review) ─────
+
+const STRESS_THREADS: usize = 4;
+const STRESS_TRADES_PER_THREAD: usize = 500;
+
+/// Take `STRESS_THREADS` books out of the manager so other threads can trade
+/// on them while the manager (still owning the processor) is stopped.
+fn stress_books<M: BookManager<()>>(mgr: &mut M) -> Vec<OrderBook<()>> {
+    (0..STRESS_THREADS)
+        .map(|i| {
+            let symbol = format!("STRESS-{i}");
+            mgr.add_book(&symbol).expect("add book");
+            mgr.remove_book(&symbol).expect("removed book")
+        })
+        .collect()
+}
+
+/// Trade on every book from its own thread, released together by `barrier`.
+fn spawn_traders(
+    books: Vec<OrderBook<()>>,
+    barrier: &Arc<std::sync::Barrier>,
+) -> Vec<std::thread::JoinHandle<()>> {
+    books
+        .into_iter()
+        .map(|book| {
+            let barrier = Arc::clone(barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..STRESS_TRADES_PER_THREAD {
+                    trade_once(&book);
+                }
+            })
+        })
+        .collect()
+}
+
+fn counting_handler() -> (Arc<AtomicUsize>, impl FnMut(TradeEvent) + Send + 'static) {
+    let processed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&processed);
+    (processed, move |_event: TradeEvent| {
+        counter.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+#[test]
+fn test_std_stop_during_concurrent_trading_processes_or_counts_every_event() {
+    let mut mgr: BookManagerStd<()> = BookManagerStd::new();
+    let books = stress_books(&mut mgr);
+    let (processed, handler) = counting_handler();
+    mgr.start_trade_processor_with(handler).expect("start");
+
+    let barrier = Arc::new(std::sync::Barrier::new(STRESS_THREADS + 1));
+    let traders = spawn_traders(books, &barrier);
+    barrier.wait();
+    mgr.stop_trade_processor().expect("clean stop");
+    for trader in traders {
+        trader.join().expect("trader thread");
+    }
+
+    let sent = (STRESS_THREADS * STRESS_TRADES_PER_THREAD) as u64;
+    let processed = processed.load(Ordering::Relaxed) as u64;
+    assert_eq!(
+        processed + mgr.dropped_trade_events(),
+        sent,
+        "every event is processed or counted (processed={processed})"
+    );
+}
+
+#[test]
+fn test_tokio_stop_during_concurrent_trading_processes_or_counts_every_event() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("runtime");
+    let mut mgr: BookManagerTokio<()> = BookManagerTokio::new();
+    let books = stress_books(&mut mgr);
+    let (processed, handler) = counting_handler();
+    mgr.start_trade_processor_on(runtime.handle(), handler)
+        .expect("start");
+
+    let barrier = Arc::new(std::sync::Barrier::new(STRESS_THREADS + 1));
+    let traders = spawn_traders(books, &barrier);
+    barrier.wait();
+    runtime
+        .block_on(mgr.stop_trade_processor())
+        .expect("clean stop");
+    for trader in traders {
+        trader.join().expect("trader thread");
+    }
+
+    let sent = (STRESS_THREADS * STRESS_TRADES_PER_THREAD) as u64;
+    let processed = processed.load(Ordering::Relaxed) as u64;
+    assert_eq!(
+        processed + mgr.dropped_trade_events(),
+        sent,
+        "every event is processed or counted (processed={processed})"
+    );
+}

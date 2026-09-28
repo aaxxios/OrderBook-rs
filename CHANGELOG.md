@@ -428,7 +428,11 @@ change.
     processor is `ManagerError::ProcessorPanicked { message }`, a cancelled
     Tokio task `ManagerError::ProcessorCancelled`, and a call with nothing
     running `ManagerError::ProcessorNotRunning`. A stopped processor cannot
-    be restarted (`ProcessorAlreadyStarted`).
+    be restarted (`ProcessorAlreadyStarted`). Trading that overlaps the
+    stop (a removed book on another thread) loses nothing: every trade
+    event is either handled or counted as dropped. `BookManagerStd` closes
+    producer admission and waits for in-flight sends before the final
+    drain; `BookManagerTokio` closes its receiver first.
   - New `dropped_trade_events()` counts trade events a listener could not
     deliver because the processor is gone; with the `metrics` feature each
     one also increments `orderbook_manager_trade_events_dropped_total`. The

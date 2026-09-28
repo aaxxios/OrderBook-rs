@@ -100,6 +100,86 @@ impl DropTracker {
     }
 }
 
+/// Producer admission gate for the `BookManagerStd` trade-event channel
+/// (#255).
+///
+/// A crossbeam channel cannot be closed from the receiving side while that
+/// side keeps draining, so without a gate a listener could `send`
+/// successfully after the stopping processor's last `try_recv` and have the
+/// event discarded, uncounted, when the receiver drops. Books can be shared
+/// across threads (a removed book keeps its listener), so this can overlap
+/// `stop_trade_processor`.
+///
+/// Protocol: a producer increments `in_flight`, then checks `closed`; stop
+/// sets `closed`, then waits for `in_flight` to reach zero, and only then
+/// tells the processor to drain. Both sides use `SeqCst`, so either the
+/// producer sees `closed` (and counts its event as dropped) or stop sees
+/// the producer in flight and waits until its `send` is done (and the drain
+/// then receives it). Every event is processed or counted, never lost.
+/// Producers never block; stop waits only for sends already under way,
+/// each of which is non-blocking (the channel is unbounded).
+#[derive(Debug, Default)]
+struct StdAdmission {
+    /// Producers currently between `enter` and the end of their `send`.
+    in_flight: AtomicU64,
+    /// Set once by `stop_trade_processor`; never cleared.
+    closed: AtomicBool,
+}
+
+/// Proof that a producer was admitted. Leaving on drop keeps `in_flight`
+/// balanced on every path out of the listener.
+struct AdmissionGuard<'a> {
+    in_flight: &'a AtomicU64,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // Checked: `enter` incremented before creating the guard, so this
+        // never underflows; `fetch_update` stores nothing if it would.
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            });
+    }
+}
+
+impl StdAdmission {
+    /// Enter the send section. `None` when stop has closed admission (or,
+    /// unreachably, `in_flight` would overflow): the caller counts the
+    /// event as dropped instead of sending it.
+    #[inline]
+    fn enter(&self) -> Option<AdmissionGuard<'_>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.in_flight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .ok()?;
+        let guard = AdmissionGuard {
+            in_flight: &self.in_flight,
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            // Stop closed admission after the fast-path check; `guard`
+            // drops here and leaves the section.
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Close admission for good and wait until every admitted producer has
+    /// finished its `send`. Afterwards no event can enter the channel.
+    fn close_and_quiesce(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// Build the event a manager's trade listener forwards to its processor.
 #[inline]
 fn trade_event_from(trade_result: &TradeResult) -> TradeEvent {
@@ -156,9 +236,10 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// Body of the `BookManagerStd` trade processor thread.
 ///
 /// Waits on the trade-event channel and the out-of-band stop signal at
-/// once. On the stop signal it handles every event already queued, then
-/// returns (dropping the receiver, so later sends fail and are counted as
-/// dropped). If the stop sender is dropped instead (the manager was dropped
+/// once. `stop_trade_processor` closes producer admission and waits for
+/// in-flight sends before it signals (see [`StdAdmission`]), so on the stop
+/// signal the channel holds every event that will ever reach it: the
+/// thread handles them all, then returns. If the stop sender is dropped instead (the manager was dropped
 /// without `stop_trade_processor`), it keeps handling events until every
 /// trade-event sender is gone.
 fn run_std_processor<F>(events: StdEventReceiver, stop: StdStopReceiver, mut handler: F)
@@ -278,6 +359,8 @@ where
     processor: Option<std::thread::JoinHandle<()>>,
     /// Dropped-event accounting shared with every book's listener
     drops: Arc<DropTracker>,
+    /// Producer admission gate shared with every book's listener
+    admission: Arc<StdAdmission>,
 }
 
 impl<T> BookManagerStd<T>
@@ -295,6 +378,7 @@ where
             stop_signal: None,
             processor: None,
             drops: Arc::new(DropTracker::default()),
+            admission: Arc::new(StdAdmission::default()),
         }
     }
 
@@ -399,12 +483,15 @@ where
 
     /// Stop the trade processor and join its thread.
     ///
-    /// Sends an out-of-band stop signal; the processor handles every trade
-    /// event already queued in the channel, then exits. Blocks the calling thread until then. Once it
-    /// has returned, trade events from the managed books are no longer
-    /// processed: they are counted in
-    /// [`dropped_trade_events`](Self::dropped_trade_events). The processor
-    /// cannot be started again.
+    /// Closes producer admission, waits for listener sends already under
+    /// way to finish, then sends an out-of-band stop signal; the processor
+    /// handles every trade event in the channel, then exits. Blocks the
+    /// calling thread until then. From the moment admission closes, trade
+    /// events (from managed books, or a removed book trading on another
+    /// thread) are no longer queued: they are counted in
+    /// [`dropped_trade_events`](Self::dropped_trade_events). So every trade
+    /// event is either handled or counted, even when trading overlaps the
+    /// stop. The processor cannot be started again.
     ///
     /// # Errors
     ///
@@ -418,6 +505,10 @@ where
             .processor
             .take()
             .ok_or(ManagerError::ProcessorNotRunning)?;
+
+        // No event may enter the channel once the processor has been told
+        // to drain it: close admission and let in-flight sends finish first.
+        self.admission.close_and_quiesce();
 
         let signalled = self
             .stop_signal
@@ -576,9 +667,16 @@ where
 
         let sender = self.trade_sender.clone();
         let drops = Arc::clone(&self.drops);
+        let admission = Arc::clone(&self.admission);
         let symbol_clone = symbol.to_string();
 
         let trade_listener: TradeListener = Arc::new(move |trade_result: &TradeResult| {
+            // Held until the send below is done, so a concurrent stop waits
+            // for it (see `StdAdmission`).
+            let Some(_admitted) = admission.enter() else {
+                drops.record_drop(&symbol_clone);
+                return;
+            };
             if sender.send(trade_event_from(trade_result)).is_err() {
                 drops.record_drop(&symbol_clone);
             }
@@ -815,8 +913,12 @@ where
     /// channel, handles every event already queued, then exits. Once the
     /// channel is closed, trade events from the managed books are no longer
     /// processed: they are counted in
-    /// [`dropped_trade_events`](Self::dropped_trade_events). The processor
-    /// cannot be started again.
+    /// [`dropped_trade_events`](Self::dropped_trade_events). Tokio's
+    /// `UnboundedReceiver::close` is atomic with respect to concurrent
+    /// sends (a send either lands before the close and is drained, or
+    /// fails and is counted), so every trade event is handled or counted
+    /// even when trading overlaps the stop, without the producer admission
+    /// gate `BookManagerStd` needs. The processor cannot be started again.
     ///
     /// Not cancel-safe: if this future is dropped before it completes, the
     /// stop signal has been sent and the task still exits, but its
