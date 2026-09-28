@@ -3,14 +3,16 @@
 //! This module provides a numerical solver to find the implied volatility
 //! that makes the Black-Scholes price equal to the observed market price.
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
 use super::black_scholes::BlackScholes;
 use super::error::IVError;
 use super::types::IVParams;
 
 /// Configuration for the Newton-Raphson solver.
+///
+/// Fields are public and the builders are infallible; every solve entry point
+/// ([`solve_iv`], [`solve_iv_bisection`] and the `OrderBook` IV methods) calls
+/// [`SolverConfig::validate`] first and returns [`IVError::InvalidConfig`] for
+/// an out-of-domain configuration instead of panicking.
 #[derive(Debug, Clone)]
 pub struct SolverConfig {
     /// Maximum iterations before giving up.
@@ -69,11 +71,77 @@ impl SolverConfig {
     }
 
     /// Sets the IV bounds.
+    ///
+    /// Not validated here; [`SolverConfig::validate`] (run by every solver
+    /// entry point) rejects `min_iv > max_iv`, a non-positive `min_iv` and
+    /// non-finite bounds.
     #[must_use]
     pub fn with_bounds(mut self, min_iv: f64, max_iv: f64) -> Self {
         self.min_iv = min_iv;
         self.max_iv = max_iv;
         self
+    }
+
+    /// Validates the configuration.
+    ///
+    /// Constraints:
+    /// - `max_iterations > 0`
+    /// - `tolerance` finite and `> 0`
+    /// - `initial_guess` finite (it is clamped into the bounds before use)
+    /// - `min_iv` finite and `> 0`
+    /// - `max_iv` finite and `>= min_iv`
+    /// - `min_vega` finite and `>= 0`
+    ///
+    /// # Errors
+    ///
+    /// [`IVError::InvalidConfig`] naming the first offending field.
+    pub fn validate(&self) -> Result<(), IVError> {
+        if self.max_iterations == 0 {
+            return Err(IVError::invalid_config(
+                "max_iterations",
+                "must be greater than zero".to_string(),
+            ));
+        }
+        if !(self.tolerance.is_finite() && self.tolerance > 0.0) {
+            return Err(IVError::invalid_config(
+                "tolerance",
+                format!("must be finite and positive, got {}", self.tolerance),
+            ));
+        }
+        if !self.initial_guess.is_finite() {
+            return Err(IVError::invalid_config(
+                "initial_guess",
+                format!("must be finite, got {}", self.initial_guess),
+            ));
+        }
+        if !(self.min_iv.is_finite() && self.min_iv > 0.0) {
+            return Err(IVError::invalid_config(
+                "min_iv",
+                format!("must be finite and positive, got {}", self.min_iv),
+            ));
+        }
+        if !self.max_iv.is_finite() {
+            return Err(IVError::invalid_config(
+                "max_iv",
+                format!("must be finite, got {}", self.max_iv),
+            ));
+        }
+        if self.min_iv > self.max_iv {
+            return Err(IVError::invalid_config(
+                "min_iv",
+                format!(
+                    "must not exceed max_iv, got min_iv={} > max_iv={}",
+                    self.min_iv, self.max_iv
+                ),
+            ));
+        }
+        if !(self.min_vega.is_finite() && self.min_vega >= 0.0) {
+            return Err(IVError::invalid_config(
+                "min_vega",
+                format!("must be finite and non-negative, got {}", self.min_vega),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -174,9 +242,11 @@ fn smart_initial_guess(params: &IVParams, market_price: f64) -> f64 {
 ///
 /// # Errors
 ///
+/// - [`IVError::InvalidConfig`] if `config` fails [`SolverConfig::validate`].
 /// - [`IVError::InvalidParams`] if `spot`, `strike`, `time_to_expiry`,
-///   `risk_free_rate`, or `market_price` is non-finite or non-positive, or if a
-///   value becomes non-finite mid-iteration.
+///   `risk_free_rate`, or `market_price` is non-finite or non-positive.
+/// - [`IVError::NonFiniteResult`] if a Black-Scholes evaluation overflows
+///   mid-iteration.
 /// - [`IVError::TimeToExpiryTooSmall`] if `time_to_expiry` is below the
 ///   numerical-stability minimum.
 /// - [`IVError::PriceBelowIntrinsic`] if `market_price` is below the option's
@@ -203,7 +273,9 @@ pub fn solve_iv(
     market_price: f64,
     config: &SolverConfig,
 ) -> Result<(f64, u32), IVError> {
-    // Validate inputs
+    // Validate inputs. The config check must come first: `f64::clamp` below
+    // panics on `min_iv > max_iv` or a NaN bound.
+    config.validate()?;
     validate_params(params)?;
 
     if !market_price.is_finite() || market_price <= 0.0 {
@@ -231,20 +303,13 @@ pub fn solve_iv(
     // Clamp initial guess to bounds
     iv = iv.clamp(config.min_iv, config.max_iv);
 
-    // Newton-Raphson iteration
-    for iteration in 0..config.max_iterations {
-        let price = BlackScholes::price(params, iv);
-
-        // Inputs are validated finite, so a non-finite price/iv here means the
-        // iteration degenerated numerically. Bail with a typed error instead of
-        // letting NaN poison `iv` and surface as `ConvergenceFailure { last_iv: NaN }`.
-        if !price.is_finite() || !iv.is_finite() {
-            return Err(IVError::InvalidParams {
-                message: format!(
-                    "non-finite value during Newton iteration (iv={iv}, price={price})"
-                ),
-            });
-        }
+    // Newton-Raphson iteration. `iterations` counts 1..=max_iterations so the
+    // reported count needs no arithmetic.
+    for iterations in 1..=config.max_iterations {
+        // `iv` stays in `[min_iv, max_iv]` (validated finite, `min_iv > 0`), so
+        // `price` only fails on a genuine overflow, reported as
+        // `NonFiniteResult` instead of letting NaN poison `iv`.
+        let price = BlackScholes::price(params, iv)?;
 
         let diff = price - market_price;
 
@@ -258,10 +323,10 @@ pub fn solve_iv(
                     max_bound: config.max_iv,
                 });
             }
-            return Ok((iv, iteration + 1));
+            return Ok((iv, iterations));
         }
 
-        let vega = BlackScholes::vega(params, iv);
+        let vega = BlackScholes::vega(params, iv)?;
 
         // Handle near-zero vega (can happen for deep ITM/OTM or near expiry)
         if vega.abs() < config.min_vega {
@@ -310,6 +375,8 @@ pub fn solve_iv(
 ///
 /// # Errors
 ///
+/// - [`IVError::InvalidConfig`] if `config` fails [`SolverConfig::validate`].
+/// - [`IVError::NonFiniteResult`] if a Black-Scholes evaluation overflows.
 /// - [`IVError::InvalidParams`] if `spot`, `strike`, `time_to_expiry`,
 ///   `risk_free_rate`, or `market_price` is non-finite or non-positive.
 /// - [`IVError::TimeToExpiryTooSmall`] if `time_to_expiry` is below the
@@ -325,6 +392,7 @@ pub fn solve_iv_bisection(
     market_price: f64,
     config: &SolverConfig,
 ) -> Result<(f64, u32), IVError> {
+    config.validate()?;
     validate_params(params)?;
 
     if !market_price.is_finite() || market_price <= 0.0 {
@@ -345,8 +413,8 @@ pub fn solve_iv_bisection(
     let mut high = config.max_iv;
 
     // Verify solution exists in bounds
-    let price_low = BlackScholes::price(params, low);
-    let price_high = BlackScholes::price(params, high);
+    let price_low = BlackScholes::price(params, low)?;
+    let price_high = BlackScholes::price(params, high)?;
 
     if market_price < price_low || market_price > price_high {
         return Err(IVError::VolatilityOutOfBounds {
@@ -360,13 +428,13 @@ pub fn solve_iv_bisection(
         });
     }
 
-    for iteration in 0..config.max_iterations {
+    for iterations in 1..=config.max_iterations {
         let mid = (low + high) / 2.0;
-        let price = BlackScholes::price(params, mid);
+        let price = BlackScholes::price(params, mid)?;
         let diff = price - market_price;
 
         if diff.abs() < config.tolerance || (high - low) < config.tolerance {
-            return Ok((mid, iteration + 1));
+            return Ok((mid, iterations));
         }
 
         if diff > 0.0 {
@@ -392,7 +460,7 @@ mod tests {
     fn test_solve_iv_atm_call() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
         let target_vol = 0.25;
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, iterations) = solve_iv(&params, market_price, &config).unwrap();
@@ -405,7 +473,7 @@ mod tests {
     fn test_solve_iv_atm_put() {
         let params = IVParams::put(100.0, 100.0, 0.25, 0.05);
         let target_vol = 0.30;
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
@@ -417,7 +485,7 @@ mod tests {
     fn test_solve_iv_itm_call() {
         let params = IVParams::call(110.0, 100.0, 0.25, 0.05);
         let target_vol = 0.20;
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
@@ -429,7 +497,7 @@ mod tests {
     fn test_solve_iv_otm_call() {
         let params = IVParams::call(90.0, 100.0, 0.25, 0.05);
         let target_vol = 0.35;
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
@@ -441,7 +509,7 @@ mod tests {
     fn test_solve_iv_high_volatility() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.0);
         let target_vol = 1.5; // 150% volatility
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
@@ -453,7 +521,7 @@ mod tests {
     fn test_solve_iv_low_volatility() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.0);
         let target_vol = 0.05; // 5% volatility
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
@@ -560,7 +628,7 @@ mod tests {
     fn test_solve_iv_bisection() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
         let target_vol = 0.25;
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (iv, _) = solve_iv_bisection(&params, market_price, &config).unwrap();
@@ -587,7 +655,7 @@ mod tests {
     fn test_smart_initial_guess() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.0);
         // Price for 25% vol ATM option
-        let market_price = BlackScholes::price(&params, 0.25);
+        let market_price = BlackScholes::price(&params, 0.25).unwrap();
 
         let guess = smart_initial_guess(&params, market_price);
         // Should be reasonably close to actual vol
@@ -598,7 +666,7 @@ mod tests {
     fn test_convergence_speed() {
         let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
         let target_vol = 0.25;
-        let market_price = BlackScholes::price(&params, target_vol);
+        let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
         let config = SolverConfig::default();
         let (_, iterations) = solve_iv(&params, market_price, &config).unwrap();
@@ -616,7 +684,7 @@ mod tests {
         for days in [7, 30, 90, 180, 365] {
             let time = days as f64 / 365.0;
             let params = IVParams::call(100.0, 100.0, time, 0.05);
-            let market_price = BlackScholes::price(&params, target_vol);
+            let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
             let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
             assert!(
@@ -635,7 +703,7 @@ mod tests {
         // Test different moneyness levels
         for strike in [80, 90, 100, 110, 120] {
             let params = IVParams::call(100.0, strike as f64, 0.25, 0.05);
-            let market_price = BlackScholes::price(&params, target_vol);
+            let market_price = BlackScholes::price(&params, target_vol).unwrap();
 
             let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
             assert!(
@@ -643,6 +711,149 @@ mod tests {
                 "Failed for strike {}",
                 strike
             );
+        }
+    }
+
+    /// Configurations that used to reach `f64::clamp` with invalid bounds (a
+    /// panic) or otherwise break the solver; each must be `InvalidConfig`.
+    fn invalid_configs() -> Vec<(&'static str, SolverConfig)> {
+        let base = SolverConfig::default;
+        vec![
+            ("min_iv", base().with_bounds(3.0, 1.0)),
+            ("min_iv", base().with_bounds(f64::NAN, 1.0)),
+            ("max_iv", base().with_bounds(0.01, f64::NAN)),
+            ("max_iv", base().with_bounds(0.01, f64::INFINITY)),
+            ("min_iv", base().with_bounds(f64::NEG_INFINITY, 1.0)),
+            ("min_iv", base().with_bounds(0.0, 1.0)),
+            ("min_iv", base().with_bounds(-0.5, 1.0)),
+            ("tolerance", base().with_tolerance(0.0)),
+            ("tolerance", base().with_tolerance(-1e-8)),
+            ("tolerance", base().with_tolerance(f64::NAN)),
+            ("tolerance", base().with_tolerance(f64::INFINITY)),
+            ("max_iterations", base().with_max_iterations(0)),
+            ("initial_guess", base().with_initial_guess(f64::NAN)),
+            ("initial_guess", base().with_initial_guess(f64::INFINITY)),
+            (
+                "min_vega",
+                SolverConfig {
+                    min_vega: -1.0,
+                    ..base()
+                },
+            ),
+            (
+                "min_vega",
+                SolverConfig {
+                    min_vega: f64::NAN,
+                    ..base()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_solver_config_validate_default_ok() {
+        assert!(SolverConfig::default().validate().is_ok());
+        // Degenerate but valid: a single-point interval.
+        assert!(
+            SolverConfig::default()
+                .with_bounds(0.3, 0.3)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_invalid_configs_return_invalid_config_and_never_panic() {
+        let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
+        let market_price = BlackScholes::price(&params, 0.25).unwrap();
+        for (field, config) in invalid_configs() {
+            match config.validate() {
+                Err(IVError::InvalidConfig { field: got, .. }) => {
+                    assert_eq!(got, field, "config {config:?}");
+                }
+                other => panic!("config {config:?}: expected InvalidConfig, got {other:?}"),
+            }
+            let newton = solve_iv(&params, market_price, &config);
+            assert!(
+                matches!(newton, Err(IVError::InvalidConfig { .. })),
+                "solve_iv {config:?}: got {newton:?}"
+            );
+            let bisect = solve_iv_bisection(&params, market_price, &config);
+            assert!(
+                matches!(bisect, Err(IVError::InvalidConfig { .. })),
+                "solve_iv_bisection {config:?}: got {bisect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_point_bounds_do_not_panic() {
+        let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
+        let market_price = BlackScholes::price(&params, 0.3).unwrap();
+        let config = SolverConfig::default().with_bounds(0.3, 0.3);
+        let (iv, _) = solve_iv(&params, market_price, &config).unwrap();
+        assert!((iv - 0.3).abs() < TOLERANCE);
+    }
+
+    #[test]
+    fn test_max_iterations_u32_max_reports_count_without_overflow() {
+        let params = IVParams::call(100.0, 100.0, 0.25, 0.05);
+        let market_price = BlackScholes::price(&params, 0.25).unwrap();
+        let config = SolverConfig::default().with_max_iterations(u32::MAX);
+        let (_, iterations) = solve_iv(&params, market_price, &config).unwrap();
+        assert!((1..=10).contains(&iterations));
+
+        // One iteration budget: the reported count is exactly the budget.
+        let config = SolverConfig::default().with_max_iterations(1);
+        match solve_iv(&params, market_price * 1.5, &config) {
+            Ok((_, n)) => assert_eq!(n, 1),
+            Err(IVError::ConvergenceFailure { iterations, .. }) => assert_eq!(iterations, 1),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_solvers_edge_floats_never_panic() {
+        let edge = [
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+            -1.0,
+            0.25,
+            100.0,
+        ];
+        for &a in &edge {
+            for &b in &edge {
+                let params = IVParams::call(a.abs() + 1.0, 100.0, 0.25, b);
+                let config = SolverConfig {
+                    min_iv: a,
+                    max_iv: b,
+                    tolerance: b,
+                    initial_guess: a,
+                    ..SolverConfig::default()
+                };
+                for price in edge {
+                    for result in [
+                        solve_iv(&params, price, &config),
+                        solve_iv_bisection(&params, price, &config),
+                        solve_iv(&params, price, &SolverConfig::default()),
+                        solve_iv_bisection(&params, price, &SolverConfig::default()),
+                    ] {
+                        match result {
+                            Ok((iv, _)) => assert!(iv.is_finite()),
+                            Err(IVError::ConvergenceFailure { last_iv, .. }) => {
+                                assert!(last_iv.is_finite());
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -64,6 +64,14 @@
 //!   at extreme prices. Such admissions are now rejected with the existing
 //!   typed risk errors. Release-side underflows are logged and counted in
 //!   `OrderBook::risk_accounting_anomalies`.
+//! - **Implied-volatility inputs are validated (#256).** `SolverConfig::validate`
+//!   and `IVConfig::validate` run at every solve entry point, so an inverted
+//!   or NaN IV bound, a zero tolerance or a bad `price_scale` returns
+//!   `IVError::InvalidConfig` instead of panicking in `f64::clamp`.
+//!   Black-Scholes and the Greeks return `Result<f64, IVError>` and never hand
+//!   back NaN or infinity. `IVError` is `#[non_exhaustive]` and gains
+//!   `InvalidConfig`, `NonFiniteResult`, `ArithmeticOverflow` and
+//!   `PriceLevel`.
 //!
 //! ### Migration from 0.13
 //!
@@ -78,6 +86,13 @@
 //! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
+//! | `BlackScholes::{price, vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
+//! | `BlackScholes::d1(spot, strike, rate, time, vol) -> f64` | `-> Result<f64, IVError>` |
+//! | `BlackScholes::d2(d1, vol, time) -> f64` | `-> Result<f64, IVError>` |
+//! | `OrderBook::theoretical_price(params, vol) -> f64` | `-> Result<f64, IVError>` |
+//! | `OrderBook::option_{vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
+//! | `IVError` (exhaustive) | `#[non_exhaustive]`; adds `InvalidConfig`, `NonFiniteResult`, `ArithmeticOverflow`, `PriceLevel` |
+//! | `solve_iv` / `solve_iv_bisection` / `implied_volatility*` accept any config | reject an invalid config with `IVError::InvalidConfig` |
 //!
 //! Re-exported pricelevel items change with pricelevel 0.10:
 //! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

@@ -1,14 +1,20 @@
 //! Error types for implied volatility calculation.
 
-use std::fmt;
+use pricelevel::PriceLevelError;
 
 /// Errors specific to IV calculation.
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`: new failure modes may be added in a minor release, so
+/// exhaustive `match`es outside this crate need a wildcard arm.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum IVError {
     /// No valid price available (empty book or no bid/ask).
+    #[error("no valid price available from order book")]
     NoPriceAvailable,
 
     /// Spread too wide for reliable calculation.
+    #[error("spread too wide: {spread_bps:.1} bps exceeds threshold of {threshold_bps:.1} bps")]
     SpreadTooWide {
         /// Current spread in basis points.
         spread_bps: f64,
@@ -18,6 +24,7 @@ pub enum IVError {
 
     /// The book is crossed (best ask below best bid) or locked (best ask equal
     /// to best bid), so no meaningful mid price exists for IV calculation.
+    #[error("book is crossed or locked: best bid {bid:.4} is not below best ask {ask:.4}")]
     CrossedBook {
         /// Best bid price (scaled to f64).
         bid: f64,
@@ -26,6 +33,7 @@ pub enum IVError {
     },
 
     /// Newton-Raphson solver did not converge within max iterations.
+    #[error("solver did not converge after {iterations} iterations, last IV: {last_iv:.4}")]
     ConvergenceFailure {
         /// Number of iterations attempted.
         iterations: u32,
@@ -34,12 +42,54 @@ pub enum IVError {
     },
 
     /// Invalid input parameters for IV calculation.
+    #[error("invalid parameters: {message}")]
     InvalidParams {
         /// Description of the invalid parameter.
         message: String,
     },
 
+    /// A solver or IV configuration field ([`SolverConfig`] /
+    /// [`IVConfig`]) is out of its valid domain (non-finite, non-positive,
+    /// or `min_iv > max_iv`).
+    ///
+    /// Returned by `SolverConfig::validate` / `IVConfig::validate`, which every
+    /// solve entry point calls before touching the configuration.
+    ///
+    /// [`SolverConfig`]: super::SolverConfig
+    /// [`IVConfig`]: super::IVConfig
+    #[error("invalid configuration: {field}: {message}")]
+    InvalidConfig {
+        /// Name of the offending configuration field.
+        field: &'static str,
+        /// Description of the constraint that was violated, including the value.
+        message: String,
+    },
+
+    /// A pricing computation produced a non-finite (NaN or infinite) result
+    /// from finite, in-domain inputs (for example an overflowing discount
+    /// factor with an extreme `risk_free_rate`).
+    #[error("{operation} produced a non-finite result: {value}")]
+    NonFiniteResult {
+        /// The computation that produced the value (e.g. `"price"`, `"vega"`).
+        operation: &'static str,
+        /// The offending non-finite value.
+        value: f64,
+    },
+
+    /// An integer aggregate used while extracting a price overflowed.
+    #[error("arithmetic overflow in {operation}")]
+    ArithmeticOverflow {
+        /// The computation that overflowed.
+        operation: &'static str,
+    },
+
+    /// Reading a price level from the book failed (for example the level's
+    /// total quantity overflows `u64`).
+    #[error("price level error: {0}")]
+    PriceLevel(#[from] PriceLevelError),
+
     /// Price is below intrinsic value (indicates arbitrage opportunity).
+    #[error("price {price:.4} is below intrinsic value {intrinsic:.4}")]
     PriceBelowIntrinsic {
         /// Market price observed.
         price: f64,
@@ -48,6 +98,7 @@ pub enum IVError {
     },
 
     /// Time to expiry is too small for reliable calculation.
+    #[error("time to expiry {time_to_expiry:.6} years is below minimum {min_time:.6} years")]
     TimeToExpiryTooSmall {
         /// Time to expiry in years.
         time_to_expiry: f64,
@@ -56,6 +107,7 @@ pub enum IVError {
     },
 
     /// Volatility is outside reasonable bounds.
+    #[error("volatility {volatility:.4} is outside bounds [{min_bound:.4}, {max_bound:.4}]")]
     VolatilityOutOfBounds {
         /// Calculated volatility.
         volatility: f64,
@@ -66,69 +118,28 @@ pub enum IVError {
     },
 }
 
-impl fmt::Display for IVError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IVError::NoPriceAvailable => {
-                write!(f, "no valid price available from order book")
-            }
-            IVError::SpreadTooWide {
-                spread_bps,
-                threshold_bps,
-            } => {
-                write!(
-                    f,
-                    "spread too wide: {spread_bps:.1} bps exceeds threshold of {threshold_bps:.1} bps"
-                )
-            }
-            IVError::CrossedBook { bid, ask } => {
-                write!(
-                    f,
-                    "book is crossed or locked: best bid {bid:.4} is not below best ask {ask:.4}"
-                )
-            }
-            IVError::ConvergenceFailure {
-                iterations,
-                last_iv,
-            } => {
-                write!(
-                    f,
-                    "solver did not converge after {iterations} iterations, last IV: {last_iv:.4}"
-                )
-            }
-            IVError::InvalidParams { message } => {
-                write!(f, "invalid parameters: {message}")
-            }
-            IVError::PriceBelowIntrinsic { price, intrinsic } => {
-                write!(
-                    f,
-                    "price {price:.4} is below intrinsic value {intrinsic:.4}"
-                )
-            }
-            IVError::TimeToExpiryTooSmall {
-                time_to_expiry,
-                min_time,
-            } => {
-                write!(
-                    f,
-                    "time to expiry {time_to_expiry:.6} years is below minimum {min_time:.6} years"
-                )
-            }
-            IVError::VolatilityOutOfBounds {
-                volatility,
-                min_bound,
-                max_bound,
-            } => {
-                write!(
-                    f,
-                    "volatility {volatility:.4} is outside bounds [{min_bound:.4}, {max_bound:.4}]"
-                )
-            }
-        }
+impl IVError {
+    /// Builds an [`IVError::InvalidConfig`].
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_config(field: &'static str, message: String) -> Self {
+        IVError::InvalidConfig { field, message }
+    }
+
+    /// Builds an [`IVError::InvalidParams`].
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_params(message: String) -> Self {
+        IVError::InvalidParams { message }
+    }
+
+    /// Builds an [`IVError::NonFiniteResult`].
+    #[cold]
+    #[must_use]
+    pub(crate) fn non_finite(operation: &'static str, value: f64) -> Self {
+        IVError::NonFiniteResult { operation, value }
     }
 }
-
-impl std::error::Error for IVError {}
 
 #[cfg(test)]
 mod tests {
@@ -180,5 +191,24 @@ mod tests {
             max_bound: 5.0,
         };
         assert!(err.to_string().contains("outside bounds"));
+
+        let err = IVError::invalid_config("min_iv", "must be <= max_iv".to_string());
+        assert_eq!(
+            err.to_string(),
+            "invalid configuration: min_iv: must be <= max_iv"
+        );
+
+        let err = IVError::non_finite("price", f64::INFINITY);
+        assert_eq!(err.to_string(), "price produced a non-finite result: inf");
+
+        let err = IVError::ArithmeticOverflow {
+            operation: "weighted mid total quantity",
+        };
+        assert!(err.to_string().contains("overflow"));
+
+        let err = IVError::from(PriceLevelError::InvalidOperation {
+            message: "price level total quantity overflow".to_string(),
+        });
+        assert!(err.to_string().starts_with("price level error:"));
     }
 }

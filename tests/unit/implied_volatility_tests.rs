@@ -192,20 +192,20 @@ fn test_theoretical_price_and_greeks() {
     let vol = 0.25;
 
     // Test theoretical price
-    let price = OrderBook::<()>::theoretical_price(&params, vol);
+    let price = OrderBook::<()>::theoretical_price(&params, vol).unwrap();
     assert!(price > 0.0);
 
     // Test Greeks
-    let delta = OrderBook::<()>::option_delta(&params, vol);
+    let delta = OrderBook::<()>::option_delta(&params, vol).unwrap();
     assert!(delta > 0.4 && delta < 0.6, "ATM call delta should be ~0.5");
 
-    let gamma = OrderBook::<()>::option_gamma(&params, vol);
+    let gamma = OrderBook::<()>::option_gamma(&params, vol).unwrap();
     assert!(gamma > 0.0, "Gamma should be positive");
 
-    let vega = OrderBook::<()>::option_vega(&params, vol);
+    let vega = OrderBook::<()>::option_vega(&params, vol).unwrap();
     assert!(vega > 0.0, "Vega should be positive");
 
-    let theta = OrderBook::<()>::option_theta(&params, vol);
+    let theta = OrderBook::<()>::option_theta(&params, vol).unwrap();
     assert!(theta < 0.0, "Theta should be negative for long options");
 }
 

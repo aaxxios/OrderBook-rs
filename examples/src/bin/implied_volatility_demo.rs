@@ -20,7 +20,7 @@ use orderbook_rs::{
     BlackScholes, IVConfig, IVError, IVParams, IVQuality, OrderBook, PriceSource, SolverConfig,
 };
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Fresh random order id (UUID v4).
 fn new_id() -> Id {
@@ -41,7 +41,9 @@ fn main() {
     demo_iv_quality();
 
     // Demo 4: Greeks calculation
-    demo_greeks_calculation();
+    if let Err(e) = demo_greeks_calculation() {
+        warn!("Greeks demo failed: {}", e);
+    }
 
     // Demo 5: Custom solver configuration
     demo_custom_solver();
@@ -256,7 +258,7 @@ fn demo_iv_quality() {
 }
 
 /// Demonstrates Greeks calculation using Black-Scholes.
-fn demo_greeks_calculation() {
+fn demo_greeks_calculation() -> Result<(), IVError> {
     info!("--- Demo 4: Greeks Calculation ---\n");
 
     // ATM call option
@@ -267,14 +269,14 @@ fn demo_greeks_calculation() {
     info!("");
 
     // Theoretical price
-    let price = OrderBook::<()>::theoretical_price(&call_params, vol);
+    let price = OrderBook::<()>::theoretical_price(&call_params, vol)?;
     info!("  Theoretical Price: ${:.4}", price);
 
     // Greeks
-    let delta = OrderBook::<()>::option_delta(&call_params, vol);
-    let gamma = OrderBook::<()>::option_gamma(&call_params, vol);
-    let vega = OrderBook::<()>::option_vega(&call_params, vol);
-    let theta = OrderBook::<()>::option_theta(&call_params, vol);
+    let delta = OrderBook::<()>::option_delta(&call_params, vol)?;
+    let gamma = OrderBook::<()>::option_gamma(&call_params, vol)?;
+    let vega = OrderBook::<()>::option_vega(&call_params, vol)?;
+    let theta = OrderBook::<()>::option_theta(&call_params, vol)?;
 
     info!("");
     info!("Greeks:");
@@ -296,8 +298,8 @@ fn demo_greeks_calculation() {
 
     // Compare call vs put
     let put_params = IVParams::put(100.0, 100.0, 90.0 / 365.0, 0.05);
-    let put_price = OrderBook::<()>::theoretical_price(&put_params, vol);
-    let put_delta = OrderBook::<()>::option_delta(&put_params, vol);
+    let put_price = OrderBook::<()>::theoretical_price(&put_params, vol)?;
+    let put_delta = OrderBook::<()>::option_delta(&put_params, vol)?;
 
     info!("ATM Put Option (same parameters):");
     info!("  Theoretical Price: ${:.4}", put_price);
@@ -310,6 +312,7 @@ fn demo_greeks_calculation() {
         100.0 - 100.0 * (-0.05 * 90.0 / 365.0_f64).exp()
     );
     info!("");
+    Ok(())
 }
 
 /// Demonstrates custom solver configuration.
@@ -437,6 +440,29 @@ fn demo_error_handling() {
         Ok(_) => info!("   Unexpected success"),
     }
 
+    // Error 4: Invalid solver configuration (min_iv > max_iv)
+    info!("");
+    info!("4. Invalid Solver Configuration:");
+    let bad_config = IVConfig::default()
+        .with_price_scale(100.0)
+        .with_solver(SolverConfig::default().with_bounds(3.0, 1.0));
+
+    match arb_book.implied_volatility_with_config(&params, PriceSource::MidPrice, &bad_config) {
+        Err(IVError::InvalidConfig { field, message }) => {
+            info!("   Error: InvalidConfig ({}: {})", field, message);
+        }
+        Err(e) => info!("   Error: {}", e),
+        Ok(_) => info!("   Unexpected success"),
+    }
+
+    // Error 5: Invalid Greeks input (zero strike)
+    info!("");
+    info!("5. Invalid Greeks Input:");
+    match OrderBook::<()>::option_delta(&IVParams::call(100.0, 0.0, 0.25, 0.05), 0.25) {
+        Err(e) => info!("   Error: {}", e),
+        Ok(delta) => info!("   Unexpected delta {:.4}", delta),
+    }
+
     info!("");
 }
 
@@ -480,7 +506,13 @@ fn demo_iv_surface() {
             let simulated_vol = base_vol + smile_adjustment + term_adjustment;
 
             // Calculate theoretical price with simulated vol
-            let price = BlackScholes::price(&params, simulated_vol);
+            let price = match BlackScholes::price(&params, simulated_vol) {
+                Ok(price) => price,
+                Err(_) => {
+                    print!("{:>10}", "N/A");
+                    continue;
+                }
+            };
 
             // Create order book with this price
             let book = OrderBook::<()>::new("TEMP");

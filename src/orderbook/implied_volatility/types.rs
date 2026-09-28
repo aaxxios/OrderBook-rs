@@ -125,8 +125,14 @@ impl IVParams {
     }
 
     /// Returns true if the option is at-the-money (within 0.1% of strike).
+    ///
+    /// Returns `false` when `strike` is not finite and strictly positive (the
+    /// relative distance is undefined), or when `spot` is not finite.
     #[must_use]
     pub fn is_atm(&self) -> bool {
+        if !(self.strike.is_finite() && self.strike > 0.0 && self.spot.is_finite()) {
+            return false;
+        }
         (self.spot - self.strike).abs() / self.strike < 0.001
     }
 
@@ -243,6 +249,43 @@ mod tests {
         assert!(params.is_atm());
         assert!(!params.is_itm());
         assert!(!params.is_otm());
+    }
+
+    #[test]
+    fn test_is_atm_guards_degenerate_strike() {
+        for strike in [0.0, -0.0, -100.0, f64::NAN, f64::INFINITY, 5e-324] {
+            let params = IVParams::call(0.0, strike, 0.25, 0.05);
+            // Subnormal strike is positive and finite: spot 0 is far from it
+            // relative to the strike, so still not ATM.
+            assert!(!params.is_atm(), "strike={strike}");
+        }
+        assert!(!IVParams::call(f64::NAN, 100.0, 0.25, 0.05).is_atm());
+        assert!(!IVParams::call(f64::INFINITY, 100.0, 0.25, 0.05).is_atm());
+    }
+
+    #[test]
+    fn test_iv_params_edge_floats_never_panic() {
+        let edge = [
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+        ];
+        for &spot in &edge {
+            for &strike in &edge {
+                for option_type in [OptionType::Call, OptionType::Put] {
+                    let params = IVParams::new(spot, strike, 0.25, 0.05, option_type);
+                    let _ = params.intrinsic_value();
+                    let _ = params.is_itm();
+                    let _ = params.is_atm();
+                    let _ = params.is_otm();
+                }
+            }
+        }
     }
 
     #[test]
