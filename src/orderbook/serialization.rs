@@ -739,7 +739,7 @@ mod tests {
             let mut mr = MatchResult::new(taker, Quantity::new(total));
             for i in 0..fills {
                 let maker = Id::from_uuid(Uuid::new_v4());
-                let trade = pricelevel::Trade::new(
+                let trade = pricelevel::Trade::with_timestamp(
                     Id::from_uuid(Uuid::new_v4()),
                     taker,
                     maker,
@@ -750,9 +750,10 @@ mod tests {
                     ),
                     Quantity::new(1),
                     Side::Buy,
+                    pricelevel::TimestampMs::new(1_700_000_000_000),
                 );
                 mr.add_trade(trade).expect("valid fill");
-                mr.add_filled_order_id(maker);
+                mr.add_filled_order_id(maker).expect("filled id");
             }
             TradeResult::new("BTC/USD".to_string(), mr)
         }
