@@ -1435,6 +1435,7 @@ pub mod wire;
 #[cfg(feature = "journal")]
 pub use orderbook::FileJournal;
 pub use orderbook::book::MAX_DEPTH_DISTRIBUTION_BINS;
+pub use orderbook::book::UNSTAMPED_ENGINE_SEQ;
 pub use orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChangedListener};
 pub use orderbook::clock::{Clock, MonotonicClock, StubClock};
 pub use orderbook::implied_volatility::{

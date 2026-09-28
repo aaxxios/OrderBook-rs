@@ -137,6 +137,15 @@ pub(crate) fn default_trade_id_namespace(symbol: &str) -> Uuid {
 /// input.
 pub const MAX_DEPTH_DISTRIBUTION_BINS: usize = 4_096;
 
+/// `engine_seq` carried by a caller-owned [`TradeResult`] whose trades
+/// committed after the book's `engine_seq` was exhausted (#250).
+///
+/// [`OrderBook::next_engine_seq`] never mints `u64::MAX` (the last
+/// mintable value is `u64::MAX - 1`), so this value is unambiguous: the
+/// trades are real, the result was returned to an `add_order_with_result`
+/// / `*_with_committed` caller, and no listener event was emitted for it.
+pub const UNSTAMPED_ENGINE_SEQ: u64 = u64::MAX;
+
 /// The OrderBook manages a collection of price levels for both bid and ask sides.
 /// It supports adding, cancelling, and matching orders with lock-free operations where possible.
 ///
@@ -976,9 +985,13 @@ where
     /// mintable value is `u64::MAX - 1`, after which the counter rests at
     /// `u64::MAX` and every call fails. The engine's own emission paths
     /// then stop publishing `TradeResult` / `PriceLevelChangedEvent`
-    /// (logged once at `ERROR`) rather than stamping a wrapped or repeated
-    /// sequence; the book itself keeps working. Snapshot restore rejects a
-    /// package whose `engine_seq` is already `u64::MAX`.
+    /// events to the listeners (logged once at `ERROR`) rather than
+    /// stamping a wrapped or repeated sequence; the book itself keeps
+    /// working. Event stamping never affects a caller-owned result: an
+    /// `add_order_with_result` / `*_with_committed` caller still receives
+    /// its committed fills, with `engine_seq` set to
+    /// [`UNSTAMPED_ENGINE_SEQ`]. Snapshot restore rejects a package whose
+    /// `engine_seq` is already `u64::MAX`.
     ///
     /// # Errors
     ///
@@ -4170,12 +4183,24 @@ where
                 return None;
             }
         };
-        // #250: an exhausted `engine_seq` suppresses the emission (logged
-        // once) instead of stamping a wrapped sequence; the trades are
-        // already committed, exactly like the pricing failure above.
-        trade_result.engine_seq = self.mint_event_seq()?;
-        if let Some(listener) = listener {
-            listener(&trade_result);
+        // #250: event stamping never affects the caller-owned result. With
+        // `engine_seq` exhausted only the listener emission is suppressed
+        // (logged once); the committed fills are still returned to an
+        // `add_order_with_result` / `*_with_committed` caller, stamped with
+        // the never-minted sentinel `u64::MAX`.
+        match self.mint_event_seq() {
+            Some(engine_seq) => {
+                trade_result.engine_seq = engine_seq;
+                if let Some(listener) = listener {
+                    listener(&trade_result);
+                }
+            }
+            None => {
+                trade_result.engine_seq = UNSTAMPED_ENGINE_SEQ;
+                if !want_result {
+                    return None;
+                }
+            }
         }
         Some(trade_result)
     }

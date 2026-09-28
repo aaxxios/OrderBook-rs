@@ -374,6 +374,77 @@ mod tests {
         assert_eq!(book.next_engine_seq().expect("mint"), 0);
     }
 
+    /// Book restored with `engine_seq` at `u64::MAX`-1, the last seq burnt,
+    /// a resting ask of 5 @ 100 and (optionally) a trade listener.
+    fn exhausted_book_with_ask(symbol: &str, trades: Option<Arc<Mutex<Vec<TradeResult>>>>) -> OrderBook<()> {
+        let mut book: OrderBook<()> = OrderBook::new(symbol);
+        if let Some(sink) = trades {
+            book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
+                sink.lock().expect("trade sink").push(trade.clone());
+            }));
+        }
+        let source: OrderBook<()> = OrderBook::new(symbol);
+        let mut package = source.create_snapshot_package(10).expect("package");
+        package.engine_seq = u64::MAX - 1;
+        book.restore_from_snapshot_package(package)
+            .expect("restore near the ceiling");
+        book.next_engine_seq().expect("burn the last seq");
+        book.add_limit_order(Id::from_u64(1), 100, 5, Side::Sell, TimeInForce::Gtc, None)
+            .expect("rest ask");
+        book
+    }
+
+    /// PR #287 review: event stamping never affects the caller-owned
+    /// result. With `engine_seq` exhausted, `add_order_with_result` still
+    /// returns its fills (stamped `UNSTAMPED_ENGINE_SEQ`) while the
+    /// listener event is suppressed.
+    #[test]
+    fn exhausted_engine_seq_still_returns_fills_to_add_order_with_result() {
+        let trades: Arc<Mutex<Vec<TradeResult>>> = Arc::new(Mutex::new(Vec::new()));
+        let book = exhausted_book_with_ask("SEQR", Some(Arc::clone(&trades)));
+
+        let (_, result) = book
+            .add_order_with_result(standard(2, 100, 5, Side::Buy))
+            .expect("crossing buy");
+        let result = result.expect("the committed fills are returned");
+        assert_eq!(result.match_result.trades().len(), 1, "one fill");
+        assert_eq!(result.engine_seq, crate::UNSTAMPED_ENGINE_SEQ);
+        assert!(trades.lock().expect("trade sink").is_empty(), "listener suppressed");
+        assert!(book.engine_seq_exhausted());
+        assert!(book.get_order(Id::from_u64(1)).is_none(), "maker filled");
+    }
+
+    /// Same guarantee on the `*_with_committed` failure path: an IOC whose
+    /// remainder cannot rest fails after real fills, and those fills are
+    /// still handed back with the error. No listener installed.
+    #[test]
+    fn exhausted_engine_seq_still_returns_committed_fills_on_failure() {
+        let book = exhausted_book_with_ask("SEQC", None);
+        let taker = OrderType::Standard {
+            id: Id::from_u64(2),
+            price: Price::new(100),
+            quantity: Quantity::new(10),
+            side: Side::Buy,
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(TS),
+            time_in_force: TimeInForce::Ioc,
+            extra_fields: (),
+        };
+        match book.add_order_with_committed(taker) {
+            Err(failure) => {
+                let committed = failure.committed.expect("committed fills returned");
+                assert_eq!(committed.match_result.trades().len(), 1);
+                assert_eq!(committed.engine_seq, crate::UNSTAMPED_ENGINE_SEQ);
+            }
+            Ok((_, Some(result))) => {
+                assert_eq!(result.match_result.trades().len(), 1);
+                assert_eq!(result.engine_seq, crate::UNSTAMPED_ENGINE_SEQ);
+            }
+            Ok((_, None)) => panic!("the committed fills were lost"),
+        }
+        assert!(book.get_order(Id::from_u64(1)).is_none(), "maker filled");
+    }
+
     // ---- tranche representability / aggregate refresh ------------------
 
     #[test]
