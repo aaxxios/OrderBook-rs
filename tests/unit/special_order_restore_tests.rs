@@ -128,7 +128,7 @@ fn test_restore_reregisters_trailing_stop_and_reprices_issue_194() {
     // Market book: best bid 110 only.
     let market = OrderBook::<()>::new("TS/USD");
     let _ = market.add_limit_order(Id::from_u64(1), 110, 10, Side::Buy, TimeInForce::Gtc, None);
-    let market_snapshot = market.create_snapshot(usize::MAX);
+    let market_snapshot = market.create_snapshot(usize::MAX).expect("snapshot");
 
     // Stop book: a lone Sell trailing stop resting at 100 (empty book, so no
     // crossing on admission). Watermark 90, trail 5.
@@ -147,7 +147,7 @@ fn test_restore_reregisters_trailing_stop_and_reprices_issue_194() {
             extra_fields: (),
         })
         .expect("lone trailing stop rests");
-    let stop_snapshot = stop_book.create_snapshot(usize::MAX);
+    let stop_snapshot = stop_book.create_snapshot(usize::MAX).expect("snapshot");
 
     // Merge: bid 110 from the market book, the Sell stop at 100 from the stop
     // book — a book that could not be built through live matching but is a valid
@@ -256,7 +256,7 @@ fn test_restore_no_special_orders_leaves_tracker_empty_issue_194() {
 fn test_restore_special_order_snapshot_round_trip_holds_issue_194() {
     let pegged_id = Id::from_u64(1000);
     let book = book_with_passive_pegged(pegged_id);
-    let original = book.create_snapshot(usize::MAX);
+    let original = book.create_snapshot(usize::MAX).expect("snapshot");
 
     let mut restored = OrderBook::<()>::new("PEG/USD");
     let json = book.snapshot_to_json(usize::MAX).expect("snapshot json");
@@ -264,7 +264,7 @@ fn test_restore_special_order_snapshot_round_trip_holds_issue_194() {
         .restore_from_snapshot_json(&json)
         .expect("restore succeeds");
 
-    let round_trip = restored.create_snapshot(usize::MAX);
+    let round_trip = restored.create_snapshot(usize::MAX).expect("snapshot");
     assert!(
         snapshots_match(&round_trip, &original),
         "snapshot round-trip must hold for a book containing a special order"
@@ -275,7 +275,7 @@ fn test_restore_special_order_snapshot_round_trip_holds_issue_194() {
     // level relocating) — the tracker rebuild did not corrupt resting state.
     let repriced = restored.reprice_pegged_orders().expect("reprice runs");
     assert_eq!(repriced, 1);
-    let after = restored.create_snapshot(usize::MAX);
+    let after = restored.create_snapshot(usize::MAX).expect("snapshot");
     // The moved peg now rests at 104; the original snapshot had it at 90.
     assert!(
         !snapshots_match(&after, &original),

@@ -600,7 +600,7 @@ mod tests {
         // Test create_snapshot with empty book (lines 519-521, 526-528)
         let book = OrderBook::<()>::new("TEST");
 
-        let snapshot = book.create_snapshot(5);
+        let snapshot = book.create_snapshot(5).expect("snapshot");
         assert_eq!(snapshot.symbol, "TEST");
         // We can't directly access bids/asks, but we can check if there are no orders
         assert!(book.get_orders_at_price(100, Side::Buy).is_empty());

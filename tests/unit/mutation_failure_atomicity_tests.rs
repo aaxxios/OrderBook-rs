@@ -39,7 +39,7 @@ mod tests_mutation_failure_atomicity {
                 extra_fields: (),
             });
             assert!(admitted.is_ok(), "fixture level admits order {order_id}");
-            level.snapshot()
+            level.snapshot().expect("level snapshot")
         };
 
         let book: OrderBook<()> = DefaultOrderBook::new("HEAD");

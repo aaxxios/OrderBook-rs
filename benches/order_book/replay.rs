@@ -107,7 +107,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
                 let journal = make_journal(count);
                 let (book, _) = ReplayEngine::<()>::replay_from(&journal, 0, "BENCH")
                     .expect("replay must succeed");
-                let expected = book.create_snapshot(usize::MAX);
+                let expected = book.create_snapshot(usize::MAX).expect("snapshot");
                 b.iter(|| {
                     let result = ReplayEngine::<()>::verify(&journal, &expected);
                     let ok = result.expect("replay verification must succeed");

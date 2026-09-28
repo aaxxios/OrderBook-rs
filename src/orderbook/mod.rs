@@ -79,7 +79,7 @@ pub use implied_volatility::{
 };
 pub use iterators::LevelInfo;
 pub use market_impact::{MarketImpact, OrderSimulation};
-pub use mass_cancel::MassCancelResult;
+pub use mass_cancel::{MassCancelFailure, MassCancelResult};
 #[cfg(feature = "nats")]
 pub use nats::NatsTradePublisher;
 #[cfg(feature = "nats")]

@@ -89,7 +89,7 @@ fn measure_read_write_contention(
                     // Read operation: snapshot or query
                     if i % 2 == 0 {
                         // Create a snapshot (read-only)
-                        let _ = thread_order_book.create_snapshot(5);
+                        let _ = thread_order_book.create_snapshot(5).expect("snapshot");
                     } else {
                         // Other read operations
                         let _ = thread_order_book.get_all_orders();

@@ -10,6 +10,7 @@ use super::journal::Journal;
 use super::types::{SequencerCommand, SequencerEvent, SequencerResult};
 use crate::orderbook::clock::Clock;
 use crate::orderbook::fees::FeeSchedule;
+use crate::orderbook::mass_cancel::MassCancelResult;
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::stp::STPMode;
 use crate::orderbook::{OrderBook, OrderBookError, OrderBookSnapshot};
@@ -830,7 +831,9 @@ where
     /// # Errors
     ///
     /// - [`ReplayError::EmptyJournal`] if the journal has no events
-    /// - [`ReplayError::OrderBookError`] if replay fails
+    /// - [`ReplayError::OrderBookError`] if replay fails, or if the replayed
+    ///   book cannot produce a snapshot (reported at the last applied
+    ///   sequence)
     /// - [`ReplayError::OutcomeMismatch`] if a re-executed rejected submit reaches a different verdict than the journal recorded
     /// - [`ReplayError::StpModeMismatch`] if a journaled STP rejection records a different [`STPMode`] than the replay book uses
     /// - [`ReplayError::JournalError`] if reading from the journal fails
@@ -838,8 +841,15 @@ where
         journal: &impl Journal<T>,
         expected_snapshot: &OrderBookSnapshot,
     ) -> Result<bool, ReplayError> {
-        let (book, _) = Self::replay_from(journal, 0, &expected_snapshot.symbol)?;
-        let actual = book.create_snapshot(usize::MAX);
+        let (book, last_sequence) = Self::replay_from(journal, 0, &expected_snapshot.symbol)?;
+        // `create_snapshot` is fallible since pricelevel 0.10; a level that
+        // cannot be snapshotted is attributed to the last applied event.
+        let actual =
+            book.create_snapshot(usize::MAX)
+                .map_err(|source| ReplayError::OrderBookError {
+                    sequence_num: last_sequence,
+                    source,
+                })?;
         Ok(snapshots_match(&actual, expected_snapshot))
     }
 
@@ -937,31 +947,81 @@ where
                         .map(|_| ()),
                 )?;
             }
+            // A mass cancel the live book refused cancelled nothing, so
+            // replay applies it as a no-op instead of re-executing it: the
+            // replay book may be readable where the live one was not, and
+            // re-execution would then cancel orders the live book kept.
+            SequencerCommand::CancelAll
+            | SequencerCommand::CancelBySide { .. }
+            | SequencerCommand::CancelByUser { .. }
+            | SequencerCommand::CancelByPriceRange { .. }
+                if Self::recorded_mass_cancel_refused(event) => {}
             SequencerCommand::CancelAll => {
-                let _ = book.cancel_all_orders();
+                Self::ensure_mass_cancel_complete(event, &book.cancel_all_orders())?;
             }
             SequencerCommand::CancelBySide { side } => {
-                let _ = book.cancel_orders_by_side(*side);
+                Self::ensure_mass_cancel_complete(event, &book.cancel_orders_by_side(*side))?;
             }
             SequencerCommand::CancelByUser { user_id } => {
-                let _ = book.cancel_orders_by_user(*user_id);
+                Self::ensure_mass_cancel_complete(event, &book.cancel_orders_by_user(*user_id))?;
             }
             SequencerCommand::CancelByPriceRange {
                 side,
                 min_price,
                 max_price,
             } => {
-                let _ = book.cancel_orders_by_price_range(*side, *min_price, *max_price);
+                Self::ensure_mass_cancel_complete(
+                    event,
+                    &book.cancel_orders_by_price_range(*side, *min_price, *max_price),
+                )?;
             }
             SequencerCommand::EvictExpiredOrders { now_ms } => {
                 // Apply the journaled cutoff, never the replay clock, so the
                 // sweep evicts exactly the orders it evicted live. The sweep
-                // is idempotent, so a duplicate replay is a no-op.
-                let _ = book.evict_expired_orders(*now_ms);
+                // is idempotent, so a duplicate replay is a no-op. A refused
+                // sweep (unreadable price level) evicted nothing, so replay
+                // would silently diverge from the live book: surface it.
+                book.evict_expired_orders(*now_ms).map_err(|source| {
+                    ReplayError::OrderBookError {
+                        sequence_num: event.sequence_num,
+                        source,
+                    }
+                })?;
             }
         }
 
         Ok(true)
+    }
+
+    /// Whether the journal recorded this mass cancel as refused.
+    ///
+    /// A refusal ([`MassCancelResult::has_failures`]) cancelled nothing on
+    /// the live book, so replay must not re-execute it.
+    fn recorded_mass_cancel_refused(event: &SequencerEvent<T>) -> bool {
+        matches!(
+            &event.result,
+            SequencerResult::MassCancelled { result } if result.has_failures()
+        )
+    }
+
+    /// Fails replay when a re-executed mass cancel recorded a failure.
+    ///
+    /// A refused mass cancel cancels nothing (see
+    /// [`MassCancelFailure`](crate::orderbook::mass_cancel::MassCancelFailure)),
+    /// so continuing would leave the replayed book diverged from the live one
+    /// without any signal. The first failure is reported as
+    /// [`ReplayError::OrderBookError`] at the event's sequence number.
+    fn ensure_mass_cancel_complete(
+        event: &SequencerEvent<T>,
+        result: &MassCancelResult,
+    ) -> Result<(), ReplayError> {
+        match result.failures().first() {
+            None => Ok(()),
+            Some(failure) => Err(ReplayError::OrderBookError {
+                sequence_num: event.sequence_num,
+                source: failure.to_order_book_error(),
+            }),
+        }
     }
 
     /// Whether a submit journaled as rejected under `code` is re-executed
@@ -1326,7 +1386,7 @@ mod tests {
                 "fixture order must be admitted"
             );
         }
-        level.snapshot()
+        level.snapshot().expect("level snapshot")
     }
 
     fn fixture_order(id: u64, price: u128, quantity: u64, tif: TimeInForce) -> OrderType<()> {
@@ -1550,8 +1610,10 @@ mod tests {
         assert_eq!(last_seq_plain, last_seq_with_clock);
         assert_eq!(last_seq_plain, 2);
 
-        let snap_plain = book_plain.create_snapshot(usize::MAX);
-        let snap_with_clock = book_with_clock.create_snapshot(usize::MAX);
+        let snap_plain = book_plain.create_snapshot(usize::MAX).expect("snapshot");
+        let snap_with_clock = book_with_clock
+            .create_snapshot(usize::MAX)
+            .expect("snapshot");
         assert!(
             snapshots_match(&snap_plain, &snap_with_clock),
             "snapshots must match across replay variants"
@@ -1660,8 +1722,8 @@ mod tests {
             ReplayEngine::<()>::replay_from(&journal, 0, "TEST").expect("replay must succeed");
         assert_eq!(last_seq, seq);
 
-        let live_snap = live_book.create_snapshot(usize::MAX);
-        let replayed_snap = replayed.create_snapshot(usize::MAX);
+        let live_snap = live_book.create_snapshot(usize::MAX).expect("snapshot");
+        let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
         assert!(
             snapshots_match(&live_snap, &replayed_snap),
             "live and replayed snapshots must match after notional market order"
@@ -1889,7 +1951,7 @@ mod tests {
 
         // Sweep live at t=5_000: evicts the two t=1_000 orders, keeps the rest.
         let now = TimestampMs::new(5_000);
-        let evicted = live.evict_expired_orders(now);
+        let evicted = live.evict_expired_orders(now).expect("evict");
         assert_eq!(evicted.len(), 2, "two GTD orders expire by t=5_000");
         let sweep = SequencerEvent::<()> {
             sequence_num: seq,
@@ -1912,8 +1974,8 @@ mod tests {
                 .expect("replay must succeed");
         assert_eq!(last_seq, seq);
 
-        let live_snap = live.create_snapshot(usize::MAX);
-        let replayed_snap = replayed.create_snapshot(usize::MAX);
+        let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+        let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
         assert!(
             snapshots_match(&live_snap, &replayed_snap),
             "post-sweep live and replayed snapshots must match"
@@ -1922,6 +1984,69 @@ mod tests {
         // Sanity: the expired levels are gone, the survivors remain.
         assert_eq!(replayed_snap.bids.len(), 2, "99 and 98 bids survive");
         assert!(replayed_snap.asks.is_empty(), "the only ask expired");
+    }
+
+    /// A mass cancel journaled as refused cancelled nothing live, so replay
+    /// must not re-execute it even when the replay book is readable.
+    #[test]
+    fn test_replay_skips_mass_cancel_recorded_as_refused() {
+        use crate::orderbook::mass_cancel::MassCancelFailure;
+
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let symbol = "REFUSED";
+        let live = OrderBook::<()>::new(symbol);
+        let order = OrderType::Standard {
+            id: Id::from_u64(1),
+            price: Price::new(100),
+            quantity: Quantity::new(5),
+            side: Side::Buy,
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
+        };
+        live.add_order(order).expect("live add");
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 0,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::AddOrder(order),
+                    result: SequencerResult::OrderAdded {
+                        order_id: order.id()
+                    },
+                })
+                .is_ok()
+        );
+        let refused = MassCancelResult::refused(MassCancelFailure::LevelUnreadable {
+            side: Side::Buy,
+            price: 100,
+            error: pricelevel::PriceLevelError::InvalidOperation {
+                message: "unreadable".to_string(),
+            },
+        });
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 1,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::CancelAll,
+                    result: SequencerResult::MassCancelled { result: refused },
+                })
+                .is_ok()
+        );
+
+        let (replayed, last_seq) =
+            ReplayEngine::<()>::replay_from(&journal, 0, symbol).expect("replay must succeed");
+        assert_eq!(last_seq, 1);
+        let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+        let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
+        assert!(snapshots_match(&live_snap, &replayed_snap));
+        assert_eq!(
+            replayed_snap.bids.len(),
+            1,
+            "the refused cancel kept the order"
+        );
     }
 
     // --- trade-ID namespace through replay (#200) ---------------------------

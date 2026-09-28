@@ -507,7 +507,7 @@ mod tests {
         let _ = book.add_order(create_standard_order(1110, 25, Side::Sell));
 
         // Create a snapshot with depth 2
-        let snapshot = book.create_snapshot(2);
+        let snapshot = book.create_snapshot(2).expect("snapshot");
 
         // Verify snapshot contents
         assert_eq!(snapshot.symbol, "BTCUSD");
@@ -704,7 +704,7 @@ mod test_orderbook_book {
         );
 
         // Create snapshot with limited depth
-        let snapshot = book.create_snapshot(2);
+        let snapshot = book.create_snapshot(2).expect("snapshot");
 
         // Check snapshot properties
         assert_eq!(snapshot.symbol, "TEST");
@@ -719,7 +719,7 @@ mod test_orderbook_book {
         assert_eq!(snapshot.asks[1].price(), Price::new(1020)); // Second lowest
 
         // Create a full depth snapshot
-        let full_snapshot = book.create_snapshot(10);
+        let full_snapshot = book.create_snapshot(10).expect("snapshot");
         assert_eq!(full_snapshot.bids.len(), 3); // All 3 bid levels
         assert_eq!(full_snapshot.asks.len(), 3); // All 3 ask levels
     }
@@ -982,7 +982,7 @@ mod test_book_remaining {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Create a snapshot of an empty book
-        let snapshot = book.create_snapshot(10);
+        let snapshot = book.create_snapshot(10).expect("snapshot");
 
         // Verify snapshot properties
         assert_eq!(snapshot.symbol, "TEST");

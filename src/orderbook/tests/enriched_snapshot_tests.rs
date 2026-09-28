@@ -31,7 +31,7 @@ mod tests {
     fn test_enriched_snapshot_all_metrics() {
         let book = setup_test_book();
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         // Check snapshot basics
         assert_eq!(snapshot.symbol, "BTC/USD");
@@ -65,7 +65,9 @@ mod tests {
         let book = setup_test_book();
 
         let flags = MetricFlags::MID_PRICE | MetricFlags::SPREAD;
-        let snapshot = book.enriched_snapshot_with_metrics(10, flags);
+        let snapshot = book
+            .enriched_snapshot_with_metrics(10, flags)
+            .expect("enriched snapshot");
 
         // Check that selected metrics are calculated
         assert!(snapshot.mid_price.is_some());
@@ -83,7 +85,9 @@ mod tests {
     fn test_enriched_snapshot_only_depth() {
         let book = setup_test_book();
 
-        let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::DEPTH);
+        let snapshot = book
+            .enriched_snapshot_with_metrics(10, MetricFlags::DEPTH)
+            .expect("enriched snapshot");
 
         assert_eq!(snapshot.bid_depth_total, 60);
         assert_eq!(snapshot.ask_depth_total, 75);
@@ -95,7 +99,9 @@ mod tests {
     fn test_enriched_snapshot_only_vwap() {
         let book = setup_test_book();
 
-        let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::VWAP);
+        let snapshot = book
+            .enriched_snapshot_with_metrics(10, MetricFlags::VWAP)
+            .expect("enriched snapshot");
 
         assert!(snapshot.vwap_bid.is_some());
         assert!(snapshot.vwap_ask.is_some());
@@ -113,7 +119,9 @@ mod tests {
     fn test_enriched_snapshot_only_imbalance() {
         let book = setup_test_book();
 
-        let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::IMBALANCE);
+        let snapshot = book
+            .enriched_snapshot_with_metrics(10, MetricFlags::IMBALANCE)
+            .expect("enriched snapshot");
 
         // Imbalance = (60 - 75) / (60 + 75) = -15/135 ≈ -0.111
         assert!((snapshot.order_book_imbalance - (-0.111)).abs() < 0.01);
@@ -123,7 +131,7 @@ mod tests {
     fn test_enriched_snapshot_empty_book() {
         let book = OrderBook::<()>::new("EMPTY");
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         assert!(snapshot.mid_price.is_none());
         assert!(snapshot.spread_bps.is_none());
@@ -139,7 +147,7 @@ mod tests {
         let book = OrderBook::<()>::new("ONE_SIDED");
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         assert!(snapshot.mid_price.is_none()); // No ask side
         assert!(snapshot.spread_bps.is_none());
@@ -151,7 +159,7 @@ mod tests {
     fn test_enriched_snapshot_limited_depth() {
         let book = setup_test_book();
 
-        let snapshot = book.enriched_snapshot(2); // Only top 2 levels
+        let snapshot = book.enriched_snapshot(2).expect("enriched snapshot"); // Only top 2 levels
 
         assert_eq!(snapshot.bids.len(), 2);
         assert_eq!(snapshot.asks.len(), 2);
@@ -167,7 +175,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 110, 10, Side::Sell, TimeInForce::Gtc, None);
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         assert!(snapshot.mid_price.is_some());
         let mid = snapshot.mid_price.unwrap();
@@ -180,7 +188,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 10000, 10, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 10100, 10, Side::Sell, TimeInForce::Gtc, None);
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         assert!(snapshot.spread_bps.is_some());
         let spread_bps = snapshot.spread_bps.unwrap();
@@ -195,7 +203,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         // Perfectly balanced book should have imbalance near 0
         assert!((snapshot.order_book_imbalance - 0.0).abs() < 0.01);
@@ -207,7 +215,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 100, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 50, Side::Sell, TimeInForce::Gtc, None);
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         // More buy volume, positive imbalance
         assert!(snapshot.order_book_imbalance > 0.0);
@@ -219,7 +227,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 30, Side::Buy, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 101, 100, Side::Sell, TimeInForce::Gtc, None);
 
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         // More sell volume, negative imbalance
         assert!(snapshot.order_book_imbalance < 0.0);
@@ -252,7 +260,9 @@ mod tests {
         let book = setup_test_book();
 
         // Request only 2 levels for VWAP calculation
-        let snapshot = book.enriched_snapshot_with_metrics(2, MetricFlags::VWAP);
+        let snapshot = book
+            .enriched_snapshot_with_metrics(2, MetricFlags::VWAP)
+            .expect("enriched snapshot");
 
         assert!(snapshot.vwap_bid.is_some());
         assert!(snapshot.vwap_ask.is_some());
@@ -266,7 +276,7 @@ mod tests {
     #[test]
     fn test_enriched_snapshot_serialization() {
         let book = setup_test_book();
-        let snapshot = book.enriched_snapshot(10);
+        let snapshot = book.enriched_snapshot(10).expect("enriched snapshot");
 
         // Test that it can be serialized
         let json = serde_json::to_string(&snapshot);

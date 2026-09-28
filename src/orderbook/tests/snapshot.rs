@@ -753,7 +753,7 @@ mod test_snapshot_engine_seq {
                     "error message must mention version 1, got: {message}"
                 );
                 assert!(
-                    message.contains("2..=3"),
+                    message.contains("2..=4"),
                     "error message must state the supported range, got: {message}"
                 );
             }
@@ -865,12 +865,12 @@ mod test_snapshot_format_v3 {
     };
     use pricelevel::{Hash32, Id, Side, TimeInForce};
 
-    /// New packages are stamped with the current (v3) format version, and a
+    /// New packages are stamped with the current (v4) format version, and a
     /// non-degraded book's payload carries no `stats_degraded` key at all
     /// (pricelevel serializes it only when `true`), which is exactly the
     /// shape a legacy v2 payload has.
     #[test]
-    fn test_new_package_is_v3_and_omits_stats_degraded_when_clean() {
+    fn test_new_package_is_v4_and_omits_stats_degraded_when_clean() {
         let book = DefaultOrderBook::new("V3");
         let added = book.add_limit_order_with_user(
             Id::from_u64(1),
@@ -888,7 +888,7 @@ mod test_snapshot_format_v3 {
             package.version, ORDERBOOK_SNAPSHOT_FORMAT_VERSION,
             "new packages carry the current format version"
         );
-        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 3, "current version is 3");
+        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 4, "current version is 4");
 
         let json = package.to_json().expect("serialize package");
         assert!(
@@ -993,15 +993,14 @@ mod test_snapshot_format_v3 {
         }
     }
 
-    /// The #206 repro: a fill whose notional overflows pricelevel's u64
-    /// statistics counter sets the sticky `stats_degraded` flag. The
-    /// resulting snapshot must serialize the flag, be stamped v3, and
-    /// round-trip — including the flag — through the checksummed package.
+    /// The reason for format v4 (pricelevel 0.10, #239): a level's
+    /// `value_executed` statistic is a `u128`. A single execution whose
+    /// notional exceeds `u64::MAX` (which degraded the 0.9 statistics,
+    /// #206) is now recorded exactly, serialized as a number above
+    /// `u64::MAX`, stamped v4, and survives the checksummed round trip.
     #[test]
-    fn test_degraded_statistics_round_trip_is_v3() {
-        let book = DefaultOrderBook::new("DEG");
-        // Price above u64::MAX: one executed unit already overflows the
-        // u64 value-executed counter, degrading the level statistics.
+    fn test_value_executed_above_u64_round_trips_as_v4() {
+        let book = DefaultOrderBook::new("WIDE");
         let price = u128::from(u64::MAX) + 1;
         let added = book.add_limit_order_with_user(
             Id::from_u64(1),
@@ -1020,29 +1019,105 @@ mod test_snapshot_format_v3 {
 
         let json = book.snapshot_to_json(10).expect("serialize package");
         assert!(
-            json.contains("\"stats_degraded\":true"),
-            "degraded flag must be serialized: {json}"
+            json.contains(&format!("\"value_executed\":{price}")),
+            "u128 value_executed must be serialized exactly: {json}"
+        );
+        assert!(
+            !json.contains("stats_degraded"),
+            "a u128 accumulator no longer degrades on this fill: {json}"
         );
 
         let package = OrderBookSnapshotPackage::from_json(&json).expect("parse package");
-        assert_eq!(package.version, 3, "degraded payload is stamped v3");
+        assert_eq!(package.version, 4, "new payloads are stamped v4");
         assert!(package.validate().is_ok(), "checksum must hold");
 
-        let mut restored = DefaultOrderBook::new("DEG");
+        let mut restored = DefaultOrderBook::new("WIDE");
         restored
             .restore_from_snapshot_package(package)
-            .expect("degraded package must restore");
+            .expect("v4 package must restore");
 
-        // The sticky flag survives the round-trip: re-snapshotting the
-        // restored book still reports the degradation.
-        let resnapshot = restored.create_snapshot(10);
+        let resnapshot = restored.create_snapshot(10).expect("snapshot");
         let level = resnapshot
             .asks
             .first()
             .expect("restored book keeps the ask level");
-        assert!(
-            level.statistics().stats_degraded(),
-            "stats_degraded must survive restore"
+        assert_eq!(
+            level.statistics().value_executed(),
+            price,
+            "value_executed above u64::MAX survives restore"
         );
+        assert!(
+            !level.statistics().stats_degraded(),
+            "statistics are not degraded"
+        );
+    }
+
+    /// A verbatim `version: 3` package written by orderbook-rs 0.13.1
+    /// (pricelevel 0.9.2) must validate and restore under 0.14 / pricelevel
+    /// 0.10, keeping its original checksum. Produced by 0.13.1 itself: asks
+    /// standard 10 @ 100 (id 1), iceberg 5 visible / 20 hidden @ 100 (id 2),
+    /// standard 7 @ 101 (id 3); bid standard 9 @ 99 (id 4); then a market
+    /// buy of 12 (id 10) that filled id 1 and 2 units of the iceberg, then
+    /// `create_snapshot_package(usize::MAX)`. Its statistics carry the u64
+    /// `value_executed` (1200) that pricelevel 0.10 widens to u128.
+    #[test]
+    fn test_genuine_v3_fixture_from_0_13_1_validates_and_restores() {
+        let fixture = include_str!("fixtures/snapshot_v3_0_13_1.json");
+
+        let package =
+            OrderBookSnapshotPackage::from_json(fixture).expect("0.13.1 payload must deserialize");
+        assert_eq!(package.version, 3, "fixture is a legacy v3 package");
+        assert_eq!(package.engine_seq, 1, "engine_seq decodes");
+        assert!(
+            package.validate().is_ok(),
+            "the 0.13.1-computed checksum must revalidate under pricelevel 0.10"
+        );
+
+        let mut restored = DefaultOrderBook::new("BTC/USD");
+        restored
+            .restore_from_snapshot_package(package)
+            .expect("genuine v3 package must restore");
+        assert_eq!(restored.best_bid(), Some(99), "bid level restored");
+        assert_eq!(restored.best_ask(), Some(100), "ask level restored");
+        assert_eq!(restored.engine_seq(), 1, "engine_seq restored verbatim");
+
+        let snapshot = restored.create_snapshot(usize::MAX).expect("snapshot");
+        let best_ask = snapshot.asks.first().expect("ask level at 100");
+        assert_eq!(best_ask.visible_quantity().as_u64(), 3, "iceberg visible");
+        assert_eq!(best_ask.hidden_quantity().as_u64(), 20, "iceberg hidden");
+        assert_eq!(
+            best_ask.statistics().value_executed(),
+            1_200,
+            "legacy u64 value_executed widens losslessly"
+        );
+
+        // Re-snapshotting the restored book writes the current format.
+        let package = restored
+            .create_snapshot_package(usize::MAX)
+            .expect("re-package");
+        assert_eq!(package.version, ORDERBOOK_SNAPSHOT_FORMAT_VERSION);
+        let json = package.to_json().expect("serialize v4");
+        let mut round_tripped = DefaultOrderBook::new("BTC/USD");
+        round_tripped
+            .restore_from_snapshot_json(&json)
+            .expect("v4 round trip");
+        assert_eq!(round_tripped.best_bid(), Some(99));
+        assert_eq!(round_tripped.best_ask(), Some(100));
+    }
+
+    /// The version range read by `validate` is exactly 2..=4.
+    #[test]
+    fn test_read_version_range_is_2_to_4() {
+        assert_eq!(ORDERBOOK_SNAPSHOT_MIN_READ_VERSION, 2);
+        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 4);
+        let book = DefaultOrderBook::new("RANGE");
+        for version in 2..=4 {
+            let mut package = book.create_snapshot_package(10).expect("build package");
+            package.version = version;
+            assert!(package.validate().is_ok(), "version {version} readable");
+        }
+        let mut package = book.create_snapshot_package(10).expect("build package");
+        package.version = 1;
+        assert!(package.validate().is_err(), "version 1 rejected");
     }
 }

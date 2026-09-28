@@ -1539,7 +1539,7 @@ where
                 Some(order.price().as_u128()),
                 order.user_id(),
                 order.id(),
-            );
+            )?;
             if potential_match < order.total_quantity() {
                 return Err(OrderBookError::InsufficientLiquidity {
                     side: order.side(),
@@ -1664,14 +1664,14 @@ where
             // Insertion-sequence order is the sweep's consumption order (#132),
             // so `safe_quantity` below is exactly the non-self depth the engine
             // pre-matches before it decides on the same-user maker.
-            let orders = level.snapshot_by_insertion_seq();
+            let orders = level.snapshot_by_insertion_seq()?;
             match check_stp_at_level(&orders, taker_user_id, self.stp_mode) {
                 STPAction::NoConflict => {
                     // No same-user maker at this level: the taker consumes its
                     // full matchable depth under the lot-rounded cap (the
                     // authoritative upstream dry run), then walks on.
                     remaining =
-                        remaining.saturating_sub(level.matchable_quantity(cap, new_order.id()));
+                        remaining.saturating_sub(level.matchable_quantity(cap, new_order.id())?);
                 }
                 STPAction::CancelTaker { safe_quantity }
                 | STPAction::CancelBoth { safe_quantity, .. } => {
@@ -1700,7 +1700,7 @@ where
                     // inside the non-self prefix, so it never counts depth
                     // behind the same-user maker.
                     remaining = remaining.saturating_sub(
-                        level.matchable_quantity(cap.min(safe_quantity), new_order.id()),
+                        level.matchable_quantity(cap.min(safe_quantity), new_order.id())?,
                     );
                     if remaining > 0 {
                         return Err(OrderBookError::SelfTradePrevented {
@@ -1802,7 +1802,7 @@ where
             Some(new_order.price().as_u128()),
             new_order.user_id(),
             new_order.id(),
-        );
+        )?;
         // `crossable < visible`: the sweep leaves a positive visible tranche
         // and the residual rests normally. `crossable >= total`: the order
         // fills completely, so nothing is discarded. Only the band in

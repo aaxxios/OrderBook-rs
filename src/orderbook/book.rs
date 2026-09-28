@@ -27,7 +27,10 @@ use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use either::Either;
 use pricelevel::OrderUpdate;
-use pricelevel::{Hash32, Id, MatchResult, OrderType, PriceLevel, Side, UuidGenerator};
+use pricelevel::{
+    Hash32, Id, MatchResult, OrderType, PriceLevel, PriceLevelError, PriceLevelSnapshot, Side,
+    UuidGenerator,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -313,19 +316,37 @@ where
 
         // Serialize bids as a BTreeMap<u128, PriceLevelSnapshot> so the key
         // ordering is deterministic (a HashMap would vary across runs).
-        let bids: BTreeMap<u128, _> = self
+        // `PriceLevel::snapshot` is fallible (pricelevel 0.10); a failed level
+        // snapshot aborts serialization with a custom error instead of being
+        // serialized as a `{"Ok": ..}` / `{"Err": ..}` wrapper.
+        let bids: BTreeMap<u128, PriceLevelSnapshot> = self
             .bids
             .iter()
-            .map(|entry| (*entry.key(), entry.value().snapshot()))
-            .collect();
+            .map(|entry| {
+                entry
+                    .value()
+                    .snapshot()
+                    .map(|snapshot| (*entry.key(), snapshot))
+            })
+            .collect::<Result<_, PriceLevelError>>()
+            .map_err(serde::ser::Error::custom)?;
         state.serialize_field("bids", &bids)?;
 
         // Serialize asks as a BTreeMap<u128, PriceLevelSnapshot> (deterministic).
-        let asks: BTreeMap<u128, _> = self
+        // `PriceLevel::snapshot` is fallible (pricelevel 0.10); a failed level
+        // snapshot aborts serialization with a custom error instead of being
+        // serialized as a `{"Ok": ..}` / `{"Err": ..}` wrapper.
+        let asks: BTreeMap<u128, PriceLevelSnapshot> = self
             .asks
             .iter()
-            .map(|entry| (*entry.key(), entry.value().snapshot()))
-            .collect();
+            .map(|entry| {
+                entry
+                    .value()
+                    .snapshot()
+                    .map(|snapshot| (*entry.key(), snapshot))
+            })
+            .collect::<Result<_, PriceLevelError>>()
+            .map_err(serde::ser::Error::custom)?;
         state.serialize_field("asks", &asks)?;
 
         // Serialize order_locations keyed by the order id's string form so the
@@ -3425,8 +3446,16 @@ where
         Ok(match_result)
     }
 
-    /// Create a snapshot of the current order book state
-    pub fn create_snapshot(&self, depth: usize) -> OrderBookSnapshot {
+    /// Create a snapshot of the current order book state, up to `depth`
+    /// price levels per side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
+    /// produce a coherent snapshot (`PriceLevel::snapshot` is fallible since
+    /// pricelevel 0.10, e.g. on a refused allocation or a walk that stays
+    /// incoherent under concurrent mutation). No partial snapshot is returned.
+    pub fn create_snapshot(&self, depth: usize) -> Result<OrderBookSnapshot, OrderBookError> {
         // Get all bid prices and sort them in descending order
         let mut bid_prices: Vec<u128> = self.bids.iter().map(|item| *item.key()).collect();
         bid_prices.sort_by(|a, b| b.cmp(a)); // Descending order
@@ -3443,23 +3472,23 @@ where
         // Create snapshots for each bid level
         for price in bid_prices {
             if let Some(entry) = self.bids.get(&price) {
-                bid_levels.push(entry.value().snapshot());
+                bid_levels.push(entry.value().snapshot()?);
             }
         }
 
         // Create snapshots for each ask level
         for price in ask_prices {
             if let Some(entry) = self.asks.get(&price) {
-                ask_levels.push(entry.value().snapshot());
+                ask_levels.push(entry.value().snapshot()?);
             }
         }
 
-        OrderBookSnapshot {
+        Ok(OrderBookSnapshot {
             symbol: self.symbol.clone(),
             timestamp: self.clock().now_millis().as_u64(),
             bids: bid_levels,
             asks: ask_levels,
-        }
+        })
     }
 
     /// Create a checksum-protected snapshot package of the entire book.
@@ -3473,7 +3502,7 @@ where
         &self,
         depth: usize,
     ) -> Result<OrderBookSnapshotPackage, OrderBookError> {
-        let snapshot = self.create_snapshot(depth);
+        let snapshot = self.create_snapshot(depth)?;
         let mut package = OrderBookSnapshotPackage::new(snapshot)?;
         package.fee_schedule = self.fee_schedule;
         package.stp_mode = self.stp_mode;
@@ -3722,15 +3751,34 @@ where
         let asks = convert(snapshot.asks, "ask")?;
 
         // Cross-level duplicate-id check. Per-level duplicates are already
-        // rejected by `PriceLevel::from_snapshot` (pricelevel 0.9); an id
+        // rejected by `PriceLevel::from_snapshot` (since pricelevel 0.9); an id
         // resting at two prices would silently orphan one of them in
         // `order_locations`, so reject the snapshot before any mutation.
         // A HashSet is safe here: only membership is consulted, no
         // iteration order can leak into book state.
+        //
+        // The same walk materializes every level's resting orders, in the
+        // commit phase's replay-stable traversal order (bids ascending price,
+        // then asks ascending price, each level by ascending insertion
+        // sequence), into `orders`. `snapshot_by_seq_into` is fallible since
+        // pricelevel 0.10; collecting here keeps that failure in the
+        // fallible phase, so `commit_restored_levels` stays infallible and
+        // never rebuilds indices from a stale scratch buffer.
         let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
+        let mut orders: Vec<(u128, Side, Arc<OrderType<()>>)> = Vec::new();
         let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
-        for (_, level) in bids.iter().chain(asks.iter()) {
-            level.snapshot_by_seq_into(&mut level_orders);
+        let sides = bids
+            .iter()
+            .map(|entry| (entry, Side::Buy))
+            .chain(asks.iter().map(|entry| (entry, Side::Sell)));
+        for ((price, level), side) in sides {
+            level.snapshot_by_seq_into(&mut level_orders)?;
+            orders.try_reserve(level_orders.len()).map_err(|_| {
+                OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+                    resource: pricelevel::CapacityResource::RestoreScratch,
+                    additional: level_orders.len(),
+                })
+            })?;
             for order in &level_orders {
                 if !seen.insert(order.id()) {
                     return Err(OrderBookError::DuplicateOrderId {
@@ -3751,10 +3799,11 @@ where
                         hidden_quantity,
                     });
                 }
+                orders.push((*price, side, Arc::clone(order)));
             }
         }
 
-        Ok(PreparedSnapshotLevels { bids, asks })
+        Ok(PreparedSnapshotLevels { bids, asks, orders })
     }
 
     /// Infallible commit phase of a snapshot restore (#207): clears the
@@ -3766,8 +3815,9 @@ where
     ///
     /// The index rebuild runs in one fixed, replay-stable pass: bids
     /// ascending price then asks ascending price (the prepared vectors are
-    /// pre-sorted), and within each level ascending insertion sequence via
-    /// [`PriceLevel::snapshot_by_seq_into`] — never the `DashMap`-backed
+    /// pre-sorted), and within each level ascending insertion sequence as
+    /// materialized by [`PriceLevel::snapshot_by_seq_into`] in the prepare
+    /// phase (`PreparedSnapshotLevels::orders`), never the `DashMap`-backed
     /// `iter_orders` view, whose per-instance-hashed order would leak into
     /// the `user_orders` `Vec<Id>` layout and make a subsequent
     /// `cancel_orders_by_user` diverge across restores of the same package
@@ -3776,7 +3826,8 @@ where
     /// the tracker's `DashSet`s, and the risk maps are order-insensitive,
     /// so their rebuild order does not leak; only `user_orders`, whose
     /// per-user `Vec` order is consumed by `cancel_orders_by_user`, needs
-    /// the fixed traversal. One scratch buffer is reused across levels.
+    /// the fixed traversal. Every level read happened in the prepare phase,
+    /// so no fallible pricelevel call remains here.
     fn commit_restored_levels(&self, prepared: &PreparedSnapshotLevels, rebuild_risk: bool) {
         self.cache.invalidate();
 
@@ -3810,41 +3861,33 @@ where
             self.asks.insert(*price, level.clone());
         }
 
-        let mut level_orders: Vec<Arc<OrderType<()>>> = Vec::new();
-        let mut rebuild_side = |levels: &[(u128, Arc<PriceLevel>)], side: Side| {
-            for (price, level) in levels {
-                level.snapshot_by_seq_into(&mut level_orders);
-                for order in &level_orders {
-                    self.order_locations.insert(order.id(), (*price, side));
-                    self.track_user_order(order.user_id(), order.id());
-                    // #230: the count is not carried by the snapshot; it is
-                    // recounted from what the restore actually installs, so
-                    // a restored non-auto reserve keeps its discard
-                    // reportable and a restore that installs none closes the
-                    // gate.
-                    self.note_rested_order(order.as_ref());
-                    #[cfg(feature = "special_orders")]
-                    self.reregister_special_order(order.as_ref());
-                    if rebuild_risk {
-                        // Same per-order registration the live admission
-                        // path uses; keeps the saturating remaining-qty
-                        // semantics of the previous snapshot-based rebuild.
-                        let remaining_qty = order
-                            .visible_quantity()
-                            .as_u64()
-                            .saturating_add(order.hidden_quantity().as_u64());
-                        self.risk_state.on_admission(
-                            order.id(),
-                            order.user_id(),
-                            *price,
-                            remaining_qty,
-                        );
-                    }
-                }
+        // The orders were materialized by the prepare phase in the fixed
+        // traversal order (bids then asks, ascending price, ascending
+        // insertion sequence), so this walk performs no fallible call.
+        for (price, side, order) in &prepared.orders {
+            let (price, side) = (*price, *side);
+            self.order_locations.insert(order.id(), (price, side));
+            self.track_user_order(order.user_id(), order.id());
+            // #230: the count is not carried by the snapshot; it is
+            // recounted from what the restore actually installs, so
+            // a restored non-auto reserve keeps its discard
+            // reportable and a restore that installs none closes the
+            // gate.
+            self.note_rested_order(order.as_ref());
+            #[cfg(feature = "special_orders")]
+            self.reregister_special_order(order.as_ref());
+            if rebuild_risk {
+                // Same per-order registration the live admission
+                // path uses; keeps the saturating remaining-qty
+                // semantics of the previous snapshot-based rebuild.
+                let remaining_qty = order
+                    .visible_quantity()
+                    .as_u64()
+                    .saturating_add(order.hidden_quantity().as_u64());
+                self.risk_state
+                    .on_admission(order.id(), order.user_id(), price, remaining_qty);
             }
-        };
-        rebuild_side(&prepared.bids, Side::Buy);
-        rebuild_side(&prepared.asks, Side::Sell);
+        }
     }
 
     /// Is `order` the one two-tranche shape `pricelevel` cannot execute
@@ -4007,7 +4050,7 @@ where
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 101, 10, Side::Sell, TimeInForce::Gtc, None);
     ///
-    /// let snapshot = book.enriched_snapshot(10);
+    /// let snapshot = book.enriched_snapshot(10)?;
     ///
     /// if let Some(mid) = snapshot.mid_price {
     ///     println!("Mid price: {}", mid);
@@ -4017,9 +4060,15 @@ where
     /// }
     /// println!("Bid depth: {}", snapshot.bid_depth_total);
     /// println!("Imbalance: {}", snapshot.order_book_imbalance);
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
-    pub fn enriched_snapshot(&self, depth: usize) -> EnrichedSnapshot {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
+    /// produce a coherent snapshot (`PriceLevel::snapshot` is fallible since
+    /// pricelevel 0.10). No partial snapshot is returned.
+    pub fn enriched_snapshot(&self, depth: usize) -> Result<EnrichedSnapshot, OrderBookError> {
         self.enriched_snapshot_with_metrics(depth, MetricFlags::ALL)
     }
 
@@ -4034,6 +4083,12 @@ where
     ///
     /// # Returns
     /// `EnrichedSnapshot` with selected metrics calculated
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
+    /// produce a coherent snapshot (`PriceLevel::snapshot` is fallible since
+    /// pricelevel 0.10). No partial snapshot is returned.
     ///
     /// # Performance
     /// O(N) where N is depth, but faster than `enriched_snapshot()` if fewer metrics selected.
@@ -4052,38 +4107,38 @@ where
     /// let snapshot = book.enriched_snapshot_with_metrics(
     ///     10,
     ///     MetricFlags::MID_PRICE | MetricFlags::SPREAD
-    /// );
+    /// )?;
     ///
     /// assert!(snapshot.mid_price.is_some());
     /// assert!(snapshot.spread_bps.is_some());
+    /// # Ok::<(), orderbook_rs::OrderBookError>(())
     /// ```
-    #[must_use]
     pub fn enriched_snapshot_with_metrics(
         &self,
         depth: usize,
         flags: MetricFlags,
-    ) -> EnrichedSnapshot {
+    ) -> Result<EnrichedSnapshot, OrderBookError> {
         // The SkipMap is already price-ordered, so iterate it directly and take
         // only the requested depth — no collect/sort/truncate of all keys and no
         // redundant second lookup per kept level. Bids are highest-first (reverse
         // iteration); asks are lowest-first.
-        let bid_levels: Vec<_> = self
+        let bid_levels: Vec<PriceLevelSnapshot> = self
             .bids
             .iter()
             .rev()
             .take(depth)
             .map(|entry| entry.value().snapshot())
-            .collect();
+            .collect::<Result<_, PriceLevelError>>()?;
 
-        let ask_levels: Vec<_> = self
+        let ask_levels: Vec<PriceLevelSnapshot> = self
             .asks
             .iter()
             .take(depth)
             .map(|entry| entry.value().snapshot())
-            .collect();
+            .collect::<Result<_, PriceLevelError>>()?;
 
         // Create enriched snapshot with pre-calculated metrics
-        EnrichedSnapshot::with_metrics(
+        Ok(EnrichedSnapshot::with_metrics(
             self.symbol.clone(),
             self.clock().now_millis().as_u64(),
             bid_levels,
@@ -4091,7 +4146,7 @@ where
             depth, // Use depth for VWAP calculation
             depth, // Use depth for imbalance calculation
             flags,
-        )
+        ))
     }
 
     /// Get the total volume at each price level
@@ -4119,15 +4174,16 @@ where
     /// Get a BTreeMap of bids with price as key and PriceLevel as value
     ///
     /// # Errors
-    /// Returns [`OrderBookError::PriceLevelError`] if rebuilding a level
-    /// from its snapshot fails validation (pricelevel 0.9 validates
-    /// snapshot admission instead of trusting it).
+    /// Returns [`OrderBookError::PriceLevelError`] if a level cannot produce
+    /// a coherent snapshot (pricelevel 0.10) or if rebuilding a level from
+    /// its snapshot fails validation (pricelevel validates snapshot
+    /// admission instead of trusting it).
     pub fn get_bt_bids(&self) -> Result<BTreeMap<u128, PriceLevel>, OrderBookError> {
         self.bids
             .iter()
             .map(|entry| {
                 let price = *entry.key();
-                let snapshot = entry.value().snapshot();
+                let snapshot = entry.value().snapshot()?;
                 let price_level = PriceLevel::try_from(&snapshot)?;
                 Ok((price, price_level))
             })
@@ -4137,15 +4193,16 @@ where
     /// Get a BTreeMap of asks with price as key and PriceLevel as value
     ///
     /// # Errors
-    /// Returns [`OrderBookError::PriceLevelError`] if rebuilding a level
-    /// from its snapshot fails validation (pricelevel 0.9 validates
-    /// snapshot admission instead of trusting it).
+    /// Returns [`OrderBookError::PriceLevelError`] if a level cannot produce
+    /// a coherent snapshot (pricelevel 0.10) or if rebuilding a level from
+    /// its snapshot fails validation (pricelevel validates snapshot
+    /// admission instead of trusting it).
     pub fn get_bt_asks(&self) -> Result<BTreeMap<u128, PriceLevel>, OrderBookError> {
         self.asks
             .iter()
             .map(|entry| {
                 let price = *entry.key();
-                let snapshot = entry.value().snapshot();
+                let snapshot = entry.value().snapshot()?;
                 let price_level = PriceLevel::try_from(&snapshot)?;
                 Ok((price, price_level))
             })
@@ -4755,6 +4812,12 @@ struct PreparedSnapshotLevels {
     bids: Vec<(u128, Arc<PriceLevel>)>,
     /// `(price, level)` pairs for the ask side, ascending by price.
     asks: Vec<(u128, Arc<PriceLevel>)>,
+    /// Every resting order of `bids` then `asks`, as `(price, side, order)`,
+    /// in the deterministic index-rebuild order: ascending price per side,
+    /// ascending insertion sequence within a level. Materialized in the
+    /// fallible prepare phase so the commit phase performs no fallible
+    /// level read.
+    orders: Vec<(u128, Side, Arc<OrderType<()>>)>,
 }
 
 /// Guard over the submit gate (#209 / #225) in either mode — held for the

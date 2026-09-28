@@ -82,7 +82,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             }
 
             // Phase 5: Create a snapshot
-            black_box(order_book.create_snapshot(5));
+            black_box(order_book.create_snapshot(5).expect("snapshot"));
         })
     });
 

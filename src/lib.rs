@@ -39,6 +39,42 @@
 //! - The Production Panic Policy is enforced mechanically: a clippy deny set
 //!   plus `scripts/check_panic_policy.py` in `make lint` (#242). See
 //!   `doc/panic-boundaries.md`.
+//! - **pricelevel 0.10 (#239).** Level snapshots, queue views and
+//!   match-result growth are fallible upstream; the book now propagates
+//!   those errors instead of ignoring them. `create_snapshot`,
+//!   `enriched_snapshot`, `enriched_snapshot_with_metrics` and
+//!   `evict_expired_orders` return `Result`.
+//! - **Mass cancels report failures.** `MassCancelResult::failures()` /
+//!   `has_failures()` and the new `MassCancelFailure`: a mass cancel whose
+//!   price level cannot be read cancels nothing and says so.
+//! - **Snapshot format v4.** Level statistics carry a `u128`
+//!   `value_executed`; v2 and v3 packages still restore.
+//! - **Wire break for bincode `TradeResult`.** pricelevel's `MatchResult`
+//!   gained a positional `error` field; JSON payloads and journals stay
+//!   compatible.
+//!
+//! ### Migration from 0.13
+//!
+//! | 0.13 | 0.14 |
+//! |------|------|
+//! | `OrderBook::create_snapshot(depth) -> OrderBookSnapshot` | `-> Result<OrderBookSnapshot, OrderBookError>` |
+//! | `OrderBook::enriched_snapshot(depth) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
+//! | `OrderBook::enriched_snapshot_with_metrics(depth, flags) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
+//! | `OrderBook::evict_expired_orders(now_ms) -> Vec<Arc<OrderType<T>>>` | `-> Result<Vec<Arc<OrderType<T>>>, OrderBookError>` |
+//! | `BookManager{Std,Tokio}::evict_expired_orders(symbol, now_ms) -> Option<Vec<..>>` | `-> Option<Result<Vec<..>, OrderBookError>>` |
+//! | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<Vec<..>, OrderBookError>>` |
+//! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
+//! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
+//!
+//! Re-exported pricelevel items change with pricelevel 0.10:
+//! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
+//! `Trade::with_timestamp`), `UuidGenerator::next` is now `try_next`,
+//! `OrderType::match_against` / `refresh_iceberg` return `Result`, and
+//! `PriceLevelError` has new variants (`CapacityExceeded`,
+//! `CounterExhausted`, `EntropyUnavailable`). Callers of the snapshot
+//! functions add `?` (or handle the error); callers of `evict_expired_orders`
+//! do the same; code that treated an empty `MassCancelResult` as "nothing
+//! to cancel" should also check `has_failures()`.
 //!
 //! ## What's New in Version 0.13.0
 //!
@@ -1190,8 +1226,8 @@ pub use orderbook::trade::{TradeEvent, TradeInfo, TradeListener, TradeResult, Tr
 #[cfg(feature = "nats")]
 pub use orderbook::{BookChangeBatch, BookChangeEntry, NatsBookChangePublisher};
 pub use orderbook::{
-    FeeOverflow, FeeSchedule, ManagerError, MassCancelResult, OrderBook, OrderBookError,
-    OrderBookSnapshot,
+    FeeOverflow, FeeSchedule, ManagerError, MassCancelFailure, MassCancelResult, OrderBook,
+    OrderBookError, OrderBookSnapshot,
 };
 pub use utils::current_time_millis;
 #[cfg(feature = "alloc-counters")]

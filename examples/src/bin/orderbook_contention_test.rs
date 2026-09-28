@@ -429,7 +429,9 @@ fn test_price_level_distribution() -> Result<(), String> {
         helpers::setup_orders_for_price_level_test(&order_book, price_levels, min_orders);
 
         // Verify that the book has orders before continuing
-        let snapshot = order_book.create_snapshot(price_levels as usize);
+        let snapshot = order_book
+            .create_snapshot(price_levels as usize)
+            .map_err(|err| format!("snapshot failed: {err}"))?;
         info!(
             "Pre-populated with {} bid levels and {} ask levels",
             snapshot.bids.len(),

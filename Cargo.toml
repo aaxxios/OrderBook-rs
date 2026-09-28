@@ -1,6 +1,6 @@
 [package]
 name = "orderbook-rs"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A high-performance, lock-free price level implementation for limit order books in Rust. This library provides the building blocks for creating efficient trading systems with support for multiple order types and concurrent access patterns."
@@ -218,7 +218,7 @@ members = [
 
 [workspace.dependencies]
 orderbook-rs = { path = "." }
-pricelevel = "0.9"
+pricelevel = "0.10"
 tracing = "0.1"
 uuid = { version = "1.26.1", features = ["v4", "v5", "serde"] }
 dashmap = "6.2"

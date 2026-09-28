@@ -49,6 +49,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10.4) instead of a single window against 10.0, which flipped on noise.
   CI now runs it (#262). Test-only change.
 
+### Changed (breaking)
+
+- **pricelevel upgraded to 0.10 (#239).** The crate version moves to
+  0.14.0. pricelevel 0.10 makes level snapshots, queue views, dry runs and
+  match-result growth fallible; every such result is now propagated as
+  `OrderBookError::PriceLevelError` instead of being ignored. Signature
+  changes (callers add `?` or handle the error):
+  - `OrderBook::create_snapshot(depth)`: `OrderBookSnapshot` →
+    `Result<OrderBookSnapshot, OrderBookError>`.
+  - `OrderBook::enriched_snapshot(depth)` and
+    `OrderBook::enriched_snapshot_with_metrics(depth, flags)`:
+    `EnrichedSnapshot` → `Result<EnrichedSnapshot, OrderBookError>`.
+  - `OrderBook::evict_expired_orders(now_ms)`: `Vec<Arc<OrderType<T>>>` →
+    `Result<Vec<Arc<OrderType<T>>>, OrderBookError>`. The read phase runs
+    before any eviction, so `Err` means nothing was evicted.
+  - `BookManagerStd` / `BookManagerTokio`: `evict_expired_orders(symbol,
+    now_ms)` returns `Option<Result<Vec<..>, OrderBookError>>` and
+    `evict_expired_across_books(now_ms)` returns
+    `HashMap<String, Result<Vec<..>, OrderBookError>>` (one failing book does
+    not stop the others). Both managers stay in parity.
+  - `OrderBookError` now derives `Clone` (the hand-written impl is gone,
+    since `PriceLevelError` derives `Clone` upstream); behaviour unchanged.
+  - Re-exported pricelevel items follow pricelevel 0.10: `PriceLevel::snapshot`
+    returns `Result`, `Trade::new` is removed (use `Trade::with_timestamp`),
+    `UuidGenerator::next` becomes `try_next`, `OrderType::match_against` /
+    `refresh_iceberg` return `Result`, `MatchResult` gains `error()`, and
+    `PriceLevelError` gains `CapacityExceeded`, `CounterExhausted` and
+    `EntropyUnavailable` (exhaustive matches need new arms).
+- **Mass cancels report failures instead of swallowing them (#239).**
+  `MassCancelResult` gains `failures()` / `has_failures()` and the new
+  `#[non_exhaustive]` `MassCancelFailure` enum (re-exported at the root).
+  `cancel_all_orders`, `cancel_orders_by_side` and
+  `cancel_orders_by_price_range` read every level in scope before cancelling
+  anything; a level whose orders cannot be read refuses the whole call:
+  nothing is cancelled and `MassCancelFailure::LevelUnreadable { side,
+  price, error }` is recorded (logged at `WARN`). Signatures are unchanged.
+  Code that treats an empty result as "nothing to cancel" should check
+  `has_failures()`. The field is `#[serde(default)]`, so JSON (including
+  journaled `MassCancelled` entries) written by 0.13 decodes with no
+  failures. Replay turns a refused mass cancel or eviction into
+  `ReplayError::OrderBookError` instead of continuing on a diverged book.
+  Replay applies a mass cancel journaled as refused as a no-op instead of
+  re-executing it, so a replay book that happens to be readable cannot
+  cancel orders the live book kept.
+- **Snapshot package format v4.** `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` goes
+  from 3 to 4 because a level's `value_executed` statistic is a `u128` in
+  pricelevel 0.10 and may exceed `u64::MAX`. Migration: none needed on read;
+  v2 (0.11) and v3 (0.12 / 0.13) packages validate with their original
+  checksum and restore (pinned by a verbatim 0.13.1 v3 fixture next to the
+  0.8.4 v2 fixture). Packages written by 0.14 are v4 and are rejected by
+  0.13 and earlier (version check, or a decode error when a
+  `value_executed` exceeds `u64::MAX`); upgrade readers before writers.
+- **Wire break: bincode `TradeResult` (NATS + `bincode`).** pricelevel 0.10
+  appended a positional `error` field to `MatchResult`, so a bincode
+  `TradeResult` written by 0.13 does not decode under 0.14 and vice versa.
+  Mixed-version NATS consumers using `BincodeEventSerializer` must upgrade
+  producers and consumers together. The JSON serializer and the
+  `FileJournal` (JSON payloads) stay compatible: a 0.13.1 JSON
+  `TradeResult` and a verbatim 0.13.1 journal segment (trades, a coded
+  rejection, a mass cancel) decode, verify and replay under 0.14 (pinned by
+  fixture tests). A bincode-encoded `MassCancelResult` from 0.13 does not
+  decode either (new `failures` field).
+- **Matching surfaces level failures.** A sweep stopped by a pricelevel
+  failure (queue view, `add_trade` / `add_filled_order_id` growth) now
+  returns `Err(OrderBookError::PriceLevelError)` after the book's indices are
+  reconciled with the makers already consumed; trades executed before the
+  failure are not reported on this path (tracked in #240). Fill-or-kill
+  feasibility and modify self-trade checks refuse the order when the dry run
+  fails instead of guessing.
+
+### Changed
+
+- **Behaviour from pricelevel 0.10.** `PriceLevel::new` starts
+  `first_arrival_time` at `0` (unstamped) instead of the wall clock, so
+  identical input yields identical level snapshot checksums.
+  `matchable_quantity` replays the queue in sweep (insertion) order, so a
+  fill-or-kill verdict involving iceberg / reserve replenishment follows
+  what the sweep actually executes. No existing test expectation changed.
+- `impl Serialize for OrderBook` maps a failed level snapshot to a serde
+  error; the JSON shape is unchanged (no `Ok` wrapper), pinned against a
+  0.13.1 capture.
+- Snapshot restore materializes every level's orders in its validation
+  phase, so the commit phase stays infallible.
+
 - Dependency floors raised to the latest semver-compatible releases: uuid
   1.26.1, serde_json 1.0.151, serde 1.0.229, crossbeam 0.8.5, bitflags
   2.13.2, thiserror 2.0.21, bytes 1.12.1, crc32fast 1.5.2, memmap2 0.9.11,

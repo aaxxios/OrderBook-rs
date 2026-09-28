@@ -329,13 +329,16 @@ mod tests {
     const FIXTURE_TAKER: u64 = 424_242;
 
     fn make_trade(price: u128, quantity: u64) -> Trade {
-        Trade::new(
+        // pricelevel 0.10 removed the wall-clock `Trade::new`; fixtures use
+        // a fixed timestamp.
+        Trade::with_timestamp(
             new_id(),
             Id::from_u64(FIXTURE_TAKER),
             new_id(),
             Price::new(price),
             Quantity::new(quantity),
             pricelevel::Side::Buy,
+            pricelevel::TimestampMs::new(1_700_000_000_000),
         )
     }
 

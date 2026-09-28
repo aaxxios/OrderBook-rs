@@ -345,7 +345,10 @@ mod tests_restore_failure_atomicity {
         OrderBookSnapshot {
             symbol: symbol.to_string(),
             timestamp: 1_700_000_000_000,
-            bids: vec![level_a.snapshot(), level_b.snapshot()],
+            bids: vec![
+                level_a.snapshot().expect("level snapshot"),
+                level_b.snapshot().expect("level snapshot"),
+            ],
             asks: Vec::new(),
         }
     }
@@ -375,7 +378,7 @@ mod tests_restore_failure_atomicity {
     /// statistics included) for byte-level before/after comparison. The
     /// top-level snapshot timestamp is deliberately excluded (wall clock).
     fn level_state_json(book: &OrderBook<()>) -> (String, String) {
-        let snapshot = book.create_snapshot(usize::MAX);
+        let snapshot = book.create_snapshot(usize::MAX).expect("snapshot");
         let bids = serde_json::to_string(&snapshot.bids).expect("serialize bids");
         let asks = serde_json::to_string(&snapshot.asks).expect("serialize asks");
         (bids, asks)
@@ -517,7 +520,7 @@ mod tests_restore_duplicate_price_levels {
                 extra_fields: (),
             });
             assert!(admitted.is_ok(), "level admits order {order_id}");
-            level.snapshot()
+            level.snapshot().expect("level snapshot")
         };
 
         let bad = OrderBookSnapshot {

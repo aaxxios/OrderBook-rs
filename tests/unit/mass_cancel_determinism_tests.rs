@@ -231,8 +231,8 @@ fn test_replay_mass_cancel_payloads_match_journaled_originals() {
     // is one less.
     assert_eq!(last_seq, seq - 1);
 
-    let live_snap = live.create_snapshot(usize::MAX);
-    let replayed_snap = replayed.create_snapshot(usize::MAX);
+    let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+    let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
     assert!(
         snapshots_match(&live_snap, &replayed_snap),
         "post-session live and replayed snapshots must match"

@@ -37,7 +37,7 @@ fn order_match_snapshot_restore_round_trip() {
     let _ = book.add_limit_order(ask_id, 110, 30, Side::Sell, TimeInForce::Gtc, None);
 
     // Verify pre-match state
-    let snap_before = book.create_snapshot(usize::MAX);
+    let snap_before = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap_before.bids.len(), 1);
     assert_eq!(snap_before.asks.len(), 1);
 
@@ -47,7 +47,7 @@ fn order_match_snapshot_restore_round_trip() {
     assert!(result.is_ok());
 
     // Snapshot after match
-    let snap_after = book.create_snapshot(usize::MAX);
+    let snap_after = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap_after.symbol, "BTC/USD");
 
     // Restore from snapshot into a new book
@@ -56,7 +56,7 @@ fn order_match_snapshot_restore_round_trip() {
     assert!(restore_result.is_ok());
 
     // Verify restored state matches
-    let snap_restored = restored.create_snapshot(usize::MAX);
+    let snap_restored = restored.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snapshots_match(&snap_after, &snap_restored));
 }
 
@@ -68,7 +68,9 @@ fn snapshot_enriched_metrics_validation() {
 
     // Enriched snapshot with specific metrics
     let flags = MetricFlags::MID_PRICE | MetricFlags::SPREAD | MetricFlags::IMBALANCE;
-    let enriched = book.enriched_snapshot_with_metrics(usize::MAX, flags);
+    let enriched = book
+        .enriched_snapshot_with_metrics(usize::MAX, flags)
+        .expect("enriched snapshot");
 
     assert!(enriched.mid_price.is_some());
     assert!(enriched.spread_bps.is_some());
@@ -166,8 +168,8 @@ fn journal_replay_reconstructs_identical_state() {
             .expect("manual add");
     }
 
-    let snap_replayed = replayed_book.create_snapshot(usize::MAX);
-    let snap_manual = manual_book.create_snapshot(usize::MAX);
+    let snap_replayed = replayed_book.create_snapshot(usize::MAX).expect("snapshot");
+    let snap_manual = manual_book.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snapshots_match(&snap_replayed, &snap_manual));
 }
 
@@ -199,7 +201,7 @@ fn journal_replay_partial_from_sequence() {
         ReplayEngine::<()>::replay_from(&journal, 1, "TEST").expect("replay should succeed");
     assert_eq!(last_seq, 2);
 
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     // Should have 1 bid (50) and 1 ask (200), NOT the first bid at 100
     assert_eq!(snap.bids.len(), 1);
     assert_eq!(snap.asks.len(), 1);
@@ -218,7 +220,7 @@ fn journal_verify_matches_snapshot() {
     // Replay and snapshot
     let (book, _) =
         ReplayEngine::<()>::replay_from(&journal, 0, "TEST").expect("replay should succeed");
-    let expected_snapshot = book.create_snapshot(usize::MAX);
+    let expected_snapshot = book.create_snapshot(usize::MAX).expect("snapshot");
 
     // Verify should return true
     let verified = ReplayEngine::<()>::verify(&journal, &expected_snapshot);
@@ -320,7 +322,7 @@ fn book_manager_multi_book_operations() {
 
     // Verify book state after match
     let book = mgr.get_book("BTC/USD").expect("BTC/USD book must exist");
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap.asks.len(), 1);
     // Remaining ask quantity should be 40
     assert_eq!(snap.asks[0].visible_quantity(), Quantity::new(40));
@@ -340,10 +342,10 @@ fn book_manager_multi_book_independent_state() {
     // Each book should have independent state
     let btc_snap = mgr
         .get_book("BTC/USD")
-        .map(|b| b.create_snapshot(usize::MAX));
+        .map(|b| b.create_snapshot(usize::MAX).expect("snapshot"));
     let eth_snap = mgr
         .get_book("ETH/USD")
-        .map(|b| b.create_snapshot(usize::MAX));
+        .map(|b| b.create_snapshot(usize::MAX).expect("snapshot"));
 
     assert!(btc_snap.is_some());
     assert!(eth_snap.is_some());
@@ -449,7 +451,7 @@ fn file_journal_write_read_verify_round_trip() {
         ReplayEngine::<()>::replay_from(&journal, 0, "TEST").expect("replay should succeed");
     assert_eq!(last_seq, 1);
 
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap.bids.len(), 1);
     assert_eq!(snap.asks.len(), 1);
 }
@@ -462,7 +464,7 @@ fn snapshot_json_round_trip() {
     let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let _ = book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
 
-    let snapshot = book.create_snapshot(usize::MAX);
+    let snapshot = book.create_snapshot(usize::MAX).expect("snapshot");
     let json = serde_json::to_string(&snapshot);
     assert!(json.is_ok());
     let json = json.expect("serialize should succeed");
@@ -499,7 +501,7 @@ fn mass_cancel_then_snapshot_shows_empty_book() {
         );
     }
 
-    let snap_before = book.create_snapshot(usize::MAX);
+    let snap_before = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap_before.bids.len(), 10);
     assert_eq!(snap_before.asks.len(), 10);
 
@@ -507,7 +509,7 @@ fn mass_cancel_then_snapshot_shows_empty_book() {
     let result = book.cancel_all_orders();
     assert!(result.cancelled_count() > 0);
 
-    let snap_after = book.create_snapshot(usize::MAX);
+    let snap_after = book.create_snapshot(usize::MAX).expect("snapshot");
     assert!(snap_after.bids.is_empty());
     assert!(snap_after.asks.is_empty());
 }
@@ -532,6 +534,6 @@ fn validation_prevents_invalid_then_valid_order_succeeds() {
     let result = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     assert!(result.is_ok());
 
-    let snap = book.create_snapshot(usize::MAX);
+    let snap = book.create_snapshot(usize::MAX).expect("snapshot");
     assert_eq!(snap.bids.len(), 1);
 }

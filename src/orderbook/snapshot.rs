@@ -143,21 +143,29 @@ impl OrderBookSnapshot {
 
 /// Format version used for checksum-enabled order book snapshots.
 ///
+/// Bumped to `4` for pricelevel 0.10: the embedded level statistics'
+/// `value_executed` is a `u128` (was `u64`), so a payload may carry a value
+/// above `u64::MAX` that a pre-0.14 reader (pricelevel 0.9) cannot decode.
+/// Newly written packages are stamped `4` so an old reader fails fast on
+/// the version check whenever the payload itself still decodes; a payload
+/// whose `value_executed` exceeds `u64::MAX` fails in deserialization
+/// instead, because decoding runs before the version check.
+///
 /// Bumped to `3` for the pricelevel 0.9 statistics schema: embedded
-/// level statistics may now carry a `stats_degraded` field (serialized
+/// level statistics may carry a `stats_degraded` field (serialized
 /// only when `true`), which a pricelevel 0.8 reader rejects with
-/// `unknown field`. Newly written packages are stamped `3` so an old
-/// reader fails fast on the version check instead of deep inside
-/// statistics deserialization (#206).
+/// `unknown field` (#206).
 ///
 /// Reads accept [`ORDERBOOK_SNAPSHOT_MIN_READ_VERSION`]`..=`this:
-/// `version: 2` payloads (written by 0.11 / pricelevel 0.8) contain the
-/// legacy 8-field statistics shape, which pricelevel 0.9 still decodes.
+/// `version: 2` payloads (written by 0.11 / pricelevel 0.8) and
+/// `version: 3` payloads (written by 0.12 / 0.13 / pricelevel 0.9) decode
+/// under pricelevel 0.10 unchanged (a `u64` `value_executed` widens to
+/// `u128` losslessly) and keep their original checksum.
 /// `version: 1` payloads (no `engine_seq`) remain rejected by
 /// [`OrderBookSnapshotPackage::validate`] with the existing
 /// `Unsupported snapshot version` error — that format break is
 /// intentional, with no special-case migration path.
-pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 3;
+pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 /// Oldest package format version [`OrderBookSnapshotPackage::validate`]
 /// still accepts on read. Version `2` packages predate the pricelevel
@@ -427,7 +435,7 @@ bitflags! {
 /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 10, Side::Buy, TimeInForce::Gtc, None);
 /// let _ = book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 101, 10, Side::Sell, TimeInForce::Gtc, None);
 ///
-/// let snapshot = book.enriched_snapshot(10);
+/// let snapshot = book.enriched_snapshot(10)?;
 ///
 /// if let Some(mid) = snapshot.mid_price {
 ///     println!("Mid price: {}", mid);
@@ -435,6 +443,7 @@ bitflags! {
 /// if let Some(spread) = snapshot.spread_bps {
 ///     println!("Spread: {} bps", spread);
 /// }
+/// # Ok::<(), orderbook_rs::OrderBookError>(())
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrichedSnapshot {

@@ -13,12 +13,18 @@
 //   cargo run --bin enriched_snapshots
 //   (from the examples directory)
 
-use orderbook_rs::{MetricFlags, OrderBook};
+use orderbook_rs::{MetricFlags, OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "enriched snapshots example failed");
+    }
+}
+
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Enriched Snapshots Example");
@@ -30,19 +36,20 @@ fn main() {
     display_book_state(&book);
 
     // Demonstrate full snapshot with all metrics
-    demo_full_enriched_snapshot(&book);
+    demo_full_enriched_snapshot(&book)?;
 
     // Demonstrate custom metric selection
-    demo_custom_metrics(&book);
+    demo_custom_metrics(&book)?;
 
     // Performance comparison
-    demo_performance_benefits(&book);
+    demo_performance_benefits(&book)?;
 
     // Practical use cases
-    demo_practical_use_cases(&book);
+    demo_practical_use_cases(&book)?;
 
     // Market data distribution
-    demo_market_data_distribution(&book);
+    demo_market_data_distribution(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
@@ -118,12 +125,12 @@ fn display_book_state(book: &OrderBook) {
     }
 }
 
-fn demo_full_enriched_snapshot(book: &OrderBook) {
+fn demo_full_enriched_snapshot(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Full Enriched Snapshot ===");
     info!("Creating snapshot with ALL metrics pre-calculated");
 
     // Create enriched snapshot with all metrics
-    let snapshot = book.enriched_snapshot(10);
+    let snapshot = book.enriched_snapshot(10)?;
 
     info!("\n📊 Snapshot Metrics:");
     info!("  Symbol: {}", snapshot.symbol);
@@ -161,16 +168,17 @@ fn demo_full_enriched_snapshot(book: &OrderBook) {
     }
 
     info!("\n✨ Key Benefit: All metrics calculated in SINGLE PASS!");
+    Ok(())
 }
 
-fn demo_custom_metrics(book: &OrderBook) {
+fn demo_custom_metrics(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Custom Metric Selection ===");
     info!("Optimize performance by selecting only needed metrics");
 
     // Example 1: Only price metrics
     info!("\n1️⃣  Price Metrics Only (MID_PRICE + SPREAD):");
     let snapshot =
-        book.enriched_snapshot_with_metrics(10, MetricFlags::MID_PRICE | MetricFlags::SPREAD);
+        book.enriched_snapshot_with_metrics(10, MetricFlags::MID_PRICE | MetricFlags::SPREAD)?;
 
     if let Some(mid) = snapshot.mid_price {
         info!("  Mid price: {:.2}", mid);
@@ -182,7 +190,7 @@ fn demo_custom_metrics(book: &OrderBook) {
 
     // Example 2: Only depth
     info!("\n2️⃣  Depth Metrics Only:");
-    let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::DEPTH);
+    let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::DEPTH)?;
 
     info!("  Bid depth: {}", snapshot.bid_depth_total);
     info!("  Ask depth: {}", snapshot.ask_depth_total);
@@ -190,7 +198,7 @@ fn demo_custom_metrics(book: &OrderBook) {
 
     // Example 3: Only VWAP
     info!("\n3️⃣  VWAP Only:");
-    let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::VWAP);
+    let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::VWAP)?;
 
     if let Some(vwap_bid) = snapshot.vwap_bid {
         info!("  Bid VWAP: {:.2}", vwap_bid);
@@ -205,7 +213,7 @@ fn demo_custom_metrics(book: &OrderBook) {
     let snapshot = book.enriched_snapshot_with_metrics(
         10,
         MetricFlags::DEPTH | MetricFlags::IMBALANCE | MetricFlags::VWAP,
-    );
+    )?;
 
     info!("  Bid depth: {}", snapshot.bid_depth_total);
     info!("  Ask depth: {}", snapshot.ask_depth_total);
@@ -214,9 +222,10 @@ fn demo_custom_metrics(book: &OrderBook) {
         info!("  Bid VWAP: {:.2}", vwap_bid);
     }
     info!("  ✓ Custom metrics for specific strategy");
+    Ok(())
 }
 
-fn demo_performance_benefits(book: &OrderBook) {
+fn demo_performance_benefits(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Performance Benefits ===");
 
     info!("\n📊 Traditional Approach (multiple passes):");
@@ -229,7 +238,7 @@ fn demo_performance_benefits(book: &OrderBook) {
     info!("  ❌ Result: 5+ separate passes through data");
 
     info!("\n⚡ Enriched Snapshot Approach:");
-    let snapshot = book.enriched_snapshot(10);
+    let snapshot = book.enriched_snapshot(10)?;
     info!("  ✓ Create snapshot with ALL metrics");
     info!("  ✅ Result: SINGLE pass through data!");
 
@@ -252,9 +261,10 @@ fn demo_performance_benefits(book: &OrderBook) {
             info!("  ✗ Serialization failed: {}", e);
         }
     }
+    Ok(())
 }
 
-fn demo_practical_use_cases(book: &OrderBook) {
+fn demo_practical_use_cases(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Practical Use Cases ===");
 
     // Use case 1: HFT trading decision
@@ -262,7 +272,7 @@ fn demo_practical_use_cases(book: &OrderBook) {
     let snapshot = book.enriched_snapshot_with_metrics(
         5,
         MetricFlags::MID_PRICE | MetricFlags::SPREAD | MetricFlags::IMBALANCE,
-    );
+    )?;
 
     if let (Some(mid), Some(spread)) = (snapshot.mid_price, snapshot.spread_bps) {
         info!("  Mid price: {:.2}", mid);
@@ -286,7 +296,7 @@ fn demo_practical_use_cases(book: &OrderBook) {
 
     // Use case 2: Market data distribution
     info!("\n2️⃣  Market Data Distribution:");
-    let _snapshot = book.enriched_snapshot(10);
+    let _snapshot = book.enriched_snapshot(10)?;
 
     info!("  Distributing snapshot to subscribers...");
     info!("  ✓ Subscribers receive pre-calculated metrics");
@@ -297,7 +307,7 @@ fn demo_practical_use_cases(book: &OrderBook) {
     // Use case 3: Risk monitoring
     info!("\n3️⃣  Risk Monitoring:");
     let risk_snapshot =
-        book.enriched_snapshot_with_metrics(10, MetricFlags::DEPTH | MetricFlags::VWAP);
+        book.enriched_snapshot_with_metrics(10, MetricFlags::DEPTH | MetricFlags::VWAP)?;
 
     info!("  Monitoring liquidity risk...");
     if risk_snapshot.bid_depth_total < 100 || risk_snapshot.ask_depth_total < 100 {
@@ -313,7 +323,7 @@ fn demo_practical_use_cases(book: &OrderBook) {
 
     // Use case 4: Execution quality
     info!("\n4️⃣  Execution Quality Analysis:");
-    let snapshot = book.enriched_snapshot(10);
+    let snapshot = book.enriched_snapshot(10)?;
     if let (Some(vwap_bid), Some(vwap_ask), Some(mid)) =
         (snapshot.vwap_bid, snapshot.vwap_ask, snapshot.mid_price)
     {
@@ -329,16 +339,17 @@ fn demo_practical_use_cases(book: &OrderBook) {
         info!("    Buy:  {:.2} bps", buy_slippage);
         info!("    Sell: {:.2} bps", sell_slippage);
     }
+    Ok(())
 }
 
-fn demo_market_data_distribution(book: &OrderBook) {
+fn demo_market_data_distribution(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Market Data Distribution Workflow ===");
 
     // Scenario: Market data provider distributing enriched snapshots
     info!("\n📡 Market Data Provider Workflow:");
 
     info!("\nStep 1: Create enriched snapshot");
-    let snapshot = book.enriched_snapshot(10);
+    let snapshot = book.enriched_snapshot(10)?;
     info!("  ✓ Snapshot created with all metrics");
 
     info!("\nStep 2: Serialize for distribution");
@@ -380,4 +391,5 @@ fn demo_market_data_distribution(book: &OrderBook) {
     info!("  • Each client extracts needed metrics");
     info!("  • No redundant calculations");
     info!("  • Optimal resource usage");
+    Ok(())
 }

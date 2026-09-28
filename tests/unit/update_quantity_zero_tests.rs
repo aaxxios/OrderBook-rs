@@ -77,7 +77,10 @@ mod tests_update_quantity_zero {
         );
         assert_eq!(book.best_ask(), None, "no phantom level at zero depth");
         assert!(
-            book.create_snapshot(usize::MAX).asks.is_empty(),
+            book.create_snapshot(usize::MAX)
+                .expect("snapshot")
+                .asks
+                .is_empty(),
             "the empty level was removed"
         );
         assert_eq!(
@@ -197,7 +200,10 @@ mod tests_update_quantity_zero {
         );
         assert_eq!(book.best_ask(), None, "no level survives on hidden depth");
         assert!(
-            book.create_snapshot(usize::MAX).asks.is_empty(),
+            book.create_snapshot(usize::MAX)
+                .expect("snapshot")
+                .asks
+                .is_empty(),
             "the empty level was removed"
         );
         assert_eq!(
