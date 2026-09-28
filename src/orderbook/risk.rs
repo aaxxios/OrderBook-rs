@@ -662,6 +662,11 @@ mod tests {
     use super::*;
     use pricelevel::Id;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn account(byte: u8) -> Hash32 {
         Hash32::new([byte; 32])
     }
@@ -803,7 +808,7 @@ mod tests {
     fn test_risk_state_no_config_is_passthrough() {
         let state = RiskState::new();
         let acct = account(1);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Every check returns Ok.
         assert!(
@@ -833,7 +838,7 @@ mod tests {
         );
 
         let acct = account(2);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         state.on_admission(order_id, acct, 100, 10);
 
         let counters = state
@@ -862,7 +867,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000_000));
 
         let acct = account(4);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         state.on_admission(order_id, acct, 100, 10);
 
         // Fully fill the account's only resting order: the per-order entry and
@@ -883,7 +888,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000_000));
 
         let acct = account(5);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         // Admit 10 @ 100 → resting_notional 1_000.
         state.on_admission(order_id, acct, 100, 10);
         assert_eq!(
@@ -994,7 +999,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000_000));
 
         let acct = account(3);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         state.on_admission(order_id, acct, 100, 10);
 
         state.on_fill(order_id, 4, 100);
@@ -1023,8 +1028,8 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
 
         let acct = account(4);
-        let keep = Id::new_uuid();
-        let fill = Id::new_uuid();
+        let keep = new_id();
+        let fill = new_id();
         // Two resting orders for the account. Fully filling one decrements
         // open_count by exactly one; the entry is retained because the
         // account still has a resting order (eviction needs both counters at 0).
@@ -1049,8 +1054,8 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(2));
 
         let acct = account(5);
-        state.on_admission(Id::new_uuid(), acct, 100, 1);
-        state.on_admission(Id::new_uuid(), acct, 100, 1);
+        state.on_admission(new_id(), acct, 100, 1);
+        state.on_admission(new_id(), acct, 100, 1);
 
         let err = state
             .check_limit_admission(acct, 100, 1, Some(100))
@@ -1076,7 +1081,7 @@ mod tests {
 
         let acct = account(6);
         // Pre-load 800 of notional.
-        state.on_admission(Id::new_uuid(), acct, 100, 8);
+        state.on_admission(new_id(), acct, 100, 8);
 
         // Attempt to add 300 more (price=100, qty=3).
         let err = state
@@ -1223,7 +1228,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
 
         let acct = account(11);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         state.on_admission(order_id, acct, 100, 10);
 
         state.disable();
@@ -1250,7 +1255,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_notional_per_account(10_000));
 
         let acct = account(12);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         state.on_admission(order_id, acct, 100, 5);
 
         // Decrement by far more than what was admitted.
@@ -1275,7 +1280,7 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(10));
 
         let acct = account(13);
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         state.on_admission(order_id, acct, 100, 5);
         state.on_fill(order_id, 5, 100); // entry removed, counters evicted at 0
         state.on_cancel(order_id); // no-op (entry not present)
@@ -1298,7 +1303,7 @@ mod tests {
         let state = RiskState::new();
         assert!(
             state
-                .check_modify_admission(Id::new_uuid(), account(1), 999_999, 999, Some(100))
+                .check_modify_admission(new_id(), account(1), 999_999, 999, Some(100))
                 .is_ok()
         );
     }
@@ -1311,7 +1316,7 @@ mod tests {
         let mut state = RiskState::new();
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(1));
         let acct = account(20);
-        let id = Id::new_uuid();
+        let id = new_id();
         state.on_admission(id, acct, 100, 10); // account at the limit
 
         assert!(
@@ -1328,7 +1333,7 @@ mod tests {
         let mut state = RiskState::new();
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000));
         let acct = account(21);
-        let id = Id::new_uuid();
+        let id = new_id();
         state.on_admission(id, acct, 100, 8); // resting_notional = 800
 
         // Modify to 100*9 = 900 projects to 800 - 800 + 900 = 900 ≤ 1_000.
@@ -1363,7 +1368,7 @@ mod tests {
         let mut state = RiskState::new();
         state.set_config(RiskConfig::new().with_max_notional_per_account(1_000));
         let acct = account(22);
-        let id = Id::new_uuid();
+        let id = new_id();
         state.on_admission(id, acct, 100, 10); // resting_notional = 1_000 (at ceiling)
 
         // Re-price to the same notional: 1_000 - 1_000 + 1_000 = 1_000 ≤ 1_000.
@@ -1382,7 +1387,7 @@ mod tests {
             RiskConfig::new().with_price_band_bps(100, ReferencePriceSource::LastTrade),
         );
         let acct = account(23);
-        let id = Id::new_uuid();
+        let id = new_id();
         state.on_admission(id, acct, 1_000_000, 1);
 
         // New price 1_100_000 vs reference 1_000_000 → +1_000 bps, far over band.
@@ -1420,11 +1425,11 @@ mod tests {
         state.set_config(RiskConfig::new().with_max_open_orders_per_account(1));
         let acct = account(24);
         // One OTHER tracked resting order already at the limit.
-        state.on_admission(Id::new_uuid(), acct, 100, 10);
+        state.on_admission(new_id(), acct, 100, 10);
 
         // The order being modified is NOT tracked → full admission → rejected
         // on the open-order count (would be a 2nd order for the account).
-        let untracked = Id::new_uuid();
+        let untracked = new_id();
         match state.check_modify_admission(untracked, acct, 110, 5, Some(105)) {
             Err(OrderBookError::RiskMaxOpenOrders { .. }) => {}
             other => panic!(

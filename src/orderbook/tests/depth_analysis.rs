@@ -5,14 +5,19 @@ mod tests {
     use crate::OrderBook;
     use pricelevel::{Id, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     #[test]
     fn test_price_at_depth_buy_side() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add bid orders at different price levels
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
 
         // Target depth of 10 should be at price 100
         assert_eq!(book.price_at_depth(10, Side::Buy), Some(100));
@@ -32,9 +37,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add ask orders at different price levels
-        let _ = book.add_limit_order(Id::new(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
 
         // Target depth of 15 should be at price 101
         assert_eq!(book.price_at_depth(15, Side::Sell), Some(101));
@@ -63,9 +68,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add bid orders at different price levels
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
 
         // Target depth of 10 should return (100, 10)
         assert_eq!(
@@ -94,9 +99,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add ask orders at different price levels
-        let _ = book.add_limit_order(Id::new(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
 
         // Target depth of 15 should return (101, 15)
         assert_eq!(
@@ -134,10 +139,10 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add bid orders at different price levels
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 97, 40, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 97, 40, Side::Buy, TimeInForce::Gtc, None);
 
         // Top 1 level should have depth of 10
         assert_eq!(book.total_depth_at_levels(1, Side::Buy), 10);
@@ -160,9 +165,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add ask orders at different price levels
-        let _ = book.add_limit_order(Id::new(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
 
         // Top 1 level should have depth of 15
         assert_eq!(book.total_depth_at_levels(1, Side::Sell), 15);
@@ -191,7 +196,7 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add some orders
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
 
         // Zero levels should return 0
         assert_eq!(book.total_depth_at_levels(0, Side::Buy), 0);
@@ -203,9 +208,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add multiple orders at the same price level
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 100, 15, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 15, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
 
         // Total at price 100 should be 25 (10 + 15)
         assert_eq!(book.price_at_depth(25, Side::Buy), Some(100));
@@ -231,9 +236,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add bids in non-sequential order to ensure priority is correct
-        let _ = book.add_limit_order(Id::new(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 98, 30, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 99, 20, Side::Buy, TimeInForce::Gtc, None);
 
         // Should iterate from highest to lowest (100, 99, 98)
         assert_eq!(book.total_depth_at_levels(1, Side::Buy), 10); // 100
@@ -246,9 +251,9 @@ mod tests {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
         // Add asks in non-sequential order to ensure priority is correct
-        let _ = book.add_limit_order(Id::new(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
-        let _ = book.add_limit_order(Id::new(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 103, 35, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 101, 15, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 102, 25, Side::Sell, TimeInForce::Gtc, None);
 
         // Should iterate from lowest to highest (101, 102, 103)
         assert_eq!(book.total_depth_at_levels(1, Side::Sell), 15); // 101

@@ -3,6 +3,7 @@ mod tests_sequencer_types {
     use orderbook_rs::orderbook::mass_cancel::MassCancelResult;
     use orderbook_rs::orderbook::sequencer::{SequencerCommand, SequencerEvent, SequencerResult};
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
+    use uuid::Uuid;
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -418,7 +419,7 @@ mod tests_sequencer_types {
     #[test]
     fn json_roundtrip_existing_add_order_unchanged() {
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: Id::from_uuid(Uuid::new_v4()),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -441,7 +442,7 @@ mod tests_sequencer_types {
 
     #[test]
     fn json_roundtrip_existing_cancel_order_unchanged() {
-        let id = Id::new();
+        let id = Id::from_uuid(Uuid::new_v4());
         let cmd: SequencerCommand<()> = SequencerCommand::CancelOrder(id);
         let json = serde_json::to_string(&cmd);
         assert!(json.is_ok());
@@ -462,11 +463,12 @@ mod tests_sequencer_types {
         use orderbook_rs::orderbook::sequencer::{
             InMemoryJournal, Journal, SequencerCommand, SequencerEvent, SequencerResult,
         };
+        use uuid::Uuid;
 
         use pricelevel::{Hash32, Id, Side, TimeInForce};
 
         fn make_add_event(seq: u64, price: u128, side: Side) -> SequencerEvent<()> {
-            let id = Id::new_uuid();
+            let id = Id::from_uuid(Uuid::new_v4());
             SequencerEvent {
                 sequence_num: seq,
                 timestamp_ns: 1_000_000_000u64.saturating_add(seq),

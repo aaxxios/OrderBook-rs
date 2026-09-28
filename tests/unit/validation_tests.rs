@@ -5,9 +5,14 @@ use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, Time
 mod tests {
     use super::*;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn make_standard_order(price: u128, quantity: u64, side: Side) -> OrderType<()> {
         OrderType::Standard {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(price),
             quantity: Quantity::new(quantity),
             side,
@@ -29,7 +34,7 @@ mod tests {
         side: Side,
     ) -> OrderType<()> {
         OrderType::IcebergOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(price),
             visible_quantity: Quantity::new(visible),
             hidden_quantity: Quantity::new(hidden),
@@ -43,7 +48,7 @@ mod tests {
 
     fn make_post_only_order(price: u128, side: Side) -> OrderType<()> {
         OrderType::PostOnly {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(price),
             quantity: Quantity::new(100),
             side,
@@ -227,16 +232,14 @@ mod tests {
     #[test]
     fn test_add_limit_order_respects_tick_size() {
         let book: OrderBook<()> = OrderBook::with_tick_size("BTC/USD", 100);
-        let result =
-            book.add_limit_order(Id::new_uuid(), 150, 100, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 150, 100, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_limit_order_valid_tick_size() {
         let book: OrderBook<()> = OrderBook::with_tick_size("BTC/USD", 100);
-        let result =
-            book.add_limit_order(Id::new_uuid(), 200, 100, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 200, 100, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_ok());
     }
 
@@ -384,7 +387,7 @@ mod tests {
         // make_post_only_order uses quantity=100, which is valid for lot=10
         // Create one with invalid quantity
         let order = OrderType::PostOnly {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(15),
             side: Side::Buy,
@@ -444,16 +447,14 @@ mod tests {
     #[test]
     fn test_add_limit_order_respects_lot_size() {
         let book: OrderBook<()> = OrderBook::with_lot_size("BTC/USD", 10);
-        let result =
-            book.add_limit_order(Id::new_uuid(), 1000, 15, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 1000, 15, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_limit_order_valid_lot_size() {
         let book: OrderBook<()> = OrderBook::with_lot_size("BTC/USD", 10);
-        let result =
-            book.add_limit_order(Id::new_uuid(), 1000, 20, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 1000, 20, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_ok());
     }
 
@@ -720,8 +721,7 @@ mod tests {
     fn test_add_limit_order_respects_min_order_size() {
         let mut book: OrderBook<()> = OrderBook::new("BTC/USD");
         book.set_min_order_size(10);
-        let result =
-            book.add_limit_order(Id::new_uuid(), 1000, 5, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 1000, 5, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_err());
     }
 
@@ -729,8 +729,7 @@ mod tests {
     fn test_add_limit_order_respects_max_order_size() {
         let mut book: OrderBook<()> = OrderBook::new("BTC/USD");
         book.set_max_order_size(100);
-        let result =
-            book.add_limit_order(Id::new_uuid(), 1000, 150, Side::Buy, TimeInForce::Gtc, None);
+        let result = book.add_limit_order(new_id(), 1000, 150, Side::Buy, TimeInForce::Gtc, None);
         assert!(result.is_err());
     }
 
@@ -788,7 +787,7 @@ mod tests {
     #[test]
     fn test_add_order_rejects_duplicate_order_id_issue_119() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        let id = Id::new_uuid();
+        let id = new_id();
 
         // First order rests on the book.
         let first = book.add_limit_order(id, 100, 10, Side::Sell, TimeInForce::Gtc, None);

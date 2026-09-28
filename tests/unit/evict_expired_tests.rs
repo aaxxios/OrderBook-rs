@@ -12,6 +12,11 @@ use orderbook_rs::{Clock, OrderBook, StubClock};
 use pricelevel::{Id, Side, TimeInForce, TimestampMs};
 use std::sync::{Arc, Mutex};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 /// A book whose clock starts at logical `0` so small `Gtd` deadlines are
 /// admitted (wall-clock admission would treat them as already expired) and the
 /// caller-supplied sweep timestamp is what drives expiry.
@@ -25,7 +30,7 @@ fn expiring_book(symbol: &str) -> OrderBook<()> {
 #[test]
 fn expired_gtd_is_evicted_and_no_longer_matchable() {
     let book = expiring_book("TEST");
-    let gtd = Id::new_uuid();
+    let gtd = new_id();
     book.add_limit_order(gtd, 100, 10, Side::Sell, TimeInForce::Gtd(1_000), None)
         .expect("add gtd");
 
@@ -35,15 +40,15 @@ fn expired_gtd_is_evicted_and_no_longer_matchable() {
     assert_eq!(book.best_ask(), None);
 
     // A crossing buy now finds no liquidity.
-    let taker = Id::new_uuid();
+    let taker = new_id();
     assert!(book.match_market_order(taker, 10, Side::Buy).is_err());
 }
 
 #[test]
 fn unexpired_gtd_and_gtc_are_untouched() {
     let book = expiring_book("TEST");
-    let gtc = Id::new_uuid();
-    let gtd_future = Id::new_uuid();
+    let gtc = new_id();
+    let gtd_future = new_id();
     book.add_limit_order(gtc, 100, 10, Side::Buy, TimeInForce::Gtc, None)
         .expect("gtc");
     book.add_limit_order(gtd_future, 99, 5, Side::Buy, TimeInForce::Gtd(10_000), None)
@@ -57,7 +62,7 @@ fn unexpired_gtd_and_gtc_are_untouched() {
 #[test]
 fn boundary_deadline_equals_now_is_expired() {
     let book = expiring_book("TEST");
-    let id = Id::new_uuid();
+    let id = new_id();
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
@@ -72,9 +77,9 @@ fn deterministic_order_bids_then_asks_ascending_fifo() {
     let book = expiring_book("TEST");
 
     // Bids across two levels; FIFO within the 95 level.
-    let b95a = Id::new_uuid();
-    let b95b = Id::new_uuid();
-    let b90 = Id::new_uuid();
+    let b95a = new_id();
+    let b95b = new_id();
+    let b90 = new_id();
     book.add_limit_order(b95a, 95, 1, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("b95a");
     book.add_limit_order(b95b, 95, 1, Side::Buy, TimeInForce::Gtd(1_000), None)
@@ -83,8 +88,8 @@ fn deterministic_order_bids_then_asks_ascending_fifo() {
         .expect("b90");
 
     // Asks across two levels.
-    let a100 = Id::new_uuid();
-    let a110 = Id::new_uuid();
+    let a100 = new_id();
+    let a110 = new_id();
     book.add_limit_order(a100, 100, 1, Side::Sell, TimeInForce::Gtd(1_000), None)
         .expect("a100");
     book.add_limit_order(a110, 110, 1, Side::Sell, TimeInForce::Gtd(1_000), None)
@@ -103,7 +108,7 @@ fn deterministic_order_bids_then_asks_ascending_fifo() {
 #[test]
 fn second_sweep_at_same_now_is_idempotent() {
     let book = expiring_book("TEST");
-    let id = Id::new_uuid();
+    let id = new_id();
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
@@ -127,7 +132,7 @@ fn eviction_fires_book_change_event_for_touched_level() {
         }
     }));
 
-    let id = Id::new_uuid();
+    let id = new_id();
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
@@ -149,7 +154,7 @@ fn order_tracker_records_time_in_force_expired() {
     let mut book = expiring_book("TEST");
     book.set_order_state_tracker(OrderStateTracker::new());
 
-    let id = Id::new_uuid();
+    let id = new_id();
     book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtd(1_000), None)
         .expect("add");
 
@@ -182,8 +187,8 @@ fn manager_std_per_symbol_and_all_books_parity() {
         book.set_clock(Arc::new(StubClock::starting_at(0)) as Arc<dyn Clock>);
     }
 
-    let btc_id = Id::new_uuid();
-    let eth_id = Id::new_uuid();
+    let btc_id = new_id();
+    let eth_id = new_id();
     if let Some(book) = mgr.get_book("BTC/USD") {
         book.add_limit_order(btc_id, 100, 1, Side::Buy, TimeInForce::Gtd(1_000), None)
             .expect("btc order");
@@ -221,7 +226,7 @@ fn manager_tokio_per_symbol_and_all_books_parity() {
         book.set_clock(Arc::new(StubClock::starting_at(0)) as Arc<dyn Clock>);
     }
 
-    let id = Id::new_uuid();
+    let id = new_id();
     if let Some(book) = mgr.get_book("BTC/USD") {
         book.add_limit_order(id, 100, 1, Side::Buy, TimeInForce::Gtd(1_000), None)
             .expect("order");

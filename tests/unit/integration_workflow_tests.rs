@@ -19,6 +19,11 @@ use orderbook_rs::orderbook::snapshot::MetricFlags;
 use orderbook_rs::{OrderBook, OrderBookSnapshot};
 use pricelevel::{Hash32, Id, Price, Quantity, Side, TimeInForce, TimestampMs};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // ─── Order → Match → Snapshot → Restore ────────────────────────────────────
 
 #[test]
@@ -26,8 +31,8 @@ fn order_match_snapshot_restore_round_trip() {
     let book = OrderBook::<()>::new("BTC/USD");
 
     // Place orders on both sides
-    let bid_id = Id::new_uuid();
-    let ask_id = Id::new_uuid();
+    let bid_id = new_id();
+    let ask_id = new_id();
     let _ = book.add_limit_order(bid_id, 100, 50, Side::Buy, TimeInForce::Gtc, None);
     let _ = book.add_limit_order(ask_id, 110, 30, Side::Sell, TimeInForce::Gtc, None);
 
@@ -37,7 +42,7 @@ fn order_match_snapshot_restore_round_trip() {
     assert_eq!(snap_before.asks.len(), 1);
 
     // Submit a market buy that crosses the spread
-    let market_id = Id::new_uuid();
+    let market_id = new_id();
     let result = book.submit_market_order(market_id, 10, Side::Buy);
     assert!(result.is_ok());
 
@@ -58,8 +63,8 @@ fn order_match_snapshot_restore_round_trip() {
 #[test]
 fn snapshot_enriched_metrics_validation() {
     let book = OrderBook::<()>::new("ETH/USD");
-    let _ = book.add_limit_order(Id::new_uuid(), 3000, 100, Side::Buy, TimeInForce::Gtc, None);
-    let _ = book.add_limit_order(Id::new_uuid(), 3010, 50, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 3000, 100, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 3010, 50, Side::Sell, TimeInForce::Gtc, None);
 
     // Enriched snapshot with specific metrics
     let flags = MetricFlags::MID_PRICE | MetricFlags::SPREAD | MetricFlags::IMBALANCE;
@@ -101,7 +106,7 @@ fn journal_replay_reconstructs_identical_state() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
 
     // Simulate a sequence of operations
-    let ids: Vec<Id> = (0..5).map(|_| Id::new_uuid()).collect();
+    let ids: Vec<Id> = (0..5).map(|_| new_id()).collect();
     assert!(
         journal
             .append(&make_sequencer_add(0, ids[0], 100, 10, Side::Buy))
@@ -169,9 +174,9 @@ fn journal_replay_reconstructs_identical_state() {
 #[test]
 fn journal_replay_partial_from_sequence() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
-    let id3 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
+    let id3 = new_id();
 
     assert!(
         journal
@@ -203,7 +208,7 @@ fn journal_replay_partial_from_sequence() {
 #[test]
 fn journal_verify_matches_snapshot() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_sequencer_add(0, id, 500, 100, Side::Buy))
@@ -228,9 +233,9 @@ fn json_serializer_trade_result_round_trip() {
     let serializer = JsonEventSerializer;
 
     let book = OrderBook::<()>::new("BTC/USD");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
 
-    let match_result = book.submit_market_order(Id::new_uuid(), 10, Side::Buy);
+    let match_result = book.submit_market_order(new_id(), 10, Side::Buy);
     assert!(match_result.is_ok());
     let trade_result = orderbook_rs::TradeResult::new(
         "BTC/USD".to_string(),
@@ -278,9 +283,9 @@ fn bincode_serializer_trade_result_round_trip() {
     let serializer = orderbook_rs::BincodeEventSerializer;
 
     let book = OrderBook::<()>::new("BTC/USD");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
 
-    let match_result = book.submit_market_order(Id::new_uuid(), 10, Side::Buy);
+    let match_result = book.submit_market_order(new_id(), 10, Side::Buy);
     assert!(match_result.is_ok());
     let trade_result = orderbook_rs::TradeResult::new(
         "BTC/USD".to_string(),
@@ -306,11 +311,11 @@ fn book_manager_multi_book_operations() {
 
     // Place a sell order
     let book = mgr.get_book("BTC/USD").expect("BTC/USD book must exist");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
 
     // Place a buy market order that crosses
     let book = mgr.get_book("BTC/USD").expect("BTC/USD book must exist");
-    let result = book.submit_market_order(Id::new_uuid(), 10, Side::Buy);
+    let result = book.submit_market_order(new_id(), 10, Side::Buy);
     assert!(result.is_ok());
 
     // Verify book state after match
@@ -328,9 +333,9 @@ fn book_manager_multi_book_independent_state() {
     mgr.add_book("ETH/USD").expect("add book");
 
     let btc_book = mgr.get_book("BTC/USD").expect("BTC/USD must exist");
-    let _ = btc_book.add_limit_order(Id::new_uuid(), 50000, 1, Side::Buy, TimeInForce::Gtc, None);
+    let _ = btc_book.add_limit_order(new_id(), 50000, 1, Side::Buy, TimeInForce::Gtc, None);
     let eth_book = mgr.get_book("ETH/USD").expect("ETH/USD must exist");
-    let _ = eth_book.add_limit_order(Id::new_uuid(), 3000, 10, Side::Sell, TimeInForce::Gtc, None);
+    let _ = eth_book.add_limit_order(new_id(), 3000, 10, Side::Sell, TimeInForce::Gtc, None);
 
     // Each book should have independent state
     let btc_snap = mgr
@@ -360,7 +365,7 @@ fn order_lifecycle_open_to_filled() {
     book.set_order_state_tracker(orderbook_rs::orderbook::order_state::OrderStateTracker::new());
 
     // Add a sell order
-    let sell_id = Id::new_uuid();
+    let sell_id = new_id();
     let _ = book.add_limit_order(sell_id, 100, 10, Side::Sell, TimeInForce::Gtc, None);
 
     // Check initial state
@@ -369,7 +374,7 @@ fn order_lifecycle_open_to_filled() {
     assert!(matches!(status, Some(OrderStatus::Open)));
 
     // Fill it completely with a market buy
-    let _ = book.submit_market_order(Id::new_uuid(), 10, Side::Buy);
+    let _ = book.submit_market_order(new_id(), 10, Side::Buy);
 
     // Check final state
     let status = book.order_status(sell_id);
@@ -388,7 +393,7 @@ fn order_lifecycle_open_to_cancelled() {
     let mut book = OrderBook::<()>::new("BTC/USD");
     book.set_order_state_tracker(orderbook_rs::orderbook::order_state::OrderStateTracker::new());
 
-    let sell_id = Id::new_uuid();
+    let sell_id = new_id();
     let _ = book.add_limit_order(sell_id, 100, 20, Side::Sell, TimeInForce::Gtc, None);
 
     // Verify it's open
@@ -413,8 +418,8 @@ fn file_journal_write_read_verify_round_trip() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let journal = FileJournal::<()>::open(dir.path()).expect("should open journal");
 
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
     assert!(
         journal
             .append(&make_sequencer_add(0, id1, 100, 10, Side::Buy))
@@ -454,8 +459,8 @@ fn file_journal_write_read_verify_round_trip() {
 #[test]
 fn snapshot_json_round_trip() {
     let book = OrderBook::<()>::new("BTC/USD");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-    let _ = book.add_limit_order(Id::new_uuid(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
 
     let snapshot = book.create_snapshot(usize::MAX);
     let json = serde_json::to_string(&snapshot);
@@ -477,7 +482,7 @@ fn mass_cancel_then_snapshot_shows_empty_book() {
     // Add multiple orders
     for i in 0..10 {
         let _ = book.add_limit_order(
-            Id::new_uuid(),
+            new_id(),
             100u128.saturating_add(i),
             10,
             Side::Buy,
@@ -485,7 +490,7 @@ fn mass_cancel_then_snapshot_shows_empty_book() {
             None,
         );
         let _ = book.add_limit_order(
-            Id::new_uuid(),
+            new_id(),
             200u128.saturating_add(i),
             10,
             Side::Sell,
@@ -516,15 +521,15 @@ fn validation_prevents_invalid_then_valid_order_succeeds() {
     book.set_lot_size(5);
 
     // Invalid: price not aligned to tick
-    let result = book.add_limit_order(Id::new_uuid(), 105, 10, Side::Buy, TimeInForce::Gtc, None);
+    let result = book.add_limit_order(new_id(), 105, 10, Side::Buy, TimeInForce::Gtc, None);
     assert!(result.is_err());
 
     // Invalid: quantity not aligned to lot
-    let result = book.add_limit_order(Id::new_uuid(), 100, 7, Side::Buy, TimeInForce::Gtc, None);
+    let result = book.add_limit_order(new_id(), 100, 7, Side::Buy, TimeInForce::Gtc, None);
     assert!(result.is_err());
 
     // Valid: both aligned
-    let result = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let result = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     assert!(result.is_ok());
 
     let snap = book.create_snapshot(usize::MAX);

@@ -3,6 +3,7 @@ use orderbook_rs::orderbook::book::OrderBook;
 use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::hint::black_box;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct OrderMetadata {
@@ -23,7 +24,7 @@ fn setup_deep_book() -> OrderBook<OrderMetadata> {
         // Add 10 orders at each price level
         for _ in 0..10 {
             let order = OrderType::Standard {
-                id: Id::new(),
+                id: Id::from_uuid(Uuid::new_v4()),
                 side: Side::Sell,
                 price: Price::new(price),
                 quantity: Quantity::new(10),
@@ -51,7 +52,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
         b.iter(|| {
             // The order to match. Its quantity (505) is chosen to match across
             // multiple price levels (50 levels + 5 from the 51st).
-            let taker_order_id = Id::new();
+            let taker_order_id = Id::from_uuid(Uuid::new_v4());
             book.match_order(
                 black_box(taker_order_id),
                 black_box(Side::Buy),

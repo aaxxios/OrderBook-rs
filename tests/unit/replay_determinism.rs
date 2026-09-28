@@ -12,6 +12,11 @@ mod inner {
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
     use proptest::prelude::*;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn make_standard_order(id: Id, price: u128, qty: u64, side: Side) -> OrderType<()> {
         OrderType::Standard {
             id,
@@ -31,8 +36,8 @@ mod inner {
         let journal: InMemoryJournal<()> = InMemoryJournal::new();
 
         // Build journal with deterministic orders.
-        let id1 = Id::new_uuid();
-        let id2 = Id::new_uuid();
+        let id1 = new_id();
+        let id2 = new_id();
         let order1 = make_standard_order(id1, 100, 10, Side::Buy);
         let order2 = make_standard_order(id2, 101, 20, Side::Sell);
 
@@ -78,7 +83,7 @@ mod inner {
 
             // Build deterministic journal from add_count.
             for (seq, i) in (0..add_count).enumerate() {
-                let id = Id::new_uuid();
+                let id = new_id();
                 let price = 100 + (i as u128 * 10);
                 let order = make_standard_order(
                     id,

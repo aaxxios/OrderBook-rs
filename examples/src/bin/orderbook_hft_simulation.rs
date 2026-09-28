@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 use tracing::info;
 use uuid::Uuid;
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // Simulation parameters
 const SYMBOL: &str = "BTC/USD";
 const SIMULATION_DURATION_MS: u64 = 5000; // 5 seconds
@@ -181,7 +186,7 @@ fn preload_order_book(order_book: &OrderBook<OrderMetadata>, count: usize) {
     for i in 0..(count / 2) {
         let price_level = i % PRICE_LEVELS as usize;
         let price = BASE_BID_PRICE - price_level as u128 * 10; // Decreasing prices for bids
-        let id = Id::new_uuid();
+        let id = new_id();
         let quantity = 10 + (i % 10) as u64; // 10-19 units
 
         let _ = order_book.add_limit_order(
@@ -199,7 +204,7 @@ fn preload_order_book(order_book: &OrderBook<OrderMetadata>, count: usize) {
         let price_level = i % PRICE_LEVELS as usize;
         let price = BASE_ASK_PRICE + price_level as u128 * 10; // Increasing prices for asks
 
-        let id = Id::new_uuid();
+        let id = new_id();
         let quantity = 10 + (i % 10) as u64; // 10-19 units
 
         let _ = order_book.add_limit_order(
@@ -222,7 +227,7 @@ fn preload_order_book(order_book: &OrderBook<OrderMetadata>, count: usize) {
             BASE_ASK_PRICE + 5
         };
 
-        let id = Id::new_uuid();
+        let id = new_id();
         let _ =
             order_book.add_iceberg_order(id, price, 5, 45, side, TimeInForce::Gtc, Some(metadata));
     }
@@ -361,7 +366,7 @@ fn spawn_maker_thread(
             let quantity = 5 + (local_count % 20); // 5-24 units
 
             // Choose order type based on iteration
-            let id = Id::new_uuid();
+            let id = new_id();
             let mut order_added = false;
             let metadata = OrderMetadata {
                 client_id: Uuid::new_v4(),
@@ -522,7 +527,7 @@ fn spawn_taker_thread(
             let quantity = 1 + (local_count % 10); // 1-10 units
 
             // Submit a market order
-            let id = Id::new_uuid();
+            let id = new_id();
             let result = order_book.submit_market_order(id, quantity, side);
 
             // Only count successful matches
@@ -591,7 +596,7 @@ fn spawn_canceller_thread(
             } else {
                 // If no orders available to cancel, try a random one occasionally
                 // This simulates attempting to cancel non-existent orders
-                let id = Id::new_uuid();
+                let id = new_id();
                 let _ = order_book.cancel_order(id);
             }
 

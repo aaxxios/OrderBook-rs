@@ -3,12 +3,13 @@ use orderbook_rs::OrderBook;
 use orderbook_rs::orderbook::snapshot::MetricFlags;
 use pricelevel::{Id, Side, TimeInForce};
 use std::hint::black_box;
+use uuid::Uuid;
 
 /// Populate a book with `n` orders (half bids, half asks across price levels).
 fn make_populated_book(n: usize) -> OrderBook<()> {
     let book = OrderBook::new("BENCH");
     for i in 0..n {
-        let id = Id::new_uuid();
+        let id = Id::from_uuid(Uuid::new_v4());
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         let price = if side == Side::Buy {
             1000_u128.saturating_sub((i % 100) as u128)

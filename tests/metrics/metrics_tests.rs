@@ -16,6 +16,11 @@ use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, Time
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 /// Captured counter / gauge state, keyed by metric name with a
 /// `reason=…` suffix when the labels include a reason.
 #[derive(Default)]
@@ -150,7 +155,7 @@ fn counters_increment_on_rejects_and_trades() {
 
     // Reject path: engage the kill switch and submit one order.
     book.engage_kill_switch();
-    let rej = book.add_limit_order(Id::new_uuid(), 100, 1, Side::Buy, TimeInForce::Gtc, None);
+    let rej = book.add_limit_order(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, None);
     assert!(rej.is_err(), "kill-switched add_order must Err");
     book.release_kill_switch();
 
@@ -163,9 +168,9 @@ fn counters_increment_on_rejects_and_trades() {
     );
 
     // Happy path: cross two limit orders to print a trade.
-    book.add_limit_order(Id::new_uuid(), 100, 5, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 5, Side::Sell, TimeInForce::Gtc, None)
         .expect("seed resting ask");
-    book.add_limit_order(Id::new_uuid(), 100, 5, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 5, Side::Buy, TimeInForce::Gtc, None)
         .expect("aggressive buy fills the ask");
 
     let trades_after = counter_value(TRADES_TOTAL);
@@ -182,11 +187,11 @@ fn depth_gauges_track_distinct_price_levels() {
     let book = OrderBook::<()>::new("METRICS-DEPTH");
 
     // Place two distinct bid levels and one ask level.
-    book.add_limit_order(Id::new_uuid(), 100, 1, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid 1");
-    book.add_limit_order(Id::new_uuid(), 99, 1, Side::Buy, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 99, 1, Side::Buy, TimeInForce::Gtc, None)
         .expect("bid 2");
-    let ask_id = Id::new_uuid();
+    let ask_id = new_id();
     book.add_limit_order(ask_id, 110, 1, Side::Sell, TimeInForce::Gtc, None)
         .expect("ask 1");
 
@@ -321,10 +326,10 @@ fn reserve_discard_counters_track_dropped_hidden_quantity() {
     // nothing is discarded and neither counter may move.
     let resting_book = OrderBook::<()>::new("METRICS-RSV-REST");
     resting_book
-        .add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        .add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("seed contra depth");
     resting_book
-        .add_order(reserve_buy(Id::new_uuid(), true))
+        .add_order(reserve_buy(new_id(), true))
         .expect("auto-replenishing reserve rests its residual");
 
     assert_eq!(
@@ -342,10 +347,10 @@ fn reserve_discard_counters_track_dropped_hidden_quantity() {
     // with its 20 hidden units dropped.
     let discard_book = OrderBook::<()>::new("METRICS-RSV-DISCARD");
     discard_book
-        .add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        .add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("seed contra depth");
     discard_book
-        .add_order(reserve_buy(Id::new_uuid(), false))
+        .add_order(reserve_buy(new_id(), false))
         .expect("the submit succeeds; the residual is discarded, not rejected");
 
     assert_eq!(
@@ -378,10 +383,10 @@ fn reserve_discard_counters_track_the_maker_path_too() {
     // that, the level drops the 20 hidden with the maker, and the sell rests
     // its own remainder of 10 as an ask.
     let book = OrderBook::<()>::new("METRICS-RSV-MAKER");
-    let maker_id = Id::new_uuid();
+    let maker_id = new_id();
     book.add_order(reserve_buy(maker_id, false))
         .expect("the reserve rests as a maker");
-    book.add_limit_order(Id::new_uuid(), 100, 20, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 20, Side::Sell, TimeInForce::Gtc, None)
         .expect("the aggressive sell takes the visible tranche");
 
     assert!(
@@ -417,10 +422,10 @@ fn reserve_discard_counters_ignore_a_replenishing_maker() {
     let quantity_before = counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL);
 
     let book = OrderBook::<()>::new("METRICS-RSV-MAKER-AUTO");
-    let maker_id = Id::new_uuid();
+    let maker_id = new_id();
     book.add_order(reserve_buy(maker_id, true))
         .expect("the reserve rests as a maker");
-    book.add_limit_order(Id::new_uuid(), 100, 20, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 100, 20, Side::Sell, TimeInForce::Gtc, None)
         .expect("the aggressive sell takes the visible tranche");
 
     // The same sell of 20 against a replenishing maker: the first 10 take

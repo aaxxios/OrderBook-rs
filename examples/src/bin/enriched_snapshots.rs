@@ -16,6 +16,7 @@
 use orderbook_rs::{MetricFlags, OrderBook};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     // Set up logging
@@ -67,7 +68,7 @@ fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
 
     for (price, quantity) in bid_orders {
         let _ = book.add_limit_order(
-            Id::new(),
+            Id::from_uuid(Uuid::new_v4()),
             price,
             quantity,
             Side::Buy,
@@ -94,7 +95,7 @@ fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
 
     for (price, quantity) in ask_orders {
         let _ = book.add_limit_order(
-            Id::new(),
+            Id::from_uuid(Uuid::new_v4()),
             price,
             quantity,
             Side::Sell,

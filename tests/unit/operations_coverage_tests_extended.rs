@@ -12,12 +12,17 @@ struct TestExtraFields {
 mod tests {
     use super::*;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     #[test]
     fn test_submit_market_order_with_liquidity() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add liquidity
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         let extra_fields = TestExtraFields {
             user_id: "seller123".to_string(),
             strategy: "market_making".to_string(),
@@ -33,7 +38,7 @@ mod tests {
         .unwrap();
 
         // Submit market order
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.submit_market_order(order_id, 30, Side::Buy);
 
         assert!(result.is_ok());
@@ -48,16 +53,16 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add some liquidity first
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 100, 50, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
-        let sell_id2 = Id::new_uuid();
+        let sell_id2 = new_id();
         book.add_limit_order(sell_id2, 110, 50, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Submit market order
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.submit_market_order(order_id, 100, Side::Buy);
 
         assert!(result.is_ok());
@@ -72,12 +77,12 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add limited liquidity
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 100, 20, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Submit market order for more than available
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.submit_market_order(order_id, 50, Side::Buy);
 
         assert!(result.is_ok());
@@ -92,15 +97,15 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add liquidity
-        let sell_id1 = Id::new_uuid();
-        let sell_id2 = Id::new_uuid();
+        let sell_id1 = new_id();
+        let sell_id2 = new_id();
         book.add_limit_order(sell_id1, 1000, 30, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
         book.add_limit_order(sell_id2, 1010, 30, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // FOK order that can be completely filled
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.add_limit_order(order_id, 1020, 50, Side::Buy, TimeInForce::Fok, None);
 
         assert!(result.is_ok());
@@ -118,12 +123,12 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add limited liquidity
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 1000, 30, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // FOK order that cannot be completely filled
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.add_limit_order(order_id, 1020, 50, Side::Buy, TimeInForce::Fok, None);
 
         assert!(result.is_err());
@@ -145,12 +150,12 @@ mod tests {
         let book = OrderBook::<TestExtraFields>::new("TEST");
 
         // Add a sell order to the book first
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 100, 30, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Add IOC buy order that will partially fill
-        let buy_id = Id::new_uuid();
+        let buy_id = new_id();
         let result = book.add_limit_order(buy_id, 100, 50, Side::Buy, TimeInForce::Ioc, None);
 
         // IOC orders should either succeed or fail, depending on implementation
@@ -170,7 +175,7 @@ mod tests {
         let book = OrderBook::<TestExtraFields>::new("TEST");
 
         // Add IOC buy order with no matching sell orders
-        let buy_id = Id::new_uuid();
+        let buy_id = new_id();
         let result = book.add_limit_order(buy_id, 100, 50, Side::Buy, TimeInForce::Ioc, None);
 
         // IOC with no fill should either succeed and be cancelled, or fail
@@ -189,12 +194,12 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add sell order at higher price
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 2000, 30, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // PostOnly buy order that won't cross
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result =
             book.add_post_only_order(order_id, 1000, 50, Side::Buy, TimeInForce::Gtc, None);
 
@@ -211,12 +216,12 @@ mod tests {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
         // Add sell order at lower price
-        let sell_id = Id::new_uuid();
+        let sell_id = new_id();
         book.add_limit_order(sell_id, 1000, 30, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // PostOnly buy order that would cross - should be rejected
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result =
             book.add_post_only_order(order_id, 1500, 50, Side::Buy, TimeInForce::Gtc, None);
 
@@ -233,7 +238,7 @@ mod tests {
     fn test_add_iceberg_order_with_extra_fields() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let extra_fields = TestExtraFields {
             user_id: "iceberg_user".to_string(),
             strategy: "iceberg_strategy".to_string(),
@@ -266,7 +271,7 @@ mod tests {
     fn test_add_iceberg_order_without_extra_fields() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.add_iceberg_order(
             order_id,
             1000,
@@ -296,7 +301,7 @@ mod tests {
     fn test_add_iceberg_order_zero_visible_quantity() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Invalid case: visible quantity 0
         let result = book.add_iceberg_order(
@@ -324,7 +329,7 @@ mod tests {
     fn test_add_iceberg_order_zero_hidden_quantity() {
         let book: OrderBook<TestExtraFields> = OrderBook::new("TEST");
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
 
         // Case: zero hidden quantity (should work - becomes regular order)
         let result = book.add_iceberg_order(
@@ -355,7 +360,7 @@ mod tests {
     fn test_order_type_methods_coverage() {
         // Test OrderType methods for coverage
         let standard_order = OrderType::Standard {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             quantity: Quantity::new(100),
             side: Side::Buy,
@@ -367,7 +372,7 @@ mod tests {
         assert_eq!(standard_order.quantity(), 100);
 
         let iceberg_order = OrderType::IcebergOrder {
-            id: Id::new_uuid(),
+            id: new_id(),
             price: Price::new(1000),
             visible_quantity: Quantity::new(20),
             hidden_quantity: Quantity::new(80),

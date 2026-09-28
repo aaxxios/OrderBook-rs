@@ -5,6 +5,11 @@ mod tests_cross_book_cancel {
     use orderbook_rs::orderbook::manager::{BookManager, BookManagerStd, BookManagerTokio};
     use pricelevel::{Hash32, Id, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // BookManagerStd
     // ═══════════════════════════════════════════════════════════════════════
@@ -16,13 +21,13 @@ mod tests_cross_book_cancel {
         mgr.add_book("ETH/USD").expect("add book");
 
         if let Some(book) = mgr.get_book("BTC/USD") {
-            book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
                 .expect("add bid");
-            book.add_limit_order(Id::new_uuid(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
                 .expect("add ask");
         }
         if let Some(book) = mgr.get_book("ETH/USD") {
-            book.add_limit_order(Id::new_uuid(), 50, 20, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 50, 20, Side::Buy, TimeInForce::Gtc, None)
                 .expect("add bid");
         }
 
@@ -68,7 +73,7 @@ mod tests_cross_book_cancel {
 
         if let Some(book) = mgr.get_book("BTC/USD") {
             book.add_limit_order_with_user(
-                Id::new_uuid(),
+                new_id(),
                 100,
                 10,
                 Side::Buy,
@@ -78,7 +83,7 @@ mod tests_cross_book_cancel {
             )
             .expect("add");
             book.add_limit_order_with_user(
-                Id::new_uuid(),
+                new_id(),
                 200,
                 5,
                 Side::Sell,
@@ -90,7 +95,7 @@ mod tests_cross_book_cancel {
         }
         if let Some(book) = mgr.get_book("ETH/USD") {
             book.add_limit_order_with_user(
-                Id::new_uuid(),
+                new_id(),
                 50,
                 20,
                 Side::Buy,
@@ -118,15 +123,15 @@ mod tests_cross_book_cancel {
         mgr.add_book("ETH/USD").expect("add book");
 
         if let Some(book) = mgr.get_book("BTC/USD") {
-            book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
                 .expect("add");
-            book.add_limit_order(Id::new_uuid(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
                 .expect("add");
         }
         if let Some(book) = mgr.get_book("ETH/USD") {
-            book.add_limit_order(Id::new_uuid(), 50, 20, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 50, 20, Side::Buy, TimeInForce::Gtc, None)
                 .expect("add");
-            book.add_limit_order(Id::new_uuid(), 60, 15, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 60, 15, Side::Sell, TimeInForce::Gtc, None)
                 .expect("add");
         }
 
@@ -156,11 +161,11 @@ mod tests_cross_book_cancel {
         mgr.add_book("ETH/USD").expect("add book");
 
         if let Some(book) = mgr.get_book("BTC/USD") {
-            book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
                 .expect("add");
         }
         if let Some(book) = mgr.get_book("ETH/USD") {
-            book.add_limit_order(Id::new_uuid(), 50, 20, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 50, 20, Side::Sell, TimeInForce::Gtc, None)
                 .expect("add");
         }
 
@@ -180,7 +185,7 @@ mod tests_cross_book_cancel {
 
         if let Some(book) = mgr.get_book("BTC/USD") {
             book.add_limit_order_with_user(
-                Id::new_uuid(),
+                new_id(),
                 100,
                 10,
                 Side::Buy,
@@ -201,9 +206,9 @@ mod tests_cross_book_cancel {
         mgr.add_book("BTC/USD").expect("add book");
 
         if let Some(book) = mgr.get_book("BTC/USD") {
-            book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None)
                 .expect("add");
-            book.add_limit_order(Id::new_uuid(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, None)
                 .expect("add");
         }
 

@@ -300,6 +300,11 @@ pub(crate) fn check_stp_at_level(
 mod tests {
     use super::*;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     #[test]
     fn test_stp_mode_default_is_none() {
         assert_eq!(STPMode::default(), STPMode::None);
@@ -332,7 +337,7 @@ mod tests {
     fn test_check_stp_zero_user_bypasses() {
         let user = Hash32::zero();
         let order = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(10),
             side: pricelevel::Side::Sell,
@@ -350,7 +355,7 @@ mod tests {
     fn test_check_stp_cancel_taker_detects_same_user() {
         let user = Hash32::new([1u8; 32]);
         let order = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(10),
             side: pricelevel::Side::Sell,
@@ -373,7 +378,7 @@ mod tests {
         let other_user = Hash32::new([2u8; 32]);
 
         let other_order = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(5),
             side: pricelevel::Side::Sell,
@@ -383,7 +388,7 @@ mod tests {
             extra_fields: (),
         });
         let same_order = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(10),
             side: pricelevel::Side::Sell,
@@ -406,7 +411,7 @@ mod tests {
         let other_user = Hash32::new([2u8; 32]);
 
         let same1 = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(5),
             side: pricelevel::Side::Sell,
@@ -416,7 +421,7 @@ mod tests {
             extra_fields: (),
         });
         let other = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(3),
             side: pricelevel::Side::Sell,
@@ -426,7 +431,7 @@ mod tests {
             extra_fields: (),
         });
         let same2 = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(7),
             side: pricelevel::Side::Sell,
@@ -449,7 +454,7 @@ mod tests {
         let other_user = Hash32::new([2u8; 32]);
 
         let other = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(3),
             side: pricelevel::Side::Sell,
@@ -459,7 +464,7 @@ mod tests {
             extra_fields: (),
         });
         let same = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(10),
             side: pricelevel::Side::Sell,
@@ -488,7 +493,7 @@ mod tests {
         let other_user = Hash32::new([2u8; 32]);
 
         let order = std::sync::Arc::new(pricelevel::OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: pricelevel::Price::new(100),
             quantity: pricelevel::Quantity::new(10),
             side: pricelevel::Side::Sell,

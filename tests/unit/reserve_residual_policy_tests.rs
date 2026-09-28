@@ -62,6 +62,11 @@ mod tests_reserve_residual_policy {
     };
     use std::num::NonZeroU64;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     const PRICE: u128 = 100;
     /// The fixture taker's visible tranche.
     const VISIBLE: u64 = 10;
@@ -119,7 +124,7 @@ mod tests_reserve_residual_policy {
     /// Seed `depth` units of resting SELL depth at `price` as a single
     /// order, so the depth it still holds after a sweep can be read back.
     fn seed_contra(book: &OrderBook<()>, price: u128, depth: u64) -> Id {
-        let contra_id = Id::new();
+        let contra_id = new_id();
         let seeded =
             book.add_limit_order(contra_id, price, depth, Side::Sell, TimeInForce::Gtc, None);
         assert!(
@@ -167,7 +172,7 @@ mod tests_reserve_residual_policy {
         auto_replenish: bool,
     ) -> Submitted {
         let contra_id = seed_contra(book, PRICE, depth);
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let submitted = book.add_order_with_result(reserve_buy(
             taker_id,
             threshold,
@@ -539,12 +544,12 @@ mod tests_reserve_residual_policy {
         // Resting: the identical order as a maker, hit by an aggressive SELL
         // of the same 20 units.
         let maker_book = tracked_book("RSV-RESTING");
-        let maker_id = Id::new();
+        let maker_id = new_id();
         let rested = maker_book.add_order(reserve_buy(maker_id, 0, None, false));
         assert!(rested.is_ok(), "seeding the maker must succeed: {rested:?}");
 
         let swept = maker_book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             20,
             Side::Sell,
@@ -628,7 +633,7 @@ mod tests_reserve_residual_policy {
     #[test]
     fn test_add_order_reserve_zero_visible_tranche_rejects() {
         let book = tracked_book("ZERO-VIS-RSV");
-        let order_id = Id::new();
+        let order_id = new_id();
         let mut order = reserve_buy(order_id, 0, None, false);
         if let OrderType::ReserveOrder {
             visible_quantity, ..
@@ -649,7 +654,7 @@ mod tests_reserve_residual_policy {
     #[test]
     fn test_add_order_iceberg_zero_visible_tranche_admits_and_executes() {
         let book = tracked_book("ZERO-VIS-ICE");
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let rested = book.add_order(iceberg_buy(order_id, PRICE, 0, HIDDEN));
         assert!(
@@ -658,7 +663,7 @@ mod tests_reserve_residual_policy {
         );
 
         let swept = book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             HIDDEN,
             Side::Sell,
@@ -687,7 +692,7 @@ mod tests_reserve_residual_policy {
     #[test]
     fn test_add_order_auto_reserve_zero_visible_tranche_admits_and_executes() {
         let book = tracked_book("ZERO-VIS-AUTO");
-        let order_id = Id::new();
+        let order_id = new_id();
         let mut order = reserve_buy(order_id, 0, Some(10), true);
         if let OrderType::ReserveOrder {
             visible_quantity, ..
@@ -703,7 +708,7 @@ mod tests_reserve_residual_policy {
         );
 
         let swept = book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             10,
             Side::Sell,
@@ -733,7 +738,7 @@ mod tests_reserve_residual_policy {
     fn test_add_order_zero_visible_iceberg_taker_partial_fill_rests_display_zero() {
         let book = tracked_book("ZERO-VIS-ICE-TAKER");
         let contra_id = seed_contra(&book, PRICE, 5);
-        let taker_id = Id::new();
+        let taker_id = new_id();
 
         let submitted = book.add_order_with_result(iceberg_buy(taker_id, PRICE, 0, HIDDEN));
         let executed: u64 = match submitted {
@@ -769,7 +774,7 @@ mod tests_reserve_residual_policy {
         }
 
         let swept = book.add_limit_order_with_result(
-            Id::new(),
+            new_id(),
             PRICE,
             15,
             Side::Sell,
@@ -799,7 +804,7 @@ mod tests_reserve_residual_policy {
     fn test_add_order_zero_visible_auto_reserve_taker_partial_fill_rests_refreshed() {
         let book = tracked_book("ZERO-VIS-AUTO-TAKER");
         let contra_id = seed_contra(&book, PRICE, 5);
-        let taker_id = Id::new();
+        let taker_id = new_id();
         let mut order = reserve_buy(taker_id, 0, Some(10), true);
         if let OrderType::ReserveOrder {
             visible_quantity, ..
@@ -841,7 +846,7 @@ mod tests_reserve_residual_policy {
     #[test]
     fn test_add_order_standard_zero_quantity_not_rejected_by_zero_visible_rule() {
         let book = tracked_book("ZERO-VIS-STD");
-        let order_id = Id::new();
+        let order_id = new_id();
 
         let result = book.add_limit_order(order_id, PRICE, 0, Side::Buy, TimeInForce::Gtc, None);
 
@@ -862,7 +867,7 @@ mod tests_reserve_residual_policy {
         {
             let kind = "reserve";
             let book = tracked_book("ZERO-VIS-MODIFY");
-            let order_id = Id::new();
+            let order_id = new_id();
             let rested = book.add_order(reserve_buy(order_id, 0, None, false));
             assert!(rested.is_ok(), "{kind}: seeding must succeed: {rested:?}");
 
@@ -954,7 +959,7 @@ mod tests_reserve_residual_policy {
     #[test]
     fn test_update_order_iceberg_zero_quantity_accepts_and_leaves_hidden_intact() {
         let book = tracked_book("ZERO-VIS-MODIFY-ICE");
-        let order_id = Id::new();
+        let order_id = new_id();
         let rested = book.add_order(iceberg_buy(order_id, PRICE, VISIBLE, HIDDEN));
         assert!(rested.is_ok(), "seeding must succeed: {rested:?}");
 
@@ -1084,7 +1089,7 @@ mod tests_reserve_residual_policy {
     fn test_update_order_reserve_without_auto_crossing_visible_depth_rejects_and_preserves_original()
      {
         for depth in [10, 15] {
-            for (label, update) in crossing_updates(Id::new()) {
+            for (label, update) in crossing_updates(new_id()) {
                 let maker_id = update_order_id(&update);
                 let (book, contra_id) = book_with_maker(
                     "RSV-MODIFY-REJECT",
@@ -1138,7 +1143,7 @@ mod tests_reserve_residual_policy {
     /// normally and nothing is discarded.
     #[test]
     fn test_update_order_reserve_without_auto_shallow_crossing_depth_executes_and_rests() {
-        for (label, update) in crossing_updates(Id::new()) {
+        for (label, update) in crossing_updates(new_id()) {
             let maker_id = update_order_id(&update);
             let (book, _contra_id) = book_with_maker(
                 "RSV-MODIFY-SHALLOW",
@@ -1188,7 +1193,7 @@ mod tests_reserve_residual_policy {
     /// `visible <= crossable < total`.
     #[test]
     fn test_update_order_reserve_without_auto_full_crossing_depth_fills_completely() {
-        for (label, update) in crossing_updates(Id::new()) {
+        for (label, update) in crossing_updates(new_id()) {
             let maker_id = update_order_id(&update);
             let (book, _contra_id) = book_with_maker(
                 "RSV-MODIFY-FULL",
@@ -1226,7 +1231,7 @@ mod tests_reserve_residual_policy {
     /// order simply rests at its new price.
     #[test]
     fn test_update_order_reserve_without_auto_non_crossing_reprice_rests_unchanged() {
-        let maker_id = Id::new();
+        let maker_id = new_id();
         // Ask depth sits at CROSS_PRICE; re-pricing the bid down crosses
         // nothing.
         let (book, contra_id) = book_with_maker(
@@ -1270,7 +1275,7 @@ mod tests_reserve_residual_policy {
     /// residual refreshes from hidden and rests, so the modify is safe.
     #[test]
     fn test_update_order_reserve_with_auto_crossing_depth_rests_refreshed() {
-        for (label, update) in crossing_updates(Id::new()) {
+        for (label, update) in crossing_updates(new_id()) {
             let maker_id = update_order_id(&update);
             let (book, _contra_id) = book_with_maker(
                 "RSV-MODIFY-AUTO",
@@ -1311,7 +1316,7 @@ mod tests_reserve_residual_policy {
     /// as before.
     #[test]
     fn test_update_order_iceberg_crossing_depth_rests_unaffected() {
-        for (label, update) in crossing_updates(Id::new()) {
+        for (label, update) in crossing_updates(new_id()) {
             let maker_id = update_order_id(&update);
             let (book, _contra_id) = book_with_maker(
                 "ICE-MODIFY",

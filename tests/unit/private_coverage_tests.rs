@@ -14,11 +14,12 @@ struct TestExtraFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     use orderbook_rs::{OrderBook, current_time_millis};
 
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]

@@ -164,6 +164,7 @@ where
     /// ```
     /// use orderbook_rs::orderbook::manager::{BookManager, BookManagerStd};
     /// use pricelevel::{Id, Side, TimeInForce};
+    /// use uuid::Uuid;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut mgr: BookManagerStd<()> = BookManagerStd::new();
@@ -171,7 +172,7 @@ where
     /// mgr.add_book("ETH/USD")?;
     ///
     /// if let Some(book) = mgr.get_book("BTC/USD") {
-    ///     book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None).ok();
+    ///     book.add_limit_order(Id::from_uuid(Uuid::new_v4()), 100, 10, Side::Buy, TimeInForce::Gtc, None).ok();
     /// }
     ///
     /// let results = mgr.cancel_all_across_books();

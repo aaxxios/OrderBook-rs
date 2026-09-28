@@ -11,6 +11,11 @@ mod tests_reject_reason {
     use orderbook_rs::{OrderBook, OrderBookError, ReferencePriceSource, RejectReason, RiskConfig};
     use pricelevel::{Hash32, Id, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn book_with_tracker() -> OrderBook<()> {
         let mut book = OrderBook::<()>::new("TEST");
         book.set_order_state_tracker(OrderStateTracker::new());
@@ -24,16 +29,9 @@ mod tests_reject_reason {
     /// Seed two crossing orders so a trade prints and `last_trade_price`
     /// is set. After the helper returns, the book has no resting orders.
     fn seed_last_trade_price(book: &OrderBook<()>, price: u128) {
-        book.add_limit_order(
-            Id::new_uuid(),
-            price,
-            10,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed resting ask");
-        book.add_limit_order(Id::new_uuid(), price, 10, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), price, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("seed resting ask");
+        book.add_limit_order(new_id(), price, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("aggressive buy fills the ask");
     }
 
@@ -46,7 +44,7 @@ mod tests_reject_reason {
         let book = book_with_tracker();
         book.engage_kill_switch();
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let result = book.add_limit_order(order_id, 100, 10, Side::Buy, TimeInForce::Gtc, None);
         assert!(matches!(result, Err(OrderBookError::KillSwitchActive)));
 
@@ -71,19 +69,11 @@ mod tests_reject_reason {
         let acct = account(11);
 
         // Fill the only open-order slot.
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first admission");
+        book.add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first admission");
 
         // Second attempt is rejected on the open-orders gate.
-        let rejected_id = Id::new_uuid();
+        let rejected_id = new_id();
         let result = book.add_limit_order_with_user(
             rejected_id,
             100,
@@ -116,19 +106,11 @@ mod tests_reject_reason {
         let acct = account(13);
 
         // 8 * 100 = 800 notional consumed by the first admission.
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            8,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first admission within budget");
+        book.add_limit_order_with_user(new_id(), 100, 8, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first admission within budget");
 
         // 3 * 100 = 300 attempted; 800 + 300 > 1_000 → reject.
-        let rejected_id = Id::new_uuid();
+        let rejected_id = new_id();
         let result = book.add_limit_order_with_user(
             rejected_id,
             100,
@@ -163,7 +145,7 @@ mod tests_reject_reason {
         );
 
         // +30% from reference → rejected.
-        let rejected_id = Id::new_uuid();
+        let rejected_id = new_id();
         let result =
             book.add_limit_order(rejected_id, 1_300_000, 1, Side::Buy, TimeInForce::Gtc, None);
         assert!(

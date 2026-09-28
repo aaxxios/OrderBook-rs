@@ -20,6 +20,11 @@
 use orderbook_rs::OrderBook;
 use pricelevel::{Hash32, Id, Side, TimeInForce};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 /// User A — the user whose orders we assert on. Spread across two bid levels
 /// (one with two orders) and two ask levels (one with two orders).
 fn user_a() -> Hash32 {
@@ -57,18 +62,18 @@ fn build_scrambled_book() -> (OrderBook<()>, UserAOrders) {
     let b = user_b();
 
     let ids = UserAOrders {
-        b90: Id::new_uuid(),
-        b100_1: Id::new_uuid(),
-        b100_2: Id::new_uuid(),
-        a110: Id::new_uuid(),
-        a120_1: Id::new_uuid(),
-        a120_2: Id::new_uuid(),
+        b90: new_id(),
+        b100_1: new_id(),
+        b100_2: new_id(),
+        a110: new_id(),
+        a120_1: new_id(),
+        a120_2: new_id(),
     };
 
-    let b_b90 = Id::new_uuid();
-    let b_b100 = Id::new_uuid();
-    let b_a110 = Id::new_uuid();
-    let b_a120 = Id::new_uuid();
+    let b_b90 = new_id();
+    let b_b100 = new_id();
+    let b_a110 = new_id();
+    let b_a120 = new_id();
 
     let add = |id: Id, price: u128, side: Side, user: Hash32| {
         assert!(

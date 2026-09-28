@@ -2,10 +2,11 @@
 mod tests {
     use crate::{OrderBook, OrderBookError};
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
+    use uuid::Uuid;
 
     // Helper function to create a unique order ID
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     // Helper to create a standard limit order
@@ -578,10 +579,11 @@ mod tests {
 mod test_orderbook_book {
     use crate::OrderBook;
     use pricelevel::{Id, Price, Side, TimeInForce};
+    use uuid::Uuid;
 
     // Helper function to create a unique order ID
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]
@@ -825,9 +827,10 @@ mod test_orderbook_book {
 mod test_book_remaining {
     use crate::OrderBook;
     use pricelevel::{Id, Side, TimeInForce};
+    use uuid::Uuid;
 
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]
@@ -993,9 +996,10 @@ mod test_book_remaining {
 mod test_book_specific {
     use crate::OrderBook;
     use pricelevel::{Id, Side, TimeInForce, TimestampMs};
+    use uuid::Uuid;
 
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]

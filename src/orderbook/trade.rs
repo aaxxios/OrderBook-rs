@@ -297,6 +297,11 @@ mod tests {
     use super::*;
     use pricelevel::{Id, MatchResult, Price, Quantity, Trade};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     /// Taker order id shared by every fixture trade: since pricelevel 0.9
     /// `MatchResult::add_trade` validates that each trade's taker order id
     /// matches the result's incoming order id, so the fixture threads one
@@ -305,7 +310,7 @@ mod tests {
         let taker_order_id = trades
             .first()
             .map(|t| t.taker_order_id())
-            .unwrap_or_else(Id::new_uuid);
+            .unwrap_or_else(new_id);
         let total_qty: u64 = trades.iter().map(|t| t.quantity().as_u64()).sum();
         let initial_qty = if trades.is_empty() { 100 } else { total_qty };
         let mut mr = MatchResult::new(taker_order_id, Quantity::new(initial_qty));
@@ -325,9 +330,9 @@ mod tests {
 
     fn make_trade(price: u128, quantity: u64) -> Trade {
         Trade::new(
-            Id::new_uuid(),
+            new_id(),
             Id::from_u64(FIXTURE_TAKER),
-            Id::new_uuid(),
+            new_id(),
             Price::new(price),
             Quantity::new(quantity),
             pricelevel::Side::Buy,

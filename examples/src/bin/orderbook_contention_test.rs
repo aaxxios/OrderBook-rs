@@ -9,6 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // Test parameters
 const THREAD_COUNT: usize = 12;
 const TEST_DURATION_MS: u64 = 3000; // 3 seconds per test
@@ -134,7 +139,7 @@ fn test_read_write_ratio() -> Result<(), String> {
                         match local_counter % 3 {
                             0 => {
                                 // Add a limit order
-                                let id = Id::new_uuid();
+                                let id = new_id();
                                 let side = if local_counter % 2 == 0 {
                                     Side::Buy
                                 } else {
@@ -152,7 +157,7 @@ fn test_read_write_ratio() -> Result<(), String> {
                             }
                             1 => {
                                 // Submit a market order
-                                let id = Id::new_uuid();
+                                let id = new_id();
                                 let side = if local_counter % 2 == 0 {
                                     Side::Buy
                                 } else {
@@ -162,7 +167,7 @@ fn test_read_write_ratio() -> Result<(), String> {
                             }
                             _ => {
                                 // Cancel a random order
-                                let id = Id::new_uuid();
+                                let id = new_id();
                                 let _ = thread_book.cancel_order(id);
                             }
                         }
@@ -493,7 +498,7 @@ fn test_price_level_distribution() -> Result<(), String> {
                                 10100 + (local_counter % max_level as u64) as u128 * 10
                             };
                             let _ = thread_book.add_limit_order(
-                                Id::new_uuid(),
+                                new_id(),
                                 price,
                                 10,
                                 side,
@@ -505,7 +510,7 @@ fn test_price_level_distribution() -> Result<(), String> {
                         2 | 3 => {
                             // Submit market buy/sell
                             let side = if op_type == 2 { Side::Buy } else { Side::Sell };
-                            let _ = thread_book.submit_market_order(Id::new_uuid(), 1, side);
+                            let _ = thread_book.submit_market_order(new_id(), 1, side);
                             std::thread::yield_now(); // Aggressively yield after write
                         }
                         4 => {

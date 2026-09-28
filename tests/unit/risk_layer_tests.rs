@@ -14,6 +14,11 @@ mod tests_risk_layer {
     use orderbook_rs::{OrderBook, OrderBookError, ReferencePriceSource, RiskConfig};
     use pricelevel::{Hash32, Id, Side, TimeInForce};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn new_book() -> OrderBook<()> {
         OrderBook::new("TEST")
     }
@@ -59,17 +64,10 @@ mod tests_risk_layer {
     /// orders.
     fn seed_last_trade_price(book: &OrderBook<()>, price: u128) {
         // Resting ask at `price`.
-        book.add_limit_order(
-            Id::new_uuid(),
-            price,
-            10,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed resting ask");
+        book.add_limit_order(new_id(), price, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("seed resting ask");
         // Aggressive buy crosses fully.
-        book.add_limit_order(Id::new_uuid(), price, 10, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), price, 10, Side::Buy, TimeInForce::Gtc, None)
             .expect("aggressive buy fills the ask");
         assert_eq!(
             book.last_trade_price(),
@@ -88,14 +86,8 @@ mod tests_risk_layer {
         );
 
         // Submit at +30% from reference → rejected.
-        let result = book.add_limit_order(
-            Id::new_uuid(),
-            1_300_000,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        );
+        let result =
+            book.add_limit_order(new_id(), 1_300_000, 1, Side::Buy, TimeInForce::Gtc, None);
         match result {
             Err(OrderBookError::RiskPriceBand {
                 submitted,
@@ -121,14 +113,8 @@ mod tests_risk_layer {
         );
 
         // +5% from reference is well within the 10% band.
-        let result = book.add_limit_order(
-            Id::new_uuid(),
-            1_050_000,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        );
+        let result =
+            book.add_limit_order(new_id(), 1_050_000, 1, Side::Buy, TimeInForce::Gtc, None);
         assert!(
             result.is_ok(),
             "in-band order must be accepted; got {result:?}"
@@ -141,29 +127,16 @@ mod tests_risk_layer {
         // Seed a last trade and confirm.
         seed_last_trade_price(&book, 1_000_000);
         // Add a single bid so the book is one-sided (no asks).
-        book.add_limit_order(
-            Id::new_uuid(),
-            999_000,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed bid");
+        book.add_limit_order(new_id(), 999_000, 1, Side::Buy, TimeInForce::Gtc, None)
+            .expect("seed bid");
         assert!(book.best_ask().is_none(), "book must be one-sided");
 
         book.set_risk_config(RiskConfig::new().with_price_band_bps(500, ReferencePriceSource::Mid));
 
         // +30% from last_trade (1.3M) → rejected because Mid falls
         // back to last_trade when the book is one-sided.
-        let result = book.add_limit_order(
-            Id::new_uuid(),
-            1_300_000,
-            1,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        );
+        let result =
+            book.add_limit_order(new_id(), 1_300_000, 1, Side::Sell, TimeInForce::Gtc, None);
         assert!(
             matches!(result, Err(OrderBookError::RiskPriceBand { .. })),
             "Mid reference should fall back to last_trade and reject; got {result:?}"
@@ -178,14 +151,8 @@ mod tests_risk_layer {
 
         // Far-out price should NOT be rejected because no reference
         // is available; the band check is skipped (warn-once latch).
-        let result = book.add_limit_order(
-            Id::new_uuid(),
-            999_999_999,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        );
+        let result =
+            book.add_limit_order(new_id(), 999_999_999, 1, Side::Buy, TimeInForce::Gtc, None);
         assert!(
             result.is_ok(),
             "no-reference path must skip the band check; got {result:?}"
@@ -207,30 +174,14 @@ mod tests_risk_layer {
         let acct = account(11);
 
         // Two admissions consume the quota.
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first order admitted");
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            101,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("second order admitted");
+        book.add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first order admitted");
+        book.add_limit_order_with_user(new_id(), 101, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("second order admitted");
 
         // Third is rejected.
         let result = book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             102,
             1,
             Side::Buy,
@@ -260,7 +211,7 @@ mod tests_risk_layer {
 
         for i in 0..3 {
             book.add_limit_order_with_user(
-                Id::new_uuid(),
+                new_id(),
                 100 + i,
                 1,
                 Side::Buy,
@@ -280,20 +231,12 @@ mod tests_risk_layer {
         let acct = account(13);
 
         // 8 * 100 = 800 notional consumed.
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            8,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first admission within budget");
+        book.add_limit_order_with_user(new_id(), 100, 8, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first admission within budget");
 
         // 3 * 100 = 300 attempted; 800 + 300 > 1_000 → reject.
         let result = book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             100,
             3,
             Side::Buy,
@@ -324,29 +267,13 @@ mod tests_risk_layer {
         let acct = account(14);
 
         // 8 * 100 = 800 in budget.
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            8,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first within budget");
+        book.add_limit_order_with_user(new_id(), 100, 8, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first within budget");
 
         // 2 * 100 = 200; 800 + 200 = 1_000, exactly at the limit, so
         // accepted (`current + attempted > limit` is the gate, strict).
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            2,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("second hits ceiling exactly and is accepted");
+        book.add_limit_order_with_user(new_id(), 100, 2, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("second hits ceiling exactly and is accepted");
     }
 
     #[test]
@@ -355,7 +282,7 @@ mod tests_risk_layer {
         book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(1));
         let acct = account(15);
 
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         book.add_limit_order_with_user(order_id, 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
             .expect("first admission");
 
@@ -363,7 +290,7 @@ mod tests_risk_layer {
         assert!(
             matches!(
                 book.add_limit_order_with_user(
-                    Id::new_uuid(),
+                    new_id(),
                     100,
                     1,
                     Side::Buy,
@@ -380,16 +307,8 @@ mod tests_risk_layer {
         book.cancel_order(order_id)
             .expect("cancel returns Ok")
             .expect("cancel returns Some");
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("cancel must drop the counter and re-open the slot");
+        book.add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("cancel must drop the counter and re-open the slot");
     }
 
     #[test]
@@ -407,7 +326,7 @@ mod tests_risk_layer {
 
         // Maker rests 10 @ 100 (1_000 notional).
         book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             100,
             10,
             Side::Buy,
@@ -419,7 +338,7 @@ mod tests_risk_layer {
 
         // Taker (different account) submits an aggressive sell that
         // partially fills the maker (qty 4 of 10 at price 100).
-        book.submit_market_order_with_user(Id::new_uuid(), 4, Side::Sell, taker_acct)
+        book.submit_market_order_with_user(new_id(), 4, Side::Sell, taker_acct)
             .expect("aggressive sell fills 4 of 10");
 
         // Maker now has 600 notional (6 * 100). New maker admission
@@ -427,7 +346,7 @@ mod tests_risk_layer {
         // 2_000 (== limit, accepted by strict `>` gate). A larger one
         // (15 * 100 = 1_500) would be rejected.
         book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             99,
             14,
             Side::Buy,
@@ -438,7 +357,7 @@ mod tests_risk_layer {
         .expect("partial fill must free notional headroom");
 
         let breach = book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             98,
             1,
             Side::Buy,
@@ -461,7 +380,7 @@ mod tests_risk_layer {
 
         // Maker uses the only slot.
         book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             100,
             5,
             Side::Buy,
@@ -472,12 +391,12 @@ mod tests_risk_layer {
         .expect("maker admitted");
 
         // Aggressive sell fully consumes the maker.
-        book.submit_market_order_with_user(Id::new_uuid(), 5, Side::Sell, taker_acct)
+        book.submit_market_order_with_user(new_id(), 5, Side::Sell, taker_acct)
             .expect("aggressive sell fills the maker fully");
 
         // Maker's slot must be free again.
         book.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             100,
             1,
             Side::Buy,
@@ -494,21 +413,13 @@ mod tests_risk_layer {
         book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(1));
         let acct = account(20);
 
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first admitted");
+        book.add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first admitted");
         // Quota full → second rejected.
         assert!(
             matches!(
                 book.add_limit_order_with_user(
-                    Id::new_uuid(),
+                    new_id(),
                     100,
                     1,
                     Side::Buy,
@@ -525,16 +436,8 @@ mod tests_risk_layer {
 
         // After disable, gate is lifted and admission succeeds even
         // though the per-account counter still reads 1 underneath.
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("disable_risk lifts the gate");
+        book.add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("disable_risk lifts the gate");
         assert!(book.risk_config().is_none());
     }
 
@@ -544,24 +447,10 @@ mod tests_risk_layer {
         // Seed resting liquidity for both market-order calls BEFORE
         // installing the risk config, so the seeding limits aren't
         // themselves blocked by the gate we're about to configure.
-        book.add_limit_order(
-            Id::new_uuid(),
-            1_000_000,
-            10,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed resting ask 1");
-        book.add_limit_order(
-            Id::new_uuid(),
-            1_000_000,
-            10,
-            Side::Sell,
-            TimeInForce::Gtc,
-            None,
-        )
-        .expect("seed resting ask 2");
+        book.add_limit_order(new_id(), 1_000_000, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("seed resting ask 1");
+        book.add_limit_order(new_id(), 1_000_000, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("seed resting ask 2");
 
         // Configure a band so tight any submitted limit price would
         // fail, plus zero open-orders / notional ceilings. Market
@@ -576,14 +465,14 @@ mod tests_risk_layer {
 
         // No user_id → submit_market_order; should match against a
         // resting ask and not be rejected by any risk gate.
-        let result = book.submit_market_order(Id::new_uuid(), 1, Side::Buy);
+        let result = book.submit_market_order(new_id(), 1, Side::Buy);
         assert!(
             result.is_ok(),
             "market orders must bypass risk checks; got {result:?}"
         );
 
         // With user_id variant: same story.
-        let result = book.submit_market_order_with_user(Id::new_uuid(), 1, Side::Buy, account(42));
+        let result = book.submit_market_order_with_user(new_id(), 1, Side::Buy, account(42));
         assert!(
             result.is_ok(),
             "submit_market_order_with_user must bypass risk; got {result:?}"
@@ -612,39 +501,15 @@ mod tests_risk_layer {
         // Account A: 2 resting orders @ price 100 — saturates the
         // open-orders quota for that account post-restore.
         original
-            .add_limit_order_with_user(
-                Id::new_uuid(),
-                100,
-                3,
-                Side::Buy,
-                TimeInForce::Gtc,
-                acct_a,
-                None,
-            )
+            .add_limit_order_with_user(new_id(), 100, 3, Side::Buy, TimeInForce::Gtc, acct_a, None)
             .expect("acct_a first admission");
         original
-            .add_limit_order_with_user(
-                Id::new_uuid(),
-                100,
-                4,
-                Side::Buy,
-                TimeInForce::Gtc,
-                acct_a,
-                None,
-            )
+            .add_limit_order_with_user(new_id(), 100, 4, Side::Buy, TimeInForce::Gtc, acct_a, None)
             .expect("acct_a second admission");
 
         // Account B: a single resting order — quota still has room.
         original
-            .add_limit_order_with_user(
-                Id::new_uuid(),
-                100,
-                2,
-                Side::Buy,
-                TimeInForce::Gtc,
-                acct_b,
-                None,
-            )
+            .add_limit_order_with_user(new_id(), 100, 2, Side::Buy, TimeInForce::Gtc, acct_b, None)
             .expect("acct_b first admission");
 
         // JSON round-trip via the public snapshot API.
@@ -673,7 +538,7 @@ mod tests_risk_layer {
         // 2. Account A saturated its quota pre-snapshot. A new
         // submission must be rejected by the rebuilt counters.
         let breach = restored.add_limit_order_with_user(
-            Id::new_uuid(),
+            new_id(),
             100,
             1,
             Side::Buy,
@@ -698,15 +563,7 @@ mod tests_risk_layer {
 
         // 3. Account B still has one slot of headroom.
         restored
-            .add_limit_order_with_user(
-                Id::new_uuid(),
-                100,
-                1,
-                Side::Buy,
-                TimeInForce::Gtc,
-                acct_b,
-                None,
-            )
+            .add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct_b, None)
             .expect("acct_b within rebuilt quota must succeed");
     }
 
@@ -756,30 +613,14 @@ mod tests_risk_layer {
         book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(2));
         let acct = account(11);
 
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            100,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("first admitted (1/2)");
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            101,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("second admitted (2/2)");
+        book.add_limit_order_with_user(new_id(), 100, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("first admitted (1/2)");
+        book.add_limit_order_with_user(new_id(), 101, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("second admitted (2/2)");
         // At the limit, a third is rejected.
         assert!(matches!(
             book.add_limit_order_with_user(
-                Id::new_uuid(),
+                new_id(),
                 102,
                 1,
                 Side::Buy,
@@ -795,15 +636,7 @@ mod tests_risk_layer {
         assert_eq!(res.cancelled_count(), 2);
 
         // A fresh order from the same account is now admitted (counter was reset).
-        book.add_limit_order_with_user(
-            Id::new_uuid(),
-            103,
-            1,
-            Side::Buy,
-            TimeInForce::Gtc,
-            acct,
-            None,
-        )
-        .expect("re-admitted after cancel_all_orders");
+        book.add_limit_order_with_user(new_id(), 103, 1, Side::Buy, TimeInForce::Gtc, acct, None)
+            .expect("re-admitted after cancel_all_orders");
     }
 }

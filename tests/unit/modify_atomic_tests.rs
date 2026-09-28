@@ -12,6 +12,11 @@ use pricelevel::{Hash32, Id, OrderUpdate, Price, Quantity, Side, TimeInForce};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 fn account(byte: u8) -> Hash32 {
     Hash32::new([byte; 32])
 }
@@ -37,11 +42,11 @@ fn post_only_modify_that_would_cross_leaves_original_untouched_and_emits_no_trad
     let (book, trade_count) = book_with_trade_counter();
 
     // Resting ask at 110 to be crossed by an aggressive buy.
-    book.add_limit_order(Id::new_uuid(), 110, 10, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 110, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("resting ask admitted");
 
     // Resting post-only buy at 100 (does not cross the 110 ask).
-    let buy_id = Id::new_uuid();
+    let buy_id = new_id();
     book.add_post_only_order(buy_id, 100, 5, Side::Buy, TimeInForce::Gtc, None)
         .expect("post-only buy admitted");
 
@@ -90,10 +95,10 @@ fn post_only_modify_that_would_cross_leaves_original_untouched_and_emits_no_trad
 fn post_only_replace_that_would_cross_leaves_original_untouched() {
     let book: OrderBook<()> = OrderBook::new("TEST");
 
-    book.add_limit_order(Id::new_uuid(), 110, 10, Side::Sell, TimeInForce::Gtc, None)
+    book.add_limit_order(new_id(), 110, 10, Side::Sell, TimeInForce::Gtc, None)
         .expect("resting ask admitted");
 
-    let buy_id = Id::new_uuid();
+    let buy_id = new_id();
     book.add_post_only_order(buy_id, 100, 5, Side::Buy, TimeInForce::Gtc, None)
         .expect("post-only buy admitted");
 
@@ -128,29 +133,13 @@ fn modify_outside_price_band_leaves_original_untouched() {
     let acct = account(31);
 
     // Two-sided book establishes a mid of 100.
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        90,
-        10,
-        Side::Buy,
-        TimeInForce::Gtc,
-        acct,
-        None,
-    )
-    .expect("bid admitted");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        110,
-        10,
-        Side::Sell,
-        TimeInForce::Gtc,
-        acct,
-        None,
-    )
-    .expect("ask admitted");
+    book.add_limit_order_with_user(new_id(), 90, 10, Side::Buy, TimeInForce::Gtc, acct, None)
+        .expect("bid admitted");
+    book.add_limit_order_with_user(new_id(), 110, 10, Side::Sell, TimeInForce::Gtc, acct, None)
+        .expect("ask admitted");
 
     // Resting order we will try to modify.
-    let order_id = Id::new_uuid();
+    let order_id = new_id();
     book.add_limit_order_with_user(order_id, 99, 5, Side::Buy, TimeInForce::Gtc, acct, None)
         .expect("order admitted within band");
 
@@ -178,7 +167,7 @@ fn modify_over_max_notional_leaves_original_untouched() {
     let acct = account(32);
 
     // Resting order contributes 100 * 5 = 500 of notional.
-    let order_id = Id::new_uuid();
+    let order_id = new_id();
     book.add_limit_order_with_user(order_id, 100, 5, Side::Buy, TimeInForce::Gtc, acct, None)
         .expect("order admitted within notional");
 
@@ -220,19 +209,11 @@ fn modify_at_max_open_orders_succeeds() {
     let acct = account(33);
 
     // Fill the open-order quota: account is now exactly at the limit.
-    let target_id = Id::new_uuid();
+    let target_id = new_id();
     book.add_limit_order_with_user(target_id, 100, 3, Side::Buy, TimeInForce::Gtc, acct, None)
         .expect("first order admitted");
-    book.add_limit_order_with_user(
-        Id::new_uuid(),
-        101,
-        3,
-        Side::Buy,
-        TimeInForce::Gtc,
-        acct,
-        None,
-    )
-    .expect("second order admitted (now at limit)");
+    book.add_limit_order_with_user(new_id(), 101, 3, Side::Buy, TimeInForce::Gtc, acct, None)
+        .expect("second order admitted (now at limit)");
 
     // A modify keeps the count unchanged (one out, one in) so it must SUCCEED
     // even though the account is at max_open_orders. This is the regression

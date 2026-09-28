@@ -19,6 +19,11 @@ mod tests_update_price_and_quantity_two_tranche {
         Hash32, Id, OrderType, OrderUpdate, Price, Quantity, Side, TimeInForce, TimestampMs,
     };
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     const PRICE: u128 = 1000;
     const NEW_PRICE: u128 = 1010;
 
@@ -79,7 +84,7 @@ mod tests_update_price_and_quantity_two_tranche {
 
     #[test]
     fn test_update_price_and_quantity_reserve_increase_sets_visible_and_keeps_hidden() {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let book = book_with_reserve(order_id, 5, 5);
 
         let result = book.update_order(OrderUpdate::UpdatePriceAndQuantity {
@@ -95,7 +100,7 @@ mod tests_update_price_and_quantity_two_tranche {
 
     #[test]
     fn test_update_price_and_quantity_reserve_decrease_sets_visible_and_keeps_hidden() {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let book = book_with_reserve(order_id, 30, 70);
 
         let result = book.update_order(OrderUpdate::UpdatePriceAndQuantity {
@@ -110,7 +115,7 @@ mod tests_update_price_and_quantity_two_tranche {
 
     #[test]
     fn test_update_price_and_quantity_reserve_amplified_case_sets_visible_and_keeps_hidden() {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let book = book_with_reserve(order_id, 30, 70);
 
         // The issue's amplified case: the requested 80 is the new visible
@@ -128,7 +133,7 @@ mod tests_update_price_and_quantity_two_tranche {
 
     #[test]
     fn test_update_price_and_quantity_iceberg_sets_visible_and_keeps_hidden() {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let book: OrderBook<()> = DefaultOrderBook::new("TWO-TRANCHE");
         let added =
             book.add_iceberg_order(order_id, PRICE, 5, 5, Side::Buy, TimeInForce::Gtc, None);
@@ -164,14 +169,14 @@ mod tests_update_price_and_quantity_two_tranche {
     /// comparison isolates the quantity semantics.
     #[test]
     fn test_update_variants_agree_on_reserve_tranche_split() {
-        let quantity_id = Id::new_uuid();
+        let quantity_id = new_id();
         let quantity_book = book_with_reserve(quantity_id, 30, 70);
         let by_quantity = quantity_book.update_order(OrderUpdate::UpdateQuantity {
             order_id: quantity_id,
             new_quantity: Quantity::new(45),
         });
 
-        let replace_id = Id::new_uuid();
+        let replace_id = new_id();
         let replace_book = book_with_reserve(replace_id, 30, 70);
         let by_replace = replace_book.update_order(OrderUpdate::Replace {
             order_id: replace_id,
@@ -180,7 +185,7 @@ mod tests_update_price_and_quantity_two_tranche {
             side: Side::Buy,
         });
 
-        let both_id = Id::new_uuid();
+        let both_id = new_id();
         let both_book = book_with_reserve(both_id, 30, 70);
         let by_both = both_book.update_order(OrderUpdate::UpdatePriceAndQuantity {
             order_id: both_id,
@@ -203,7 +208,7 @@ mod tests_update_price_and_quantity_two_tranche {
     #[test]
     fn test_update_price_and_quantity_reserve_rejected_by_max_order_size_leaves_original_unchanged()
     {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let mut book: OrderBook<()> = DefaultOrderBook::new("TWO-TRANCHE");
         book.set_max_order_size(15);
         let added = book.add_order(reserve_order(order_id, 5, 5, Hash32::zero()));
@@ -233,7 +238,7 @@ mod tests_update_price_and_quantity_two_tranche {
     #[test]
     fn test_update_price_and_quantity_reserve_rejected_by_risk_notional_leaves_original_unchanged()
     {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let user_id = Hash32::new([7; 32]);
         let mut book: OrderBook<()> = DefaultOrderBook::new("TWO-TRANCHE");
         // The modify-aware check swaps the order's tracked contribution, so
@@ -264,7 +269,7 @@ mod tests_update_price_and_quantity_two_tranche {
 
     #[test]
     fn test_update_price_and_quantity_reserve_overflow_rejected_leaves_original_unchanged() {
-        let order_id = Id::new_uuid();
+        let order_id = new_id();
         let book = book_with_reserve(order_id, 5, 5);
 
         // u64::MAX visible + 5 hidden is unrepresentable (#210).

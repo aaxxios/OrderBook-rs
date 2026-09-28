@@ -6,6 +6,11 @@ mod tests {
     use crate::orderbook::book::OrderBook;
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     // Helper function to create a new order book for testing.
     fn setup_book() -> OrderBook<()> {
         OrderBook::new("TEST_SYMBOL")
@@ -14,7 +19,7 @@ mod tests {
     // Helper to add a standard limit order to the book.
     fn add_limit_order(book: &OrderBook, side: Side, price: u128, quantity: u64) -> Id {
         let order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             side,
             price: Price::new(price),
             quantity: Quantity::new(quantity),
@@ -42,9 +47,7 @@ mod tests {
         let maker_b = add_limit_order(&book, Side::Sell, 100, 10);
 
         // First aggressor partially fills A (A: 10 -> 6).
-        let r1 = book
-            .match_order(Id::new(), Side::Buy, 4, Some(100))
-            .unwrap();
+        let r1 = book.match_order(new_id(), Side::Buy, 4, Some(100)).unwrap();
         let t1 = r1.trades().as_vec();
         assert_eq!(t1.len(), 1);
         assert_eq!(t1[0].maker_order_id(), maker_a);
@@ -52,9 +55,7 @@ mod tests {
 
         // Second, separate aggressor must continue consuming A's remainder,
         // NOT jump to the later arrival B (this is the exact #88 failure).
-        let r2 = book
-            .match_order(Id::new(), Side::Buy, 4, Some(100))
-            .unwrap();
+        let r2 = book.match_order(new_id(), Side::Buy, 4, Some(100)).unwrap();
         let t2 = r2.trades().as_vec();
         assert_eq!(t2.len(), 1);
         assert_eq!(
@@ -65,9 +66,7 @@ mod tests {
 
         // Third aggressor exhausts A's last 2 then spills into B: the trade
         // order proves A is fully consumed before B is ever touched.
-        let r3 = book
-            .match_order(Id::new(), Side::Buy, 5, Some(100))
-            .unwrap();
+        let r3 = book.match_order(new_id(), Side::Buy, 5, Some(100)).unwrap();
         let t3 = r3.trades().as_vec();
         assert_eq!(t3.len(), 2);
         assert_eq!(t3[0].maker_order_id(), maker_a);
@@ -86,7 +85,7 @@ mod tests {
         book.set_order_state_tracker(OrderStateTracker::new());
 
         let maker = add_limit_order(&book, Side::Sell, 100, 10);
-        let taker = Id::new();
+        let taker = new_id();
         let result = book.match_order(taker, Side::Buy, 10, None).unwrap();
         assert!(result.is_complete());
 
@@ -114,7 +113,7 @@ mod tests {
 
         // FOK buy 10 (lot-aligned) at limit 101 — full reachable depth is 10.
         let fok = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(101),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -140,7 +139,7 @@ mod tests {
         use std::num::NonZeroU64;
 
         let book: OrderBook<()> = OrderBook::new("TEST");
-        let reserve_id = Id::new();
+        let reserve_id = new_id();
         book.add_order(OrderType::ReserveOrder {
             id: reserve_id,
             price: Price::new(100),
@@ -162,7 +161,7 @@ mod tests {
         // trade and the reserve untouched. The old raw-depth check let it proceed,
         // fill 5, drop the hidden, and error with the book already mutated.
         let fok = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -195,7 +194,7 @@ mod tests {
     fn test_fok_fills_against_iceberg_replenishable_hidden_issue_136() {
         let book: OrderBook<()> = OrderBook::new("TEST");
         book.add_order(OrderType::IcebergOrder {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             visible_quantity: Quantity::new(2),
             hidden_quantity: Quantity::new(8),
@@ -211,7 +210,7 @@ mod tests {
         // its 8 hidden, so `matchable_quantity` reports 10 drawable → the FOK
         // fills fully and consumes the level.
         let fok = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             price: Price::new(100),
             quantity: Quantity::new(10),
             side: Side::Buy,
@@ -234,7 +233,7 @@ mod tests {
         let book = setup_book();
         add_limit_order(&book, Side::Sell, 100, 50); // Add a sell order
 
-        let taker_order_id = Id::new();
+        let taker_order_id = new_id();
         let result = book
             .match_order(taker_order_id, Side::Buy, 50, None)
             .unwrap();
@@ -252,7 +251,7 @@ mod tests {
         let book = setup_book();
         add_limit_order(&book, Side::Buy, 90, 30);
 
-        let taker_order_id = Id::new();
+        let taker_order_id = new_id();
         let result = book
             .match_order(taker_order_id, Side::Sell, 50, None)
             .unwrap();
@@ -269,7 +268,7 @@ mod tests {
         add_limit_order(&book, Side::Sell, 100, 50);
 
         // This limit buy order has a favorable price (higher than the ask)
-        let taker_order_id = Id::new();
+        let taker_order_id = new_id();
         let result = book
             .match_order(taker_order_id, Side::Buy, 50, Some(105))
             .unwrap();
@@ -285,7 +284,7 @@ mod tests {
         add_limit_order(&book, Side::Buy, 90, 50);
 
         // This limit sell order has an unfavorable price (higher than the bid)
-        let taker_order_id = Id::new();
+        let taker_order_id = new_id();
         let result = book
             .match_order(taker_order_id, Side::Sell, 50, Some(95))
             .unwrap();
@@ -299,7 +298,7 @@ mod tests {
     #[test]
     fn test_market_order_no_liquidity_error() {
         let book = setup_book();
-        let taker_order_id = Id::new();
+        let taker_order_id = new_id();
         let result = book.match_order(taker_order_id, Side::Buy, 50, None);
 
         assert!(matches!(
@@ -315,7 +314,7 @@ mod tests {
         add_limit_order(&book, Side::Sell, 101, 30);
         add_limit_order(&book, Side::Sell, 102, 40);
 
-        let taker_order_id = Id::new();
+        let taker_order_id = new_id();
         // Market order to buy 70 shares, should consume the first two levels and part of the third
         let result = book
             .match_order(taker_order_id, Side::Buy, 70, None)
@@ -334,9 +333,9 @@ mod tests {
     #[test]
     fn test_peek_match_buy_side_full_match() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        book.add_limit_order(Id::new(), 101, 10, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 101, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
-        book.add_limit_order(Id::new(), 102, 5, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 102, 5, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Request 15, which is fully available (10 at 101, 5 at 102)
@@ -347,7 +346,7 @@ mod tests {
     #[test]
     fn test_peek_match_buy_side_partial_match() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        book.add_limit_order(Id::new(), 101, 10, Side::Sell, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 101, 10, Side::Sell, TimeInForce::Gtc, None)
             .unwrap();
 
         // Request 20, but only 10 is available
@@ -358,11 +357,11 @@ mod tests {
     #[test]
     fn test_peek_match_sell_side_with_price_limit() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        book.add_limit_order(Id::new(), 98, 10, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 98, 10, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
-        book.add_limit_order(Id::new(), 99, 5, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 99, 5, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
-        book.add_limit_order(Id::new(), 100, 20, Side::Buy, TimeInForce::Gtc, None)
+        book.add_limit_order(new_id(), 100, 20, Side::Buy, TimeInForce::Gtc, None)
             .unwrap();
 
         // Request to sell with a limit of 99. Should only match with bids at 99 and 100.

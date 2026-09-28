@@ -3,10 +3,11 @@ mod test_order_modifications {
 
     use crate::{OrderBook, OrderBookError};
     use pricelevel::{Id, OrderType, OrderUpdate, Price, Quantity, Side, TimeInForce};
+    use uuid::Uuid;
 
     // Helper function to create a unique order ID
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]
@@ -228,6 +229,7 @@ mod test_order_modifications {
 mod test_modifications_remaining {
     use crate::OrderBook;
     use crate::orderbook::modifications::OrderQuantity;
+    use uuid::Uuid;
 
     use pricelevel::{
         Hash32, Id, OrderType, OrderUpdate, PegReferenceType, Price, Quantity, Side, TimeInForce,
@@ -235,7 +237,7 @@ mod test_modifications_remaining {
     };
 
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]
@@ -508,9 +510,10 @@ mod test_modifications_specific {
         Hash32, Id, OrderType, OrderUpdate, PegReferenceType, Price, Quantity, Side, TimeInForce,
         TimestampMs,
     };
+    use uuid::Uuid;
 
     fn create_order_id() -> Id {
-        Id::new_uuid()
+        Id::from_uuid(Uuid::new_v4())
     }
 
     #[test]
@@ -672,10 +675,15 @@ mod tests {
         Hash32, Id, OrderType, OrderUpdate, Price, Quantity, Side, TimeInForce, TimestampMs,
     };
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     fn setup_book_with_orders() -> OrderBook<()> {
         let book: OrderBook<()> = OrderBook::new("TEST");
         let sell_order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Sell,
             price: Price::new(100),
             quantity: Quantity::new(10),
@@ -687,7 +695,7 @@ mod tests {
         book.add_order(sell_order).unwrap();
 
         let buy_order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Buy,
             price: Price::new(90),
             quantity: Quantity::new(10),
@@ -704,7 +712,7 @@ mod tests {
     fn test_add_post_only_order_crossing_market() {
         let book = setup_book_with_orders();
         let post_only_order = OrderType::PostOnly {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Buy,
             price: Price::new(100), // This price crosses the best ask (100)
             quantity: Quantity::new(5),
@@ -724,7 +732,7 @@ mod tests {
         book.set_market_close_timestamp(100); // Market closed at timestamp 100
 
         let expired_order = OrderType::Standard {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Buy,
             price: Price::new(95),
             quantity: Quantity::new(10),
@@ -744,7 +752,7 @@ mod tests {
     #[test]
     fn test_successful_cancel_order_removes_level() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        let order_id = Id::new();
+        let order_id = new_id();
         let order = OrderType::Standard {
             id: order_id,
             side: Side::Sell,
@@ -766,7 +774,7 @@ mod tests {
     #[test]
     fn test_update_order_not_found() {
         let book: OrderBook<()> = OrderBook::new("TEST");
-        let non_existent_id = Id::new();
+        let non_existent_id = new_id();
         let result = book.update_order(OrderUpdate::Cancel {
             order_id: non_existent_id,
         });
@@ -796,7 +804,7 @@ mod tests {
     #[test]
     fn test_set_total_remaining_for_reserve_order_replenishes_visible_and_conserves_total() {
         let mut order = OrderType::ReserveOrder {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Buy,
             price: Price::new(100),
             visible_quantity: Quantity::new(10),
@@ -832,7 +840,7 @@ mod tests {
     /// Build a reserve order with the given tranche split (#221 fixtures).
     fn reserve_order(visible: u64, hidden: u64) -> OrderType<()> {
         OrderType::ReserveOrder {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Buy,
             price: Price::new(100),
             visible_quantity: Quantity::new(visible),
@@ -885,7 +893,7 @@ mod tests {
     #[test]
     fn test_set_quantity_for_iceberg_order_sets_visible_and_keeps_hidden() {
         let mut order = OrderType::IcebergOrder {
-            id: Id::new(),
+            id: new_id(),
             side: Side::Buy,
             price: Price::new(100),
             visible_quantity: Quantity::new(5),
@@ -919,6 +927,7 @@ mod test_add_order_with_result {
     use crate::{OrderBook, OrderBookError, TradeListener, TradeResult};
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
     use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
 
     /// Helper: create a non-zero user hash from a single byte value.
     fn user(byte: u8) -> Hash32 {
@@ -928,7 +937,7 @@ mod test_add_order_with_result {
     /// Helper: build a standard GTC order.
     fn standard_order(price: u128, quantity: u64, side: Side, user_id: Hash32) -> OrderType<()> {
         OrderType::Standard {
-            id: Id::new(),
+            id: Id::from_uuid(Uuid::new_v4()),
             price: Price::new(price),
             quantity: Quantity::new(quantity),
             side,
@@ -1119,7 +1128,7 @@ mod test_add_order_with_result {
         assert!(result.is_ok(), "failed to rest maker: {result:?}");
 
         let ioc = OrderType::Standard {
-            id: Id::new(),
+            id: Id::from_uuid(Uuid::new_v4()),
             price: Price::new(100),
             quantity: Quantity::new(20),
             side: Side::Buy,

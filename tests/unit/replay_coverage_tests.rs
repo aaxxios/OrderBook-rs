@@ -11,6 +11,11 @@ use orderbook_rs::orderbook::sequencer::{
 };
 use pricelevel::{Hash32, Id, Price, Quantity, Side, TimeInForce, TimestampMs};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
 fn make_add_event(seq: u64, id: Id, price: u128, qty: u64, side: Side) -> SequencerEvent<()> {
@@ -69,7 +74,7 @@ fn replay_empty_journal_returns_error() {
 #[test]
 fn replay_invalid_sequence_returns_error() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     let event = make_add_event(0, id, 100, 10, Side::Buy);
     assert!(journal.append(&event).is_ok());
 
@@ -89,8 +94,8 @@ fn replay_invalid_sequence_returns_error() {
 #[test]
 fn replay_sequence_gap_returns_error() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
 
     // Append events with a gap: 0, then 5 (skipping 1-4)
     assert!(
@@ -120,7 +125,7 @@ fn replay_sequence_gap_returns_error() {
 #[test]
 fn replay_single_add_order() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -138,7 +143,7 @@ fn replay_single_add_order() {
 #[test]
 fn replay_add_then_cancel() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -158,7 +163,7 @@ fn replay_add_then_cancel() {
 #[test]
 fn replay_skips_rejected_events() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -179,8 +184,8 @@ fn replay_skips_rejected_events() {
 #[test]
 fn replay_with_progress_callback() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id1, 100, 10, Side::Buy))
@@ -207,7 +212,7 @@ fn replay_with_progress_callback() {
 #[test]
 fn replay_cancel_all_command() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -234,7 +239,7 @@ fn replay_cancel_all_command() {
 #[test]
 fn replay_cancel_by_side_command() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -261,7 +266,7 @@ fn replay_cancel_by_side_command() {
 #[test]
 fn replay_cancel_by_user_command() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
 
     let add_event = make_add_event(0, id, 100, 10, Side::Buy);
     assert!(journal.append(&add_event).is_ok());
@@ -285,7 +290,7 @@ fn replay_cancel_by_user_command() {
 #[test]
 fn replay_cancel_by_price_range_command() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -313,8 +318,8 @@ fn replay_cancel_by_price_range_command() {
 #[test]
 fn replay_market_order_command() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
     // Add a sell order for the market buy to match against
     assert!(
         journal
@@ -346,7 +351,7 @@ fn replay_market_order_command() {
 #[test]
 fn replay_verify_matching_snapshot() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -365,7 +370,7 @@ fn replay_verify_matching_snapshot() {
 #[test]
 fn replay_verify_mismatched_snapshot() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id, 100, 10, Side::Buy))
@@ -374,7 +379,7 @@ fn replay_verify_mismatched_snapshot() {
 
     // Create a snapshot from a different book
     let other_book = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = other_book.add_limit_order(Id::new_uuid(), 999, 99, Side::Sell, TimeInForce::Gtc, None);
+    let _ = other_book.add_limit_order(new_id(), 999, 99, Side::Sell, TimeInForce::Gtc, None);
     let wrong_snapshot = other_book.create_snapshot(usize::MAX);
 
     let result = ReplayEngine::<()>::verify(&journal, &wrong_snapshot);
@@ -387,8 +392,8 @@ fn replay_verify_mismatched_snapshot() {
 #[test]
 fn snapshots_match_identical_books() {
     let book = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-    let _ = book.add_limit_order(Id::new_uuid(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
     let s1 = book.create_snapshot(usize::MAX);
     let s2 = book.create_snapshot(usize::MAX);
     assert!(snapshots_match(&s1, &s2));
@@ -406,9 +411,9 @@ fn snapshots_match_different_symbols_returns_false() {
 #[test]
 fn snapshots_match_different_bids_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book1.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book1.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book2.add_limit_order(Id::new_uuid(), 200, 20, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book2.add_limit_order(new_id(), 200, 20, Side::Buy, TimeInForce::Gtc, None);
     let s1 = book1.create_snapshot(usize::MAX);
     let s2 = book2.create_snapshot(usize::MAX);
     assert!(!snapshots_match(&s1, &s2));
@@ -417,9 +422,9 @@ fn snapshots_match_different_bids_returns_false() {
 #[test]
 fn snapshots_match_different_asks_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book1.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book1.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book2.add_limit_order(Id::new_uuid(), 200, 20, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book2.add_limit_order(new_id(), 200, 20, Side::Sell, TimeInForce::Gtc, None);
     let s1 = book1.create_snapshot(usize::MAX);
     let s2 = book2.create_snapshot(usize::MAX);
     assert!(!snapshots_match(&s1, &s2));
@@ -428,7 +433,7 @@ fn snapshots_match_different_asks_returns_false() {
 #[test]
 fn snapshots_match_different_bid_count_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book1.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book1.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
     let s1 = book1.create_snapshot(usize::MAX);
     let s2 = book2.create_snapshot(usize::MAX);
@@ -438,7 +443,7 @@ fn snapshots_match_different_bid_count_returns_false() {
 #[test]
 fn snapshots_match_different_ask_count_returns_false() {
     let book1 = orderbook_rs::OrderBook::<()>::new("TEST");
-    let _ = book1.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book1.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
     let book2 = orderbook_rs::OrderBook::<()>::new("TEST");
     let s1 = book1.create_snapshot(usize::MAX);
     let s2 = book2.create_snapshot(usize::MAX);
@@ -471,7 +476,7 @@ fn in_memory_journal_with_capacity() {
 #[test]
 fn in_memory_journal_append_and_len() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id = Id::new_uuid();
+    let id = new_id();
     let event = make_add_event(0, id, 100, 10, Side::Buy);
     assert!(journal.append(&event).is_ok());
     assert!(!journal.is_empty());
@@ -482,9 +487,9 @@ fn in_memory_journal_append_and_len() {
 #[test]
 fn in_memory_journal_read_from_filters_correctly() {
     let journal: InMemoryJournal<()> = InMemoryJournal::new();
-    let id1 = Id::new_uuid();
-    let id2 = Id::new_uuid();
-    let id3 = Id::new_uuid();
+    let id1 = new_id();
+    let id2 = new_id();
+    let id3 = new_id();
     assert!(
         journal
             .append(&make_add_event(0, id1, 100, 10, Side::Buy))

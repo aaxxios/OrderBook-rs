@@ -21,6 +21,11 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::atomic::Ordering;
 
+    /// Fresh random order id (UUID v4).
+    fn new_id() -> Id {
+        Id::from_uuid(uuid::Uuid::new_v4())
+    }
+
     const PRICE: u128 = 100;
     /// A GTD deadline far past any real clock reading, so the order is
     /// admitted and only the explicit eviction below expires it.
@@ -90,8 +95,8 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_stays_false_for_iceberg_and_auto_reserve() {
         let book: OrderBook<()> = OrderBook::new("FLAG-SAFE");
-        let iceberg_id = Id::new();
-        let auto_id = Id::new();
+        let iceberg_id = new_id();
+        let auto_id = new_id();
 
         assert!(
             book.add_order(iceberg_buy(iceberg_id, 10, 20)).is_ok(),
@@ -106,7 +111,7 @@ mod tests {
 
         // A sweep across both leaves the gate closed as well.
         assert!(
-            book.add_limit_order(Id::new(), PRICE, 15, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), PRICE, 15, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "the crossing sell must be accepted"
         );
@@ -118,7 +123,7 @@ mod tests {
     fn test_strandable_makers_resting_set_by_resting_non_auto_reserve() {
         let book: OrderBook<()> = OrderBook::new("FLAG-ARM");
         assert!(
-            book.add_order(reserve_buy(Id::new(), 10, 20, None, false))
+            book.add_order(reserve_buy(new_id(), 10, 20, None, false))
                 .is_ok(),
             "the reserve must rest"
         );
@@ -131,7 +136,7 @@ mod tests {
     fn test_strandable_makers_resting_stays_false_without_hidden_depth() {
         let book: OrderBook<()> = OrderBook::new("FLAG-NO-HIDDEN");
         assert!(
-            book.add_order(reserve_buy(Id::new(), 10, 0, None, false))
+            book.add_order(reserve_buy(new_id(), 10, 0, None, false))
                 .is_ok(),
             "the reserve must rest"
         );
@@ -145,11 +150,11 @@ mod tests {
     fn test_strandable_makers_resting_set_by_rested_residual() {
         let book: OrderBook<()> = OrderBook::new("FLAG-RESIDUAL");
         assert!(
-            book.add_limit_order(Id::new(), PRICE, 5, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), PRICE, 5, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "contra depth must rest"
         );
-        let taker_id = Id::new();
+        let taker_id = new_id();
         assert!(
             book.add_order(reserve_buy(taker_id, 10, 20, None, false))
                 .is_ok(),
@@ -168,7 +173,7 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_rederived_by_snapshot_package_restore() {
         let source: OrderBook<()> = OrderBook::new("FLAG-RESTORE");
-        let order_id = Id::new();
+        let order_id = new_id();
         assert!(
             source
                 .add_order(reserve_buy(order_id, 10, 20, None, false))
@@ -204,7 +209,7 @@ mod tests {
     fn test_strandable_makers_resting_stays_false_restoring_a_safe_package() {
         let source: OrderBook<()> = OrderBook::new("FLAG-RESTORE-SAFE");
         assert!(
-            source.add_order(iceberg_buy(Id::new(), 10, 20)).is_ok(),
+            source.add_order(iceberg_buy(new_id(), 10, 20)).is_ok(),
             "the iceberg must rest on the source book"
         );
         let package = match source.create_snapshot_package(usize::MAX) {
@@ -225,8 +230,8 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_returns_to_zero_on_cancel() {
         let book: OrderBook<()> = OrderBook::new("COUNT-CANCEL");
-        let first = Id::new();
-        let second = Id::new();
+        let first = new_id();
+        let second = new_id();
         assert!(
             book.add_order(reserve_buy(first, 10, 20, None, false))
                 .is_ok()
@@ -249,15 +254,15 @@ mod tests {
     fn test_strandable_makers_resting_returns_to_zero_on_mass_cancel() {
         let book: OrderBook<()> = OrderBook::new("COUNT-MASS");
         assert!(
-            book.add_order(reserve_buy(Id::new(), 10, 20, None, false))
+            book.add_order(reserve_buy(new_id(), 10, 20, None, false))
                 .is_ok()
         );
         assert!(
-            book.add_order(reserve_buy(Id::new(), 10, 20, None, false))
+            book.add_order(reserve_buy(new_id(), 10, 20, None, false))
                 .is_ok()
         );
         // An iceberg is not counted and must not disturb the tally.
-        assert!(book.add_order(iceberg_buy(Id::new(), 10, 20)).is_ok());
+        assert!(book.add_order(iceberg_buy(new_id(), 10, 20)).is_ok());
         assert_eq!(count(&book), 2, "only the reserves are counted");
 
         let cancelled = book.cancel_all_orders();
@@ -274,7 +279,7 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_returns_to_zero_when_consumed() {
         let book: OrderBook<()> = OrderBook::new("COUNT-CONSUMED");
-        let maker_id = Id::new();
+        let maker_id = new_id();
         assert!(
             book.add_order(reserve_buy(maker_id, 10, 20, None, false))
                 .is_ok()
@@ -282,7 +287,7 @@ mod tests {
         assert_eq!(count(&book), 1, "the maker is counted");
 
         assert!(
-            book.add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "the sweep takes the whole visible tranche"
         );
@@ -301,7 +306,7 @@ mod tests {
     fn test_strandable_makers_resting_decrements_exactly_once_per_maker() {
         // Removed by cancel: the later sweep must not decrement again.
         let cancelled: OrderBook<()> = OrderBook::new("COUNT-ONCE-CANCEL");
-        let maker = Id::new();
+        let maker = new_id();
         assert!(
             cancelled
                 .add_order(reserve_buy(maker, 10, 20, None, false))
@@ -312,7 +317,7 @@ mod tests {
         assert_eq!(count(&cancelled), 0, "one decrement");
         assert!(
             cancelled
-                .add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+                .add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "a later sweep finds nothing to consume"
         );
@@ -320,7 +325,7 @@ mod tests {
 
         // Removed by matching: a later cancel must not decrement again.
         let matched: OrderBook<()> = OrderBook::new("COUNT-ONCE-MATCH");
-        let consumed = Id::new();
+        let consumed = new_id();
         assert!(
             matched
                 .add_order(reserve_buy(consumed, 10, 20, None, false))
@@ -329,7 +334,7 @@ mod tests {
         assert_eq!(count(&matched), 1);
         assert!(
             matched
-                .add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+                .add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "the sweep consumes it"
         );
@@ -347,7 +352,7 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_ignores_a_reused_id() {
         let book: OrderBook<()> = OrderBook::new("COUNT-ID-REUSE");
-        let shared_id = Id::new();
+        let shared_id = new_id();
         assert!(
             book.add_order(reserve_buy(shared_id, 10, 20, None, false))
                 .is_ok()
@@ -365,7 +370,7 @@ mod tests {
         assert_eq!(count(&book), 0, "a Standard order is not strandable");
 
         assert!(
-            book.add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "a sweep consumes the plain order"
         );
@@ -379,7 +384,7 @@ mod tests {
         for label in ["by_side", "by_user", "by_price_range", "expiry"] {
             let book: OrderBook<()> = OrderBook::new("COUNT-MASS-PATHS");
             let user = pricelevel::Hash32::from([5u8; 32]);
-            let mut order = reserve_buy(Id::new(), 10, 20, None, false);
+            let mut order = reserve_buy(new_id(), 10, 20, None, false);
             if let OrderType::ReserveOrder {
                 user_id,
                 time_in_force,
@@ -425,7 +430,7 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_survives_a_cancel_then_add_modify() {
         let book: OrderBook<()> = OrderBook::new("COUNT-MODIFY");
-        let maker = Id::new();
+        let maker = new_id();
         assert!(
             book.add_order(reserve_buy(maker, 10, 20, None, false))
                 .is_ok()
@@ -518,11 +523,11 @@ mod tests {
     /// in its prepare phase, before any state change.
     #[test]
     fn test_direct_restore_rejects_a_zero_visible_non_auto_reserve() {
-        let ghost_id = Id::new();
+        let ghost_id = new_id();
         let source = book_holding_a_ghost("GHOST-DIRECT", ghost_id);
         let snapshot = source.create_snapshot(usize::MAX);
 
-        let survivor = Id::new();
+        let survivor = new_id();
         let destination = destination_with_state("GHOST-DIRECT", survivor);
 
         match destination.restore_from_snapshot(snapshot) {
@@ -541,14 +546,14 @@ mod tests {
     /// The **JSON** path rejects it too, through the same prepare phase.
     #[test]
     fn test_json_restore_rejects_a_zero_visible_non_auto_reserve() {
-        let ghost_id = Id::new();
+        let ghost_id = new_id();
         let source = book_holding_a_ghost("GHOST-JSON", ghost_id);
         let json = match source.snapshot_to_json(usize::MAX) {
             Ok(json) => json,
             Err(error) => panic!("snapshot json must build: {error}"),
         };
 
-        let survivor = Id::new();
+        let survivor = new_id();
         let mut destination = destination_with_state("GHOST-JSON", survivor);
 
         match destination.restore_from_snapshot_json(&json) {
@@ -570,7 +575,7 @@ mod tests {
         // of an already-admitted reserve through the level itself, which is
         // how a pre-#230 book could come to hold one.
         let source: OrderBook<()> = OrderBook::new("GHOST-RESTORE");
-        let ghost_id = Id::new();
+        let ghost_id = new_id();
         assert!(
             source
                 .add_order(reserve_buy(ghost_id, 10, 20, None, false))
@@ -595,7 +600,7 @@ mod tests {
 
         // The destination holds a healthy order that must survive.
         let mut destination: OrderBook<()> = OrderBook::new("GHOST-RESTORE");
-        let survivor = Id::new();
+        let survivor = new_id();
         assert!(
             destination
                 .add_limit_order(survivor, PRICE, 5, Side::Buy, TimeInForce::Gtc, None)
@@ -643,7 +648,7 @@ mod tests {
 
         // A strandable maker owned by the same user as the incoming taker,
         // resting behind a foreign maker at the same price.
-        let foreign = Id::new();
+        let foreign = new_id();
         assert!(
             book.add_limit_order_with_user(
                 foreign,
@@ -657,7 +662,7 @@ mod tests {
             .is_ok(),
             "the foreign maker rests first"
         );
-        let mut strandable = reserve_buy(Id::new(), 10, 20, None, false);
+        let mut strandable = reserve_buy(new_id(), 10, 20, None, false);
         let strandable_id = strandable.id();
         if let OrderType::ReserveOrder { user_id, .. } = &mut strandable {
             *user_id = user;
@@ -668,7 +673,7 @@ mod tests {
         // The same user sells into the level: it may take the foreign depth,
         // then STP cancels it at its own maker.
         let taker = book.add_limit_order_with_user(
-            Id::new(),
+            new_id(),
             PRICE,
             8,
             Side::Sell,
@@ -707,7 +712,7 @@ mod tests {
     #[test]
     fn test_strandable_scan_gate_does_not_change_matching_outcome() {
         let book: OrderBook<()> = OrderBook::new("FLAG-SEMANTICS");
-        let maker_id = Id::new();
+        let maker_id = new_id();
         assert!(
             book.add_order(reserve_buy(maker_id, 10, 20, None, false))
                 .is_ok(),
@@ -716,7 +721,7 @@ mod tests {
         // Close the gate behind the maker's back, then sweep it.
         book.strandable_makers_resting.store(0, Ordering::Relaxed);
         assert!(
-            book.add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "the crossing sell must be accepted"
         );
@@ -740,8 +745,8 @@ mod tests {
     #[test]
     fn test_strandable_makers_resting_returns_to_zero_on_a_zero_quantity_update() {
         let book: OrderBook<()> = OrderBook::new("COUNT-ZERO-UPDATE");
-        let first = Id::new();
-        let second = Id::new();
+        let first = new_id();
+        let second = new_id();
         assert!(
             book.add_order(reserve_buy(first, 10, 20, None, false))
                 .is_ok()
@@ -779,7 +784,7 @@ mod tests {
         // Nothing is left to consume, so a later sweep cannot decrement a
         // second time for makers this path already removed.
         assert!(
-            book.add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+            book.add_limit_order(new_id(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
                 .is_ok(),
             "a later sweep finds nothing to consume"
         );

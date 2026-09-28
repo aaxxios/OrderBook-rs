@@ -7,6 +7,11 @@
 use orderbook_rs::orderbook::manager::{BookManager, BookManagerStd, BookManagerTokio};
 use pricelevel::{Hash32, Id, Side, TimeInForce};
 
+/// Fresh random order id (UUID v4).
+fn new_id() -> Id {
+    Id::from_uuid(uuid::Uuid::new_v4())
+}
+
 // ─── BookManagerStd ─────────────────────────────────────────────────────────
 
 #[test]
@@ -54,7 +59,7 @@ fn std_get_book_mut_allows_modification() {
     let mut mgr: BookManagerStd<()> = BookManagerStd::new();
     mgr.add_book("ETH/USD").expect("add book");
     let book = mgr.get_book_mut("ETH/USD").expect("book must exist");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let snap = book.create_snapshot(usize::MAX);
     assert_eq!(snap.bids.len(), 1);
 }
@@ -109,9 +114,9 @@ fn std_add_order_and_cancel_across_books() {
     mgr.add_book("ETH/USD").expect("add book");
 
     let btc = mgr.get_book("BTC/USD").expect("BTC book must exist");
-    let _ = btc.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = btc.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     let eth = mgr.get_book("ETH/USD").expect("ETH book must exist");
-    let _ = eth.add_limit_order(Id::new_uuid(), 200, 5, Side::Sell, TimeInForce::Gtc, None);
+    let _ = eth.add_limit_order(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, None);
 
     let results = mgr.cancel_all_across_books();
     assert_eq!(results.len(), 2);
@@ -137,7 +142,7 @@ fn std_cancel_by_user_across_books() {
 
     let book = mgr.get_book("BTC/USD").expect("book must exist");
     let _ = book.add_limit_order_with_user(
-        Id::new_uuid(),
+        new_id(),
         100,
         10,
         Side::Buy,
@@ -161,8 +166,8 @@ fn std_cancel_by_side_across_books() {
     mgr.add_book("BTC/USD").expect("add book");
 
     let book = mgr.get_book("BTC/USD").expect("book must exist");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
-    let _ = book.add_limit_order(Id::new_uuid(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 110, 5, Side::Sell, TimeInForce::Gtc, None);
 
     let results = mgr.cancel_by_side_across_books(Side::Buy);
     assert_eq!(results["BTC/USD"].cancelled_count(), 1);
@@ -232,7 +237,7 @@ fn tokio_cancel_all_across_books() {
     let mut mgr: BookManagerTokio<()> = BookManagerTokio::new();
     mgr.add_book("BTC/USD").expect("add book");
     let book = mgr.get_book("BTC/USD").expect("book must exist");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
 
     let results = mgr.cancel_all_across_books();
     assert_eq!(results["BTC/USD"].cancelled_count(), 1);
@@ -249,7 +254,7 @@ fn tokio_cancel_by_user_across_books() {
     mgr.add_book("BTC/USD").expect("add book");
     let book = mgr.get_book("BTC/USD").expect("book must exist");
     let _ = book.add_limit_order_with_user(
-        Id::new_uuid(),
+        new_id(),
         100,
         10,
         Side::Buy,
@@ -272,7 +277,7 @@ fn tokio_cancel_by_side_across_books() {
     let mut mgr: BookManagerTokio<()> = BookManagerTokio::new();
     mgr.add_book("BTC/USD").expect("add book");
     let book = mgr.get_book("BTC/USD").expect("book must exist");
-    let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
 
     let results = mgr.cancel_by_side_across_books(Side::Sell);
     assert_eq!(results["BTC/USD"].cancelled_count(), 1);
@@ -293,7 +298,7 @@ fn std_add_book_duplicate_symbol_is_rejected_and_preserves_existing_issue_105() 
     mgr.add_book("BTC/USD").expect("first add");
     // Seed a resting order into the existing book.
     if let Some(book) = mgr.get_book("BTC/USD") {
-        let _ = book.add_limit_order(Id::new_uuid(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
     }
 
     // A second add_book for the same symbol must NOT overwrite the live book.
@@ -318,7 +323,7 @@ fn tokio_add_book_duplicate_symbol_is_rejected_and_preserves_existing_issue_105(
     let mut mgr: BookManagerTokio<()> = BookManagerTokio::new();
     mgr.add_book("ETH/USD").expect("first add");
     if let Some(book) = mgr.get_book("ETH/USD") {
-        let _ = book.add_limit_order(Id::new_uuid(), 200, 5, Side::Sell, TimeInForce::Gtc, None);
+        let _ = book.add_limit_order(new_id(), 200, 5, Side::Sell, TimeInForce::Gtc, None);
     }
 
     match mgr.add_book("ETH/USD") {
