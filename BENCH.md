@@ -92,7 +92,9 @@ plotters; the directory lives under `target/` and is gitignored.
   `std::time::Instant::now()` (one call before, one after) and writes
   the elapsed-nanosecond value into the histogram. The closure result
   is consumed via `std::hint::black_box` to prevent dead-code
-  elimination.
+  elimination. Scenarios whose single-op cost is at or near the host's
+  clock-tick resolution use `record_batch(...)` instead — see "Timing
+  only the operation under test" below.
 - **Warmup.** Long-running scenarios (`add_only`, `mixed_70_20_10`)
   discard 200 000 ops before the measurement window starts.
   Pre-loading scenarios (`cancel_only`, `aggressive_walk`,
@@ -116,6 +118,123 @@ plotters; the directory lives under `target/` and is gitignored.
   --bench mixed_70_20_10_hdr` reduces variance from cross-core
   scheduling. On macOS the benches were run without pinning — see the
   run conditions block below.
+
+### Timing only the operation under test (issue #258)
+
+An audit of every Criterion and HDR bench in `benches/` found two
+classes of methodology bug, both fixed in the same pass that landed
+this section:
+
+1. **Timed setup / teardown.** Several of the plain Criterion benches
+   under `benches/order_book/*.rs` (not the `_hdr` files) built a fresh
+   `OrderBook` — sometimes populated with dozens to thousands of
+   orders — *inside* the timed `b.iter(...)` closure and let it drop
+   there too, so the reported number was construction + N ops + Drop,
+   not the N ops the bench claimed to measure
+   (`add_orders.rs`, `match_orders.rs`, `update_orders.rs`,
+   `mixed_operations.rs`). A few more (`snapshot.rs::restore_from_snapshot`,
+   `replay.rs::journal_append`) built the *output* of the operation
+   under test inside the timed closure and dropped it there instead.
+   Every one of these now moves construction into an unmeasured
+   `iter_batched_ref` / `iter_batched` `setup` closure and takes the
+   value under test by `&mut` (or reuses one long-lived value across
+   samples, for `restore_from_snapshot`, which replaces every level on
+   `&self`) so the corresponding drop also lands after Criterion's
+   `end()` call closes the measurement window — see each file's own
+   `# Methodology (issue #258)` doc comment for the specific fix.
+   `snapshot.rs`'s `create_snapshot` / `enriched_snapshot_*` and
+   `replay.rs`'s `replay_from_journal` switched from plain `b.iter` to
+   `b.iter_with_large_drop`, deferring the drop of a snapshot /
+   replayed book that is not a trivial value at 10 000 orders.
+   `mass_cancel.rs` already excluded setup correctly but consumed the
+   populated book inside `routine`, dropping it — post-cancel, so
+   cheap, but still timed — before Criterion's own `end()` call;
+   switched to `iter_batched_ref`.
+2. **Sub-tick single-op timing.** The HDR benches record one
+   `Instant::now()` pair per operation. On this host class (Apple
+   silicon) the clock's tick resolution is about 41.67 ns — at or above
+   the actual cost of `cancel_only`, `aggressive_walk`, `notional_walk`,
+   `thin_book_sweep` and the thin `reserve_sweep_nonauto` /
+   `reserve_sweep_auto` scenarios (pre-fix `p50` values of 41-83 ns,
+   several with *zero* run-to-run jitter — the tell that the number is
+   the clock, not the operation). Below that floor, timing a single
+   call measures `Instant::now()`'s own resolution. These scenarios now
+   use `hdr_common::record_batch`, which wraps `BATCH` (`32`)
+   invocations in one `Instant` pair and records the per-op average;
+   the trade-off — the recorded value is an average over the batch, not
+   that batch's own per-op tail — is documented on `record_batch` itself
+   and in each affected file. `add_only`, `mixed_70_20_10`,
+   `mass_cancel_burst`, `stp_sweep`, `stp_contention` and
+   `reserve_sweep_dense_nonauto` / `reserve_sweep_mixed_*` all measure
+   comfortably above the tick per single op (hundreds of ns to tens of
+   us) and were left on single-op `record`, preserving full per-op tail
+   fidelity.
+
+A new `add_only_risk_hdr` scenario (§ below) and three new
+`alloc_count_add_only_*` allocation scenarios (§ "Allocation profile"
+above) were added in the same pass — see their own doc comments for
+what they isolate.
+
+### `add_only_risk` — passive limit entry with a `RiskConfig` installed
+
+Every other scenario above runs on a book with no `RiskConfig` at all
+(`RiskState` is `None`, so every pre-trade check is a no-op
+`Option::is_none` branch — see `src/orderbook/risk.rs`'s module docs).
+`add_only_risk_hdr` is `add_only_hdr` unchanged in every other respect
+with a `RiskConfig` enabling all three checks
+(`max_open_orders_per_account`, `max_notional_per_account`,
+`price_band_bps`) at limits wide enough that this workload never trips
+a rejection, isolating the fixed per-op cost of the risk gate
+(counter lookups, the notional product, the price-band comparison)
+from a rejection branch. Compare its `p50` / `p99` / `p99.9` / `p99.99`
+directly against `add_only`'s above — the delta is the risk-admission
+overhead on the passive-add path. Run: `cargo bench --bench
+add_only_risk_hdr`.
+
+### Cross-version comparison harness (issues #258 / #259)
+
+`scripts/bench_compare.sh` builds a small, standalone bench crate
+(`benches/compare/`, its own `[workspace]` — never a member of the main
+crate's own workspace or touched by `cargo test --all-features` /
+`cargo build --release` at the repo root) against two git refs, each in
+its own detached worktree with its own `CARGO_TARGET_DIR`, and runs
+both binaries for `--rounds` interleaved rounds (baseline, candidate,
+baseline, candidate, ...; `--rounds 3` minimum for a real comparison —
+see #259). `benches/compare/src/adapter.rs` isolates every
+version-specific API detail behind `v0_13` / `head` Cargo features so
+`workloads.rs` — the actual benchmark code — is byte-identical on both
+sides; today's three scenarios (`add_only`, `cancel_only`,
+`aggressive_walk`) call nothing that differs between the `v0.13.1` tag
+and `HEAD`, so both feature arms currently have the same body, but the
+seam is there for the next API break.
+
+Each round's raw output plus a `summary.md` / `summary.csv` (median
+`p50` per side, round-to-round spread as a percentage, delta, verdict)
+and `system_info.md` (CPU, cores, RAM, OS, rustc, load average
+before/after, each side's resolved `Cargo.lock`) land in a fresh
+`bench-results/<UTC timestamp>/` directory at the repo root —
+deliberately outside `benches/`, since `Cargo.toml`'s `include` list
+ships `benches/**/*` in the published crate tarball and comparison
+results never should be. `bench-results/` is gitignored outright (see
+`.gitignore`); a maintainer who wants to publish a comparison's numbers
+copies the `summary.md` table into `BENCH.md` / `BENCHMARKS.md` by
+hand, the same way every existing table in these two files was
+produced.
+
+**Noise policy.** A row whose round-to-round spread exceeds 10
+percentage points on either side is marked `NOISY (inconclusive)` —
+never a pass, regardless of the delta — and must be re-measured (more
+rounds, a quieter host) before drawing any conclusion. This mirrors the
+`reserve_sweep_dense_nonauto` handling elsewhere in this document (nine
+runs reported as a range, not a point estimate, because this scenario's
+single-threaded p50 is bimodal across this host's performance/
+efficiency core split).
+
+Usage: `make bench-compare-refs ARGS="--quick --rounds 1"` for a fast
+pipeline smoke test (tiny op counts, never a real measurement); `make
+bench-compare-refs ARGS="--baseline v0.13.1 --candidate HEAD --rounds
+5"` for a real comparison. `scripts/bench_compare.sh --help` documents
+every flag.
 
 ## Run conditions for the numbers below
 

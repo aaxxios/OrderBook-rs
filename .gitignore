@@ -38,6 +38,17 @@ src/.DS_Store
 !/scripts/panic_policy_fixtures/*.rs
 !/scripts/panic_policy_allowlist.txt
 !/scripts/clippy_ratchet.txt
+!/scripts/bench_compare.sh
+
+# `scripts/bench_compare.sh` (issue #258) writes raw per-round JSON,
+# system info and a summary into a fresh timestamped directory here on
+# every run. Kept out of git entirely — it is scratch output, not
+# source, and living outside `benches/` keeps it out of
+# `Cargo.toml`'s `include = ["benches/**/*", ...]` (published crate
+# tarball) regardless. A maintainer who wants to publish a comparison
+# copies its `summary.md` into `BENCH.md` / `BENCHMARKS.md` by hand, the
+# same way every existing comparison table in those files was produced.
+/bench-results/
 
 # Temporary files
 tmp_reply.json

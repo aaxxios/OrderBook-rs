@@ -223,9 +223,21 @@ bench-json: check-cargo-criterion
 bench-clean:
 	rm -rf target/criterion
 
+.PHONY: bench-compare-refs
+# Cross-version A/B comparison harness (issue #258/#259): builds the
+# small standalone `benches/compare/` crate against two git refs in two
+# detached worktrees (default: the `v0.13.1` tag vs `HEAD`) and reports
+# a summary table. Pass through extra flags after `--`, e.g.:
+#   make bench-compare-refs ARGS="--quick --rounds 1"
+#   make bench-compare-refs ARGS="--baseline v0.13.1 --candidate HEAD --rounds 5"
+# See `scripts/bench_compare.sh --help` and BENCH.md "Methodology".
+bench-compare-refs:
+	./scripts/bench_compare.sh $(ARGS)
+
 .PHONY: bench-hdr
 bench-hdr:
 	cargo bench --bench add_only_hdr
+	cargo bench --bench add_only_risk_hdr
 	cargo bench --bench cancel_only_hdr
 	cargo bench --bench aggressive_walk_hdr
 	cargo bench --bench notional_walk_hdr

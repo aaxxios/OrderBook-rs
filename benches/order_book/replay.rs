@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion};
 use orderbook_rs::orderbook::sequencer::{
     InMemoryJournal, Journal, ReplayEngine, SequencerCommand, SequencerEvent, SequencerResult,
 };
@@ -43,6 +43,20 @@ fn make_journal(n: usize) -> InMemoryJournal<()> {
 }
 
 /// Register journal and replay benchmarks.
+///
+/// # Methodology (issue #258)
+///
+/// `journal_append` used `iter_with_setup` (= `iter_batched` with
+/// `BatchSize::PerIteration`) with a *consuming* `routine`, so the fresh
+/// `InMemoryJournal` (holding up to 10 000 appended events) was dropped
+/// as the closure returned — inside the timed window. `iter_batched_ref`
+/// takes `(journal, events)` by `&mut` so that drop happens after the
+/// window closes; only the `append` calls are timed.
+/// `replay_from_journal` built the `journal` outside the loop already
+/// (good) but used plain `b.iter`, whose timing model also includes
+/// `mem::drop` of whatever the closure returns — here, a freshly
+/// replayed `OrderBook` with up to 10 000 orders. `iter_with_large_drop`
+/// defers that drop past the measurement window.
 pub fn register_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("OrderBook - Replay");
 
@@ -52,7 +66,7 @@ pub fn register_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("journal_append", event_count),
             &event_count,
             |b, &count| {
-                b.iter_with_setup(
+                b.iter_batched_ref(
                     || {
                         let ids: Vec<_> =
                             (0..count).map(|_| Id::from_uuid(Uuid::new_v4())).collect();
@@ -72,10 +86,11 @@ pub fn register_benchmarks(c: &mut Criterion) {
                         (InMemoryJournal::<()>::new(), events)
                     },
                     |(journal, events)| {
-                        for event in &events {
+                        for event in events.iter() {
                             let _ = black_box(journal.append(event));
                         }
                     },
+                    BatchSize::SmallInput,
                 );
             },
         );
@@ -88,11 +103,11 @@ pub fn register_benchmarks(c: &mut Criterion) {
             &event_count,
             |b, &count| {
                 let journal = make_journal(count);
-                b.iter(|| {
-                    let _ = black_box(
+                b.iter_with_large_drop(|| {
+                    black_box(
                         ReplayEngine::<()>::replay_from(&journal, 0, "BENCH")
                             .expect("replay must succeed"),
-                    );
+                    )
                 });
             },
         );
