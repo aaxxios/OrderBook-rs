@@ -50,6 +50,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Default trade-id namespace no longer reads panicking OS entropy
+  (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
+  `with_trade_and_price_level_listener` (and every constructor built on
+  them) minted the trade-id namespace with `Uuid::new_v4()`, which panics
+  through `getrandom` when the OS RNG fails. The namespace is now a UUIDv5
+  derived from the symbol, the process id, the wall clock in nanoseconds
+  (`0` before the epoch) and a process-wide `checked_add` construction
+  counter: distinct for every book in a process, across concurrent
+  processes and across restarts (argument in the function docs and
+  `doc/panic-boundaries.md`). No `Uuid::new_v4()` remains in production
+  code; std's `RandomState` seeding (behind `HashMap` / `DashMap`) is the
+  documented remaining OS-entropy read.
+  Compatibility: constructor signatures are unchanged and still
+  infallible. Default namespaces are UUID version 5 instead of version 4
+  and are still unique per book; trade ids keep their format (UUIDv5 over
+  namespace + counter). `set_trade_id_namespace`,
+  `with_clock_and_namespace` and `ReplayBookConfig` injection are
+  unchanged, so replay is unaffected. No wire, journal or snapshot format
+  change.
+
 - **Checked time and allocation-counter helpers (#257).**
   `current_time_millis()` narrowed the `u128` millisecond count to `u64`
   with `as` and silently returned `0` for a clock set before the UNIX

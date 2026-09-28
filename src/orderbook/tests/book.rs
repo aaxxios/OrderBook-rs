@@ -1654,9 +1654,10 @@ mod test_book_specific {
     }
 
     #[test]
-    fn test_default_constructors_keep_random_distinct_namespaces() {
-        // OrderBook::new must keep minting a random namespace per book:
-        // two default books over the same stream diverge in trade IDs.
+    fn test_default_constructors_keep_distinct_namespaces() {
+        // OrderBook::new must keep minting a distinct namespace per book
+        // (#265: derived, no longer random): two default books over the
+        // same stream diverge in trade IDs.
         let book_a: OrderBook<()> = OrderBook::new("TEST");
         let book_b: OrderBook<()> = OrderBook::new("TEST");
 
@@ -1665,7 +1666,123 @@ mod test_book_specific {
 
         assert_ne!(
             ids_a, ids_b,
-            "default construction must keep per-book random namespaces"
+            "default construction must keep per-book distinct namespaces"
         );
+    }
+
+    // --- #265: default namespace without OS entropy -----------------------
+
+    fn namespace_of(book: &OrderBook<()>) -> uuid::Uuid {
+        book.transaction_id_generator.namespace()
+    }
+
+    #[test]
+    fn test_default_namespace_is_uuid_v5() {
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        assert_eq!(
+            namespace_of(&book).get_version(),
+            Some(uuid::Version::Sha1),
+            "default namespaces are derived UUIDv5, not random v4"
+        );
+    }
+
+    #[test]
+    fn test_default_namespaces_distinct_in_tight_loop() {
+        use std::collections::HashSet;
+
+        const BOOKS: usize = 10_000;
+        let mut seen = HashSet::with_capacity(BOOKS);
+        for _ in 0..BOOKS {
+            let book: OrderBook<()> = OrderBook::new("TEST");
+            assert!(
+                seen.insert(namespace_of(&book)),
+                "same-symbol books created back to back must not share a namespace"
+            );
+        }
+        assert_eq!(seen.len(), BOOKS);
+    }
+
+    #[test]
+    fn test_default_namespaces_distinct_across_threads_and_constructors() {
+        use crate::orderbook::clock::{Clock, MonotonicClock};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 2_500;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_THREAD)
+                        .map(|i| {
+                            // Same symbol on every thread; rotate through the
+                            // constructors that mint a default namespace.
+                            let book: OrderBook<()> = match (thread + i) % 4 {
+                                0 => OrderBook::new("SAME"),
+                                1 => OrderBook::with_clock(
+                                    "SAME",
+                                    Arc::new(MonotonicClock) as Arc<dyn Clock>,
+                                ),
+                                2 => OrderBook::with_trade_listener("SAME", Arc::new(|_| {})),
+                                _ => OrderBook::with_trade_and_price_level_listener(
+                                    "SAME",
+                                    Arc::new(|_| {}),
+                                    Arc::new(|_| {}),
+                                ),
+                            };
+                            namespace_of(&book)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut seen = HashSet::with_capacity(THREADS * PER_THREAD);
+        for handle in handles {
+            for namespace in handle.join().expect("worker thread") {
+                assert!(seen.insert(namespace), "duplicate default namespace");
+            }
+        }
+        assert_eq!(seen.len(), THREADS * PER_THREAD);
+    }
+
+    #[test]
+    fn test_namespace_seq_exhaustion_does_not_wrap() {
+        use crate::orderbook::book::next_namespace_seq;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_namespace_seq(&counter), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        // Exhausted: pinned at u64::MAX, never wraps to 0.
+        assert_eq!(next_namespace_seq(&counter), u64::MAX);
+        assert_eq!(next_namespace_seq(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn test_default_namespace_differs_by_symbol() {
+        let a: OrderBook<()> = OrderBook::new("AAA");
+        let b: OrderBook<()> = OrderBook::new("BBB");
+        assert_ne!(namespace_of(&a), namespace_of(&b));
+    }
+
+    #[test]
+    fn test_set_trade_id_namespace_overrides_default() {
+        let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"VENUE/OVERRIDE");
+        let mut book: OrderBook<()> = OrderBook::new("TEST");
+        assert_ne!(namespace_of(&book), namespace);
+        book.set_trade_id_namespace(namespace);
+        assert_eq!(namespace_of(&book), namespace);
+
+        let injected: OrderBook<()> = OrderBook::with_clock_and_namespace(
+            "TEST",
+            std::sync::Arc::new(crate::orderbook::clock::MonotonicClock),
+            namespace,
+        );
+        assert_eq!(namespace_of(&injected), namespace);
     }
 }

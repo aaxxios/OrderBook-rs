@@ -44,6 +44,98 @@ use uuid::Uuid;
 /// One basis point = 0.01% = 0.0001
 const DEFAULT_BASIS_POINTS_MULTIPLIER: f64 = 10_000.0;
 
+/// Label hashed under [`Uuid::NAMESPACE_OID`] to obtain the root UUIDv5
+/// namespace of every default trade-ID namespace (#265).
+const DEFAULT_TRADE_ID_NAMESPACE_LABEL: &[u8] = b"orderbook-rs/default-trade-id-namespace";
+
+/// Process-wide construction counter mixed into every default trade-ID
+/// namespace (#265). Advanced with `checked_add`; see
+/// [`default_trade_id_namespace`] for the exhaustion behaviour.
+static DEFAULT_TRADE_ID_NAMESPACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Takes the next value of a namespace construction counter: the value
+/// before a `checked_add(1)`, or `u64::MAX` (logged at `WARN`, counter left
+/// untouched) once the counter is exhausted. Never panics or wraps.
+#[must_use]
+pub(crate) fn next_namespace_seq(counter: &AtomicU64) -> u64 {
+    match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    }) {
+        Ok(previous) => previous,
+        Err(exhausted) => {
+            tracing::warn!(
+                seq = exhausted,
+                "default trade-id namespace counter exhausted; \
+                 uniqueness now relies on the wall clock"
+            );
+            exhausted
+        }
+    }
+}
+
+/// Derives the default trade-ID namespace of a new book without reading OS
+/// entropy (#265).
+///
+/// Every constructor that is not given a namespace used to call
+/// `Uuid::new_v4()`, which reads OS entropy through `getrandom` and panics
+/// when the RNG fails. The namespace does not need to be random or
+/// cryptographic; it only needs to differ between book instances, in this
+/// process and across restarts, so that two books never issue the same
+/// trade ID. It is a UUIDv5 over non-panicking inputs:
+///
+/// 1. `symbol_ns = v5(root, symbol)`, where `root = v5(NAMESPACE_OID,
+///    "orderbook-rs/default-trade-id-namespace")`;
+/// 2. `namespace = v5(symbol_ns, pid ‖ wall_ns ‖ seq)`: the process id
+///    ([`std::process::id`], 4 bytes LE), the wall clock in nanoseconds
+///    since the UNIX epoch (16 bytes LE; `0` if the clock reads before the
+///    epoch) and a process-wide construction counter (8 bytes LE).
+///
+/// Uniqueness argument:
+///
+/// - **Same process.** `seq` is taken with an atomic `fetch_update` +
+///   `checked_add`, so every construction sees a distinct value, whatever
+///   the thread, symbol or clock reading.
+/// - **Concurrent processes.** Live processes have distinct pids.
+/// - **Restarts.** A restarted process sees a later wall clock (and
+///   usually a different pid), so `(pid, wall_ns, seq)` differs from every
+///   tuple of the earlier run unless the clock was stepped back to the same
+///   nanosecond while the OS handed out the same pid again. A clock that
+///   reads before the epoch contributes `0`, leaving restart uniqueness to
+///   the pid for as long as the clock stays broken.
+/// - **Hash.** Distinct names map to distinct UUIDv5 values except for a
+///   SHA-1 collision over 122 bits, negligible for non-adversarial input.
+///
+/// Counter exhaustion: after `u64::MAX` constructions in one process
+/// (about 584 years at one book per nanosecond) `checked_add` refuses to
+/// advance, `seq` stays at `u64::MAX`, a `WARN` is logged and uniqueness
+/// then rests on the nanosecond wall clock alone. Nothing panics or wraps.
+///
+/// Replay determinism does not depend on this value: replay injects the
+/// recorded namespace ([`OrderBook::set_trade_id_namespace`],
+/// `ReplayBookConfig`), so the default only has to be unique.
+#[must_use]
+pub(crate) fn default_trade_id_namespace(symbol: &str) -> Uuid {
+    let seq = next_namespace_seq(&DEFAULT_TRADE_ID_NAMESPACE_SEQ);
+    let wall_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |elapsed| elapsed.as_nanos());
+    let pid = std::process::id();
+
+    let mut name = [0u8; 28];
+    for (slot, byte) in name.iter_mut().zip(
+        pid.to_le_bytes()
+            .into_iter()
+            .chain(wall_ns.to_le_bytes())
+            .chain(seq.to_le_bytes()),
+    ) {
+        *slot = byte;
+    }
+
+    let root = Uuid::new_v5(&Uuid::NAMESPACE_OID, DEFAULT_TRADE_ID_NAMESPACE_LABEL);
+    let symbol_ns = Uuid::new_v5(&root, symbol.as_bytes());
+    Uuid::new_v5(&symbol_ns, &name)
+}
+
 /// The OrderBook manages a collection of price levels for both bid and ask sides.
 /// It supports adding, cancelling, and matching orders with lock-free operations where possible.
 pub struct OrderBook<T = ()> {
@@ -566,6 +658,12 @@ where
     /// The book is installed with a [`MonotonicClock`] (wall-clock
     /// milliseconds). Use [`Self::with_clock`] to inject a custom
     /// [`Clock`] implementation.
+    ///
+    /// The trade-ID namespace is derived without OS entropy and is unique
+    /// per book instance, in this process and across restarts (UUIDv5 of
+    /// symbol, process id, wall-clock nanoseconds and a process-wide
+    /// counter, #265). Inject a fixed one with
+    /// [`Self::set_trade_id_namespace`] for replay.
     pub fn new(symbol: &str) -> Self {
         Self::with_clock(symbol, Arc::new(MonotonicClock) as Arc<dyn Clock>)
     }
@@ -576,9 +674,13 @@ where
     /// Use this when byte-identical timestamp behaviour is required, e.g.
     /// for sequencer replay or deterministic tests — pass in a
     /// [`super::clock::StubClock`].
+    ///
+    /// The default trade-ID namespace is unique per book but not
+    /// reproducible (see [`Self::new`]); use
+    /// [`Self::with_clock_and_namespace`] for byte-identical trade IDs.
     pub fn with_clock(symbol: &str, clock: Arc<dyn Clock>) -> Self {
-        // Create a unique namespace for this order book's transaction IDs
-        let namespace = Uuid::new_v4();
+        // Unique per book without OS entropy (#265).
+        let namespace = default_trade_id_namespace(symbol);
 
         Self {
             symbol: symbol.to_string(),
@@ -1344,7 +1446,7 @@ where
 
     /// Create a new order book for the given symbol with a trade listener
     pub fn with_trade_listener(symbol: &str, trade_listener: TradeListener) -> Self {
-        let namespace = Uuid::new_v4();
+        let namespace = default_trade_id_namespace(symbol);
 
         Self {
             symbol: symbol.to_string(),
@@ -1401,7 +1503,7 @@ where
         trade_listener: TradeListener,
         book_changed_listener: PriceLevelChangedListener,
     ) -> Self {
-        let namespace = Uuid::new_v4();
+        let namespace = default_trade_id_namespace(symbol);
 
         Self {
             symbol: symbol.to_string(),
