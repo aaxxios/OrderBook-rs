@@ -44,7 +44,8 @@
 use crate::orderbook::nats_common::{
     DropLog, LinkState, RetryPolicy, batch_deadline, checked_reserve, clamp_channel_capacity,
     clamp_duration_ms, clamp_max_batch_size, counter_exhausted, drain_buffered, increment_metric,
-    new_batch_buffer, new_jitter_seed, publish_with_backoff, shutdown_task, store_slot, throttle,
+    new_batch_buffer, new_jitter_seed, publish_with_backoff, shutdown_task, store_slot,
+    throttle_or_shutdown,
 };
 use crate::orderbook::serialization::{EventSerializer, JsonEventSerializer};
 use crate::orderbook::trade::{TradeListener, TradeResult};
@@ -553,8 +554,7 @@ impl NatsTradePublisher {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_rx => {
-                        Self::drain_on_shutdown(&publisher, &mut rx, &mut batch, &mut last_publish)
-                            .await;
+                        Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
                         return;
                     }
                     maybe = rx.recv() => match maybe {
@@ -572,13 +572,7 @@ impl NatsTradePublisher {
                     tokio::select! {
                         biased;
                         _ = &mut shutdown_rx => {
-                            Self::drain_on_shutdown(
-                                &publisher,
-                                &mut rx,
-                                &mut batch,
-                                &mut last_publish,
-                            )
-                            .await;
+                            Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
                             return;
                         }
                         received = tokio::time::timeout_at(deadline, rx.recv()) => {
@@ -586,13 +580,7 @@ impl NatsTradePublisher {
                                 Ok(Some(trade)) => batch.push(trade),
                                 Ok(None) => {
                                     // Channel closed — flush remaining and exit.
-                                    Self::flush_batch(
-                                        &publisher,
-                                        &mut batch,
-                                        &mut last_publish,
-                                        min_interval,
-                                    )
-                                    .await;
+                                    Self::flush_batch(&publisher, &mut batch).await;
                                     return;
                                 }
                                 Err(_) => break, // Timeout — flush batch
@@ -607,11 +595,18 @@ impl NatsTradePublisher {
                 );
             }
 
-            Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval).await;
+            Self::flush_batch(&publisher, &mut batch).await;
+
+            // Throttle before the next flush, raced with the shutdown signal
+            // so a long interval never delays teardown.
+            if throttle_or_shutdown(&mut last_publish, min_interval, &mut shutdown_rx).await {
+                Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
+                return;
+            }
         }
 
         // Flush any remaining trades.
-        Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval).await;
+        Self::flush_batch(&publisher, &mut batch).await;
     }
 
     /// Shutdown path: close the channel to new trades, then flush the current
@@ -622,7 +617,6 @@ impl NatsTradePublisher {
         publisher: &Arc<Self>,
         rx: &mut mpsc::Receiver<TradeResult>,
         batch: &mut Vec<TradeResult>,
-        last_publish: &mut tokio::time::Instant,
     ) {
         rx.close();
         loop {
@@ -630,21 +624,17 @@ impl NatsTradePublisher {
             if batch.is_empty() {
                 break;
             }
-            Self::flush_batch(publisher, batch, last_publish, None).await;
+            Self::flush_batch(publisher, batch).await;
         }
     }
 
     /// Flush the accumulated batch: serialize and publish each trade to its
-    /// per-symbol and aggregate subjects, then apply throttling.
+    /// per-symbol and aggregate subjects. The throttle is applied by the
+    /// caller, raced with the shutdown signal.
     ///
     /// Serialization, subject construction, and the JetStream publish all
     /// happen here in the background task — never on the matching hot path.
-    async fn flush_batch(
-        publisher: &Arc<Self>,
-        batch: &mut Vec<TradeResult>,
-        last_publish: &mut tokio::time::Instant,
-        min_interval: Option<Duration>,
-    ) {
+    async fn flush_batch(publisher: &Arc<Self>, batch: &mut Vec<TradeResult>) {
         if batch.is_empty() {
             return;
         }
@@ -684,9 +674,6 @@ impl NatsTradePublisher {
         }
 
         increment_metric(&publisher.batches_published, "batches_published");
-
-        // Throttle: wait if needed before allowing the next flush.
-        throttle(last_publish, min_interval).await;
     }
 
     /// Publish a trade event to both the symbol-specific and aggregate subjects
@@ -928,6 +915,39 @@ mod tests {
         assert_eq!(handle.error_count(), 5, "every buffered trade was flushed");
         assert_eq!(handle.dropped_events(), 0);
         assert_eq!(handle.sequence(), 0, "no publish was attempted");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_during_throttle_completes_promptly() {
+        // A 60 s (clamped) publish interval must not delay shutdown: the
+        // throttle wait is raced with the shutdown signal.
+        let publisher = NatsTradePublisher::new(
+            offline_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_min_publish_interval_ms(u64::MAX)
+        .with_serializer(Arc::new(FaultySerializer { panic: false }));
+        let (handle, listener) = publisher.into_listener();
+        listener(&make_trade_result("BTC/USD"));
+        // Let the task flush the first trade and enter the throttle wait.
+        for _ in 0..1_000 {
+            if handle.batches_published() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(handle.batches_published(), 1, "first flush happened");
+        // Buffered while the task is throttled; must still be drained.
+        listener(&make_trade_result("BTC/USD"));
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle.shutdown()).await;
+        assert_eq!(
+            joined,
+            Ok(Ok(())),
+            "shutdown must not wait out the throttle"
+        );
+        assert_eq!(handle.error_count(), 2, "both trades reached a flush");
+        assert_eq!(handle.dropped_events(), 0);
     }
 
     #[tokio::test]

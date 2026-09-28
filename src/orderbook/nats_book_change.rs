@@ -49,7 +49,8 @@ use crate::orderbook::nats::{
 use crate::orderbook::nats_common::{
     DropLog, LinkState, RetryPolicy, batch_deadline, checked_reserve, clamp_channel_capacity,
     clamp_duration_ms, clamp_max_batch_size, counter_exhausted, drain_buffered, increment_metric,
-    new_batch_buffer, new_jitter_seed, publish_with_backoff, shutdown_task, store_slot, throttle,
+    new_batch_buffer, new_jitter_seed, publish_with_backoff, shutdown_task, store_slot,
+    throttle_or_shutdown,
 };
 use pricelevel::Side;
 use serde::Serialize;
@@ -598,8 +599,7 @@ impl NatsBookChangePublisher {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_rx => {
-                        Self::drain_on_shutdown(&publisher, &mut rx, &mut batch, &mut last_publish)
-                            .await;
+                        Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
                         return;
                     }
                     maybe = rx.recv() => match maybe {
@@ -617,13 +617,7 @@ impl NatsBookChangePublisher {
                     tokio::select! {
                         biased;
                         _ = &mut shutdown_rx => {
-                            Self::drain_on_shutdown(
-                                &publisher,
-                                &mut rx,
-                                &mut batch,
-                                &mut last_publish,
-                            )
-                            .await;
+                            Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
                             return;
                         }
                         received = tokio::time::timeout_at(deadline, rx.recv()) => {
@@ -631,13 +625,7 @@ impl NatsBookChangePublisher {
                                 Ok(Some(event)) => batch.push(BookChangeEntry::from(event)),
                                 Ok(None) => {
                                     // Channel closed — flush remaining and exit
-                                    Self::flush_batch(
-                                        &publisher,
-                                        &mut batch,
-                                        &mut last_publish,
-                                        min_interval,
-                                    )
-                                    .await;
+                                    Self::flush_batch(&publisher, &mut batch).await;
                                     return;
                                 }
                                 Err(_) => break, // Timeout — flush batch
@@ -652,12 +640,18 @@ impl NatsBookChangePublisher {
                 );
             }
 
-            // Flush the batch (throttling is applied inside flush_batch)
-            Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval).await;
+            Self::flush_batch(&publisher, &mut batch).await;
+
+            // Throttle before the next flush, raced with the shutdown signal
+            // so a long interval never delays teardown.
+            if throttle_or_shutdown(&mut last_publish, min_interval, &mut shutdown_rx).await {
+                Self::drain_on_shutdown(&publisher, &mut rx, &mut batch).await;
+                return;
+            }
         }
 
         // Flush any remaining events
-        Self::flush_batch(&publisher, &mut batch, &mut last_publish, min_interval).await;
+        Self::flush_batch(&publisher, &mut batch).await;
     }
 
     /// Shutdown path: close the channel to new events, then flush the current
@@ -669,7 +663,6 @@ impl NatsBookChangePublisher {
         publisher: &Arc<Self>,
         rx: &mut mpsc::Receiver<PriceLevelChangedEvent>,
         batch: &mut Vec<BookChangeEntry>,
-        last_publish: &mut tokio::time::Instant,
     ) {
         rx.close();
         loop {
@@ -677,7 +670,7 @@ impl NatsBookChangePublisher {
             if batch.is_empty() {
                 break;
             }
-            Self::flush_batch(publisher, batch, last_publish, None).await;
+            Self::flush_batch(publisher, batch).await;
         }
     }
 
@@ -691,13 +684,9 @@ impl NatsBookChangePublisher {
     /// Side-specific subjects are only published if the batch contains events
     /// for that side. Every sequence number the batch needs is reserved in one
     /// atomic step before anything is published, so a batch is either emitted
-    /// on all of its subjects or refused as a whole (never partially).
-    async fn flush_batch(
-        publisher: &Arc<Self>,
-        batch: &mut Vec<BookChangeEntry>,
-        last_publish: &mut tokio::time::Instant,
-        min_interval: Option<Duration>,
-    ) {
+    /// on all of its subjects or refused as a whole (never partially). The
+    /// throttle is applied by the caller, raced with the shutdown signal.
+    async fn flush_batch(publisher: &Arc<Self>, batch: &mut Vec<BookChangeEntry>) {
         if batch.is_empty() {
             return;
         }
@@ -717,7 +706,6 @@ impl NatsBookChangePublisher {
             // only some subjects.
             counter_exhausted("sequence");
             increment_metric(&publisher.error_count, "error_count");
-            throttle(last_publish, min_interval).await;
             return;
         };
         let timestamp_ms = crate::utils::current_time_millis();
@@ -781,9 +769,6 @@ impl NatsBookChangePublisher {
             increment_metric(&publisher.batches_published, "batches_published");
             trace!(seq, symbol = %publisher.symbol, "book change batch published to NATS");
         }
-
-        // Throttle: wait if needed before allowing next flush
-        throttle(last_publish, min_interval).await;
     }
 
     /// Serialize and publish a single batch to a NATS subject with retry logic.
@@ -1038,6 +1023,34 @@ mod tests {
             "unexpected sequence {sequence}"
         );
         assert_eq!(handle.publish_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_during_throttle_completes_promptly() {
+        let publisher = publisher()
+            .await
+            .with_min_publish_interval_ms(u64::MAX)
+            .with_max_retries(0);
+        let (handle, listener) = publisher.into_listener();
+        listener(event(Side::Buy, 1));
+        // Let the task flush the first batch (it fails fast against the
+        // offline client) and enter the throttle wait.
+        let flushed = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.error_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(flushed.is_ok(), "first batch flushed");
+        listener(event(Side::Sell, 2));
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle.shutdown()).await;
+        assert_eq!(
+            joined,
+            Ok(Ok(())),
+            "shutdown must not wait out the throttle"
+        );
+        assert_eq!(handle.sequence(), 4, "both batches were flushed");
+        assert_eq!(handle.dropped_events(), 0);
     }
 
     #[tokio::test]

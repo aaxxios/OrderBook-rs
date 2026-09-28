@@ -254,17 +254,31 @@ pub(crate) fn throttle_remaining(interval: Duration, elapsed: Duration) -> Optio
 }
 
 /// Sleeps out the remainder of the throttle interval since `last_publish`,
-/// then stamps `last_publish` with the current instant.
-pub(crate) async fn throttle(
+/// racing the wait against the shutdown signal, then stamps `last_publish`
+/// with the current instant.
+///
+/// Returns `true` when `shutdown_rx` completed during the wait (a shutdown
+/// request, or its sender dropped); the caller must then go straight to its
+/// shutdown drain and must not poll `shutdown_rx` again. Returns `false`
+/// when the wait ran out or no throttle applies, in which case
+/// `shutdown_rx` was not completed.
+pub(crate) async fn throttle_or_shutdown(
     last_publish: &mut tokio::time::Instant,
     min_interval: Option<Duration>,
-) {
+    shutdown_rx: &mut oneshot::Receiver<()>,
+) -> bool {
+    let mut shutdown_requested = false;
     if let Some(interval) = min_interval
         && let Some(remaining) = throttle_remaining(interval, last_publish.elapsed())
     {
-        tokio::time::sleep(remaining).await;
+        tokio::select! {
+            biased;
+            _ = &mut *shutdown_rx => shutdown_requested = true,
+            () = tokio::time::sleep(remaining) => {}
+        }
     }
     *last_publish = tokio::time::Instant::now();
+    shutdown_requested
 }
 
 // ─── Counters ───────────────────────────────────────────────────────────────
@@ -700,6 +714,38 @@ mod tests {
         );
         assert_eq!(throttle_remaining(interval, interval), None);
         assert_eq!(throttle_remaining(interval, Duration::MAX), None);
+    }
+
+    #[tokio::test]
+    async fn test_throttle_or_shutdown_returns_promptly_on_shutdown() {
+        let (tx, mut rx) = oneshot::channel::<()>();
+        let mut last_publish = tokio::time::Instant::now();
+        let interval = Some(Duration::from_millis(MAX_MIN_PUBLISH_INTERVAL_MS));
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(());
+        });
+        let started = std::time::Instant::now();
+        let observed = tokio::time::timeout(
+            Duration::from_secs(5),
+            throttle_or_shutdown(&mut last_publish, interval, &mut rx),
+        )
+        .await;
+        assert_eq!(observed, Ok(true), "shutdown must interrupt the throttle");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        sender.await.expect("sender task");
+    }
+
+    #[tokio::test]
+    async fn test_throttle_or_shutdown_without_signal_waits_out_interval() {
+        let (_tx, mut rx) = oneshot::channel::<()>();
+        let mut last_publish = tokio::time::Instant::now();
+        assert!(!throttle_or_shutdown(&mut last_publish, None, &mut rx).await);
+        let before = last_publish;
+        assert!(
+            !throttle_or_shutdown(&mut last_publish, Some(Duration::from_millis(5)), &mut rx).await
+        );
+        assert!(last_publish >= before, "last_publish is re-stamped");
     }
 
     #[test]

@@ -342,7 +342,8 @@ change.
     without a cap (up to `u64::MAX` ms). The jitter is a hash of a
     per-publisher seed, the message sequence and the retry index; no new
     dependency.
-  - Shutdown is observed while a batch window is open (not only when
+  - Shutdown is observed while a batch window is open or a
+    `min_publish_interval_ms` throttle wait is running (not only when
     idle), closes the channel before draining so the drain terminates, and
     skips the publish throttle. Events sent after shutdown, or after the
     task died, are counted in `dropped_events`; a closed channel logs one
