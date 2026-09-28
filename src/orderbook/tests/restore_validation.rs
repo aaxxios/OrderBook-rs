@@ -376,7 +376,10 @@ mod tests {
 
     /// Book restored with `engine_seq` at `u64::MAX`-1, the last seq burnt,
     /// a resting ask of 5 @ 100 and (optionally) a trade listener.
-    fn exhausted_book_with_ask(symbol: &str, trades: Option<Arc<Mutex<Vec<TradeResult>>>>) -> OrderBook<()> {
+    fn exhausted_book_with_ask(
+        symbol: &str,
+        trades: Option<Arc<Mutex<Vec<TradeResult>>>>,
+    ) -> OrderBook<()> {
         let mut book: OrderBook<()> = OrderBook::new(symbol);
         if let Some(sink) = trades {
             book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
@@ -409,7 +412,10 @@ mod tests {
         let result = result.expect("the committed fills are returned");
         assert_eq!(result.match_result.trades().len(), 1, "one fill");
         assert_eq!(result.engine_seq, crate::UNSTAMPED_ENGINE_SEQ);
-        assert!(trades.lock().expect("trade sink").is_empty(), "listener suppressed");
+        assert!(
+            trades.lock().expect("trade sink").is_empty(),
+            "listener suppressed"
+        );
         assert!(book.engine_seq_exhausted());
         assert!(book.get_order(Id::from_u64(1)).is_none(), "maker filled");
     }

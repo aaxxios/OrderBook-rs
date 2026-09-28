@@ -210,7 +210,8 @@
 //!   `next_engine_seq()` returns `Result` and refuses with
 //!   `OrderBookError::EngineSeqExhausted` instead of wrapping; the engine's
 //!   emission paths suppress (and latch, `engine_seq_exhausted()`) an event
-//!   they cannot stamp, and the book keeps matching. Restore rejects, before
+//!   they cannot stamp (caller-owned results keep their fills, stamped
+//!   `UNSTAMPED_ENGINE_SEQ`), and the book keeps matching. Restore rejects, before
 //!   touching the live book, a crossed or locked snapshot (new
 //!   `OrderBookError::SnapshotCrossed`), an order whose `visible + hidden`
 //!   overflows `u64`, and a package whose `engine_seq` is `u64::MAX`; tick /
@@ -220,8 +221,9 @@
 //!   `spread()` / `spread_bps()` return `None` for a crossed read. The
 //!   strandable-maker count, `StubClock` (pinned at its ceiling,
 //!   `is_exhausted()`), repricing counters and the order-state tracker's
-//!   purge use checked forms; the tracker recovers a poisoned eviction queue
-//!   and evicts with `DashMap::remove_if`.
+//!   purge use checked forms; the tracker recovers a poisoned eviction queue,
+//!   keeps each order's status and history in one entry and evicts it
+//!   atomically with `DashMap::remove_if`.
 //!
 //! ### Migration from 0.13
 //!

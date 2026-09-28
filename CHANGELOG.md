@@ -168,9 +168,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and refuses with the new `OrderBookError::EngineSeqExhausted { engine_seq }`
   instead of wrapping (the last mintable value is `u64::MAX - 1`). The
   engine's own emission paths run after the mutation, so on exhaustion they
-  suppress the `TradeResult` / `PriceLevelChangedEvent` (logged once at
-  `ERROR`, reported by the new `OrderBook::engine_seq_exhausted()`) instead
-  of stamping a wrapped sequence; the book keeps matching. All
+  suppress the listener `TradeResult` / `PriceLevelChangedEvent` (logged
+  once at `ERROR`, reported by the new `OrderBook::engine_seq_exhausted()`)
+  instead of stamping a wrapped sequence; the book keeps matching. A
+  caller-owned result is never affected: `add_order_with_result` and the
+  `*_with_committed` APIs still return their committed fills, stamped with
+  the new `UNSTAMPED_ENGINE_SEQ` (`u64::MAX`, never minted). All
   `PriceLevelChangedEvent` emissions now go through one helper.
   Snapshot restore, both `restore_from_snapshot` and
   `restore_from_snapshot_package`, now rejects in the prepare phase, before
@@ -192,9 +195,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`StubClock::is_exhausted()`, logged once); a retention window reaching
   before the clock's epoch purges nothing. The order-state tracker
   recovers a poisoned terminal-queue mutex (the queue is an eviction hint,
-  re-checked per id) instead of silently skipping eviction forever, and
-  evicts with `DashMap::remove_if`, so an id re-activated concurrently is
-  never evicted.
+  re-checked per id) instead of silently skipping eviction forever. Each
+  order's status and history now live in one map entry, so a transition
+  updates both atomically and an eviction (`DashMap::remove_if` on that
+  entry) removes exactly the lifecycle it checked: an id re-activated or
+  re-terminated concurrently is never evicted or split from its history.
+  The eviction queue lock is never held while a map lock is taken.
   `book.rs`, `order_state.rs` and `snapshot.rs` leave both ratchet ledgers.
   Compatibility: `next_engine_seq()` and
   `OrderBookSnapshot::refresh_aggregates()` change signature (see the
