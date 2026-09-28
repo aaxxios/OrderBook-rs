@@ -121,9 +121,12 @@
 //! - **Default trade-id namespace without OS entropy (#265).** Constructors
 //!   that are not given a namespace derive a UUIDv5 from the symbol, process
 //!   id, wall-clock nanoseconds and a process-wide checked counter instead of
-//!   calling the panicking `Uuid::new_v4()`. Namespaces stay unique per book
-//!   and across restarts; trade-id format and namespace injection for replay
-//!   are unchanged.
+//!   calling the panicking `Uuid::new_v4()`. Namespaces are unique per book
+//!   within a process and are designed to differ across restarts; a restart
+//!   that reuses the same process id with the wall clock stepped back to the
+//!   same nanosecond can repeat one (see `default_trade_id_namespace`), so
+//!   inject a namespace when cross-restart uniqueness must be guaranteed.
+//!   Trade-id format and namespace injection for replay are unchanged.
 //!
 //! ### Migration from 0.13
 //!
