@@ -77,6 +77,10 @@ const ENTRY_FIXED_BODY: usize = SEQUENCE_SIZE + TIMESTAMP_SIZE + ENTRY_CRC_SIZE;
 /// pre-allocated segment is never materialised on disk.
 const ZERO_SCAN_CHUNK: usize = 4096;
 
+/// Bytes of the `entry_length` field after its first byte: a candidate
+/// entry start lies at most this far before a non-zero byte.
+const LENGTH_FIELD_TAIL: usize = ENTRY_LENGTH_SIZE - 1;
+
 /// Offset of the JSON payload from the start of the entry body (after
 /// `entry_length`): sequence plus timestamp.
 const PAYLOAD_OFFSET: usize = SEQUENCE_SIZE + TIMESTAMP_SIZE;
@@ -289,48 +293,76 @@ fn recover_segment(data: &[u8], path: &Path) -> Result<Recovery, JournalError> {
     let mut offset = 0usize;
     let mut last_seq = None;
     loop {
-        match decode_entry(data, offset) {
+        let reason = match decode_entry(data, offset) {
             Ok(Decoded::End) => break,
             Ok(Decoded::Entry(raw)) if raw.crc_ok() => {
                 last_seq = Some(raw.sequence);
                 offset = raw.end;
+                continue;
             }
-            Ok(Decoded::Entry(raw)) => {
-                // Framing is intact but the CRC is not. A torn tail is the
-                // last thing written, so nothing valid can follow it.
-                if let Ok(Decoded::Entry(next)) = decode_entry(data, raw.end)
-                    && next.crc_ok()
-                {
-                    error!(
-                        path = %path.display(),
-                        offset = raw.offset,
-                        sequence = raw.sequence,
-                        "journal corruption inside committed data; refusing to open"
-                    );
-                    return Err(raw.corrupt());
-                }
-                warn!(
-                    path = %path.display(),
-                    offset,
-                    "torn journal tail detected on reopen (CRC mismatch); truncating to the last good entry"
-                );
-                break;
-            }
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    offset,
-                    error = %err,
-                    "torn journal tail detected on reopen (invalid header); truncating to the last good entry"
-                );
-                break;
-            }
+            Ok(Decoded::Entry(_)) => "CRC mismatch",
+            Err(_) => "invalid header",
+        };
+        // The entry at `offset` does not validate. A torn tail is the last
+        // thing written, so no valid entry can follow it anywhere in the
+        // segment. Any valid entry after it means the damage is inside
+        // committed data (possibly several adjacent entries): refuse.
+        if let Some(later) = find_valid_entry_after(data, offset) {
+            error!(
+                path = %path.display(),
+                offset,
+                later_offset = later.offset,
+                later_sequence = later.sequence,
+                "journal corruption inside committed data; refusing to open"
+            );
+            return Err(match decode_entry(data, offset) {
+                Ok(Decoded::Entry(raw)) => raw.corrupt(),
+                Err(err) => err,
+                Ok(Decoded::End) => invalid_header(offset, "damaged entry"),
+            });
         }
+        warn!(
+            path = %path.display(),
+            offset,
+            reason,
+            "torn journal tail detected on reopen; truncating to the last good entry"
+        );
+        break;
     }
     Ok(Recovery {
         write_pos: offset,
         last_seq,
     })
+}
+
+/// Searches `data` after the damaged entry at `from` for any entry whose
+/// framing and CRC validate, at every byte offset.
+///
+/// A valid entry has a non-zero `entry_length`, so every candidate start
+/// lies at most `ENTRY_LENGTH_SIZE - 1` bytes before a non-zero byte; runs of
+/// zero bytes (the pre-allocated tail) are skipped with a vectorisable scan
+/// instead of being probed byte by byte. A random candidate passes the CRC
+/// with probability 2^-32.
+fn find_valid_entry_after(data: &[u8], from: usize) -> Option<RawEntry> {
+    let mut probe = from.checked_add(1)?;
+    loop {
+        let rest = data.get(probe..)?;
+        let nonzero = probe.checked_add(rest.iter().position(|b| *b != 0)?)?;
+        // Candidates whose length field covers the non-zero byte.
+        let mut candidate = match nonzero.checked_sub(LENGTH_FIELD_TAIL) {
+            Some(start) => start.max(probe),
+            None => probe,
+        };
+        while candidate <= nonzero {
+            if let Ok(Decoded::Entry(raw)) = decode_entry(data, candidate)
+                && raw.crc_ok()
+            {
+                return Some(raw);
+            }
+            candidate = candidate.checked_add(1)?;
+        }
+        probe = nonzero.checked_add(1)?;
+    }
 }
 
 /// Zeroes every non-zero byte of `mmap` from `from` to the end and flushes
@@ -1034,7 +1066,19 @@ where
         let mmap = map_read_only(&path)?;
         let (active_start, active_write_pos) = self.active;
         self.limit = if start_seq == active_start {
-            active_write_pos.min(mmap.len())
+            // The writer committed `active_write_pos` bytes; a shorter file
+            // was truncated externally and lost committed entries, even when
+            // the cut lands on an entry boundary.
+            if mmap.len() < active_write_pos {
+                return Err(invalid_header(
+                    mmap.len(),
+                    format!(
+                        "active segment truncated to {} bytes below its committed write position {active_write_pos}",
+                        mmap.len()
+                    ),
+                ));
+            }
+            active_write_pos
         } else {
             mmap.len()
         };
@@ -2197,5 +2241,104 @@ mod tests {
             first,
             Some(Err(JournalError::DeserializationError { sequence: 6, .. }))
         ));
+    }
+
+    /// #252 review: several adjacent damaged entries followed by a valid,
+    /// durable one are corruption inside committed data. Reopen scans past
+    /// all of them, finds the valid entry and refuses without touching the
+    /// file (a one-entry lookahead would have zeroed the valid entry).
+    #[test]
+    fn test_reopen_refuses_adjacent_corrupted_entries_before_a_valid_one() {
+        for header_damaged in [false, true] {
+            let dir = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+            let journal = FileJournal::<()>::open(dir.path()).unwrap_or_else(|_| panic!("open"));
+            for i in 0..4 {
+                assert!(journal.append(&make_event(i)).is_ok());
+            }
+            drop(journal);
+
+            let seg_path = segment_path(dir.path(), 0);
+            let data = fs::read(&seg_path).unwrap_or_default();
+            let offsets = entry_offsets(&data);
+            assert_eq!(offsets.len(), 4);
+            // Damage entries 1 and 2; entry 3 stays valid.
+            for &entry in &offsets[1..3] {
+                let at = entry + 30;
+                patch_file(&seg_path, at, &[data[at] ^ 0xFF]);
+            }
+            if header_damaged {
+                // Entry 1's length now runs past the segment: no framing to
+                // follow, so only a byte scan can find entry 3.
+                patch_file(&seg_path, offsets[1], &0xFFFF_FF00u32.to_le_bytes());
+            }
+            let before = fs::read(&seg_path).unwrap_or_default();
+
+            match FileJournal::<()>::open(dir.path()) {
+                Err(JournalError::CorruptEntry { sequence, .. }) => {
+                    assert!(!header_damaged);
+                    assert_eq!(sequence, 1);
+                }
+                Err(JournalError::InvalidEntryHeader { offset, .. }) => {
+                    assert!(header_damaged);
+                    assert_eq!(offset, offsets[1]);
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert_eq!(
+                fs::read(&seg_path).unwrap_or_default(),
+                before,
+                "a refused reopen must not modify the segment"
+            );
+        }
+    }
+
+    /// #252 review: an active segment truncated externally below its
+    /// committed write position, even on an entry boundary, is an error on
+    /// read instead of a silently shorter replay.
+    #[test]
+    fn test_read_reports_active_segment_truncated_below_write_position() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+        let journal = FileJournal::<()>::open(dir.path()).unwrap_or_else(|_| panic!("open"));
+        for i in 0..3 {
+            assert!(journal.append(&make_event(i)).is_ok());
+        }
+        let seg_path = segment_path(dir.path(), 0);
+        let offsets = entry_offsets(&fs::read(&seg_path).unwrap_or_default());
+        // Cut exactly at the start of entry 2 (an entry boundary). Nothing
+        // below touches the writer's mapping past the new end of file.
+        OpenOptions::new()
+            .write(true)
+            .open(&seg_path)
+            .and_then(|f| f.set_len(offsets[2] as u64))
+            .unwrap_or_else(|_| panic!("truncate"));
+
+        let results: Vec<_> = journal
+            .read_from(0)
+            .unwrap_or_else(|_| panic!("read_from"))
+            .collect();
+        assert_eq!(results.len(), 1, "the error, then nothing");
+        assert!(matches!(
+            results[0],
+            Err(JournalError::InvalidEntryHeader { .. })
+        ));
+        assert!(matches!(
+            journal.verify_integrity(),
+            Err(JournalError::InvalidEntryHeader { .. })
+        ));
+    }
+
+    /// The forward scan finds a valid entry at an arbitrary offset and
+    /// ignores zero runs and garbage.
+    #[test]
+    fn test_find_valid_entry_after_scans_every_offset() {
+        let entry = FileJournal::<()>::encode_entry(&make_event(4), DEFAULT_SEGMENT_SIZE)
+            .unwrap_or_else(|_| panic!("encode"));
+        let mut data = vec![0u8; 8192];
+        data[10..20].copy_from_slice(&[7u8; 10]); // garbage
+        data[5003..5003 + entry.len()].copy_from_slice(&entry);
+        let found = find_valid_entry_after(&data, 0).unwrap_or_else(|| panic!("found"));
+        assert_eq!((found.offset, found.sequence), (5003, 4));
+        assert!(find_valid_entry_after(&data, 5003).is_none());
+        assert!(find_valid_entry_after(&[0u8; 64], 0).is_none());
     }
 }
