@@ -174,10 +174,18 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     (_macro_pattern("todo"), "todo!(...)", "todo_macro"),
     (_macro_pattern("unimplemented"), "unimplemented!(...)", "unimplemented_macro"),
     (_macro_pattern("unreachable"), "unreachable!(...)", "unreachable_macro"),
-    # `panic_any` / `resume_unwind` are plain functions (`std::panic::`), not
-    # macros: only the `(...)` call form is valid Rust for them.
+    # `panic_any` / `resume_unwind` / `catch_unwind` are plain functions
+    # (`std::panic::`), not macros: only the `(...)` call form is valid Rust
+    # for them. `catch_unwind` itself never panics, but
+    # `rules/global_rules.md`'s Production Panic Policy explicitly forbids
+    # it in production ("Never evade this policy with... `catch_unwind`"):
+    # catching a panic and continuing is exactly the kind of "recover and
+    # keep going" this crate's typed-error contract replaces. `\b` matches
+    # both the bare and `std::panic::`-qualified call forms, the same as
+    # `panic_any` / `resume_unwind` below.
     (re.compile(r"\bpanic_any\s*\("), "panic_any(...)", "panic_any"),
     (re.compile(r"\bresume_unwind\s*\("), "resume_unwind(...)", "resume_unwind"),
+    (re.compile(r"\bcatch_unwind\s*\("), "catch_unwind(...)", "catch_unwind"),
     # Method calls: `(...)` is the only valid form, no macro delimiters.
     (re.compile(r"\.unwrap\s*\("), ".unwrap()", "unwrap"),
     (re.compile(r"\.unwrap_err\s*\("), ".unwrap_err()", "unwrap_err"),
@@ -756,8 +764,8 @@ def write_allowlist(paths: list[str]) -> int:
         "#",
         "# rule ids: assert, assert_eq, assert_ne, debug_assert, debug_assert_eq,",
         "# debug_assert_ne, panic_macro, todo_macro, unimplemented_macro,",
-        "# unreachable_macro, panic_any, resume_unwind, unwrap, unwrap_err,",
-        "# expect, expect_err, get_unwrap, process_exit, process_abort,",
+        "# unreachable_macro, panic_any, resume_unwind, catch_unwind, unwrap,",
+        "# unwrap_err, expect, expect_err, get_unwrap, process_exit, process_abort,",
         "# saturating_wrapping, indexing_slicing.",
         "",
     ]

@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tooling only: no public API or behaviour change.
 - `rules/global_rules.md` is now tracked; the policy script and fixtures
   are un-ignored in `.gitignore` (not part of the published package).
+- **Clippy ratchet count ledger (#242 follow-up, PR #266 review).** A
+  per-file `#![allow(clippy::...)]` ratchet line is not itself a counted
+  ratchet: `scripts/check_clippy_ratchet.py` (`make lint-clippy-ratchet`,
+  part of `make lint`) closes that by re-running clippy against a scratch
+  copy of the crate with those markers stripped, gated on
+  `scripts/clippy_ratchet.txt` with the same exact-count discipline as
+  `panic_policy_allowlist.txt`. `check_panic_policy.py` also now denies
+  `catch_unwind`, `panic_any` and `resume_unwind` in production (tests may
+  still use all three).
 
 ### Changed
 

@@ -116,25 +116,46 @@ unwinds).
 
 ## Ratchet
 
-`scripts/check_panic_policy.py --ratchet-report` lists every clippy-side
-`#![allow(clippy::...)] // panic-policy-ratchet: see #242, removed by the
-fix issue` currently in the tree. `scripts/panic_policy_allowlist.txt` lists
-every `assert!`/`debug_assert!`-family and `saturating_*`/`wrapping_*`
-finding this script's own syntax scan currently tolerates, one
-`path:rule:count` line per file/rule pair.
+Three ledgers, all mechanically enforced (`make lint`), all shrink-only:
 
-Both only ever shrink. A fix PR (issues #243-#257) that removes a
-production violation:
+1. `scripts/check_panic_policy.py --ratchet-report` lists every clippy-side
+   `#![allow(clippy::...)] // panic-policy-ratchet: see #242, removed by the
+   fix issue` currently in the tree — but a plain per-file `allow` is not
+   itself a count-based ratchet: `cargo clippy` cannot tell a violation that
+   existed when the marker was written from a brand new one added later in
+   the same file, for an already-listed lint. Ledger 3 below closes that.
+2. `scripts/panic_policy_allowlist.txt` lists every `assert!`/
+   `debug_assert!`-family, `saturating_*`/`wrapping_*`, `catch_unwind`,
+   `panic_any` and `resume_unwind` finding `scripts/check_panic_policy.py`'s
+   own syntax scan currently tolerates, one `path:rule:count` line per
+   file/rule pair (`check_panic_policy.py --write-allowlist` regenerates
+   it).
+3. `scripts/clippy_ratchet.txt` (PR #266 review) is the count-based
+   companion to ledger 1: `scripts/check_clippy_ratchet.py` copies the
+   crate to a scratch directory, strips every `panic-policy-ratchet`
+   `#![allow(...)]` block from the copy only, and re-runs `cargo clippy`
+   there with `RUSTFLAGS=--cap-lints=warn` (so the crate's own
+   `[lints.clippy]` `"deny"` entries report instead of aborting the
+   scratch build). Each ratcheted file/lint pair's finding count in the
+   ledger must match exactly; `check_clippy_ratchet.py
+   --write-clippy-ratchet` regenerates it. `make lint-clippy-ratchet` runs
+   it standalone; `make lint` runs it last (see the Makefile for the
+   measured cost).
+
+All three fail the build if a count grows past its ledger value (a new
+violation) **or** falls below it (a stale, over-generous entry) — so a fix
+PR is forced to shrink them, never to widen them. A fix PR (issues
+#243-#257) that removes a production violation:
 
 1. Deletes or narrows the file's `#![allow(clippy::...)]` ratchet line (or
    removes the whole marker once that file has none left).
 2. Regenerates `scripts/panic_policy_allowlist.txt` via `python3
-   scripts/check_panic_policy.py --write-allowlist` and confirms the diff
-   only removes/lowers entries for files it touched — the gate fails if any
-   entry it did not touch grew, and fails if any entry is now stale (too
-   high), so this is enforced mechanically, not just by convention.
+   scripts/check_panic_policy.py --write-allowlist` and
+   `scripts/clippy_ratchet.txt` via `python3
+   scripts/check_clippy_ratchet.py --write-clippy-ratchet`, and confirms
+   each diff only removes/lowers entries for files it touched.
 
-When both are empty, delete `scripts/panic_policy_allowlist.txt` (an absent
-file is an empty allowlist, matching a from-scratch audit — `--write-
-allowlist` still regenerates the header-only file, which the final cleanup
-PR then removes) and delete this ratchet section.
+When all three are empty, delete the two ledger files (an absent file is an
+empty ledger, matching a from-scratch audit — `--write-allowlist` /
+`--write-clippy-ratchet` still regenerate a header-only file, which the
+final cleanup PR then removes) and delete this ratchet section.
