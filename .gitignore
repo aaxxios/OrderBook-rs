@@ -27,7 +27,17 @@ src/.DS_Store
 /cobertura.xml
 /tarpaulin-report.html
 .secrets
-/scripts/
+# `/scripts/` holds untracked personal helper scripts (e.g. `smoke-test.sh`).
+# The `check_panic_policy.py` enforcement gate (issue #242) and its fixtures
+# ARE tracked — Cargo.toml's `include` list has no `scripts/**` glob, so they
+# never ship in the published crate either way.
+/scripts/*
+!/scripts/check_panic_policy.py
+!/scripts/check_clippy_ratchet.py
+!/scripts/panic_policy_fixtures/
+!/scripts/panic_policy_fixtures/*.rs
+!/scripts/panic_policy_allowlist.txt
+!/scripts/clippy_ratchet.txt
 
 # Temporary files
 tmp_reply.json

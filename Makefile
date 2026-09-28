@@ -32,14 +32,62 @@ fmt:
 fmt-check:
 	cargo +stable fmt --check
 
-# Run Clippy for linting
+# Run Clippy for linting, plus the Production Panic Policy syntax gate
+# (issue #242, ported from PriceLevel's issue #173): clippy's
+# `[lints.clippy]` restriction lints (Cargo.toml) and this crate's
+# `clippy.toml` cover unwrap/expect/panic/unreachable/todo/unimplemented/
+# indexing/string-slicing/narrowing-casts/raw-arithmetic in production.
+# `lint-panic` below covers what clippy has NO lint for at all (the
+# `assert!`/`debug_assert!` family) and what clippy's own `#[cfg(test)]`
+# heuristic can wrongly exempt (a standalone `#[cfg(test)]` production
+# helper that is not a `mod tests { ... }` block), plus
+# `saturating_*`/`wrapping_*` on production state. `lint-clippy-ratchet`
+# (PR #266 review) runs LAST: it re-checks every file carrying a
+# `panic-policy-ratchet` `#![allow(clippy::...)]` for a NEW violation of an
+# already-ratcheted lint, which a plain `cargo clippy` above can never see
+# (that is exactly what the file's own `allow` suppresses).
 .PHONY: lint
-lint:
+lint: lint-panic
 	cargo clippy --all-targets --all-features -- -D warnings
+	$(MAKE) lint-clippy-ratchet
+
+# Production Panic Policy syntax gate (issue #242): scripts/check_panic_policy.py.
+# Runs the scanner's own fixture self-test first — a broken scanner must
+# never silently report a clean src/ — then scans src/ for real, gated on
+# scripts/panic_policy_allowlist.txt (the ratchet: existing violations tolerate
+# their current count exactly, any new one, or any stale over-allowance, fails).
+.PHONY: lint-panic
+lint-panic:
+	python3 scripts/check_panic_policy.py --self-test
+	python3 scripts/check_panic_policy.py
+
+# Clippy-side ratchet gate (issue #242 follow-up, PR #266 review):
+# scripts/check_clippy_ratchet.py. A per-file `#![allow(clippy::...)]`
+# ratchet marker is not itself a count-based ratchet — normal `cargo clippy`
+# above cannot see a NEW violation of an already-allowed lint in that same
+# file. This copies the crate to a scratch dir, strips just those markers,
+# and re-runs clippy there (`--cap-lints=warn` so the crate's own
+# `[lints.clippy]` `"deny"` reports instead of aborting), gated on
+# scripts/clippy_ratchet.txt with the same exact-count ratchet discipline as
+# `lint-panic`. Measured cost: ~2-7s wall on a warm `target/` (shared with
+# the main build on purpose, for speed — dependency artifacts are content-
+# addressed and reused; only `orderbook-rs` itself recompiles against the
+# scratch copy's path, which can in turn invalidate the main tree's own
+# cached `orderbook-rs` build output for the next normal build).
+.PHONY: lint-clippy-ratchet
+lint-clippy-ratchet:
+	python3 scripts/check_clippy_ratchet.py
 
 .PHONY: lint-fix
 lint-fix:
-	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+	# `-A clippy::manual_saturating_arithmetic`: `cargo clippy --fix` can
+	# rewrite checked arithmetic into `saturating_*` (issue #242) — this
+	# crate never wants that rewrite auto-applied. `lint-panic` re-scans
+	# src/ for saturating_*/wrapping_* afterward as an independent,
+	# non-autofix-dependent check.
+	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged \
+		-- -D warnings -A clippy::manual_saturating_arithmetic
+	$(MAKE) lint-panic
 
 # Clean the project
 .PHONY: clean
@@ -60,7 +108,15 @@ fix:
 	cargo fix --allow-staged --allow-dirty
 
 .PHONY: pre-push
-pre-push: fix fmt lint-fix test readme doc
+# Ordering (issue #242, ported from PriceLevel's issue #173 review):
+# `lint-fix` runs BEFORE `fmt`, not after. `cargo clippy --fix` can rewrite
+# code (including, before `-A clippy::manual_saturating_arithmetic` above,
+# into `saturating_*`) without reformatting it, so running `fmt` first and
+# `lint-fix` last used to leave the tree unformatted after a "clean"
+# pre-push. `lint-panic` runs after `fmt` since it is a plain text scan
+# unaffected by formatting, and before `test` so a Production Panic Policy
+# regression fails fast.
+pre-push: fix lint-fix fmt lint-panic test readme doc
 
 .PHONY: doc
 doc:

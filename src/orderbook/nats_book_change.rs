@@ -24,6 +24,9 @@
 //! orderbook-rs = { version = "0.6", features = ["nats"] }
 //! ```
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChangedListener};
 use pricelevel::Side;
 use serde::Serialize;

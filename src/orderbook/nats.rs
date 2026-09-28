@@ -26,6 +26,9 @@
 //! orderbook-rs = { version = "0.6", features = ["nats"] }
 //! ```
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::orderbook::serialization::{EventSerializer, JsonEventSerializer};
 use crate::orderbook::trade::{TradeListener, TradeResult};
 use std::sync::atomic::{AtomicU64, Ordering};

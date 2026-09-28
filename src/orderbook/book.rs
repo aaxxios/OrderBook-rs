@@ -1,5 +1,13 @@
 //! Core OrderBook implementation for managing price levels and orders
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing
+)]
+
 use super::cache::PriceLevelCache;
 use super::clock::{Clock, MonotonicClock};
 use super::error::OrderBookError;

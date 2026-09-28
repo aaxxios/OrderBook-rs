@@ -21,6 +21,9 @@
 //! book.reprice_special_orders();
 //! ```
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects, clippy::cast_sign_loss)]
+
 use crate::orderbook::error::OrderBookError;
 use dashmap::DashSet;
 use pricelevel::{Id, OrderType, PegReferenceType, Side};

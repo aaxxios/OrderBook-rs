@@ -3,6 +3,9 @@
 //! This module provides methods on the OrderBook struct to calculate
 //! implied volatility from order book prices.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use super::black_scholes::BlackScholes;
 use super::error::IVError;
 use super::solver::{SolverConfig, solve_iv};

@@ -28,6 +28,7 @@ pub mod operations;
 mod pool;
 mod private;
 pub mod snapshot;
+#[cfg(test)]
 mod tests;
 /// Enhanced trade result that includes symbol information
 pub mod trade;

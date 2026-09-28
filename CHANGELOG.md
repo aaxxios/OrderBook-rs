@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Production Panic Policy CI gate (#242).** `[lints.clippy]` in
+  `Cargo.toml` denies `unwrap_used`, `expect_used`, `panic`, `unreachable`,
+  `todo`, `unimplemented`, `indexing_slicing`, `string_slice`,
+  `arithmetic_side_effects`, `cast_possible_truncation`, `cast_sign_loss`,
+  `cast_possible_wrap`, `manual_assert`, `panic_in_result_fn`, `get_unwrap`
+  and `exit` package-wide (the `examples` member does not inherit it);
+  `clippy.toml` exempts real tests. `scripts/check_panic_policy.py` (`make
+  lint-panic`, part of `make lint` and `make pre-push`) catches what clippy
+  cannot: the `assert!` / `debug_assert!` family, `saturating_*` /
+  `wrapping_*`, `std::process::exit` / `abort`, and production-reachable
+  `#[cfg(test)]` seams. `doc/panic-boundaries.md` documents irreducible
+  dependency limits, the single `unsafe` exception (`memmap2`, feature
+  `journal`) and the no-panic obligations of caller-supplied code.
+- **Panic-policy ratchet (#242).** Existing violations are tolerated at
+  their current count and may only shrink: 17 production files carry a
+  narrow `#![allow(clippy::...)] // panic-policy-ratchet` line
+  (`--ratchet-report` lists them) and `scripts/panic_policy_allowlist.txt`
+  holds the script-only forms. A count above or below the recorded value
+  fails the gate, so each fix issue (#243 to #265) removes its entries.
+  Tooling only: no public API or behaviour change.
+- `rules/global_rules.md` is now tracked; the policy script and fixtures
+  are un-ignored in `.gitignore` (not part of the published package).
+- **Clippy ratchet count ledger (#242 follow-up, PR #266 review).** A
+  per-file `#![allow(clippy::...)]` ratchet line is not itself a counted
+  ratchet: `scripts/check_clippy_ratchet.py` (`make lint-clippy-ratchet`,
+  part of `make lint`) closes that by re-running clippy against a scratch
+  copy of the crate with those markers stripped, gated on
+  `scripts/clippy_ratchet.txt` with the same exact-count discipline as
+  `panic_policy_allowlist.txt`. `check_panic_policy.py` also now denies
+  `catch_unwind`, `panic_any` and `resume_unwind` in production (tests may
+  still use all three).
+
 ### Changed
 
 - `tests/alloc_budget.rs` (feature `alloc-counters`) now asserts the median

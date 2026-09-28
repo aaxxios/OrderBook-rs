@@ -1,4 +1,6 @@
 #[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use crate::current_time_millis;
     use std::thread;

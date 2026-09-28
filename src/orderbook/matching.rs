@@ -4,6 +4,9 @@
 //! via [`crate::STPMode`]. When STP is disabled (`STPMode::None`, the default),
 //! the matching hot path is unchanged with zero overhead.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 use crate::orderbook::book_change_event::PriceLevelChangedEvent;
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::pool::MatchingPool;

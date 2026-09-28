@@ -2,6 +2,9 @@
 //!
 //! See `doc/wire-protocol.md` for the canonical layout.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::wire::error::WireError;
 
 /// Fixed payload size in bytes for a `TradePrintWire`.

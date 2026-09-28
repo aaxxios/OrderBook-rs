@@ -1,3 +1,20 @@
+// This crate root is entirely bench code, not production (issue #242's
+// Production Panic Policy gate, `[lints.clippy]` in `Cargo.toml`, is
+// package-wide and would otherwise apply here too). Bench fixtures freely
+// `.unwrap()` / `.expect()` setup, index fixed-size scratch buffers and do
+// raw arithmetic on sample sizes; none of that reaches `src/`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 // mixed_70_20_10_hdr — 70 % submits, 20 % cancels, 10 % aggressive.
 // The "realistic" scenario the BENCH.md headline numbers come from.
 
