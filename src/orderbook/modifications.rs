@@ -1124,8 +1124,9 @@ where
     /// holds afterwards, so the book's indices never disagree with it
     /// (#248):
     ///
-    /// - the order **still rests**: [`OrderBookError::PriceLevelError`],
-    ///   with no book-side mutation and no event;
+    /// - the order **still rests**: [`OrderBookError::PriceLevelError`];
+    ///   no index, risk, state or level-map change and no event (only the
+    ///   price-level cache was invalidated up front, which is harmless);
     /// - the order is **gone** (pricelevel can commit a removal and then
     ///   report a broken level invariant, poisoning the level): the removal
     ///   is completed on the book side exactly like a successful cancel

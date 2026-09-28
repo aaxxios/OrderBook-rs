@@ -266,6 +266,12 @@ change.
     the replay book cannot evict is reported as `ReplayError::OrderBookError`.
     Without a journaled result the sweep is re-run and any failure is
     reported.
+  - `SequencerResult::from(&OrderBookError)` records
+    `OrderRemovedWithLevelFault` as `OrderCancelled { order_id }` (the
+    outcome the book took), not as a rejection, so replay removes the
+    order too; an `UpdateOrder` journaled as `OrderCancelled` is replayed
+    as that cancel rather than by re-executing the update (whose re-add
+    the live book never performed).
   - Replay skips only a **refused** journaled mass cancel
     (`is_refused()`), not every result with failures; a mass cancel
     journaled with per-order failures is re-executed and reported as

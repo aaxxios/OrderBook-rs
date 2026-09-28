@@ -174,6 +174,7 @@
 //! | cancel whose level removed the order, then failed: `Ok(None)`, indices stale | removal completed, `Err(OrderBookError::OrderRemovedWithLevelFault { .. })` |
 //! | `evict_expired_orders`: per-order failure silently skipped | recorded in `EvictionResult::failures()`; the rest is still evicted |
 //! | journaled eviction replayed by re-running the sweep | replay evicts exactly the journaled ids (`MassCancelled` result) |
+//! | `SequencerResult::from(&err)` is always a rejection | `OrderRemovedWithLevelFault` records `OrderCancelled { order_id }` |
 //! | mass cancels on the shared submit gate | exclusive gate; `cancel_all_orders` emits after clearing |
 //! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 //! | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |

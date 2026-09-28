@@ -415,11 +415,19 @@ where
     ///   close it by recording `RejectedWithCode`
     ///   (`SequencerResult::from(&OrderBookError)`).
     /// - Every other rejected command is skipped, including one flagged
-    ///   `may_have_mutated`: the modify paths validate before touching the
-    ///   book and cancels are no-ops on a missing order, so a rejected
-    ///   non-submit is failure-atomic. The flag is derived from the error
-    ///   alone, which cannot tell the atomic modify `PriceLevelError` from
-    ///   the submit one, so the command kind decides.
+    ///   `may_have_mutated`. That is sound for `CancelOrder` and for an
+    ///   `UpdateOrder` not rejected under `MatchAborted`: the modify paths
+    ///   validate before touching the book, a cancel whose level refuses
+    ///   the removal mutates nothing, and a cancel whose level committed
+    ///   the removal before failing is journaled as `OrderCancelled`, not
+    ///   as a rejection (#248). The flag is derived from the error alone,
+    ///   which cannot tell the atomic modify `PriceLevelError` from the
+    ///   submit one, so the command kind decides. Mass cancels and
+    ///   `EvictExpiredOrders` are the exceptions with their own
+    ///   reconciliation: they never fail after mutating (a partial outcome
+    ///   is an `Ok` result carrying per-order failures, journaled as
+    ///   `MassCancelled` and replayed by identity for eviction), and their
+    ///   only `Err` is a refusal that changed nothing.
     ///
     /// Skipped events do not advance the applied sequence or the applied
     /// count; a re-executed rejection does, whether or not it traded. Both
@@ -903,9 +911,16 @@ where
     /// Every other rejected event is skipped: a string-only
     /// [`SequencerResult::Rejected`] carries no code to decide by (the
     /// historical behaviour, and the documented gap for such journals),
-    /// and a rejected non-submit is failure-atomic — the modify paths
-    /// validate before touching the book and cancels are no-ops on a
-    /// missing order.
+    /// and a rejected `CancelOrder` or non-`MatchAborted` `UpdateOrder` is
+    /// failure-atomic — the modify paths validate before touching the book,
+    /// a cancel whose level refuses the removal mutates nothing, and a
+    /// cancel whose level committed the removal is journaled as
+    /// `OrderCancelled`, not as a rejection (#248). Mass cancels and
+    /// eviction are the exceptions with their own reconciliation: they
+    /// never fail after mutating (a partial outcome is an `Ok` result with
+    /// per-order failures, journaled as `MassCancelled`), and the only `Err`
+    /// an eviction returns is a refusal that evicted nothing, so skipping
+    /// its journaled rejection is faithful.
     ///
     /// Before any of that, a journaled rejection that carries the source
     /// book's [`STPMode`] is checked against the replay book's
@@ -969,6 +984,23 @@ where
                         sequence_num: event.sequence_num,
                         source: e,
                     })?;
+            }
+            // #248: an update journaled as `OrderCancelled` removed the
+            // order and did nothing else: a zero-quantity update, or a
+            // cancel-then-add modify whose cancel the level committed and
+            // then failed (`OrderRemovedWithLevelFault`, recorded as the
+            // cancel it was). Re-executing the update would re-add the
+            // order, so replay applies the recorded cancel instead.
+            SequencerCommand::UpdateOrder(_)
+                if matches!(event.result, SequencerResult::OrderCancelled { .. }) =>
+            {
+                if let SequencerResult::OrderCancelled { order_id } = &event.result {
+                    book.cancel_order(*order_id)
+                        .map_err(|e| ReplayError::OrderBookError {
+                            sequence_num: event.sequence_num,
+                            source: e,
+                        })?;
+                }
             }
             SequencerCommand::UpdateOrder(update) => {
                 // Only a journaled `MatchAborted` rejection reaches here
@@ -2297,6 +2329,139 @@ mod tests {
         assert!(snapshots_match(&live_snap, &replayed_snap));
         assert!(replayed.get_order(Id::from_u64(2)).is_some());
         assert!(replayed.get_order(Id::from_u64(1)).is_none());
+    }
+
+    /// Journals `command` with the result its live execution produced, the
+    /// way a sequencer does (`SequencerResult::from(&err)` on `Err`).
+    fn journal_live(
+        journal: &InMemoryJournal<()>,
+        seq: u64,
+        command: SequencerCommand<()>,
+        ok: SequencerResult,
+        outcome: Result<(), OrderBookError>,
+    ) {
+        let result = match outcome {
+            Ok(()) => ok,
+            Err(err) => SequencerResult::from(&err),
+        };
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: seq,
+                    timestamp_ns: 0,
+                    command,
+                    result,
+                })
+                .is_ok()
+        );
+    }
+
+    /// Live book with bids 1 @ 100 and 2 @ 101 (journaled), whose cancel of
+    /// id 1 is committed by its level and then fails (#248).
+    fn level_fault_fixture(symbol: &str) -> (OrderBook<()>, InMemoryJournal<()>) {
+        use crate::orderbook::book::CancelFault;
+
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let mut live = OrderBook::<()>::new(symbol);
+        live.cancel_fault_hook = Some(Arc::new(|id| {
+            (id == Id::from_u64(1)).then(|| {
+                CancelFault::RemoveThenFail(pricelevel::PriceLevelError::InvalidOperation {
+                    message: "broken level".to_string(),
+                })
+            })
+        }));
+        for (seq, (id, price)) in [(1u64, 100u128), (2, 101)].into_iter().enumerate() {
+            let ev = make_add_event(
+                u64::try_from(seq).expect("seq"),
+                Id::from_u64(id),
+                price,
+                5,
+                Side::Buy,
+            );
+            if let SequencerCommand::AddOrder(order) = &ev.command {
+                live.add_order(*order).expect("live add");
+            }
+            assert!(journal.append(&ev).is_ok());
+        }
+        (live, journal)
+    }
+
+    fn assert_replay_matches(live: &OrderBook<()>, journal: &InMemoryJournal<()>, symbol: &str) {
+        let (replayed, _) =
+            ReplayEngine::<()>::replay_from(journal, 0, symbol).expect("replay must succeed");
+        let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+        let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
+        assert!(
+            snapshots_match(&live_snap, &replayed_snap),
+            "replayed book diverged from the live one"
+        );
+    }
+
+    /// #248: `SequencerResult::from` records a level-committed removal as
+    /// the cancel it was, not as a rejection.
+    #[test]
+    fn test_sequencer_result_records_level_fault_removal_as_cancel() {
+        let err = OrderBookError::OrderRemovedWithLevelFault {
+            order_id: Id::from_u64(5),
+            source: Box::new(pricelevel::PriceLevelError::InvalidOperation {
+                message: "broken level".to_string(),
+            }),
+        };
+        assert!(matches!(
+            SequencerResult::from(&err),
+            SequencerResult::OrderCancelled { order_id } if order_id == Id::from_u64(5)
+        ));
+    }
+
+    /// #248: a cancel whose level committed the removal and then failed is
+    /// journaled as the cancel it was, and replay removes the order too.
+    #[test]
+    fn test_replay_cancel_committed_by_a_faulty_level_matches_live_book() {
+        let (live, journal) = level_fault_fixture("LFAULT");
+        let outcome = live.cancel_order(Id::from_u64(1)).map(|_| ());
+        assert!(matches!(
+            outcome,
+            Err(OrderBookError::OrderRemovedWithLevelFault { .. })
+        ));
+        journal_live(
+            &journal,
+            2,
+            SequencerCommand::CancelOrder(Id::from_u64(1)),
+            SequencerResult::OrderCancelled {
+                order_id: Id::from_u64(1),
+            },
+            outcome,
+        );
+        assert_replay_matches(&live, &journal, "LFAULT");
+    }
+
+    /// #248: a re-price whose cancel the level committed before failing
+    /// removed the original and re-added nothing; replay applies the
+    /// journaled cancel instead of re-executing the update (which would
+    /// re-add it).
+    #[test]
+    fn test_replay_modify_whose_cancel_hit_a_faulty_level_matches_live_book() {
+        let (live, journal) = level_fault_fixture("LFMOD");
+        let update = pricelevel::OrderUpdate::UpdatePrice {
+            order_id: Id::from_u64(1),
+            new_price: Price::new(99),
+        };
+        let outcome = live.update_order(update).map(|_| ());
+        assert!(matches!(
+            outcome,
+            Err(OrderBookError::OrderRemovedWithLevelFault { .. })
+        ));
+        assert!(live.get_order(Id::from_u64(1)).is_none(), "original gone");
+        journal_live(
+            &journal,
+            2,
+            SequencerCommand::UpdateOrder(update),
+            SequencerResult::OrderUpdated {
+                order_id: Id::from_u64(1),
+            },
+            outcome,
+        );
+        assert_replay_matches(&live, &journal, "LFMOD");
     }
 
     /// #248: a journaled eviction naming an order the replay book does not
