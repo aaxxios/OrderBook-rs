@@ -2,6 +2,9 @@
 //!
 //! See `doc/wire-protocol.md` for the canonical layout.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::cast_sign_loss)]
+
 use crate::wire::error::WireError;
 use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};

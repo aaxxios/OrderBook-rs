@@ -1,3 +1,19 @@
+// This crate root is entirely bench code, not production (issue #242's
+// Production Panic Policy gate, `[lints.clippy]` in `Cargo.toml`, is
+// package-wide and would otherwise apply here too). Bench fixtures freely
+// `.unwrap()` / `.expect()` setup, index fixed-size scratch buffers and do
+// raw arithmetic on sample sizes; none of that reaches `src/`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 // alloc_count — feature-gated allocation profile of the mixed
 // 70/20/10 hot-path workload. Reports `allocs_per_op` and a
 // per-counter delta over a measurement window.
@@ -5,7 +21,6 @@
 // Build / run:
 //
 //     cargo bench --features alloc-counters --bench alloc_count
-
 #![cfg(feature = "alloc-counters")]
 
 #[path = "hdr_common.rs"]

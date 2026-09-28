@@ -1,3 +1,6 @@
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::cast_possible_truncation)]
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Returns the current wall-clock time in milliseconds since the UNIX epoch.

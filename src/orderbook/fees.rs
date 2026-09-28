@@ -1,5 +1,8 @@
 //! Fee schedule implementation for OrderBook trading fees
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use serde::{Deserialize, Serialize};
 
 /// Denominator for basis-point fee math: 1 bps = 1 / 10_000 of the notional.

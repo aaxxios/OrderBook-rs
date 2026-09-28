@@ -22,6 +22,13 @@
 //! the configured journal directory. Archived segments are renamed to
 //! `.journal.archived`.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing
+)]
+
 use super::error::JournalError;
 use super::journal::{ENTRY_CRC_SIZE, ENTRY_HEADER_SIZE, Journal, JournalEntry, JournalReadIter};
 use super::types::SequencerEvent;
@@ -990,6 +997,8 @@ fn scan_last_sequence(data: &[u8], write_pos: usize) -> Option<u64> {
 }
 
 #[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
     use crate::orderbook::sequencer::types::{SequencerCommand, SequencerResult};

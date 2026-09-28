@@ -921,6 +921,8 @@ mod tests {
 }
 
 #[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::cast_possible_truncation)]
 mod test_add_order_with_result {
     use crate::orderbook::modifications::OrderQuantity;
     use crate::orderbook::stp::STPMode;

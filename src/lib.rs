@@ -36,6 +36,9 @@
 //!
 //! - Dependency floors raised to the latest semver-compatible releases
 //!   (#237). `bincode` stays on 2.0.1.
+//! - The Production Panic Policy is enforced mechanically: a clippy deny set
+//!   plus `scripts/check_panic_policy.py` in `make lint` (#242). See
+//!   `doc/panic-boundaries.md`.
 //!
 //! ## What's New in Version 0.13.0
 //!

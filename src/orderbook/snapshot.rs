@@ -1,5 +1,8 @@
 //! Order book snapshot for market data
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use bitflags::bitflags;
 use pricelevel::PriceLevelSnapshot;
 use serde::{Deserialize, Serialize};

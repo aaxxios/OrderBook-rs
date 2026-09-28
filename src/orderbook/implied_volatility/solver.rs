@@ -3,6 +3,9 @@
 //! This module provides a numerical solver to find the implied volatility
 //! that makes the Black-Scholes price equal to the observed market price.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects)]
+
 use super::black_scholes::BlackScholes;
 use super::error::IVError;
 use super::types::IVParams;

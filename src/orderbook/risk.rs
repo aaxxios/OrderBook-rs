@@ -27,6 +27,9 @@
 //! future per-account market-order rate limiter without breaking the
 //! call shape.
 
+// panic-policy-ratchet: see #242, removed by the fix issue
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 use crate::orderbook::error::OrderBookError;
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
@@ -658,6 +661,8 @@ impl RiskState {
 }
 
 #[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use pricelevel::Id;
