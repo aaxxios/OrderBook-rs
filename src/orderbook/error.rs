@@ -22,8 +22,10 @@ pub enum OrderBookError {
         price: u128,
         /// Side of the order
         side: Side,
-        /// Best opposite price
-        opposite_price: u128,
+        /// Best opposite price, in price ticks; `None` when the opposite
+        /// side emptied before the error was built (before 0.14.0 this
+        /// case read `0`, #247).
+        opposite_price: Option<u128>,
     },
 
     /// Insufficient liquidity for market order
@@ -298,6 +300,12 @@ pub enum OrderBookError {
     /// `OrderStatus::Cancelled { filled_quantity: executed_quantity,
     /// reason: CancelReason::MatchAborted }`.
     ///
+    /// Returned by `update_order`, it also means the modify's original was
+    /// already cancelled: the aborted sweep was its re-add, which traded
+    /// before the level failed, so the original cannot be restored (#247).
+    /// For such a re-add the terminal state's `filled_quantity` is
+    /// cumulative (the original's tracked fills plus `executed_quantity`).
+    ///
     /// Carries primitive and upstream types only, so this module stays a
     /// leaf: the committed trades themselves travel through the listeners
     /// and, for a journal, through `SubmitFailure::committed`. Maps to the
@@ -335,6 +343,69 @@ pub enum OrderBookError {
         /// The failure the level reported after the removal. Boxed so the
         /// variant does not widen every `Result<_, OrderBookError>`.
         source: Box<PriceLevelError>,
+    },
+
+    /// A cancel-then-add modify (`UpdatePrice`, `UpdatePriceAndQuantity`,
+    /// `Replace`) cancelled the original, the re-add then failed before any
+    /// trade, and the original was **restored** (#247).
+    ///
+    /// Every admission check runs before the cancel, so this only follows a
+    /// failure the book could not predict: a concurrent mutation under the
+    /// shared submit gate, or a price level or allocation failing. The
+    /// original rests again with the same id, price, quantity and
+    /// timestamp, and its order state is restored, but at the **back** of
+    /// its level's queue: its time priority is lost. The cancel and re-add
+    /// level events were emitted. Maps to the stable wire code
+    /// `RejectReason::ModifyRolledBack`.
+    ModifyRolledBack {
+        /// The order whose modify was rolled back; it rests again.
+        order_id: pricelevel::Id,
+        /// Why the re-add failed.
+        source: Box<OrderBookError>,
+    },
+
+    /// A cancel-then-add modify cancelled the original and the re-add
+    /// failed; the order **is gone** (#247).
+    ///
+    /// Either the re-added order traded and then failed (its trades are
+    /// real, `executed_quantity > 0`, `restore_error` is `None`; the
+    /// remainder did not rest), or it failed before trading and the
+    /// original could not be restored either (`restore_error` says why).
+    /// The book's indices hold no trace of the order and its state is
+    /// terminal (`Cancelled { RestFailed }` for a failed restore, unless a
+    /// live order now owns the id). A re-add sweep aborted by a failed
+    /// level after trading is reported as [`Self::MatchAborted`] instead,
+    /// as before. Maps to the stable wire code
+    /// `RejectReason::ModifyOrderLost`.
+    ModifyOrderLost {
+        /// The order that was lost.
+        order_id: pricelevel::Id,
+        /// Quantity the **re-added** order executed before failing, in
+        /// quantity units; the original's earlier fills are not included.
+        /// The order's terminal state carries the cumulative figure.
+        executed_quantity: u64,
+        /// Why the re-add failed.
+        source: Box<OrderBookError>,
+        /// Why the original could not be restored; `None` when the re-add
+        /// traded, which rules a restore out.
+        restore_error: Option<Box<OrderBookError>>,
+    },
+
+    /// The order a `UpdatePriceAndQuantity` / `Replace` modify read had
+    /// changed by the time the modify cancelled it (#247): a concurrent
+    /// taker filled part of it, or a concurrent quantity update resized it,
+    /// under the shared submit gate. The caller named the new quantity
+    /// against a state that no longer exists, so the modify is not applied.
+    /// Only ever the `source` of [`Self::ModifyRolledBack`] (the remainder
+    /// is restored) or [`Self::ModifyOrderLost`] (it could not be).
+    /// `UpdatePrice` does not raise it: it re-adds the cancelled remainder.
+    OrderChangedDuringModify {
+        /// The modified order.
+        order_id: pricelevel::Id,
+        /// Total quantity when the modify read the order, in quantity units.
+        read_quantity: u64,
+        /// Total quantity the cancel removed, in quantity units.
+        cancelled_quantity: u64,
     },
 
     /// A taker's fee could not be computed exactly under the configured
@@ -450,12 +521,16 @@ impl fmt::Display for OrderBookError {
                 price,
                 side,
                 opposite_price,
-            } => {
-                write!(
+            } => match opposite_price {
+                Some(opposite_price) => write!(
                     f,
                     "Price crossing: {side} {price} would cross opposite at {opposite_price}"
-                )
-            }
+                ),
+                None => write!(
+                    f,
+                    "Price crossing: {side} {price} would cross the opposite side"
+                ),
+            },
             OrderBookError::InsufficientLiquidity {
                 side,
                 requested,
@@ -613,6 +688,37 @@ impl fmt::Display for OrderBookError {
                     "order {order_id} was removed but its price level then failed: {source}"
                 )
             }
+            OrderBookError::OrderChangedDuringModify {
+                order_id,
+                read_quantity,
+                cancelled_quantity,
+            } => {
+                write!(
+                    f,
+                    "order {order_id} changed during the modify: read with {read_quantity} units, cancelled with {cancelled_quantity}"
+                )
+            }
+            OrderBookError::ModifyRolledBack { order_id, source } => {
+                write!(
+                    f,
+                    "modify rolled back: re-adding order {order_id} failed before any trade and the original was restored at the back of its level: {source}"
+                )
+            }
+            OrderBookError::ModifyOrderLost {
+                order_id,
+                executed_quantity,
+                source,
+                restore_error,
+            } => match restore_error {
+                Some(restore_error) => write!(
+                    f,
+                    "modify lost order {order_id}: the re-add failed ({source}) and the original could not be restored ({restore_error})"
+                ),
+                None => write!(
+                    f,
+                    "modify lost order {order_id}: the re-add executed {executed_quantity} and then failed; remainder cancelled: {source}"
+                ),
+            },
             OrderBookError::FeeOverflow {
                 notional,
                 bps,
@@ -670,6 +776,8 @@ impl std::error::Error for OrderBookError {
         match self {
             OrderBookError::MatchAborted { source, .. }
             | OrderBookError::OrderRemovedWithLevelFault { source, .. } => Some(source.as_ref()),
+            OrderBookError::ModifyRolledBack { source, .. }
+            | OrderBookError::ModifyOrderLost { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -805,7 +913,7 @@ mod tests {
         let error = OrderBookError::PriceCrossing {
             price: 100,
             side: Side::Buy,
-            opposite_price: 99,
+            opposite_price: Some(99),
         };
         let cloned = error.clone();
         assert!(matches!(
@@ -813,7 +921,7 @@ mod tests {
             OrderBookError::PriceCrossing {
                 price: 100,
                 side: Side::Buy,
-                opposite_price: 99
+                opposite_price: Some(99)
             }
         ));
     }

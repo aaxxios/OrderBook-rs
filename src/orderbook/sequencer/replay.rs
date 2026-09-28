@@ -526,8 +526,14 @@ where
     ///   in which the reconstructed book trades past the point where the
     ///   live one stopped. See `doc/panic-boundaries.md`. An `UpdateOrder` journaled as `RejectedWithCode` under
     ///   [`RejectReason::MatchAborted`] (its re-add aborted after the
-    ///   original was cancelled) is likewise re-executed and reconciled by
-    ///   code.
+    ///   original was cancelled), [`RejectReason::ModifyRolledBack`] (its
+    ///   re-add failed after the cancel and the original was restored at
+    ///   the back of its level) or [`RejectReason::ModifyOrderLost`] (the
+    ///   order is gone, #247) is likewise re-executed and reconciled by
+    ///   code. Those failures come from a concurrent mutation or a resource
+    ///   the journal does not carry, so the re-execution normally succeeds
+    ///   and replay stops with [`ReplayError::OutcomeMismatch`]: loud, never
+    ///   a silent divergence.
     /// - A submit journaled as the string-only [`SequencerResult::Rejected`]
     ///   is skipped, as it always was: without a code replay cannot tell a
     ///   pure rejection from one that traded first, so such a journal keeps
@@ -536,7 +542,8 @@ where
     ///   (`SequencerResult::from(&OrderBookError)`).
     /// - Every other rejected command is skipped, including one flagged
     ///   `may_have_mutated`. That is sound for `CancelOrder` and for an
-    ///   `UpdateOrder` not rejected under `MatchAborted`: the modify paths
+    ///   `UpdateOrder` not rejected under `MatchAborted`,
+    ///   `ModifyRolledBack` or `ModifyOrderLost`: the modify paths
     ///   validate before touching the book, a cancel whose level refuses
     ///   the removal mutates nothing, and a cancel whose level committed
     ///   the removal before failing is journaled as `OrderCancelled`, not
@@ -1048,7 +1055,9 @@ where
         );
         // #240: an update whose re-add aborted mid-sweep after the original
         // was cancelled changed the book although it failed, so it is
-        // re-executed like a submit and reconciled by code.
+        // re-executed like a submit and reconciled by code. #247: so is one
+        // whose re-add failed after the cancel and was rolled back (the
+        // original moved to the back of its level) or lost the order.
         let is_update = matches!(event.command, SequencerCommand::UpdateOrder(_));
         // The reject code the journal recorded for a submit replay
         // re-executes; `None` for a journaled success.
@@ -1061,7 +1070,13 @@ where
                 ..
             } => {
                 Self::check_stp_mode(book, event, *stp_mode)?;
-                let replays_update = is_update && *code == RejectReason::MatchAborted;
+                let replays_update = is_update
+                    && matches!(
+                        code,
+                        RejectReason::MatchAborted
+                            | RejectReason::ModifyRolledBack
+                            | RejectReason::ModifyOrderLost
+                    );
                 if !(is_submit || replays_update)
                     || !Self::replays_rejection(*code, *may_have_mutated)
                 {
@@ -1113,9 +1128,10 @@ where
                 }
             }
             SequencerCommand::UpdateOrder(update) => {
-                // Only a journaled `MatchAborted` rejection reaches here
-                // with `recorded` set (see above); a journaled success is
-                // reconciled exactly as before.
+                // Only a journaled `MatchAborted`, `ModifyRolledBack` or
+                // `ModifyOrderLost` rejection reaches here with `recorded`
+                // set (see above); a journaled success is reconciled exactly
+                // as before.
                 Self::reconcile_submit(event, recorded, book.update_order(*update).map(|_| ()))?;
             }
             SequencerCommand::MarketOrder { id, quantity, side } => {

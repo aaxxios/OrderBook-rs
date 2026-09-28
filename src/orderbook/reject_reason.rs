@@ -60,6 +60,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `CounterExhausted`       | 17  |
 /// | `FeeOverflow`            | 18  |
 /// | `NotionalOverflow`       | 19  |
+/// | `ModifyRolledBack`       | 20  |
+/// | `ModifyOrderLost`        | 21  |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -120,6 +122,18 @@ pub enum RejectReason {
     /// does not fit `u128`; rejected before the book changed (#244).
     /// Carried by `OrderBookError::NotionalOverflow`.
     NotionalOverflow = 19,
+    /// A cancel-then-add modify's re-add failed before any trade after the
+    /// original was cancelled; the original was restored at the back of
+    /// its level (#247). Carried by `OrderBookError::ModifyRolledBack`.
+    /// The order is live and unchanged, so protocol adapters answer the
+    /// modify as a plain reject (FIX `35=9`), but its time priority was
+    /// lost: report that priority change separately.
+    ModifyRolledBack = 20,
+    /// A cancel-then-add modify's re-add failed after the original was
+    /// cancelled and the order is gone: it traded first, or the original
+    /// could not be restored (#247). Carried by
+    /// `OrderBookError::ModifyOrderLost`.
+    ModifyOrderLost = 21,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -155,6 +169,8 @@ impl RejectReason {
             Self::CounterExhausted => 17,
             Self::FeeOverflow => 18,
             Self::NotionalOverflow => 19,
+            Self::ModifyRolledBack => 20,
+            Self::ModifyOrderLost => 21,
             Self::Other(code) => code,
         }
     }
@@ -186,6 +202,8 @@ impl RejectReason {
             17 => Self::CounterExhausted,
             18 => Self::FeeOverflow,
             19 => Self::NotionalOverflow,
+            20 => Self::ModifyRolledBack,
+            21 => Self::ModifyOrderLost,
             other => Self::Other(other),
         }
     }
@@ -242,6 +260,8 @@ impl std::fmt::Display for RejectReason {
             Self::CounterExhausted => write!(f, "counter exhausted"),
             Self::FeeOverflow => write!(f, "fee overflow"),
             Self::NotionalOverflow => write!(f, "notional overflow"),
+            Self::ModifyRolledBack => write!(f, "modify rolled back"),
+            Self::ModifyOrderLost => write!(f, "modify lost the order"),
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -292,6 +312,9 @@ impl From<&OrderBookError> for RejectReason {
             }
             OrderBookError::FeeOverflow { .. } => Self::FeeOverflow,
             OrderBookError::NotionalOverflow { .. } => Self::NotionalOverflow,
+            OrderBookError::ModifyRolledBack { .. } => Self::ModifyRolledBack,
+            OrderBookError::ModifyOrderLost { .. } => Self::ModifyOrderLost,
+            OrderBookError::OrderChangedDuringModify { .. } => Self::Other(0),
             OrderBookError::PriceLevelError(_) => Self::Other(0),
             OrderBookError::OrderNotFound(_) => Self::Other(0),
             OrderBookError::InvalidOperation { .. } => Self::Other(0),
@@ -322,7 +345,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 19] {
+    fn named_variants() -> [RejectReason; 21] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -343,6 +366,8 @@ mod tests {
             RejectReason::CounterExhausted,
             RejectReason::FeeOverflow,
             RejectReason::NotionalOverflow,
+            RejectReason::ModifyRolledBack,
+            RejectReason::ModifyOrderLost,
         ]
     }
 
@@ -367,6 +392,44 @@ mod tests {
         assert_eq!(RejectReason::CounterExhausted.as_u16(), 17);
         assert_eq!(RejectReason::FeeOverflow.as_u16(), 18);
         assert_eq!(RejectReason::NotionalOverflow.as_u16(), 19);
+        assert_eq!(RejectReason::ModifyRolledBack.as_u16(), 20);
+        assert_eq!(RejectReason::ModifyOrderLost.as_u16(), 21);
+    }
+
+    /// #247: both modify re-add outcomes have their own codes, round trip
+    /// through `from_u16`, and expose the re-add error as their source.
+    #[test]
+    fn test_from_order_book_error_maps_the_modify_readd_variants() {
+        let source = || {
+            Box::new(OrderBookError::DuplicateOrderId {
+                order_id: Id::from_u64(1),
+            })
+        };
+        let rolled_back = OrderBookError::ModifyRolledBack {
+            order_id: Id::from_u64(1),
+            source: source(),
+        };
+        assert_eq!(
+            RejectReason::from(&rolled_back),
+            RejectReason::ModifyRolledBack
+        );
+        let lost = OrderBookError::ModifyOrderLost {
+            order_id: Id::from_u64(1),
+            executed_quantity: 0,
+            source: source(),
+            restore_error: Some(source()),
+        };
+        assert_eq!(RejectReason::from(&lost), RejectReason::ModifyOrderLost);
+        for (code, text) in [(20u16, "modify rolled back"), (21, "modify lost the order")] {
+            let reason = RejectReason::from_u16(code);
+            assert!(!matches!(reason, RejectReason::Other(_)), "{code} is named");
+            assert_eq!(reason.as_u16(), code);
+            assert_eq!(reason.to_string(), text);
+        }
+        assert!(std::error::Error::source(&rolled_back).is_some());
+        assert!(std::error::Error::source(&lost).is_some());
+        assert!(rolled_back.to_string().contains("restored"));
+        assert!(lost.to_string().contains("could not be restored"));
     }
 
     /// #244: the untouched fee / notional rejections have their own codes.
@@ -545,7 +608,7 @@ mod tests {
         let err = OrderBookError::PriceCrossing {
             price: 100,
             side: Side::Buy,
-            opposite_price: 99,
+            opposite_price: Some(99),
         };
         assert_eq!(RejectReason::from(&err), RejectReason::PostOnlyWouldCross);
     }

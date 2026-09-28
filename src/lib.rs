@@ -224,6 +224,20 @@
 //!   purge use checked forms; the tracker recovers a poisoned eviction queue,
 //!   keeps each order's status and history in one entry and evicts it
 //!   atomically with `DashMap::remove_if`.
+//! - **Modifications stop swallowing mutation errors (#247).**
+//!   `update_order(OrderUpdate::Cancel)` is the same removal as
+//!   `cancel_order` (errors propagated, `Cancelled` state, risk released).
+//!   A cancel-then-add modify whose re-add fails after the cancel restores
+//!   the original at the back of its level (`OrderBookError::ModifyRolledBack`,
+//!   code 20) or, if it traded or cannot be restored, reports it gone with
+//!   consistent indices (`ModifyOrderLost`, code 21); replay re-executes both.
+//!   A remainder that cannot rest after trades ends
+//!   `Cancelled { RestFailed }`, and a failed self-trade-prevention maker
+//!   cancel aborts the sweep (`MatchAborted`). `OrderQuantity::total_quantity`
+//!   is checked and `PriceCrossing::opposite_price` is an `Option`. A modify
+//!   never creates quantity when a fill races it, never restores into a
+//!   locked book, and keeps `filled_quantity` cumulative; an emptied price
+//!   level is never removed while a concurrent submit is admitting into it.
 //!
 //! ### Migration from 0.13
 //!
@@ -298,6 +312,15 @@
 //! | `OrderBookError` (no counter-exhaustion / crossed-restore variant) | adds `EngineSeqExhausted { engine_seq }`, `SnapshotCrossed { best_bid, best_ask }` (wire code `Other(0)`) |
 //! | restore of a crossed / locked snapshot or a package with `engine_seq == u64::MAX`: accepted | rejected before any live state is touched |
 //! | `OrderBook::spread()` / `spread_bps()` / `OrderBookSnapshot::spread()` on a crossed read: `Some(0)` | `None` |
+//! | `OrderQuantity::total_quantity() -> u64` (saturating) | `-> Result<u64, OrderBookError>` (`QuantityOverflow`) |
+//! | `OrderBookError::PriceCrossing { opposite_price: u128 }` (`0` when empty) | `opposite_price: Option<u128>` |
+//! | `update_order(Cancel)`: level error ignored, indices removed anyway | same removal as `cancel_order`; errors propagated |
+//! | modify re-add failing after the cancel: `Err(..)`, original lost | `Err(ModifyRolledBack { .. })` (original restored, back of queue) or `Err(ModifyOrderLost { .. })` |
+//! | `RejectReason` codes 1 to 19 | adds `ModifyRolledBack` (20), `ModifyOrderLost` (21) |
+//! | `CancelReason` (9 variants) | adds `RestFailed` (exhaustive matches need an arm) |
+//! | remainder not rested after trades: no terminal state | `Cancelled { filled_quantity, reason: RestFailed }` |
+//! | modify after a concurrent partial fill: re-add rested the quantity read before it | `UpdatePrice` moves the remainder; `UpdatePriceAndQuantity` / `Replace`: `Err(ModifyRolledBack { source: OrderChangedDuringModify, .. })` |
+//! | re-priced partially filled order: state reset to `Open` | `PartiallyFilled` with cumulative quantities |
 //!
 //! Re-exported pricelevel items change with pricelevel 0.10:
 //! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

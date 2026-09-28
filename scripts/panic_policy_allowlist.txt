@@ -13,5 +13,3 @@
 # unwrap_err, expect, expect_err, get_unwrap, process_exit, process_abort,
 # saturating_wrapping, indexing_slicing.
 
-src/orderbook/modifications.rs:debug_assert:3
-src/orderbook/modifications.rs:saturating_wrapping:15

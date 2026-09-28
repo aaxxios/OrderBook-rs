@@ -348,6 +348,141 @@ unreachable for the trades it commits:
   `orderbook_match_fold_failures_total`), which therefore covers both
   un-foldable level prefixes (#240) and un-buildable trade results (#244).
 
+## Modify rollback and lost orders (#247)
+
+`UpdatePrice`, `UpdatePriceAndQuantity` and `Replace` are cancel-then-add.
+Every admission check runs on the projected order **before** the original
+is cancelled (shape, trade-id and fee / notional preflights, modify-aware
+risk, the #168 STP self-cross and #230 reserve-residual dry runs), and the
+re-add takes that verdict as its admission: it does not re-run the kill
+switch, the risk limits or the shape checks, so a kill switch engaged, a
+risk limit consumed or a clock tick between the checks and the re-add
+cannot fail it. A re-add can still fail after the cancel on a concurrent
+mutation under the shared submit gate (the id taken by another submit, a
+post-only now crossing) or a resource the book cannot observe beforehand
+(a level refusing the admission, a refused allocation, a sweep abort). The
+book resolves every such failure instead of losing the order silently:
+
+- **`OrderBookError::ModifyRolledBack` (reject code 20).** The re-add
+  failed before any trade. The original is re-rested with the same id,
+  price, quantity (as it was when cancelled) and timestamp, its risk
+  contribution is reserved again, special-order tracking is re-registered
+  and its order state is set back to what it was before the modify
+  (`Open` when it had none). It rests at the **back** of its level's queue:
+  pricelevel 0.10 assigns a fresh insertion sequence and has no public way
+  to reinstate the old one, so **time priority is lost**. The cancel and
+  re-add level events were emitted. `source` carries the re-add's error.
+- **`OrderBookError::ModifyOrderLost` (reject code 21).** The order is
+  gone, with every index consistent (no location, user-index or risk entry;
+  any level the attempt created is removed). Two shapes:
+  - the re-add traded and then failed (its remainder could not rest, or
+    self-trade prevention cancelled it): `executed_quantity > 0`,
+    `restore_error: None`. The trades are real, so restoring the original
+    would double-count them. A re-add sweep aborted by a failed level after
+    trading keeps reporting `MatchAborted` (#240) instead;
+  - the re-add failed before trading and the restore failed too:
+    `executed_quantity == 0`, `restore_error` says why.
+- **`CancelReason::RestFailed`.** The terminal state of an order the book
+  could not rest after accepting it: a lost modify whose restore failed
+  (`Cancelled { filled_quantity: prior fills, RestFailed }`), and any submit
+  whose remainder the level or the risk reservation refused after the sweep
+  traded (`Cancelled { filled_quantity: executed, RestFailed }`; a taker
+  that did not trade is `Rejected` under the error's code). No state is
+  recorded when the failure is a duplicate id: that id's state belongs to
+  the live order that owns it.
+
+The restore only rests, it never matches. Under the shared gate an
+opposite order can arrive between the cancel and the restore at a price
+the original now crosses or locks (a post-only bid at 100 re-priced to 101,
+a sell resting at 100 meanwhile, the re-add refused as post-only); resting
+the original there would have the engine itself create a locked or crossed
+book. The restore is then refused with `PriceCrossing` and the order is
+reported lost (`restore_error: PriceCrossing`, `Cancelled { RestFailed }`).
+
+A concurrent taker can also fill part of the order between the modify's
+read and its cancel. The re-add is built from the order the cancel
+**returned**, never from the earlier read, so no quantity is created:
+`UpdatePrice` moves the cancelled remainder; `UpdatePriceAndQuantity` and
+`Replace`, whose explicit quantity was chosen against a state that no
+longer exists, restore the remainder and return `ModifyRolledBack` with
+source `OrderChangedDuringModify` (the conservative option: the caller
+decides what to do with the smaller order).
+
+`filled_quantity` is cumulative in every state a re-add records (the fills
+the order-state tracker knew for the original, plus fills that raced the
+modify, plus the re-add's own). `ModifyOrderLost::executed_quantity` is the
+re-add's fills only. The tracker does not record a resting maker's partial
+fills, so "known fills" means what it recorded (a taker's pre-rest fills),
+the same convention every cancel follows.
+
+Order-state listener sequence on a rollback: `Cancelled { UserRequested }`
+for the cancel, then the restored status. A re-add failure the modify
+resolves records no `Rejected` state or reject metric of its own; a
+failure raised inside the re-add's sweep (a self-trade-prevention cancel
+with no fill, a failed post-only probe, an abort with an empty prefix) is
+recorded by the sweep and then overwritten by the restored status. For a
+protocol adapter a rollback answers the modify as a plain reject (FIX
+`35=9`, order unchanged), but the order lost its time priority, which the
+adapter must report separately.
+
+A cancel that finds the order already gone (filled or cancelled
+concurrently) returns `Ok(None)` and re-adds nothing. The fill-or-kill
+guard on the re-add is a typed `InvalidOperation` raised before the
+cancel. The self-trade-prevention maker cancel (`CancelMaker` /
+`CancelBoth`) resolves a level failure like #248's single-order cancel
+(the maker still rests, or the book completes the removal) and then stops
+the sweep with the #240 abort semantics.
+
+**Replay.** `SequencerResult::from(&err)` records both variants as
+`RejectedWithCode` with `may_have_mutated: true`, and replay re-executes an
+`UpdateOrder` journaled under code 20 or 21 (as under `MatchAborted`)
+instead of skipping it, since the live book did change. Their causes (a
+concurrent mutation, a level or allocator failure) are not in the journal,
+so the re-execution normally succeeds and replay stops with
+`ReplayError::OutcomeMismatch` **by design**: loud, never a silent
+divergence. A sequencer feeding a single writer only meets them on
+resource failures.
+
+**Known limitation.** Replay stops at any journal containing a rollback or
+a lost-order modify whose cause does not reproduce on the replay book,
+which is every cause except a deterministic resource failure. Such a
+journal is replayable only up to that event; recover from a snapshot taken
+after it.
+
+## Empty price-level removal (#247)
+
+A level that becomes empty is removed from the bid / ask map by the
+single-order cancel, the in-place `UpdateQuantity`, the sweep's drain of
+emptied levels and the cleanup of a failed rest. Under the shared submit
+gate a concurrent submit can admit into the same `Arc<PriceLevel>` after
+the remover saw it empty; an unconditional `SkipMap::remove` then unlinked
+the level with that live order inside, indexed in `order_locations` but
+unreachable through `bids` / `asks`.
+
+Design: a striped per-price `std::sync::RwLock<()>` (`OrderBook::level_locks`,
+64 stripes by `price % 64`). Every admission into a level (`get_or_insert`
+plus `PriceLevel::add_order`) takes the stripe's **shared** side, so
+admissions at the same price still run in parallel; removing an emptied
+level takes the **exclusive** side and re-reads the level under it
+(`OrderBook::remove_level_if_empty`): the entry is removed only if it is
+still empty, so a refilled level, or one removed and re-created by someone
+else, is left in place. Matching and in-place updates never add orders and
+take no stripe. A guard is held for one level operation only, never across
+a sweep, a listener call or another lock, and never upgraded (a failed
+rest drops its shared guard before its cleanup takes the exclusive one), so
+the stripes cannot deadlock. Poisoning can only follow a panic that
+unwound while a guard was held; the data is `()`, so the guard is
+recovered and the poison logged at `ERROR`, as for the submit gate. Mass
+cancels and eviction run under the exclusive submit gate and were already
+safe.
+
+Cost, measured against main with three interleaved rounds: a first design
+with a `Mutex` per stripe serialised admissions at a hot price
+(`concurrent_add_limit_orders` 1.7x to 4.5x slower at 2 to 16 threads, all
+adding at one price); the shared side keeps concurrent admissions at
+main's speed. Single-threaded adds pay one uncontended shared acquire and
+release per rested order, and a removed level one exclusive acquire.
+
 ## Ratchet
 
 Three ledgers, all mechanically enforced (`make lint`), all shrink-only:

@@ -62,6 +62,13 @@ pub enum CancelReason {
     /// Appended last so the positional (bincode) index of every earlier
     /// variant is unchanged.
     MatchAborted,
+    /// The book could not rest the order after accepting it (#247): the
+    /// price level or the per-account risk reservation refused its
+    /// remainder after the sweep, or a cancel-then-add modify could neither
+    /// re-add nor restore it. `filled_quantity` is what the order executed.
+    /// Appended last so the positional (bincode) index of every earlier
+    /// variant is unchanged.
+    RestFailed,
 }
 
 impl std::fmt::Display for CancelReason {
@@ -76,6 +83,7 @@ impl std::fmt::Display for CancelReason {
             Self::MassCancelByPriceRange => write!(f, "mass cancel by price range"),
             Self::InsufficientLiquidity => write!(f, "insufficient liquidity"),
             Self::MatchAborted => write!(f, "match aborted"),
+            Self::RestFailed => write!(f, "rest failed"),
         }
     }
 }

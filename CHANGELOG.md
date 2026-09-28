@@ -363,6 +363,71 @@ can now return `RiskMaxNotional`, `RiskMaxOpenOrders` or
 snapshot format change; realistic prices and quantities see no behaviour
 change.
 
+- **Modifications stop swallowing mutation errors (#247).**
+  - `update_order(OrderUpdate::Cancel)` ignored the level's answer and
+    removed the order's location and user-index entries anyway, leaving a
+    refused order resting but unreachable; it also never recorded the
+    `Cancelled` state, released the risk contribution or unregistered
+    special-order tracking. It now runs the same removal as `cancel_order`:
+    a refusal returns `Err(PriceLevelError)` with the order untouched, a
+    removal the level committed then failed completes and returns
+    `OrderRemovedWithLevelFault` (#248), and a success records
+    `Cancelled { UserRequested }` and releases risk.
+  - A cancel-then-add modify (`UpdatePrice`, `UpdatePriceAndQuantity`,
+    `Replace`) whose re-add failed after the original was cancelled lost the
+    order. The re-add now takes the validate-first verdict as its admission
+    (the kill-switch, risk-limit and shape checks are not re-run after the
+    cancel), and a failure that still happens (a concurrent mutation under
+    the shared gate, a failing level or allocation) is resolved: if nothing
+    traded, the original is restored with the same id, price, quantity and
+    timestamp at the **back** of its level (time priority lost) and the call
+    returns `OrderBookError::ModifyRolledBack`; if the restore fails too, or
+    the re-added order traded before failing, the call returns
+    `OrderBookError::ModifyOrderLost` and the indices hold no trace of the
+    order. A re-add sweep aborted by a failed level after trading still
+    returns `MatchAborted`. A modify whose cancel finds the order already
+    gone (filled concurrently) now returns `Ok(None)` instead of re-adding
+    it.
+  - A submit whose remainder could not be rested after irreversible trades
+    (level admission or risk reservation refused) returned `Err` with no
+    terminal state; the taker now ends
+    `Cancelled { filled_quantity, reason: RestFailed }` (or `Rejected`
+    when it did not trade).
+  - A self-trade-prevention maker cancel (`CancelMaker` / `CancelBoth`)
+    that the level failed was skipped silently and the sweep went on. It is
+    now resolved like a single-order cancel (the maker still rests, or the
+    removal is completed) and stops the sweep with the #240 abort
+    semantics: prefix published, taker `Cancelled { MatchAborted }`,
+    `Err(MatchAborted)`.
+  - The three `debug_assert!`s guarding the modify re-add against
+    fill-or-kill are a typed `InvalidOperation` raised before the cancel;
+    every `saturating_*` and raw arithmetic in `modifications.rs` is
+    checked or an exact case analysis. `modifications.rs` leaves both
+    panic-policy ledgers.
+  - Review of #285: a rolled-back modify never restores the original into
+    a crossed or locked book (an opposite order that arrived after the
+    cancel makes the restore fail with `PriceCrossing`: `ModifyOrderLost`,
+    `Cancelled { RestFailed }`). The re-add is built from the order the
+    cancel returned, so a concurrent fill between the modify's read and its
+    cancel no longer creates quantity (pre-existing on main): `UpdatePrice`
+    moves the remainder, `UpdatePriceAndQuantity` / `Replace` roll back
+    with source `OrderChangedDuringModify`. `filled_quantity` in every
+    state a re-add records is cumulative (the original's known fills plus
+    the re-add's), and a re-add failure the modify resolves records no
+    `Rejected` state or reject metric.
+- **Emptied price levels can no longer unlink a concurrent admission
+  (#247, Copilot on #285).** Under the shared submit gate the single-order
+  cancel, `UpdateQuantity`, the sweep's drain and a failed rest's cleanup
+  removed a level they had seen empty without re-checking, so an order a
+  concurrent submit admitted into it in between was left indexed but
+  unreachable (pre-existing on main). Admissions into a level and
+  removals of emptied levels now run under a striped per-price
+  reader-writer lock (admission shared, removal exclusive) and the removal
+  re-checks emptiness under it (`OrderBook::remove_level_if_empty`).
+  Concurrent admissions at the same price still run in parallel; cost is
+  one uncontended shared acquire per rested order and one exclusive
+  acquire per removed level.
+
 ### Changed
 
 - `tests/alloc_budget.rs` (feature `alloc-counters`) now asserts the median
@@ -449,6 +514,41 @@ change.
     fail replay loudly with `ReplayError::MassCancelMismatch` at the first
     such mass cancel instead of passing on equal counts. Re-record them, or
     replay them with a build before 0.14.
+
+- **Modification error contract (#247).** Compatibility:
+  - `OrderQuantity::total_quantity()`: `u64` (saturating) →
+    `Result<u64, OrderBookError>` (`QuantityOverflow` for an
+    unrepresentable two-tranche total). Values are unchanged for every
+    representable order; add `?` or handle the error.
+    `checked_total_quantity()` is unchanged.
+  - `OrderBookError::PriceCrossing::opposite_price`: `u128` →
+    `Option<u128>`; `None` where `0` used to stand for an opposite side
+    that emptied before the error was built.
+  - `OrderBookError` gains `ModifyRolledBack`, `ModifyOrderLost` and
+    `OrderChangedDuringModify` (only ever the source of the first two);
+    `RejectReason` gains `ModifyRolledBack` (20) and `ModifyOrderLost`
+    (21); `CancelReason` gains `RestFailed`, appended last so the bincode
+    index of every earlier variant is unchanged (exhaustive matches on
+    `CancelReason` need a new arm). Existing codes do not move.
+  - `InsufficientLiquidity` from an IOC remainder now carries the taker's
+    total as `requested` and its executed quantity as `available`; both
+    were read off the visible tranche before, so only two-tranche IOC
+    takers see different numbers.
+  - Behaviour: `update_order(Cancel)` now records `Cancelled
+    { UserRequested }` and releases the order's risk contribution, like
+    `cancel_order`. A re-priced order keeps its fill history: its state is
+    `PartiallyFilled` with cumulative quantities instead of resetting to
+    `Open`. A modify re-add is no longer rejected by a kill switch
+    engaged, or a risk limit consumed, after the modify's own checks
+    passed.
+  - Replay: `SequencerResult::from(&err)` records both new variants as
+    `RejectedWithCode` with `may_have_mutated: true`, and replay
+    re-executes an `UpdateOrder` journaled under code 20 or 21 (as it does
+    under `MatchAborted`) instead of skipping it. Their causes are not in
+    the journal, so replay normally stops with
+    `ReplayError::OutcomeMismatch`: loud, never a silent divergence. No
+    snapshot, journal or wire format change;
+    `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` stays 4.
 
 - **pricelevel upgraded to 0.10 (#239).** The crate version moves to
   0.14.0. pricelevel 0.10 makes level snapshots, queue views, dry runs and

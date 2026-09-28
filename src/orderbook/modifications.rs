@@ -1,6 +1,3 @@
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::matching::MatchOutcome;
@@ -22,17 +19,18 @@ pub trait OrderQuantity<T = ()> {
     /// For iceberg orders, this is the visible quantity.
     fn quantity(&self) -> u64;
 
-    /// Returns the total quantity of the order (e.g., visible + hidden).
+    /// Returns the total quantity of the order (visible + hidden for the
+    /// two-tranche kinds, the single quantity otherwise), in quantity units.
     ///
-    /// Saturates on `visible + hidden` overflow for the two-tranche kinds.
-    /// Every order admitted through `add_order` / the submit APIs / the
-    /// validate-first modify path has already passed
-    /// [`Self::checked_total_quantity`] validation (#210), so the
-    /// saturating arm is unreachable for those book-resident orders; use
-    /// the checked variant at admission boundaries. Snapshot restore
-    /// trusts its (checksummed) source and does not re-validate totals —
-    /// consistent with its existing saturating risk rebuild.
-    fn total_quantity(&self) -> u64;
+    /// # Errors
+    ///
+    /// [`OrderBookError::QuantityOverflow`] when `visible + hidden`
+    /// overflows `u64` for an iceberg or reserve order. Every order admitted
+    /// through `add_order`, the submit APIs or the validate-first modify
+    /// path has passed this check (#210), so it cannot fail for a
+    /// book-resident order. Before 0.14.0 this method saturated at
+    /// `u64::MAX` instead (#247).
+    fn total_quantity(&self) -> Result<u64, OrderBookError>;
 
     /// Returns the total quantity, or `None` when `visible + hidden`
     /// overflows `u64` for a two-tranche order (Iceberg / Reserve). The
@@ -124,32 +122,7 @@ impl<T> OrderQuantity<T> for OrderType<T> {
     }
 
     #[inline]
-    fn total_quantity(&self) -> u64 {
-        match self {
-            OrderType::Standard { quantity, .. } => quantity.as_u64(),
-            OrderType::IcebergOrder {
-                visible_quantity,
-                hidden_quantity,
-                ..
-            } => visible_quantity
-                .as_u64()
-                .saturating_add(hidden_quantity.as_u64()),
-            OrderType::PostOnly { quantity, .. } => quantity.as_u64(),
-            OrderType::TrailingStop { quantity, .. } => quantity.as_u64(),
-            OrderType::PeggedOrder { quantity, .. } => quantity.as_u64(),
-            OrderType::MarketToLimit { quantity, .. } => quantity.as_u64(),
-            OrderType::ReserveOrder {
-                visible_quantity,
-                hidden_quantity,
-                ..
-            } => visible_quantity
-                .as_u64()
-                .saturating_add(hidden_quantity.as_u64()),
-        }
-    }
-
-    #[inline]
-    fn checked_total_quantity(&self) -> Option<u64> {
+    fn total_quantity(&self) -> Result<u64, OrderBookError> {
         match self {
             OrderType::IcebergOrder {
                 visible_quantity,
@@ -162,8 +135,32 @@ impl<T> OrderQuantity<T> for OrderType<T> {
                 ..
             } => visible_quantity
                 .as_u64()
+                .checked_add(hidden_quantity.as_u64())
+                .ok_or_else(|| quantity_overflow(*visible_quantity, *hidden_quantity)),
+            _ => Ok(self.quantity()),
+        }
+    }
+
+    #[inline]
+    fn checked_total_quantity(&self) -> Option<u64> {
+        match self {
+            OrderType::Standard { quantity, .. }
+            | OrderType::PostOnly { quantity, .. }
+            | OrderType::TrailingStop { quantity, .. }
+            | OrderType::PeggedOrder { quantity, .. }
+            | OrderType::MarketToLimit { quantity, .. } => Some(quantity.as_u64()),
+            OrderType::IcebergOrder {
+                visible_quantity,
+                hidden_quantity,
+                ..
+            }
+            | OrderType::ReserveOrder {
+                visible_quantity,
+                hidden_quantity,
+                ..
+            } => visible_quantity
+                .as_u64()
                 .checked_add(hidden_quantity.as_u64()),
-            _ => Some(self.total_quantity()),
         }
     }
 
@@ -212,10 +209,16 @@ impl<T> OrderQuantity<T> for OrderType<T> {
                 // residual rests with at most one display tranche visible
                 // and the rest hidden — conservation by construction:
                 // visible + hidden == remaining_total.
+                // Exact split without arithmetic that could wrap: a
+                // remainder of at least one display tranche shows the
+                // display and hides the rest; a smaller one is all visible.
                 let display = visible_quantity.as_u64();
-                let visible = display.min(remaining_total);
+                let (visible, hidden) = match remaining_total.checked_sub(display) {
+                    Some(rest) => (display, rest),
+                    None => (remaining_total, 0),
+                };
                 *visible_quantity = Quantity::new(visible);
-                *hidden_quantity = Quantity::new(remaining_total - visible);
+                *hidden_quantity = Quantity::new(hidden);
             }
             OrderType::ReserveOrder { .. } => reduce_reserve_to_total(self, remaining_total),
         }
@@ -253,24 +256,40 @@ fn reduce_reserve_to_total<T>(order: &mut OrderType<T>, new_total_quantity: u64)
         ..
     } = order
     {
-        let original_total = visible_quantity
-            .as_u64()
-            .saturating_add(hidden_quantity.as_u64());
-        let amount_to_reduce = original_total.saturating_sub(new_total_quantity);
-
-        let vis = visible_quantity.as_u64();
-        let filled_from_visible = amount_to_reduce.min(vis);
-        *visible_quantity = Quantity::new(vis.saturating_sub(filled_from_visible));
-
-        let remaining_to_reduce = amount_to_reduce - filled_from_visible;
+        // Draw `total - new_total` from the visible tranche first, then
+        // from hidden, as an exact case analysis (#247), with no arithmetic
+        // that could wrap or saturate:
+        //
+        // - `new_total >= total`: nothing to reduce (a larger target is
+        //   never applied here, exactly as before);
+        // - `new_total >= hidden`: the reduction fits in the visible
+        //   tranche, which keeps `new_total - hidden`; hidden is untouched;
+        // - otherwise the visible tranche is emptied and hidden keeps
+        //   `new_total`.
+        //
+        // An unrepresentable `visible + hidden` is larger than any `u64`
+        // target, so it always reduces.
+        //
         // Hidden may only ever DECREASE here, and only by a lot-aligned
         // amount (the executed remainder is lot-rounded by the sweep): the
         // #226 lot-size admission check validates the replenishment transfer
         // once, against the hidden tranche as submitted, and
         // `min(amount, hidden)` stays lot-aligned only while hidden stays
         // lot-aligned and never grows.
-        *hidden_quantity =
-            Quantity::new(hidden_quantity.as_u64().saturating_sub(remaining_to_reduce));
+        let vis = visible_quantity.as_u64();
+        let hid = hidden_quantity.as_u64();
+        let reduces = vis
+            .checked_add(hid)
+            .is_none_or(|total| new_total_quantity < total);
+        if reduces {
+            match new_total_quantity.checked_sub(hid) {
+                Some(visible_left) => *visible_quantity = Quantity::new(visible_left),
+                None => {
+                    *visible_quantity = Quantity::new(0);
+                    *hidden_quantity = Quantity::new(new_total_quantity);
+                }
+            }
+        }
 
         // #230: `auto_replenish` governs this refresh exactly as it governs
         // a resting maker's in `pricelevel`'s `match_against`, including the
@@ -297,13 +316,25 @@ fn reduce_reserve_to_total<T>(order: &mut OrderType<T>, new_total_quantity: u64)
                 .map(|q| q.get())
                 .unwrap_or(DEFAULT_RESERVE_REPLENISH_AMOUNT.get())
                 .min(hidden_quantity.as_u64());
-            // Cannot saturate: `visible + refresh <= visible + hidden`, and
-            // admission rejects a two-tranche order whose `visible + hidden`
-            // overflows `u64` (#210). Both operands are lot-aligned, so the
-            // refreshed tranche is too.
-            *visible_quantity = Quantity::new(visible_quantity.as_u64().saturating_add(refresh));
-            // Decrease only, by the validated lot-aligned transfer, for the same reason as above.
-            *hidden_quantity = Quantity::new(hidden_quantity.as_u64().saturating_sub(refresh));
+            // `refresh <= hidden`, and after the reduction above
+            // `visible + hidden <= new_total_quantity`, a `u64`: both checked
+            // forms below always succeed (#247). Both operands are
+            // lot-aligned, so the refreshed tranche is too. Hidden only
+            // decreases, by the validated lot-aligned transfer.
+            if let (Some(visible), Some(hidden)) = (
+                visible_quantity.as_u64().checked_add(refresh),
+                hidden_quantity.as_u64().checked_sub(refresh),
+            ) {
+                *visible_quantity = Quantity::new(visible);
+                *hidden_quantity = Quantity::new(hidden);
+            } else {
+                tracing::error!(
+                    visible = visible_quantity.as_u64(),
+                    hidden = hidden_quantity.as_u64(),
+                    refresh,
+                    "reserve refresh out of range; tranches left unrefreshed"
+                );
+            }
         }
     }
 }
@@ -345,19 +376,108 @@ fn reserve_residual_would_be_discarded(
     visible_quantity: u64,
     crossable_quantity: u64,
     hidden_quantity: u64,
+    discarded_quantity: u64,
 ) -> OrderBookError {
     OrderBookError::ReserveResidualWouldBeDiscarded {
         order_id,
         visible_quantity,
         crossable_quantity,
         hidden_quantity,
-        // The residual the re-add would leave unmatched and then abandon.
-        // Cannot underflow: the caller only builds this error inside the
-        // band `crossable < visible + hidden`.
-        discarded_quantity: visible_quantity
-            .saturating_add(hidden_quantity)
-            .saturating_sub(crossable_quantity),
+        // The residual the re-add would leave unmatched and then abandon,
+        // `visible + hidden - crossable`, computed checked by the caller.
+        discarded_quantity,
     }
+}
+
+/// Build the [`OrderBookError::QuantityOverflow`] rejection of a two-tranche
+/// order whose `visible + hidden` does not fit `u64` (#210 / #247).
+#[cold]
+#[inline(never)]
+#[must_use]
+fn quantity_overflow(visible: Quantity, hidden: Quantity) -> OrderBookError {
+    OrderBookError::QuantityOverflow {
+        visible: visible.as_u64(),
+        hidden: hidden.as_u64(),
+    }
+}
+
+/// A resting order can never carry fill-or-kill, so a cancel-then-add
+/// modify never re-adds one: the modify's submit gate mode was chosen once
+/// at the boundary and a fill-or-kill window needs the exclusive gate. Kept
+/// as a typed pre-cancel rejection rather than an assertion (#247), so a
+/// future time-in-force change cannot silently void the #209 guarantee.
+#[cold]
+#[inline(never)]
+#[must_use]
+fn fill_or_kill_readd(order_id: Id) -> OrderBookError {
+    OrderBookError::InvalidOperation {
+        message: format!(
+            "order {order_id} cannot be re-added as fill-or-kill by a cancel-then-add modify"
+        ),
+    }
+}
+
+/// `PriceLevel::matchable_quantity` answered more than it was asked for.
+/// Its contract bounds the answer by the request, so this is an upstream
+/// invariant breach, reported before any mutation (#247).
+#[cold]
+#[inline(never)]
+#[must_use]
+fn matchable_exceeds_request(requested: u64, matchable: u64) -> OrderBookError {
+    OrderBookError::InvalidOperation {
+        message: format!(
+            "price level reported {matchable} matchable units for a request of {requested}"
+        ),
+    }
+}
+
+/// Lot rounding of `quantity` by `lot` could not be computed (#247).
+#[cold]
+#[inline(never)]
+#[must_use]
+fn lot_rounding_failed(quantity: u64, lot: u64) -> OrderBookError {
+    OrderBookError::InvalidOperation {
+        message: format!("cannot round quantity {quantity} down to lot size {lot}"),
+    }
+}
+
+/// Rounds `quantity` down to a whole multiple of `lot`, in quantity units,
+/// exactly like the sweep's per-level cap; `lot <= 1` leaves it unchanged.
+///
+/// # Errors
+/// Never for `lot > 1` (`quantity / lot * lot <= quantity`); the checked
+/// forms report a breach as [`OrderBookError::InvalidOperation`] instead of
+/// assuming it away (#247).
+#[inline]
+fn lot_floor(quantity: u64, lot: u64) -> Result<u64, OrderBookError> {
+    if lot <= 1 {
+        return Ok(quantity);
+    }
+    quantity
+        .checked_div(lot)
+        .and_then(|lots| lots.checked_mul(lot))
+        .ok_or_else(|| lot_rounding_failed(quantity, lot))
+}
+
+/// `remaining - matchable` for a dry-run step that asked for `requested`
+/// (`requested <= remaining`) and was answered `matchable`.
+///
+/// # Errors
+/// [`OrderBookError::InvalidOperation`] when the level answered more than
+/// it was asked for, an upstream contract breach (#247). Raised by the
+/// validate-first checks only, before the original order is touched.
+#[inline]
+fn consume_matchable(
+    remaining: u64,
+    requested: u64,
+    matchable: u64,
+) -> Result<u64, OrderBookError> {
+    if matchable > requested {
+        return Err(matchable_exceeds_request(requested, matchable));
+    }
+    remaining
+        .checked_sub(matchable)
+        .ok_or_else(|| matchable_exceeds_request(remaining, matchable))
 }
 
 /// The untouched rejection of a crossing taker when the book's trade-id
@@ -506,16 +626,73 @@ where
     /// shared, where the #168 self-cross dry run keeps its existing
     /// best-effort character.
     ///
-    /// # Aborted re-adds (#240)
+    /// # Failed re-adds (#240, #247)
     ///
     /// A re-price that crosses while the book's trade-id generator is
     /// exhausted is refused in the validate-first phase, **before** the
     /// original is cancelled: the original keeps resting and the call
-    /// returns `PriceLevelError(CapacityExceeded)` (reject code 16). Any
-    /// other price-level failure during the re-add's sweep happens **after**
-    /// the original was cancelled: the committed prefix is published, the
-    /// remainder does not rest, the call returns
-    /// [`OrderBookError::MatchAborted`], and the original order is gone.
+    /// returns `PriceLevelError(CapacityExceeded)` (reject code 16).
+    ///
+    /// The re-add takes the validate-first verdict as its admission: it
+    /// does not re-run the kill-switch, risk-limit or shape checks, so a
+    /// kill switch engaged, a clock tick or a risk limit consumed between
+    /// the checks and the re-add cannot fail it. What can still fail after
+    /// the original was cancelled is a concurrent mutation under the shared
+    /// gate (the id taken by another submit, a post-only now crossing) or a
+    /// resource the book cannot observe beforehand (a price level that
+    /// fails, a refused allocation). The outcome depends on whether the
+    /// re-added order traded first:
+    ///
+    /// - **Nothing traded**: the original is restored and the call returns
+    ///   [`OrderBookError::ModifyRolledBack`] carrying the re-add's error.
+    ///   It rests again with the same id, price, quantity (as it was when
+    ///   cancelled) and timestamp, and its order state is restored, but at
+    ///   the **back** of its price level's queue: pricelevel assigns a new
+    ///   insertion sequence and offers no way to reinstate the old one, so
+    ///   time priority is lost. The cancel and re-add events were emitted.
+    /// - **Nothing traded and the restore failed too**: the order is gone.
+    ///   The call returns [`OrderBookError::ModifyOrderLost`] with
+    ///   `restore_error` set; the indices hold no trace of the order and its
+    ///   state is `Cancelled { reason: RestFailed }` (unless another live
+    ///   order now owns the id). The restore only rests, never matches: if
+    ///   the original's price now crosses or locks the best opposite price
+    ///   (an opposite order arrived after the cancel), it is refused with
+    ///   `PriceCrossing` rather than letting the engine lock the book.
+    /// - **The re-add traded, then failed**: its trades are real and the
+    ///   original cannot be restored. A sweep aborted by a failed level
+    ///   returns [`OrderBookError::MatchAborted`] as before; any other
+    ///   failure (the residual could not be rested, self-trade prevention
+    ///   cancelled the remainder) returns [`OrderBookError::ModifyOrderLost`]
+    ///   with the executed quantity. The remainder never rests and the
+    ///   order ends in a terminal state.
+    ///
+    /// A cancel that finds the order already gone (filled or cancelled
+    /// concurrently) returns `Ok(None)` and re-adds nothing.
+    ///
+    /// # Concurrent fills during a modify (#247)
+    ///
+    /// Under the shared submit gate a taker can fill part of the order
+    /// between the modify's read and its cancel. The re-add is built from
+    /// what the cancel removed, never from the earlier read, so no quantity
+    /// is created: `UpdatePrice` moves the remaining quantity to the new
+    /// price; `UpdatePriceAndQuantity` and `Replace`, whose new quantity
+    /// was chosen against the old state, are not applied: the remainder is
+    /// restored (back of its level) and the call returns
+    /// [`OrderBookError::ModifyRolledBack`] with source
+    /// [`OrderBookError::OrderChangedDuringModify`].
+    ///
+    /// # Order state across a modify (#247)
+    ///
+    /// `filled_quantity` in every state the re-add records is cumulative:
+    /// the fills the tracker already knew for the original, plus fills that
+    /// raced the modify, plus the re-add's own. The original's cancel is
+    /// recorded as `Cancelled { UserRequested }`; a re-add failure the
+    /// modify resolves records no `Rejected` state or reject metric of its
+    /// own, so a rollback reads `Cancelled { UserRequested }` followed by
+    /// the restored status. A failure raised inside the re-add's sweep (a
+    /// self-trade-prevention cancel with no fill, a failed post-only probe,
+    /// an abort with an empty prefix) is recorded by the sweep and then
+    /// overwritten by the restored status.
     pub fn update_order(
         &self,
         update: OrderUpdate,
@@ -585,66 +762,12 @@ where
                         OrderType::ReserveOrder { price, .. } => *price = new_price,
                     }
 
-                    // Validate-first atomic modify (#98): validate the new
-                    // order's shape and run the modify-aware risk check
-                    // *before* removing the original. On any rejection we
-                    // return the typed error and the original order is
-                    // never cancelled — no book mutation, no events, no
-                    // trades. These checks are pure functions of the new
-                    // order + the opposite book side, so evaluating them
-                    // while the same-side original still rests yields the
-                    // same verdict as after cancel.
-                    let verdict = self.validate_order_shape(&new_order)?;
-                    self.check_risk_modify_admission(
+                    self.cancel_then_readd(
                         order_id,
-                        new_order.user_id(),
-                        new_order.price().as_u128(),
-                        new_order.total_quantity(),
-                    )?;
-
-                    // #168: reject a re-price that would self-cross the same
-                    // user's opposite-side liquidity under CancelTaker/CancelBoth
-                    // BEFORE cancelling the original, so the original survives.
-                    self.check_modify_stp_self_cross(&new_order)?;
-
-                    // #230: reject a re-price whose re-add would exhaust a
-                    // non-auto-replenishing reserve's visible tranche and
-                    // discard its hidden remainder, which would destroy the
-                    // order after the original was already cancelled.
-                    self.check_modify_reserve_residual(&new_order)?;
-
-                    // All checks passed: cancel the original and add the
-                    // updated order. `add_order` re-runs its own checks;
-                    // post-cancel the account count is restored so its risk
-                    // check passes — consistent with the pre-guard.
-                    // Ungated inner variants: `update_order` already holds
-                    // the submit gate (#209 / #225); the public wrappers
-                    // would re-acquire it (std RwLock is not reentrant).
-                    // The gate mode was chosen once at the boundary by
-                    // `modify_needs_exclusive_gate` — exclusive whenever STP
-                    // is engaged — and it is never upgraded here, so the
-                    // re-add must never be a fill-or-kill (whose
-                    // all-or-nothing window always requires the exclusive
-                    // gate, including on an `STPMode::None` book).
-                    // Unreachable today — an FOK never rests, so it can
-                    // never be modified — but enforced so a future TIF
-                    // change cannot silently void the #209 guarantee.
-                    debug_assert!(
-                        !new_order.is_fill_or_kill(),
-                        "a resting order can never carry FOK; the re-add cannot upgrade the gate"
-                    );
-                    self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    // #244: the arithmetic preflight already ran above,
-                    // before the cancel; the re-add must not fail it again.
-                    let result = self
-                        .add_order_inner(
-                            new_order,
-                            false,
-                            false,
-                            Some(verdict.arithmetic_verified_price),
-                        )?
-                        .0;
-                    Ok(Some(result))
+                        &original_order,
+                        new_order,
+                        ReAddQuantity::FollowsRemainder,
+                    )
                 } else {
                     Ok(None) // Order not found
                 }
@@ -669,9 +792,8 @@ where
                 // be nonzero and the hidden depth would keep filling; zero
                 // still cancels the whole order by contract, hidden depth
                 // included. Cancel through `cancel_order_with_reason`, the
-                // removal `OrderBook::cancel_order` performs (not the
-                // `OrderUpdate::Cancel` arm below, which is a separate
-                // implementation). This branch runs no validator at all — a
+                // removal `OrderBook::cancel_order` and, since #247, the
+                // `OrderUpdate::Cancel` arm below perform. This branch runs no validator at all — a
                 // removal has no shape to validate — so a configured
                 // `min_order_size` cannot veto it. Only `UpdateQuantity` has
                 // this removal semantic: `Replace` / `UpdatePriceAndQuantity`
@@ -724,11 +846,12 @@ where
                         let current = self.convert_from_unit_type(current_unit.as_ref());
                         let projected = current.with_reduced_quantity(new_quantity.as_u64());
                         self.validate_order_shape(&projected)?;
+                        let projected_total = projected.total_quantity()?;
                         self.check_risk_modify_admission(
                             order_id,
                             projected.user_id(),
                             price,
-                            projected.total_quantity(),
+                            projected_total,
                         )?;
 
                         // #243 review: pre-book an increase's notional
@@ -737,7 +860,7 @@ where
                         // mutation. Settled below once the level answers.
                         let risk_reservation = self
                             .risk_state
-                            .reserve_quantity_update(order_id, projected.total_quantity())?;
+                            .reserve_quantity_update(order_id, projected_total)?;
 
                         let update = OrderUpdate::UpdateQuantity {
                             order_id,
@@ -750,11 +873,27 @@ where
                         match price_level.update_order(update) {
                             Ok(Some(order)) => {
                                 // Keep the per-account risk counters in
-                                // lockstep with the applied update.
-                                self.risk_state.commit_quantity_update(
-                                    risk_reservation,
-                                    OrderQuantity::<()>::total_quantity(order.as_ref()),
-                                );
+                                // lockstep with the applied update. The
+                                // level stores the validated projection, so
+                                // its total is representable; should it not
+                                // be, the validated projection is booked
+                                // instead and the breach is logged (#247).
+                                let applied_total = match OrderQuantity::<()>::total_quantity(
+                                    order.as_ref(),
+                                ) {
+                                    Ok(total) => total,
+                                    Err(err) => {
+                                        tracing::error!(
+                                            %order_id,
+                                            projected_total,
+                                            error = %err,
+                                            "updated order total unrepresentable; risk booked at the validated projection"
+                                        );
+                                        projected_total
+                                    }
+                                };
+                                self.risk_state
+                                    .commit_quantity_update(risk_reservation, applied_total);
                                 // notify price level changes
                                 self.emit_level_changed(side, price_level);
                                 result = Some(Arc::new(self.convert_from_unit_type(&order)));
@@ -773,7 +912,7 @@ where
 
                     // If the price level is now empty, remove it
                     if is_empty {
-                        price_levels.remove(&price);
+                        self.remove_level_if_empty(side, price);
                         self.order_locations.remove(&order_id);
                         self.untrack_order_by_id(&order_id);
                     }
@@ -825,112 +964,25 @@ where
                     // keep hidden untouched, like `UpdateQuantity` (#221).
                     new_order.set_quantity(new_quantity.as_u64());
 
-                    // Validate-first atomic modify (#98): validate the new
-                    // order's shape and run the modify-aware risk check
-                    // *before* removing the original. On any rejection the
-                    // original order is never cancelled.
-                    let verdict = self.validate_order_shape(&new_order)?;
-                    self.check_risk_modify_admission(
+                    self.cancel_then_readd(
                         order_id,
-                        new_order.user_id(),
-                        new_order.price().as_u128(),
-                        new_order.total_quantity(),
-                    )?;
-
-                    // #168: reject a re-price that would self-cross the same
-                    // user's opposite-side liquidity under CancelTaker/CancelBoth
-                    // BEFORE cancelling the original, so the original survives.
-                    self.check_modify_stp_self_cross(&new_order)?;
-
-                    // #230: reject a re-price whose re-add would exhaust a
-                    // non-auto-replenishing reserve's visible tranche and
-                    // discard its hidden remainder, which would destroy the
-                    // order after the original was already cancelled.
-                    self.check_modify_reserve_residual(&new_order)?;
-
-                    // All checks passed: cancel the original and add the
-                    // updated order.
-                    // Ungated inner variants: `update_order` already holds
-                    // the submit gate (#209 / #225); the public wrappers
-                    // would re-acquire it (std RwLock is not reentrant).
-                    // The gate mode was chosen once at the boundary by
-                    // `modify_needs_exclusive_gate` — exclusive whenever STP
-                    // is engaged — and it is never upgraded here, so the
-                    // re-add must never be a fill-or-kill (whose
-                    // all-or-nothing window always requires the exclusive
-                    // gate, including on an `STPMode::None` book).
-                    // Unreachable today — an FOK never rests, so it can
-                    // never be modified — but enforced so a future TIF
-                    // change cannot silently void the #209 guarantee.
-                    debug_assert!(
-                        !new_order.is_fill_or_kill(),
-                        "a resting order can never carry FOK; the re-add cannot upgrade the gate"
-                    );
-                    self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    // #244: the arithmetic preflight already ran above,
-                    // before the cancel; the re-add must not fail it again.
-                    let result = self
-                        .add_order_inner(
-                            new_order,
-                            false,
-                            false,
-                            Some(verdict.arithmetic_verified_price),
-                        )?
-                        .0;
-                    Ok(Some(result))
+                        &original_order,
+                        new_order,
+                        ReAddQuantity::Explicit,
+                    )
                 } else {
                     Ok(None) // Order not found
                 }
             }
 
             OrderUpdate::Cancel { order_id } => {
-                // Get order location without locking
-                let location = self.order_locations.get(&order_id).map(|val| *val);
-
-                if let Some((price, side)) = location {
-                    // Get the appropriate price levels map
-                    let price_levels = match side {
-                        Side::Buy => &self.bids,
-                        Side::Sell => &self.asks,
-                    };
-
-                    // Attempt to cancel the order
-                    let mut result = None;
-                    let mut is_empty = false;
-
-                    // Get the current order first
-                    if let Some(current_order) = self.get_order(order_id) {
-                        result = Some(current_order);
-
-                        // Remove the order directly from the price level
-                        if let Some(entry) = price_levels.get(&price) {
-                            let price_level = entry.value();
-                            let cancel_update = OrderUpdate::Cancel { order_id };
-                            let result = price_level.update_order(cancel_update);
-                            // notify price level changes
-                            if let Ok(updated_order) = result
-                                && updated_order.is_some()
-                            {
-                                self.emit_level_changed(side, price_level);
-                            }
-                            is_empty = price_level.order_count() == 0;
-                        }
-
-                        // Remove from order locations tracking
-                        self.order_locations.remove(&order_id);
-                        // Remove from user_orders index
-                        self.untrack_order_by_id(&order_id);
-                    }
-
-                    // If price level is empty, remove it
-                    if is_empty {
-                        price_levels.remove(&price);
-                    }
-
-                    Ok(result)
-                } else {
-                    Ok(None) // Order not found
-                }
+                // #247: the same removal `cancel_order` performs, so a level
+                // failure is propagated (the order still rests, or the
+                // removal was completed and reported) and a successful
+                // cancel records `Cancelled { UserRequested }`, releases the
+                // risk contribution and unregisters special-order tracking.
+                // Ungated: `update_order` holds the submit gate (#209).
+                self.cancel_order_with_reason(order_id, CancelReason::UserRequested)
             }
 
             OrderUpdate::Replace {
@@ -1034,60 +1086,7 @@ where
                         }
                     }
 
-                    // Validate-first atomic modify (#98): validate the new
-                    // order's shape and run the modify-aware risk check
-                    // *before* removing the original. On any rejection the
-                    // original order is never cancelled — no book mutation,
-                    // no events, no trades.
-                    let verdict = self.validate_order_shape(&new_order)?;
-                    self.check_risk_modify_admission(
-                        order_id,
-                        new_order.user_id(),
-                        new_order.price().as_u128(),
-                        new_order.total_quantity(),
-                    )?;
-
-                    // #168: reject a re-price that would self-cross the same
-                    // user's opposite-side liquidity under CancelTaker/CancelBoth
-                    // BEFORE cancelling the original, so the original survives.
-                    self.check_modify_stp_self_cross(&new_order)?;
-
-                    // #230: reject a re-price whose re-add would exhaust a
-                    // non-auto-replenishing reserve's visible tranche and
-                    // discard its hidden remainder, which would destroy the
-                    // order after the original was already cancelled.
-                    self.check_modify_reserve_residual(&new_order)?;
-
-                    // All checks passed: cancel the original and add the
-                    // new order.
-                    // Ungated inner variants: `update_order` already holds
-                    // the submit gate (#209 / #225); the public wrappers
-                    // would re-acquire it (std RwLock is not reentrant).
-                    // The gate mode was chosen once at the boundary by
-                    // `modify_needs_exclusive_gate` — exclusive whenever STP
-                    // is engaged — and it is never upgraded here, so the
-                    // re-add must never be a fill-or-kill (whose
-                    // all-or-nothing window always requires the exclusive
-                    // gate, including on an `STPMode::None` book).
-                    // Unreachable today — an FOK never rests, so it can
-                    // never be modified — but enforced so a future TIF
-                    // change cannot silently void the #209 guarantee.
-                    debug_assert!(
-                        !new_order.is_fill_or_kill(),
-                        "a resting order can never carry FOK; the re-add cannot upgrade the gate"
-                    );
-                    self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    // #244: the arithmetic preflight already ran above,
-                    // before the cancel; the re-add must not fail it again.
-                    let result = self
-                        .add_order_inner(
-                            new_order,
-                            false,
-                            false,
-                            Some(verdict.arithmetic_verified_price),
-                        )?
-                        .0;
-                    Ok(Some(result))
+                    self.cancel_then_readd(order_id, &original, new_order, ReAddQuantity::Explicit)
                 } else {
                     Ok(None) // Original order not found
                 }
@@ -1167,24 +1166,11 @@ where
 
         if let Some(entry) = price_levels.get(&price) {
             let price_level = entry.value();
-            match self.remove_from_level(price_level, order_id) {
-                Ok(None) => {}
-                Ok(Some(order)) => removed = Some(RemovedOrder::Clean(order)),
-                Err(error) => {
-                    // #248: a failed removal is resolved by what the level
-                    // still holds. Cold path: one scan of this level.
-                    if price_level
-                        .iter_orders()
-                        .any(|order| order.id() == order_id)
-                    {
-                        // Refused with nothing mutated: the order is still
-                        // indexed exactly as before (location, user index,
-                        // risk, state).
-                        return Err(OrderBookError::PriceLevelError(error));
-                    }
-                    removed = Some(RemovedOrder::Faulted(error));
-                }
-            }
+            // #248: a refused removal (the order still rests) is returned
+            // before anything is touched.
+            removed = self
+                .remove_resolved(price_level, order_id)
+                .map_err(OrderBookError::PriceLevelError)?;
 
             // notify price level changes
             if removed.is_some() {
@@ -1200,6 +1186,61 @@ where
             return Ok(None);
         };
 
+        self.finish_removal(order_id, &removed, reason);
+
+        // If the level became empty, remove it, unless a concurrent
+        // admission refilled it meanwhile (#247: checked under the price's
+        // stripe).
+        if empty_level && self.remove_level_if_empty(side, price) {
+            // Refresh the depth gauges now that a level was removed. No-op
+            // when the `metrics` feature is disabled.
+            self.record_depth_metric();
+        }
+
+        match removed {
+            RemovedOrder::Clean(order) => Ok(Some(Arc::new(self.convert_from_unit_type(&order)))),
+            RemovedOrder::Faulted(error) => {
+                Err(self.order_removed_with_level_fault(order_id, side, price, reason, error))
+            }
+        }
+    }
+
+    /// Asks `price_level` to remove `order_id` and resolves a failure by
+    /// what the level still holds afterwards (#248):
+    ///
+    /// - `Ok(None)`: the level does not hold the order;
+    /// - `Ok(Some(Clean(order)))`: removed;
+    /// - `Ok(Some(Faulted(error)))`: the level removed the order and then
+    ///   reported `error`; the caller completes the removal;
+    /// - `Err(error)`: refused, the order still rests and nothing changed.
+    fn remove_resolved(
+        &self,
+        price_level: &PriceLevel,
+        order_id: Id,
+    ) -> Result<Option<RemovedOrder>, PriceLevelError> {
+        match self.remove_from_level(price_level, order_id) {
+            Ok(None) => Ok(None),
+            Ok(Some(order)) => Ok(Some(RemovedOrder::Clean(order))),
+            Err(error) => {
+                // Cold path: one scan of this level.
+                if price_level
+                    .iter_orders()
+                    .any(|order| order.id() == order_id)
+                {
+                    Err(error)
+                } else {
+                    Ok(Some(RemovedOrder::Faulted(error)))
+                }
+            }
+        }
+    }
+
+    /// The book-side effects of a removal the level committed, shared by
+    /// every single-order cancel (#248 / #247): the `Cancelled { reason }`
+    /// state (keeping any prior fill), the location, the per-account risk
+    /// contribution, the user index, the strandable-maker count and
+    /// special-order tracking. Level-map removal stays with the caller.
+    fn finish_removal(&self, order_id: Id, removed: &RemovedOrder, reason: CancelReason) {
         // Track the cancellation in the order state tracker
         let prev_filled = self
             .order_state_tracker
@@ -1224,13 +1265,14 @@ where
         // body. No-op when no `RiskConfig` is installed.
         self.risk_state.on_cancel(order_id);
 
-        match &removed {
+        match removed {
             RemovedOrder::Clean(order) => {
                 // Remove the order from the user_orders index
                 self.untrack_user_order(order.user_id(), &order_id);
                 // #230: this helper is the funnel for user cancels, the
-                // cancel-then-add modifies, mass cancel and expiry eviction,
-                // so one decrement here covers all of them.
+                // cancel-then-add modifies, mass cancel, expiry eviction and
+                // the self-trade-prevention maker cancel, so one decrement
+                // here covers all of them.
                 self.note_removed_order(order.as_ref());
             }
             RemovedOrder::Faulted(_) => {
@@ -1251,21 +1293,6 @@ where
                 .unregister_pegged_order(&order_id);
             self.special_order_tracker
                 .unregister_trailing_stop(&order_id);
-        }
-
-        // If the level became empty, remove it
-        if empty_level {
-            price_levels.remove(&price);
-            // Refresh the depth gauges now that a level was removed. No-op
-            // when the `metrics` feature is disabled.
-            self.record_depth_metric();
-        }
-
-        match removed {
-            RemovedOrder::Clean(order) => Ok(Some(Arc::new(self.convert_from_unit_type(&order)))),
-            RemovedOrder::Faulted(error) => {
-                Err(self.order_removed_with_level_fault(order_id, side, price, reason, error))
-            }
         }
     }
 
@@ -1341,51 +1368,47 @@ where
     /// it never removes a level the iterator still references and never
     /// re-resolves `order_locations`, so a sequence of cancels on the same held
     /// level cannot skip a later order. Used by the STP `CancelMaker` /
-    /// `CancelBoth` arms (#95). No-op if `order_id` is not resting on the level.
+    /// `CancelBoth` arms (#95). `Ok(())` if `order_id` is not resting on the
+    /// level.
+    ///
+    /// # Errors
+    ///
+    /// A level that fails the removal is resolved exactly like
+    /// [`Self::cancel_order_with_reason`] resolves it (#248, #247): if the
+    /// maker still rests nothing changed; if the level removed it first, the
+    /// removal is completed on the book side (event, state, indices, risk)
+    /// and logged at `ERROR`. Either way the level's `PriceLevelError` is
+    /// returned so the sweep stops at this level with the #240 abort
+    /// semantics (committed prefix published, taker
+    /// `Cancelled { MatchAborted }`), instead of carrying on as if the
+    /// maker had been cancelled.
     pub(super) fn cancel_resting_maker_on_level(
         &self,
         price_level: &PriceLevel,
         side: Side,
         order_id: Id,
         reason: CancelReason,
-    ) {
-        let Ok(Some(cancelled)) = price_level.update_order(OrderUpdate::Cancel { order_id }) else {
-            return;
+    ) -> Result<(), PriceLevelError> {
+        let Some(removed) = self.remove_resolved(price_level, order_id)? else {
+            return Ok(());
         };
         self.cache.invalidate();
-
-        // 1. Notify the level change (same shape as cancel_order_with_reason).
         self.emit_level_changed(side, price_level);
-
-        // 2. Record the terminal cancellation, preserving any prior fill.
-        let prev_filled = self
-            .order_state_tracker
-            .as_ref()
-            .and_then(|t| t.get(order_id))
-            .map(|s| s.filled_quantity())
-            .unwrap_or(0);
-        self.track_state(
-            order_id,
-            OrderStatus::Cancelled {
-                filled_quantity: prev_filled,
-                reason,
-            },
-        );
-
-        // 3. Drop the per-account risk contribution, then untrack the order.
-        self.order_locations.remove(&order_id);
-        self.risk_state.on_cancel(order_id);
-        self.untrack_user_order(cancelled.user_id(), &order_id);
-        // #230: the self-trade-prevention maker cancel is the one removal
-        // that does not go through `cancel_order_with_reason`.
-        self.note_removed_order(cancelled.as_ref());
-
-        #[cfg(feature = "special_orders")]
-        {
-            self.special_order_tracker
-                .unregister_pegged_order(&order_id);
-            self.special_order_tracker
-                .unregister_trailing_stop(&order_id);
+        self.finish_removal(order_id, &removed, reason);
+        match removed {
+            RemovedOrder::Clean(_) => Ok(()),
+            RemovedOrder::Faulted(error) => {
+                tracing::error!(
+                    symbol = %self.symbol,
+                    %order_id,
+                    %side,
+                    price = price_level.price(),
+                    %reason,
+                    %error,
+                    "price level failed after removing a self-trade-prevention maker; the book completed the removal and the sweep stops here"
+                );
+                Err(error)
+            }
         }
     }
 
@@ -1521,36 +1544,11 @@ where
         &self,
         order: &OrderType<T>,
     ) -> Result<ShapeVerdict, OrderBookError> {
-        self.validate_order_shape_with(order, None)
-    }
-
-    /// [`Self::validate_order_shape`] with the trade arithmetic preflight
-    /// (#244) optionally taken as already done: `Some(price)` is the verified
-    /// price a validate-first modify measured before it cancelled the
-    /// original, and the check is not re-run. The re-add therefore cannot
-    /// fail with `FeeOverflow` / `NotionalOverflow` after the cancel; a maker
-    /// admitted concurrently under the shared gate at a worse price is
-    /// caught by the sweep's backstop instead (`MatchAborted`, which replay
-    /// reconciles as a may-have-mutated outcome).
-    ///
-    /// # Errors
-    /// Returns the first failing check's typed [`OrderBookError`].
-    pub(super) fn validate_order_shape_with(
-        &self,
-        order: &OrderType<T>,
-        preverified_arithmetic: Option<u128>,
-    ) -> Result<ShapeVerdict, OrderBookError> {
         // Two-tranche total representability (#210): an Iceberg / Reserve
         // whose visible + hidden overflows u64 cannot be tracked by any of
         // the engine's quantity arithmetic — reject it before every other
-        // check so the saturating `total_quantity` below (and everywhere
-        // downstream) is provably unreachable for admitted orders.
-        if order.checked_total_quantity().is_none() {
-            return Err(OrderBookError::QuantityOverflow {
-                visible: order.visible_quantity().as_u64(),
-                hidden: order.hidden_quantity().as_u64(),
-            });
-        }
+        // check. The checked total is then used by every check below.
+        let total = order.total_quantity()?;
 
         // Zero visible tranche (#230): a NON-AUTO-REPLENISHING reserve that
         // displays nothing is a ghost — no visible depth, and `pricelevel`
@@ -1659,7 +1657,7 @@ where
         }
 
         // Min/max order size validation
-        let qty = order.total_quantity();
+        let qty = total;
         if let Some(min) = self.min_order_size
             && qty < min
         {
@@ -1686,15 +1684,7 @@ where
         }
 
         if order.is_post_only() && self.will_cross_market(order.price().as_u128(), order.side()) {
-            return Err(OrderBookError::PriceCrossing {
-                price: order.price().as_u128(),
-                side: order.side(),
-                opposite_price: if order.side() == Side::Buy {
-                    self.best_ask().unwrap_or(0)
-                } else {
-                    self.best_bid().unwrap_or(0)
-                },
-            });
+            return Err(self.price_crossing(order));
         }
 
         // For FOK orders, first check if the entire quantity can be matched
@@ -1725,16 +1715,12 @@ where
         // trade can carry a clamped or dropped fee. Post-only takers never
         // trade and are exempt; a non-crossing order passes. Runs before
         // the original is cancelled on the modify path.
+        // The re-add of a validate-first modify takes this whole verdict
+        // as its admission and never re-runs it (#244, #247).
         let arithmetic_verified_price = if order.is_post_only() {
             0
-        } else if let Some(verified) = preverified_arithmetic {
-            verified
         } else {
-            self.check_trade_arithmetic(
-                order.side(),
-                order.total_quantity(),
-                Some(order.price().as_u128()),
-            )?
+            self.check_trade_arithmetic(order.side(), total, Some(order.price().as_u128()))?
         };
 
         //
@@ -1750,15 +1736,15 @@ where
         if order.is_fill_or_kill() {
             let feasibility = self.fok_fillable_quantity(
                 order.side(),
-                order.total_quantity(),
+                total,
                 Some(order.price().as_u128()),
                 order.user_id(),
                 order.id(),
             )?;
-            if feasibility.fillable < order.total_quantity() {
+            if feasibility.fillable < total {
                 return Err(OrderBookError::InsufficientLiquidity {
                     side: order.side(),
-                    requested: order.total_quantity(),
+                    requested: total,
                     available: feasibility.fillable,
                 });
             }
@@ -1855,7 +1841,7 @@ where
         };
 
         let lot = self.lot_size.unwrap_or(1);
-        let mut remaining = new_order.total_quantity();
+        let mut remaining = new_order.total_quantity()?;
         for entry in iter {
             // Lot-round the remaining budget exactly like the sweep's
             // `StopCondition::level_qty_cap`. A spent budget is a complete
@@ -1873,11 +1859,7 @@ where
             // quote-notional sell arm keeps walking on a zero cap, because
             // its per-level cap rises again as bids get cheaper, and no
             // modify ever takes that arm.
-            let cap = if lot <= 1 {
-                remaining
-            } else {
-                remaining - (remaining % lot)
-            };
+            let cap = lot_floor(remaining, lot)?;
             if cap == 0 {
                 return Ok(());
             }
@@ -1900,8 +1882,11 @@ where
                     // No same-user maker at this level: the taker consumes its
                     // full matchable depth under the lot-rounded cap (the
                     // authoritative upstream dry run), then walks on.
-                    remaining =
-                        remaining.saturating_sub(level.matchable_quantity(cap, new_order.id())?);
+                    remaining = consume_matchable(
+                        remaining,
+                        cap,
+                        level.matchable_quantity(cap, new_order.id())?,
+                    )?;
                 }
                 STPAction::CancelTaker { safe_quantity }
                 | STPAction::CancelBoth { safe_quantity, .. } => {
@@ -1929,9 +1914,12 @@ where
                     // Capping its request at `cap.min(safe_quantity)` keeps it
                     // inside the non-self prefix, so it never counts depth
                     // behind the same-user maker.
-                    remaining = remaining.saturating_sub(
-                        level.matchable_quantity(cap.min(safe_quantity), new_order.id())?,
-                    );
+                    let request = cap.min(safe_quantity);
+                    remaining = consume_matchable(
+                        remaining,
+                        request,
+                        level.matchable_quantity(request, new_order.id())?,
+                    )?;
                     if remaining > 0 {
                         return Err(OrderBookError::SelfTradePrevented {
                             mode: self.stp_mode,
@@ -2025,7 +2013,7 @@ where
             return Ok(());
         }
 
-        let total = visible.saturating_add(hidden);
+        let total = new_order.total_quantity()?;
         let crossable = self
             .fok_fillable_quantity(
                 new_order.side(),
@@ -2042,12 +2030,18 @@ where
         // `validate_order_shape` already rejects a projected zero visible
         // tranche, and without that rule a non-crossing re-price of such an
         // order would fall inside the band vacuously.
-        if crossable > 0 && crossable >= visible && crossable < total {
+        // `total - crossable` is positive exactly when `crossable < total`.
+        if crossable > 0
+            && crossable >= visible
+            && let Some(discarded) = total.checked_sub(crossable)
+            && discarded > 0
+        {
             return Err(reserve_residual_would_be_discarded(
                 new_order.id(),
                 visible,
                 crossable,
                 hidden,
+                discarded,
             ));
         }
         Ok(())
@@ -2271,9 +2265,9 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, false, false, None)
+        self.add_order_inner(order, false, false, Admission::Submit)
             .map(|(order, _)| order)
-            .map_err(SubmitFailure::into_error)
+            .map_err(|failure| failure.into_submit().into_error())
     }
 
     /// Add a new order to the book, automatically matching it if it's
@@ -2331,8 +2325,8 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true, false, None)
-            .map_err(SubmitFailure::into_error)
+        self.add_order_inner(order, true, false, Admission::Submit)
+            .map_err(|failure| failure.into_submit().into_error())
     }
 
     /// [`Self::add_order_with_result`] for callers that must record what a
@@ -2365,7 +2359,8 @@ where
             order.is_post_only(),
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true, true, None)
+        self.add_order_inner(order, true, true, Admission::Submit)
+            .map_err(AdmitFailure::into_submit)
     }
 
     /// Shared implementation behind [`Self::add_order`] and
@@ -2379,49 +2374,61 @@ where
     /// remainder, STP taker cancel, residual admission, abort) do not box a
     /// `TradeResult` just to discard it.
     ///
-    /// `preverified_arithmetic` is `Some` only for the re-add of a
-    /// validate-first modify, which ran the trade arithmetic preflight
-    /// (#244) before cancelling the original; see
-    /// [`Self::validate_order_shape_with`].
-    fn add_order_inner(
+    /// `admission` is [`Admission::ReAdd`] only for the re-add of a
+    /// validate-first modify, which ran every admission check before it
+    /// cancelled the original; the re-add takes that verdict instead of
+    /// re-running them (#244, #247).
+    ///
+    /// Every failure carries what the taker executed before it
+    /// ([`AdmitFailure::traded`]), which decides whether a failed modify
+    /// re-add can restore the original (#247). Every failure also leaves the
+    /// taker in a terminal order state, except a duplicate id, whose state
+    /// belongs to the live order that owns the id.
+    pub(super) fn add_order_inner(
         &self,
         mut order: OrderType<T>,
         want_result: bool,
         want_committed: bool,
-        preverified_arithmetic: Option<u128>,
-    ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
+        admission: Admission,
+    ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), AdmitFailure> {
         let committed = |trade_result: Option<TradeResult>| {
             if want_committed { trade_result } else { None }
         };
-        self.check_kill_switch_or_reject(order.id())?;
-        // Representability gate (#210): an unrepresentable two-tranche
-        // total must be rejected before the risk gate below, which would
-        // otherwise evaluate the account's notional against the SATURATED
-        // `u64::MAX` total and reject with a misleading risk-family error.
-        // `validate_order_shape` re-checks this for the shared modify path;
-        // the duplicate check is a single jump-table match + checked_add.
-        if order.checked_total_quantity().is_none() {
-            let err = OrderBookError::QuantityOverflow {
-                visible: order.visible_quantity().as_u64(),
-                hidden: order.hidden_quantity().as_u64(),
-            };
-            self.record_shape_rejection(&order, &err);
-            return Err(err.into());
-        }
-        // Pre-trade risk gate: per-account open-orders / notional /
-        // price band. No-op when no `RiskConfig` is installed.
-        // Documented order: kill_switch → risk → STP → fees → match.
-        // On the cold reject path, record an `OrderStatus::Rejected`
-        // transition with the closed `RejectReason` taxonomy before
-        // propagating the typed error.
-        if let Err(err) = self.check_risk_limit_admission(
-            order.user_id(),
-            order.price().as_u128(),
-            order.total_quantity(),
-        ) {
-            self.reject_with_risk(order.id(), &err);
-            return Err(err.into());
-        }
+        let total = match admission {
+            Admission::Submit => {
+                self.check_kill_switch_or_reject(order.id())?;
+                // Representability gate (#210): an unrepresentable
+                // two-tranche total must be rejected before the risk gate
+                // below, which could not evaluate the account's notional.
+                // `validate_order_shape` re-checks this for the shared
+                // modify path.
+                let total = match order.total_quantity() {
+                    Ok(total) => total,
+                    Err(err) => {
+                        self.record_shape_rejection(&order, &err);
+                        return Err(err.into());
+                    }
+                };
+                // Pre-trade risk gate: per-account open-orders / notional /
+                // price band. No-op when no `RiskConfig` is installed.
+                // Documented order: kill_switch → risk → STP → fees → match.
+                // On the cold reject path, record an `OrderStatus::Rejected`
+                // transition with the closed `RejectReason` taxonomy before
+                // propagating the typed error.
+                if let Err(err) =
+                    self.check_risk_limit_admission(order.user_id(), order.price().as_u128(), total)
+                {
+                    self.reject_with_risk(order.id(), &err);
+                    return Err(err.into());
+                }
+                total
+            }
+            // Validated before the original was cancelled; the kill switch
+            // and the modify-aware risk check ran there too, under the same
+            // gate. Re-running them here could only fail the re-add after
+            // the original is gone (#247).
+            Admission::ReAdd { .. } => order.total_quantity()?,
+        };
 
         // Reject a duplicate order id: an order with this id is already
         // resting on the book. Admitting it would overwrite the existing
@@ -2443,7 +2450,9 @@ where
         // id can both pass here and both rest (last-writer-wins on insert).
         // Serializing order ids is the ingress / sequencing layer's job.
         if self.order_locations.contains_key(&order.id()) {
-            crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
+            if admission.records_rejections() {
+                crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
+            }
             return Err(OrderBookError::DuplicateOrderId {
                 order_id: order.id(),
             }
@@ -2469,12 +2478,15 @@ where
         let ShapeVerdict {
             fok,
             arithmetic_verified_price,
-        } = match self.validate_order_shape_with(&order, preverified_arithmetic) {
-            Ok(verdict) => verdict,
-            Err(err) => {
-                self.record_shape_rejection(&order, &err);
-                return Err(err.into());
-            }
+        } = match admission {
+            Admission::Submit => match self.validate_order_shape(&order) {
+                Ok(verdict) => verdict,
+                Err(err) => {
+                    self.record_shape_rejection(&order, &err);
+                    return Err(err.into());
+                }
+            },
+            Admission::ReAdd { verdict, .. } => verdict,
         };
 
         // Residual-admission headroom pre-check (#211): a non-immediate
@@ -2503,17 +2515,11 @@ where
                 let level_total = match entry.value().total_quantity() {
                     Ok(total) => total,
                     Err(err) => {
-                        self.track_state(
-                            order.id(),
-                            OrderStatus::Rejected {
-                                reason: RejectReason::InvalidQuantity,
-                            },
-                        );
-                        crate::orderbook::metrics::record_reject(RejectReason::InvalidQuantity);
+                        self.reject_admission(admission, &order, RejectReason::InvalidQuantity);
                         return Err(OrderBookError::PriceLevelError(err).into());
                     }
                 };
-                if level_total.checked_add(order.total_quantity()).is_none() {
+                if level_total.checked_add(total).is_none() {
                     let err = OrderBookError::InvalidOperation {
                         message: format!(
                             "resting order {} would overflow the aggregate capacity of level {}",
@@ -2521,13 +2527,7 @@ where
                             order.price()
                         ),
                     };
-                    self.track_state(
-                        order.id(),
-                        OrderStatus::Rejected {
-                            reason: RejectReason::InvalidQuantity,
-                        },
-                    );
-                    crate::orderbook::metrics::record_reject(RejectReason::InvalidQuantity);
+                    self.reject_admission(admission, &order, RejectReason::InvalidQuantity);
                     return Err(err.into());
                 }
             }
@@ -2550,6 +2550,12 @@ where
         } else {
             TakerKind::Standard
         };
+        // An `Err` from the sweep is raised before any trade: an untouched
+        // rejection (a failed post-only probe or fill-or-kill reservation)
+        // or a self-trade prevention cancel with no fills. The one `Err`
+        // raised after trades, an aborted prefix whose executed quantity
+        // cannot be summed, is ruled out by the `MatchResult` invariant
+        // (every fold is a checked subtraction from the `u64` budget).
         let MatchOutcome {
             result: match_result,
             taker_stp_cancelled,
@@ -2558,7 +2564,7 @@ where
         } = self.match_order_with_user_outcome(
             order.id(),
             order.side(),
-            order.total_quantity(), // Use total quantity for matching
+            total, // Use total quantity for matching
             Some(order.price().as_u128()),
             order.user_id(),
             taker_kind,
@@ -2571,23 +2577,8 @@ where
         // exactly like the precheck would have — the race between precheck
         // and sweep can no longer make a post-only order take liquidity.
         if taker_post_only_rejected {
-            self.track_state(
-                order.id(),
-                OrderStatus::Rejected {
-                    reason: RejectReason::PostOnlyWouldCross,
-                },
-            );
-            crate::orderbook::metrics::record_reject(RejectReason::PostOnlyWouldCross);
-            return Err(OrderBookError::PriceCrossing {
-                price: order.price().as_u128(),
-                side: order.side(),
-                opposite_price: if order.side() == Side::Buy {
-                    self.best_ask().unwrap_or(0)
-                } else {
-                    self.best_bid().unwrap_or(0)
-                },
-            }
-            .into());
+            self.reject_admission(admission, &order, RejectReason::PostOnlyWouldCross);
+            return Err(self.price_crossing(&order).into());
         }
 
         // Emit trades BEFORE any early return below: the STP taker-cancel and
@@ -2598,18 +2589,50 @@ where
         // so the plain `add_order` hot path skips the `MatchResult` clone.
         let trade_result = self.publish_trades(&match_result, want_result);
 
+        // True (non-self) executed quantity. `remaining_quantity` only
+        // decrements on real trades, so STP-prevented self-fills never count
+        // toward it, and it never exceeds the budget the sweep was given.
+        let remaining = match_result.remaining_quantity().as_u64();
+        let Some(filled_qty) = total.checked_sub(remaining) else {
+            return Err(self.remaining_exceeds_total(
+                &order,
+                total,
+                remaining,
+                &match_result,
+                committed(trade_result),
+                admission,
+            ));
+        };
+        // `filled_quantity` in every order state below is cumulative: a
+        // modify's re-add adds its fills to what the original had executed
+        // (#247). A new submit starts from zero.
+        let prior_filled = admission.prior_filled();
+        let state_filled = cumulative_filled(order.id(), prior_filled, filled_qty);
+
         // #240: the sweep stopped at a failed price level. The committed
         // prefix was published above exactly like a partial fill; the
         // taker's terminal `Cancelled { MatchAborted }` state was recorded
         // by the sweep. The remainder must never rest, whatever the TIF.
         if let Some(err) = aborted {
-            return Err(SubmitFailure::with_committed(err, committed(trade_result)));
+            // The sweep recorded the re-add's own executed quantity; a
+            // re-add of a partially filled original restates it
+            // cumulatively (a second `Cancelled { MatchAborted }`
+            // transition, only when the original had tracked fills).
+            if prior_filled > 0 {
+                self.track_state(
+                    order.id(),
+                    OrderStatus::Cancelled {
+                        filled_quantity: state_filled,
+                        reason: CancelReason::MatchAborted,
+                    },
+                );
+            }
+            return Err(AdmitFailure::after(
+                err,
+                committed(trade_result),
+                filled_qty,
+            ));
         }
-
-        // True (non-self) executed quantity. `remaining_quantity` only decrements on
-        // real trades, so STP-prevented self-fills never count toward it.
-        let original_qty = order.total_quantity();
-        let filled_qty = original_qty.saturating_sub(match_result.remaining_quantity().as_u64());
 
         // If STP cancelled the taker, the residual must NOT rest — even though some
         // non-self fills already occurred at earlier levels. Record the terminal
@@ -2619,23 +2642,24 @@ where
             self.track_state(
                 order.id(),
                 OrderStatus::Cancelled {
-                    filled_quantity: filled_qty,
+                    filled_quantity: state_filled,
                     reason: CancelReason::SelfTradePrevention,
                 },
             );
             crate::orderbook::metrics::record_reject(RejectReason::SelfTradePrevention);
-            return Err(SubmitFailure::with_committed(
+            return Err(AdmitFailure::after(
                 OrderBookError::SelfTradePrevented {
                     mode: self.stp_mode,
                     taker_order_id: order.id(),
                     user_id: order.user_id(),
                 },
                 committed(trade_result),
+                filled_qty,
             ));
         }
 
         // If the order was not fully filled, add the remainder to the book
-        if match_result.remaining_quantity().as_u64() > 0 {
+        if remaining > 0 {
             if order.is_immediate() {
                 // IOC/FOK orders should not have a resting part.
                 // If FOK, it should have been fully filled or cancelled before this point.
@@ -2648,15 +2672,18 @@ where
                     },
                 );
                 crate::orderbook::metrics::record_reject(RejectReason::InsufficientLiquidity);
-                return Err(SubmitFailure::with_committed(
+                // `requested` is the total the taker swept with and
+                // `available` what it executed (#247: before 0.14.0 both
+                // were read off the visible tranche and `available`
+                // saturated at zero for a two-tranche taker).
+                return Err(AdmitFailure::after(
                     OrderBookError::InsufficientLiquidity {
                         side: order.side(),
-                        requested: order.quantity(), // Now uses the trait method
-                        available: order
-                            .quantity()
-                            .saturating_sub(match_result.remaining_quantity().as_u64()),
+                        requested: total,
+                        available: filled_qty,
                     },
                     committed(trade_result),
+                    filled_qty,
                 ));
             }
 
@@ -2667,8 +2694,8 @@ where
             // the rest stays hidden — assigning the total to the visible
             // tranche (the old `set_quantity` semantics) manufactured
             // liquidity by keeping the original hidden tranche on top.
-            if match_result.remaining_quantity().as_u64() < order.total_quantity() {
-                order.set_total_remaining(match_result.remaining_quantity().as_u64());
+            if remaining < total {
+                order.set_total_remaining(remaining);
 
                 // #230: a reserve residual whose visible tranche the sweep
                 // exhausted, with hidden left behind and no automatic
@@ -2716,7 +2743,7 @@ where
                     self.track_state(
                         order.id(),
                         OrderStatus::Filled {
-                            filled_quantity: filled_qty,
+                            filled_quantity: state_filled,
                         },
                     );
                     // Hand back a shape that matches the outcome: the order
@@ -2733,126 +2760,33 @@ where
                 }
             }
 
-            let price = order.price().as_u128();
-            let side = order.side();
-
-            let price_levels = match side {
-                Side::Buy => &self.bids,
-                Side::Sell => &self.asks,
-            };
-
-            // Pre-trade risk hook (#243): reserve the resting remainder's
-            // contribution to the per-account counters BEFORE the order is
-            // placed on its level, so a reservation that cannot be
-            // represented (only reachable when concurrent admissions on the
-            // same account raced past the pre-trade check) rejects the
-            // remainder instead of resting it untracked. Checked and
-            // all-or-nothing; released below if the placement fails. No-op
-            // when no `RiskConfig` is installed.
-            let risk_reservation = match self.risk_state.on_admission(
-                order.id(),
-                order.user_id(),
-                price,
-                match_result.remaining_quantity().as_u64(),
-            ) {
-                Ok(reservation) => reservation,
-                Err(err) => {
-                    // A same-id order won a concurrent admission race
-                    // (#243 review): the id belongs to that live order, so
-                    // its tracked state must not be clobbered with a
-                    // rejection, mirroring the pre-trade duplicate check.
-                    let duplicate = matches!(err, OrderBookError::DuplicateOrderId { .. });
-                    if filled_qty == 0 && !duplicate {
-                        self.reject_with_risk(order.id(), &err);
-                    }
-                    tracing::error!(
-                        order_id = %order.id(),
-                        price,
-                        executed_quantity = filled_qty,
-                        error = %err,
-                        "risk reservation for the resting remainder failed; remainder not rested"
-                    );
-                    return Err(SubmitFailure::with_committed(err, committed(trade_result)));
-                }
-            };
-
-            let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
-            let level = price_level.value();
-
-            // Convert to unit type for PriceLevel compatibility. Admission
-            // into the level is validated upstream since pricelevel 0.9
-            // (duplicate id, counter capacity). The pre-sweep headroom
-            // check above makes a failure here concurrent-only; if it
-            // still happens, remove the level when this call created it
-            // empty — `best_bid` / `best_ask`, the cache, and the depth
-            // gauges must never expose a phantom level — and surface the
-            // error loudly: the sweep's trades are already irreversible
-            // (#211).
-            let unit_order = self.convert_to_unit_type(&order);
-            let unit_order_arc = match price_level.value().add_order(unit_order) {
+            // Rest the remainder (#243 risk reservation first, then the
+            // level). The pre-sweep headroom check above makes a level
+            // refusal concurrent-only; if it still happens after the
+            // sweep's irreversible trades, the remainder does not rest, the
+            // taker ends in a terminal state and the error is surfaced
+            // loudly (#211, #247).
+            let unit_order_arc = match self.rest_on_level(&order, remaining) {
                 Ok(admitted) => admitted,
-                Err(err) => {
-                    // Release the risk reservation taken above: the
-                    // order does not rest. Keyed by the reservation's
-                    // generation, so this can never release a same-id
-                    // order's entry (#243 review).
-                    self.risk_state.release_reservation(risk_reservation);
-                    if level.order_count() == 0 {
-                        price_levels.remove(&price);
-                    }
-                    self.cache.invalidate();
-                    self.record_depth_metric();
-                    tracing::error!(
-                        order_id = %order.id(),
-                        price,
-                        error = %err,
-                        "residual admission failed after irreversible trades; level cleaned up"
-                    );
-                    return Err(SubmitFailure::with_committed(
-                        OrderBookError::PriceLevelError(err),
+                Err(failure) => {
+                    return Err(self.rest_failed(
+                        &order,
+                        failure,
+                        filled_qty,
                         committed(trade_result),
+                        admission,
                     ));
                 }
             };
-            // #230: this is the single point where `add_order` rests an
-            // order on a level — both the untouched submit and the
-            // partially-filled residual reach it — so flagging here covers
-            // the whole admission path. Enables the sweep's
-            // strandable-maker scan for this book from now on.
-            self.note_rested_order(unit_order_arc.as_ref());
-            // notify price level changes
-            self.emit_level_changed(side, level);
-            self.order_locations
-                .insert(unit_order_arc.id(), (price, side));
 
-            // Refresh the depth gauges. The level may be brand-new
-            // (`get_or_insert` created it) or pre-existing — either
-            // way the gauge reflects current state. No-op when the
-            // `metrics` feature is disabled.
-            self.record_depth_metric();
-
-            // Track the order in the user_orders index
-            self.track_user_order(order.user_id(), unit_order_arc.id());
-
-            // Register special orders for re-pricing tracking
-            #[cfg(feature = "special_orders")]
-            match &order {
-                OrderType::PeggedOrder { id, .. } => {
-                    self.special_order_tracker.register_pegged_order(*id);
-                }
-                OrderType::TrailingStop { id, .. } => {
-                    self.special_order_tracker.register_trailing_stop(*id);
-                }
-                _ => {}
-            }
-
-            // Track state: Open (no fills) or PartiallyFilled (some fills, resting)
-            if filled_qty > 0 {
+            // Track state: Open (no fills) or PartiallyFilled (some fills,
+            // resting), counting a modified original's earlier fills.
+            if state_filled > 0 {
                 self.track_state(
                     order.id(),
                     OrderStatus::PartiallyFilled {
-                        original_quantity: original_qty,
-                        filled_quantity: filled_qty,
+                        original_quantity: cumulative_filled(order.id(), prior_filled, total),
+                        filled_quantity: state_filled,
                     },
                 );
             } else {
@@ -2867,10 +2801,700 @@ where
             self.track_state(
                 order.id(),
                 OrderStatus::Filled {
-                    filled_quantity: original_qty,
+                    filled_quantity: cumulative_filled(order.id(), prior_filled, total),
                 },
             );
             Ok((Arc::new(order), trade_result))
+        }
+    }
+
+    /// Records the `Rejected { reason }` state and reject metric of an
+    /// untouched admission failure, except for a modify's re-add, whose
+    /// failure the modify resolves (#247).
+    #[cold]
+    #[inline(never)]
+    fn reject_admission(&self, admission: Admission, order: &OrderType<T>, reason: RejectReason) {
+        if admission.records_rejections() {
+            self.track_state(order.id(), OrderStatus::Rejected { reason });
+            crate::orderbook::metrics::record_reject(reason);
+        }
+    }
+
+    /// The post-only `PriceCrossing` rejection of `order`, carrying the best
+    /// opposite price, or `None` when that side emptied in the meantime
+    /// (#247: it used to report `0`).
+    #[cold]
+    #[inline(never)]
+    fn price_crossing(&self, order: &OrderType<T>) -> OrderBookError {
+        OrderBookError::PriceCrossing {
+            price: order.price().as_u128(),
+            side: order.side(),
+            opposite_price: match order.side() {
+                Side::Buy => self.best_ask(),
+                Side::Sell => self.best_bid(),
+            },
+        }
+    }
+
+    /// The sweep reported more remaining quantity than it was given, which
+    /// the `MatchResult` invariant rules out. Handled rather than assumed
+    /// (#247): nothing rests, the taker ends `Cancelled { RestFailed }` and
+    /// the breach is logged at `ERROR`. The executed quantity is the sum of
+    /// the committed trades; should that be unavailable too while trades
+    /// exist, the taker's whole budget is reported, so a failed modify
+    /// re-add never restores an original whose re-added order traded.
+    #[cold]
+    #[inline(never)]
+    fn remaining_exceeds_total(
+        &self,
+        order: &OrderType<T>,
+        total: u64,
+        remaining: u64,
+        match_result: &pricelevel::MatchResult,
+        committed: Option<TradeResult>,
+        admission: Admission,
+    ) -> AdmitFailure {
+        let traded = !match_result.trades().as_vec().is_empty();
+        let executed = match match_result.executed_quantity() {
+            Ok(executed) if executed.as_u64() > 0 => executed.as_u64(),
+            _ if traded => total,
+            _ => 0,
+        };
+        let err = OrderBookError::InvalidOperation {
+            message: format!(
+                "sweep of order {} left {remaining} of {total} units unmatched",
+                order.id()
+            ),
+        };
+        tracing::error!(
+            order_id = %order.id(),
+            total,
+            remaining,
+            "sweep remainder exceeds the taker's quantity; remainder not rested"
+        );
+        self.track_state(
+            order.id(),
+            OrderStatus::Cancelled {
+                filled_quantity: cumulative_filled(order.id(), admission.prior_filled(), executed),
+                reason: CancelReason::RestFailed,
+            },
+        );
+        AdmitFailure::after(err, committed, executed)
+    }
+
+    /// Resolves a remainder the book could not rest after the sweep (#211,
+    /// #243, #247): the taker ends in a terminal state and the failure is
+    /// logged at `ERROR`.
+    ///
+    /// - A duplicate id (a same-id order won a concurrent admission race)
+    ///   records nothing: the id's state belongs to that live order.
+    /// - Otherwise, a taker that traded ends
+    ///   `Cancelled { filled_quantity, reason: RestFailed }`, with
+    ///   `filled_quantity` cumulative for a modify's re-add (the original's
+    ///   earlier fills plus the re-add's); one that did not is `Rejected`
+    ///   under the error's reject code, except a modify's re-add, whose
+    ///   untraded failure the modify resolves (restore or `RestFailed`).
+    #[cold]
+    #[inline(never)]
+    fn rest_failed(
+        &self,
+        order: &OrderType<T>,
+        failure: RestFailure,
+        filled_qty: u64,
+        committed: Option<TradeResult>,
+        admission: Admission,
+    ) -> AdmitFailure {
+        let err = failure.into_error();
+        if !matches!(err, OrderBookError::DuplicateOrderId { .. }) {
+            if filled_qty > 0 {
+                self.track_state(
+                    order.id(),
+                    OrderStatus::Cancelled {
+                        filled_quantity: cumulative_filled(
+                            order.id(),
+                            admission.prior_filled(),
+                            filled_qty,
+                        ),
+                        reason: CancelReason::RestFailed,
+                    },
+                );
+                crate::orderbook::metrics::record_reject(RejectReason::from(&err));
+            } else if admission.records_rejections() {
+                self.reject_with_risk(order.id(), &err);
+            }
+        }
+        tracing::error!(
+            order_id = %order.id(),
+            price = order.price().as_u128(),
+            executed_quantity = filled_qty,
+            error = %err,
+            "remainder could not be rested; taker ended, level cleaned up"
+        );
+        AdmitFailure::after(err, committed, filled_qty)
+    }
+
+    /// Rests `order` with `quantity` units on its price level and indexes
+    /// it: the #243 risk reservation first, then the level admission, then
+    /// the strandable-maker count, the level event, the location, the depth
+    /// gauges, the user index and special-order tracking. Records no order
+    /// state; the caller does.
+    ///
+    /// # Errors
+    ///
+    /// [`RestFailure::Risk`] when the risk reservation is refused (nothing
+    /// was touched); [`RestFailure::Level`] when the level refuses the order
+    /// (the reservation is released and a level this call left empty is
+    /// removed, so no phantom level is exposed).
+    fn rest_on_level(
+        &self,
+        order: &OrderType<T>,
+        quantity: u64,
+    ) -> Result<Arc<OrderType<()>>, RestFailure> {
+        let price = order.price().as_u128();
+        let side = order.side();
+        let price_levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+
+        // Pre-trade risk hook (#243): reserve the resting remainder's
+        // contribution to the per-account counters BEFORE the order is
+        // placed on its level, so a reservation that cannot be
+        // represented (only reachable when concurrent admissions on the
+        // same account raced past the pre-trade check) rejects the
+        // remainder instead of resting it untracked. Checked and
+        // all-or-nothing; released below if the placement fails. No-op
+        // when no `RiskConfig` is installed.
+        let risk_reservation = self
+            .risk_state
+            .on_admission(order.id(), order.user_id(), price, quantity)
+            .map_err(RestFailure::Risk)?;
+
+        // #247: admission into the level runs under the shared side of the
+        // price's stripe, so a concurrent removal of the level (it was
+        // empty a moment ago) either completes before `get_or_insert` (a
+        // fresh level is created) or waits and then sees this order and
+        // leaves the level in place. Concurrent admissions do not exclude
+        // each other. Released before the listener runs.
+        let stripe = self.lock_level(price);
+        let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
+        let level = price_level.value();
+
+        // Convert to unit type for PriceLevel compatibility. Admission
+        // into the level is validated upstream since pricelevel 0.9
+        // (duplicate id, counter capacity). If it fails, remove the level
+        // when it is left empty — `best_bid` / `best_ask`, the cache, and
+        // the depth gauges must never expose a phantom level (#211).
+        let admitted = match self.admit_to_level(level, self.convert_to_unit_type(order)) {
+            Ok(admitted) => admitted,
+            Err(err) => {
+                // Keyed by the reservation's generation, so this can never
+                // release a same-id order's entry (#243 review).
+                self.risk_state.release_reservation(risk_reservation);
+                drop(stripe);
+                self.remove_level_if_empty(side, price);
+                self.cache.invalidate();
+                self.record_depth_metric();
+                return Err(RestFailure::Level(err));
+            }
+        };
+        drop(stripe);
+        // #230: this is the single point where the book rests an order on a
+        // level (the untouched submit, the partially-filled residual and a
+        // restored modify original), so flagging here covers the whole
+        // admission path. Enables the sweep's strandable-maker scan for this
+        // book from now on.
+        self.note_rested_order(admitted.as_ref());
+        self.emit_level_changed(side, level);
+        self.order_locations.insert(admitted.id(), (price, side));
+
+        // Refresh the depth gauges. The level may be brand-new
+        // (`get_or_insert` created it) or pre-existing — either way the
+        // gauge reflects current state. No-op when the `metrics` feature is
+        // disabled.
+        self.record_depth_metric();
+
+        // Track the order in the user_orders index
+        self.track_user_order(order.user_id(), admitted.id());
+
+        // Register special orders for re-pricing tracking
+        #[cfg(feature = "special_orders")]
+        match order {
+            OrderType::PeggedOrder { id, .. } => {
+                self.special_order_tracker.register_pegged_order(*id);
+            }
+            OrderType::TrailingStop { id, .. } => {
+                self.special_order_tracker.register_trailing_stop(*id);
+            }
+            _ => {}
+        }
+        Ok(admitted)
+    }
+
+    /// Adds `order` to `level`. In `cfg(test)` builds the `rest_fault_hook`
+    /// can make the admission fail with nothing mutated (#247).
+    #[inline]
+    fn admit_to_level(
+        &self,
+        level: &PriceLevel,
+        order: OrderType<()>,
+    ) -> Result<Arc<OrderType<()>>, PriceLevelError> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .rest_fault_hook
+            .as_ref()
+            .and_then(|hook| hook(order.id()))
+        {
+            return Err(error);
+        }
+        level.add_order(order)
+    }
+
+    /// The validate-first cancel-then-add behind `UpdatePrice`,
+    /// `UpdatePriceAndQuantity` and `Replace` (#98, #168, #230, #244, #247).
+    ///
+    /// Every admission check runs on `new_order` **before** the original is
+    /// cancelled, so a rejection leaves it resting untouched: the shared
+    /// shape validator (including the #240 trade-id and #244 arithmetic
+    /// preflights), the modify-aware risk check, the #168 STP self-cross
+    /// dry run and the #230 reserve-residual dry run. These checks are pure
+    /// functions of the new order plus the *opposite* book side, so
+    /// evaluating them while the same-side original still rests yields the
+    /// same verdict as after the cancel. The re-add then takes that verdict
+    /// as its admission. A re-add that still fails is resolved by
+    /// [`Self::resolve_failed_readd`].
+    ///
+    /// `snapshot` is the order as the caller read it to build `new_order`.
+    /// Under the shared submit gate a concurrent taker can fill part of it
+    /// before the cancel lands, so the re-add is built from the order the
+    /// cancel **returned**, never from the snapshot, and quantity is never
+    /// created (#247):
+    ///
+    /// - [`ReAddQuantity::FollowsRemainder`] (`UpdatePrice`): the re-add
+    ///   carries the cancelled remainder at the new price. The pre-cancel
+    ///   verdict still holds: every check is monotone in the quantity, and
+    ///   the remainder is never larger than what was validated (a
+    ///   concurrent size-up takes the same path and rolls back instead).
+    /// - [`ReAddQuantity::Explicit`] (`UpdatePriceAndQuantity`, `Replace`):
+    ///   the caller named a new quantity against a state that no longer
+    ///   exists, so the modify is not applied. The remainder is restored
+    ///   and the call returns [`OrderBookError::ModifyRolledBack`] whose
+    ///   source is [`OrderBookError::OrderChangedDuringModify`].
+    ///
+    /// Returns `Ok(None)` when the cancel finds no order to remove (it was
+    /// filled or cancelled concurrently): nothing is re-added, so a
+    /// finished order is never resurrected.
+    pub(super) fn cancel_then_readd(
+        &self,
+        order_id: Id,
+        snapshot: &OrderType<T>,
+        new_order: OrderType<T>,
+        quantity: ReAddQuantity,
+    ) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
+        // The gate mode was chosen once at the boundary by
+        // `modify_needs_exclusive_gate` and is never upgraded here, so the
+        // re-add must never be a fill-or-kill (whose all-or-nothing window
+        // always requires the exclusive gate). Unreachable today — an FOK
+        // never rests, so it can never be modified — but rejected with a
+        // typed error before the cancel (#209, #247).
+        if new_order.is_fill_or_kill() {
+            return Err(fill_or_kill_readd(order_id));
+        }
+        let verdict = self.validate_order_shape(&new_order)?;
+        self.check_risk_modify_admission(
+            order_id,
+            new_order.user_id(),
+            new_order.price().as_u128(),
+            new_order.total_quantity()?,
+        )?;
+
+        // #168: reject a re-price that would self-cross the same user's
+        // opposite-side liquidity under CancelTaker / CancelBoth BEFORE
+        // cancelling the original, so the original survives.
+        self.check_modify_stp_self_cross(&new_order)?;
+
+        // #230: reject a re-price whose re-add would exhaust a
+        // non-auto-replenishing reserve's visible tranche and discard its
+        // hidden remainder, which would destroy the order after the
+        // original was already cancelled.
+        self.check_modify_reserve_residual(&new_order)?;
+
+        #[cfg(test)]
+        self.fire_modify_hook(order_id, ModifyPhase::BeforeCancel);
+
+        // All checks passed: cancel the original and re-add the updated
+        // order. Ungated inner variants: `update_order` already holds the
+        // submit gate (#209 / #225); the public wrappers would re-acquire it
+        // (std RwLock is not reentrant).
+        let prior_status = self.order_status(order_id);
+        let Some(original) =
+            self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?
+        else {
+            return Ok(None);
+        };
+
+        #[cfg(test)]
+        self.fire_modify_hook(order_id, ModifyPhase::AfterCancel);
+
+        // What the tracker knew the order had executed, plus any fill that
+        // landed between the caller's read and the cancel (a smaller
+        // cancelled remainder than the snapshot). A larger remainder is a
+        // concurrent size-up, not a fill.
+        let snapshot_total = snapshot.total_quantity()?;
+        let original_total = original.total_quantity()?;
+        let tracked_filled = prior_status
+            .as_ref()
+            .map_or(0, OrderStatus::filled_quantity);
+        let prior_filled = match snapshot_total.checked_sub(original_total) {
+            Some(raced_fills) => cumulative_filled(order_id, tracked_filled, raced_fills),
+            // A larger cancelled remainder: a concurrent size-up, no fill.
+            None => tracked_filled,
+        };
+        let changed = !same_quantities(snapshot, original.as_ref());
+
+        let new_order = match (changed, quantity) {
+            (false, _) => new_order,
+            (true, ReAddQuantity::FollowsRemainder) => {
+                let mut remainder = (*original).clone();
+                set_order_price(&mut remainder, new_order.price());
+                remainder
+            }
+            (true, ReAddQuantity::Explicit) => {
+                let changed = OrderBookError::OrderChangedDuringModify {
+                    order_id,
+                    read_quantity: snapshot_total,
+                    cancelled_quantity: original_total,
+                };
+                return Err(self.resolve_failed_readd(
+                    order_id,
+                    original.as_ref(),
+                    prior_status,
+                    prior_filled,
+                    AdmitFailure::from(changed),
+                ));
+            }
+        };
+        match self.add_order_inner(
+            new_order,
+            false,
+            false,
+            Admission::ReAdd {
+                verdict,
+                prior_filled,
+            },
+        ) {
+            Ok((order, _)) => Ok(Some(order)),
+            Err(failure) => Err(self.resolve_failed_readd(
+                order_id,
+                original.as_ref(),
+                prior_status,
+                prior_filled,
+                failure,
+            )),
+        }
+    }
+
+    /// Test-only interleaving point of a cancel-then-add modify (#247).
+    #[cfg(test)]
+    fn fire_modify_hook(&self, order_id: Id, phase: ModifyPhase) {
+        if let Some(hook) = self.modify_interleave_hook.as_ref() {
+            hook(self, order_id, phase);
+        }
+    }
+
+    /// Resolves a modify re-add that failed after the original was
+    /// cancelled (#247); see the "Failed re-adds" section of
+    /// [`Self::update_order`].
+    ///
+    /// - The re-add traded: the original cannot be restored. A #240 abort is
+    ///   returned as is (`MatchAborted`); any other failure becomes
+    ///   [`OrderBookError::ModifyOrderLost`] with the re-add's executed
+    ///   quantity. The terminal state `add_order_inner` recorded is already
+    ///   cumulative (`prior_filled` plus the re-add's fills).
+    /// - Nothing traded: the original is restored and the result is
+    ///   [`OrderBookError::ModifyRolledBack`]. Should the restore fail too,
+    ///   the order is gone ([`OrderBookError::ModifyOrderLost`] with
+    ///   `restore_error`) and ends
+    ///   `Cancelled { filled_quantity: prior_filled, RestFailed }`, unless a
+    ///   live order now owns its id.
+    #[cold]
+    #[inline(never)]
+    fn resolve_failed_readd(
+        &self,
+        order_id: Id,
+        original: &OrderType<T>,
+        prior_status: Option<OrderStatus>,
+        prior_filled: u64,
+        failure: AdmitFailure,
+    ) -> OrderBookError {
+        let traded = failure.traded();
+        let AdmitFailure {
+            error: source,
+            executed_quantity,
+            ..
+        } = failure;
+        if traded {
+            if matches!(source, OrderBookError::MatchAborted { .. }) {
+                return source;
+            }
+            tracing::error!(
+                symbol = %self.symbol,
+                %order_id,
+                executed_quantity,
+                error = %source,
+                "modify re-add failed after trading; the remainder did not rest and the order is gone"
+            );
+            return OrderBookError::ModifyOrderLost {
+                order_id,
+                executed_quantity,
+                source: Box::new(source),
+                restore_error: None,
+            };
+        }
+        match self.restore_cancelled_order(original, prior_status.clone()) {
+            Ok(()) => {
+                tracing::warn!(
+                    symbol = %self.symbol,
+                    %order_id,
+                    error = %source,
+                    "modify re-add failed; original order restored at the back of its level"
+                );
+                OrderBookError::ModifyRolledBack {
+                    order_id,
+                    source: Box::new(source),
+                }
+            }
+            Err(restore_error) => {
+                if !matches!(restore_error, OrderBookError::DuplicateOrderId { .. }) {
+                    self.track_state(
+                        order_id,
+                        OrderStatus::Cancelled {
+                            filled_quantity: prior_filled,
+                            reason: CancelReason::RestFailed,
+                        },
+                    );
+                }
+                tracing::error!(
+                    symbol = %self.symbol,
+                    %order_id,
+                    error = %source,
+                    restore_error = %restore_error,
+                    "modify re-add failed and the original could not be restored; the order is gone"
+                );
+                OrderBookError::ModifyOrderLost {
+                    order_id,
+                    executed_quantity: 0,
+                    source: Box::new(source),
+                    restore_error: Some(Box::new(restore_error)),
+                }
+            }
+        }
+    }
+
+    /// Re-rests a modify's cancelled `original` (#247): same id, price,
+    /// quantity and timestamp, at the back of its level's queue, with its
+    /// order state set back to `prior_status` (`Open` when it had none).
+    ///
+    /// The restore never matches: it only rests. Under the shared submit
+    /// gate an opposite order can arrive between the cancel and the
+    /// restore at a price the original now crosses or locks; resting there
+    /// would have the engine itself create a crossed or locked book, so
+    /// the restore is refused instead.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::DuplicateOrderId`] when another order took the id
+    /// meanwhile; [`OrderBookError::PriceCrossing`] when the original's
+    /// price now crosses or locks the best opposite price; otherwise the
+    /// risk or level error that refused the order. Nothing is left indexed
+    /// on failure.
+    fn restore_cancelled_order(
+        &self,
+        original: &OrderType<T>,
+        prior_status: Option<OrderStatus>,
+    ) -> Result<(), OrderBookError> {
+        let order_id = original.id();
+        if self.order_locations.contains_key(&order_id) {
+            return Err(OrderBookError::DuplicateOrderId { order_id });
+        }
+        if self.will_cross_market(original.price().as_u128(), original.side()) {
+            return Err(self.price_crossing(original));
+        }
+        let quantity = original.total_quantity()?;
+        self.rest_on_level(original, quantity)
+            .map_err(RestFailure::into_error)?;
+        self.track_state(order_id, prior_status.unwrap_or(OrderStatus::Open));
+        self.cache.invalidate();
+        Ok(())
+    }
+}
+
+/// How [`OrderBook::add_order_inner`] admits an order (#247).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Admission {
+    /// A new submit: every admission check runs.
+    Submit,
+    /// The re-add of a validate-first modify: the kill-switch, risk and
+    /// shape checks ran before the original was cancelled, and their
+    /// verdict is taken as is. Rejections are not recorded as order state
+    /// or reject metrics: the modify resolves them (#247).
+    ReAdd {
+        /// The pre-cancel admission verdict.
+        verdict: ShapeVerdict,
+        /// What the original had executed before the modify, in quantity
+        /// units; every order state the re-add records adds its own fills
+        /// to it, so `filled_quantity` stays cumulative (#247).
+        prior_filled: u64,
+    },
+}
+
+impl Admission {
+    /// Whether rejections are recorded as order state and reject metrics.
+    #[inline]
+    fn records_rejections(self) -> bool {
+        matches!(self, Self::Submit)
+    }
+
+    /// Fills the order executed before this admission.
+    #[inline]
+    fn prior_filled(self) -> u64 {
+        match self {
+            Self::Submit => 0,
+            Self::ReAdd { prior_filled, .. } => prior_filled,
+        }
+    }
+}
+
+/// How a cancel-then-add modify sizes its re-add when the order changed
+/// between the caller's read and the cancel (#247).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReAddQuantity {
+    /// `UpdatePrice`: the re-add carries whatever the cancel removed.
+    FollowsRemainder,
+    /// `UpdatePriceAndQuantity` / `Replace`: the caller named the quantity;
+    /// a changed order rolls the modify back.
+    Explicit,
+}
+
+/// Where a cancel-then-add modify is when the test-only
+/// `modify_interleave_hook` fires (#247).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModifyPhase {
+    /// Every pre-cancel check passed; the original still rests.
+    BeforeCancel,
+    /// The original was cancelled; the re-add has not run.
+    AfterCancel,
+}
+
+/// Whether two views of an order carry the same tranches.
+fn same_quantities<T>(a: &OrderType<T>, b: &OrderType<T>) -> bool {
+    a.quantity() == b.quantity() && a.checked_total_quantity() == b.checked_total_quantity()
+}
+
+/// Sets `order`'s limit price.
+fn set_order_price<T>(order: &mut OrderType<T>, new_price: pricelevel::Price) {
+    match order {
+        OrderType::Standard { price, .. }
+        | OrderType::IcebergOrder { price, .. }
+        | OrderType::PostOnly { price, .. }
+        | OrderType::TrailingStop { price, .. }
+        | OrderType::PeggedOrder { price, .. }
+        | OrderType::MarketToLimit { price, .. }
+        | OrderType::ReserveOrder { price, .. } => *price = new_price,
+    }
+}
+
+/// `prior + more`, the cumulative executed quantity of an order, in
+/// quantity units. Both are bounded by quantities the order held, so the
+/// sum fits; a breach is logged and the larger operand kept rather than
+/// wrapped (#247).
+fn cumulative_filled(order_id: Id, prior: u64, more: u64) -> u64 {
+    match prior.checked_add(more) {
+        Some(total) => total,
+        None => {
+            tracing::error!(%order_id, prior, more, "cumulative filled quantity overflows u64");
+            prior.max(more)
+        }
+    }
+}
+
+/// A failed [`OrderBook::add_order_inner`] (#247): the submit failure plus
+/// whether the taker traded before it failed.
+#[derive(Debug)]
+pub(super) struct AdmitFailure {
+    /// The typed error the submit APIs return.
+    error: OrderBookError,
+    /// The committed trades, when the caller asked for them. Kept flat
+    /// rather than as a nested [`SubmitFailure`] so the failure stays below
+    /// clippy's large-error threshold.
+    committed: Option<Box<TradeResult>>,
+    /// Quantity the taker executed before the failure, in quantity units.
+    /// Positive exactly when the sweep committed a trade (every trade
+    /// carries a positive quantity), which is what decides whether a failed
+    /// modify re-add may restore the original.
+    executed_quantity: u64,
+}
+
+impl AdmitFailure {
+    /// A failure raised after the sweep.
+    #[inline]
+    fn after(
+        error: OrderBookError,
+        committed: Option<TradeResult>,
+        executed_quantity: u64,
+    ) -> Self {
+        Self {
+            error,
+            committed: committed.map(Box::new),
+            executed_quantity,
+        }
+    }
+
+    /// Whether the taker traded before the failure.
+    #[inline]
+    fn traded(&self) -> bool {
+        self.executed_quantity > 0
+    }
+
+    /// The submit API's failure.
+    #[inline]
+    pub(super) fn into_submit(self) -> SubmitFailure {
+        SubmitFailure {
+            error: self.error,
+            committed: self.committed,
+        }
+    }
+}
+
+impl From<OrderBookError> for AdmitFailure {
+    /// A failure raised before any trade.
+    #[inline]
+    fn from(error: OrderBookError) -> Self {
+        Self {
+            error,
+            committed: None,
+            executed_quantity: 0,
+        }
+    }
+}
+
+/// Why [`OrderBook::rest_on_level`] could not rest an order (#247).
+#[derive(Debug)]
+enum RestFailure {
+    /// The per-account risk reservation was refused; nothing was touched.
+    Risk(OrderBookError),
+    /// The price level refused the order; the reservation was released.
+    Level(PriceLevelError),
+}
+
+impl RestFailure {
+    /// The typed error to surface.
+    #[inline]
+    fn into_error(self) -> OrderBookError {
+        match self {
+            Self::Risk(error) => error,
+            Self::Level(error) => OrderBookError::PriceLevelError(error),
         }
     }
 }

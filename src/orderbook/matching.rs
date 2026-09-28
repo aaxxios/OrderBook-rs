@@ -1171,15 +1171,31 @@ where
                         // in lockstep, but does NOT remove the level from the map (no
                         // order_locations re-resolution either), so level removal stays
                         // with the post-walk empty_price_levels drain (#95).
+                        // #247: a maker cancel the level fails stops the
+                        // sweep here with the #240 abort semantics (prefix
+                        // of the earlier levels published, remainder never
+                        // rested) instead of carrying on as if it had been
+                        // cancelled.
+                        let mut maker_cancel_error = None;
                         for order in &stp_orders {
-                            if order.user_id() == taker_user_id {
-                                self.cancel_resting_maker_on_level(
+                            if order.user_id() == taker_user_id
+                                && let Err(err) = self.cancel_resting_maker_on_level(
                                     price_level,
                                     side.opposite(),
                                     order.id(),
                                     CancelReason::SelfTradePrevention,
-                                );
+                                )
+                            {
+                                maker_cancel_error = Some(err);
+                                break;
                             }
+                        }
+                        if let Some(err) = maker_cancel_error {
+                            if price_level.order_count() == 0 {
+                                empty_price_levels.push(price);
+                            }
+                            sweep_error = Some(err);
+                            break;
                         }
                         // If the level is now empty, mark for removal and continue
                         if price_level.order_count() == 0 {
@@ -1253,7 +1269,9 @@ where
                         // Cancel the maker on the held level for the same lockstep
                         // event + state + risk effects as CancelMaker (#95); level
                         // removal stays with the empty_price_levels drain below.
-                        self.cancel_resting_maker_on_level(
+                        // #247: a failed maker cancel aborts the sweep
+                        // (#240) with this level's pre-match in the prefix.
+                        let maker_cancel = self.cancel_resting_maker_on_level(
                             price_level,
                             side.opposite(),
                             maker_order_id,
@@ -1261,6 +1279,10 @@ where
                         );
                         if price_level.order_count() == 0 {
                             empty_price_levels.push(price);
+                        }
+                        if let Err(err) = maker_cancel {
+                            sweep_error = Some(err);
+                            break;
                         }
                         stp_taker_cancelled = true;
                         break;
@@ -1327,7 +1349,9 @@ where
         // Batch remove empty price levels
         let levels_removed = !empty_price_levels.is_empty();
         for price in &empty_price_levels {
-            match_side.remove(price);
+            // #247: re-checked under the price's stripe, so a level a
+            // concurrent submit refilled after the sweep emptied it stays.
+            self.remove_level_if_empty(side.opposite(), *price);
         }
         if levels_removed {
             // Refresh the operational depth gauges now that levels may

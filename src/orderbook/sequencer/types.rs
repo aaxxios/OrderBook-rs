@@ -431,7 +431,14 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::PriceLevelError(_)
         | OrderBookError::MatchAborted { .. }
         // A cancel whose level removed the order, then failed (#248).
-        | OrderBookError::OrderRemovedWithLevelFault { .. } => true,
+        | OrderBookError::OrderRemovedWithLevelFault { .. }
+        // A modify that cancelled the original before its re-add failed:
+        // restored at the back of its level, or gone (#247).
+        | OrderBookError::ModifyRolledBack { .. }
+        | OrderBookError::ModifyOrderLost { .. }
+        // Only ever the source of one of the two above; classified with
+        // them in case a caller surfaces it on its own.
+        | OrderBookError::OrderChangedDuringModify { .. } => true,
         // Admission and shape checks (all evaluated before the sweep), the
         // operational gates, and the non-reject internal errors. The
         // post-sweep post-only rejection is here too: `pricelevel`
