@@ -947,6 +947,15 @@ where
                         .map(|_| ()),
                 )?;
             }
+            // A mass cancel the live book refused cancelled nothing, so
+            // replay applies it as a no-op instead of re-executing it: the
+            // replay book may be readable where the live one was not, and
+            // re-execution would then cancel orders the live book kept.
+            SequencerCommand::CancelAll
+            | SequencerCommand::CancelBySide { .. }
+            | SequencerCommand::CancelByUser { .. }
+            | SequencerCommand::CancelByPriceRange { .. }
+                if Self::recorded_mass_cancel_refused(event) => {}
             SequencerCommand::CancelAll => {
                 Self::ensure_mass_cancel_complete(event, &book.cancel_all_orders())?;
             }
@@ -982,6 +991,17 @@ where
         }
 
         Ok(true)
+    }
+
+    /// Whether the journal recorded this mass cancel as refused.
+    ///
+    /// A refusal ([`MassCancelResult::has_failures`]) cancelled nothing on
+    /// the live book, so replay must not re-execute it.
+    fn recorded_mass_cancel_refused(event: &SequencerEvent<T>) -> bool {
+        matches!(
+            &event.result,
+            SequencerResult::MassCancelled { result } if result.has_failures()
+        )
     }
 
     /// Fails replay when a re-executed mass cancel recorded a failure.
@@ -1964,6 +1984,69 @@ mod tests {
         // Sanity: the expired levels are gone, the survivors remain.
         assert_eq!(replayed_snap.bids.len(), 2, "99 and 98 bids survive");
         assert!(replayed_snap.asks.is_empty(), "the only ask expired");
+    }
+
+    /// A mass cancel journaled as refused cancelled nothing live, so replay
+    /// must not re-execute it even when the replay book is readable.
+    #[test]
+    fn test_replay_skips_mass_cancel_recorded_as_refused() {
+        use crate::orderbook::mass_cancel::MassCancelFailure;
+
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let symbol = "REFUSED";
+        let live = OrderBook::<()>::new(symbol);
+        let order = OrderType::Standard {
+            id: Id::from_u64(1),
+            price: Price::new(100),
+            quantity: Quantity::new(5),
+            side: Side::Buy,
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
+        };
+        live.add_order(order).expect("live add");
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 0,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::AddOrder(order),
+                    result: SequencerResult::OrderAdded {
+                        order_id: order.id()
+                    },
+                })
+                .is_ok()
+        );
+        let refused = MassCancelResult::refused(MassCancelFailure::LevelUnreadable {
+            side: Side::Buy,
+            price: 100,
+            error: pricelevel::PriceLevelError::InvalidOperation {
+                message: "unreadable".to_string(),
+            },
+        });
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 1,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::CancelAll,
+                    result: SequencerResult::MassCancelled { result: refused },
+                })
+                .is_ok()
+        );
+
+        let (replayed, last_seq) =
+            ReplayEngine::<()>::replay_from(&journal, 0, symbol).expect("replay must succeed");
+        assert_eq!(last_seq, 1);
+        let live_snap = live.create_snapshot(usize::MAX).expect("snapshot");
+        let replayed_snap = replayed.create_snapshot(usize::MAX).expect("snapshot");
+        assert!(snapshots_match(&live_snap, &replayed_snap));
+        assert_eq!(
+            replayed_snap.bids.len(),
+            1,
+            "the refused cancel kept the order"
+        );
     }
 
     // --- trade-ID namespace through replay (#200) ---------------------------

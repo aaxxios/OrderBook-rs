@@ -90,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journaled `MassCancelled` entries) written by 0.13 decodes with no
   failures. Replay turns a refused mass cancel or eviction into
   `ReplayError::OrderBookError` instead of continuing on a diverged book.
+  Replay applies a mass cancel journaled as refused as a no-op instead of
+  re-executing it, so a replay book that happens to be readable cannot
+  cancel orders the live book kept.
 - **Snapshot package format v4.** `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` goes
   from 3 to 4 because a level's `value_executed` statistic is a `u128` in
   pricelevel 0.10 and may exceed `u64::MAX`. Migration: none needed on read;

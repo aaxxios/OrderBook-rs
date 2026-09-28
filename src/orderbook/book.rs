@@ -3751,7 +3751,7 @@ where
         let asks = convert(snapshot.asks, "ask")?;
 
         // Cross-level duplicate-id check. Per-level duplicates are already
-        // rejected by `PriceLevel::from_snapshot` (pricelevel 0.9); an id
+        // rejected by `PriceLevel::from_snapshot` (since pricelevel 0.9); an id
         // resting at two prices would silently orphan one of them in
         // `order_locations`, so reject the snapshot before any mutation.
         // A HashSet is safe here: only membership is consulted, no
@@ -4176,7 +4176,7 @@ where
     /// # Errors
     /// Returns [`OrderBookError::PriceLevelError`] if a level cannot produce
     /// a coherent snapshot (pricelevel 0.10) or if rebuilding a level from
-    /// its snapshot fails validation (pricelevel 0.9 validates snapshot
+    /// its snapshot fails validation (pricelevel validates snapshot
     /// admission instead of trusting it).
     pub fn get_bt_bids(&self) -> Result<BTreeMap<u128, PriceLevel>, OrderBookError> {
         self.bids
@@ -4195,7 +4195,7 @@ where
     /// # Errors
     /// Returns [`OrderBookError::PriceLevelError`] if a level cannot produce
     /// a coherent snapshot (pricelevel 0.10) or if rebuilding a level from
-    /// its snapshot fails validation (pricelevel 0.9 validates snapshot
+    /// its snapshot fails validation (pricelevel validates snapshot
     /// admission instead of trusting it).
     pub fn get_bt_asks(&self) -> Result<BTreeMap<u128, PriceLevel>, OrderBookError> {
         self.asks
