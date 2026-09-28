@@ -282,7 +282,7 @@ fn json_serializer_book_change_round_trip() {
 #[cfg(feature = "bincode")]
 #[test]
 fn bincode_serializer_trade_result_round_trip() {
-    let serializer = orderbook_rs::BincodeEventSerializer;
+    let serializer = orderbook_rs::BincodeEventSerializer::new();
 
     let book = OrderBook::<()>::new("BTC/USD");
     let _ = book.add_limit_order(new_id(), 100, 50, Side::Sell, TimeInForce::Gtc, None);
