@@ -88,6 +88,17 @@
 //! - **Fill-or-kill preflight.** A FOK checks trade-id headroom and reserves
 //!   its result buffers before any mutation; a shortfall rejects it
 //!   untouched.
+//! - **Dead-book signal.** `OrderBook::match_aborts()`,
+//!   `match_fold_failures()` and the latched `trade_ids_exhausted()` (plus
+//!   `metrics` counters). With an exhausted trade-id generator every
+//!   crossing submit / modify is rejected untouched (code 16); a failed
+//!   post-only probe is also a clean `Rejected`, not an abort.
+//! - **Limitations.** A journal holding a resource-exhaustion abort replays
+//!   at best from genesis, never from a mid-stream snapshot (the trade-id
+//!   generator is not in the snapshot); the committed-prefix check only
+//!   applies to submits recorded through `*_with_committed` /
+//!   `SequencerResult::from_submit_failure`, and aborted updates are
+//!   reconciled by code only. See `doc/panic-boundaries.md`.
 //!
 //! ### Migration from 0.13
 //!

@@ -373,17 +373,11 @@ mod tests {
 
     #[test]
     fn test_abort_on_first_level_commits_nothing() {
+        // The raw match entry point has no trade-id pre-check, so an
+        // exhausted generator aborts it at the first level.
         let (book, streams) = aborting_book(0);
         let err = book
-            .add_limit_order_with_user(
-                Id::from_u64(TAKER),
-                102,
-                20,
-                Side::Buy,
-                TimeInForce::Gtc,
-                taker_user(),
-                None,
-            )
+            .match_order(Id::from_u64(TAKER), Side::Buy, 20, Some(102))
             .expect_err("sweep must abort");
         assert_aborted(&err, 0, 0);
         assert!(streams.trades.lock().expect("trade sink").is_empty());
@@ -406,6 +400,133 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn assert_rejected_untouched_for_ids(
+        book: &OrderBook<()>,
+        streams: &Streams,
+        err: &OrderBookError,
+    ) {
+        assert!(
+            matches!(
+                err,
+                OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+                    resource: CapacityResource::IdSequence,
+                    additional: 1,
+                })
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(RejectReason::from(err), RejectReason::CapacityExceeded);
+        assert!(streams.trades.lock().expect("trade sink").is_empty());
+        assert!(streams.levels.lock().expect("level sink").is_empty());
+        for maker in [MAKER_A, MAKER_B, MAKER_C, MAKER_D] {
+            assert!(book.get_order(Id::from_u64(maker)).is_some());
+        }
+        assert!(book.trade_ids_exhausted(), "exhaustion is latched");
+        assert_eq!(book.match_aborts(), 0, "nothing was aborted");
+    }
+
+    #[test]
+    fn test_exhausted_generator_rejects_crossing_add_untouched() {
+        let (book, streams) = aborting_book(0);
+        let err = book
+            .add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                102,
+                20,
+                Side::Buy,
+                TimeInForce::Gtc,
+                taker_user(),
+                None,
+            )
+            .expect_err("no trade id left");
+        assert_rejected_untouched_for_ids(&book, &streams, &err);
+        assert_eq!(
+            book.order_status(Id::from_u64(TAKER)),
+            Some(OrderStatus::Rejected {
+                reason: RejectReason::CapacityExceeded,
+            })
+        );
+        assert_eq!(book.best_bid(), None);
+
+        // Non-crossing and post-only orders never mint a trade id.
+        book.add_limit_order_with_user(
+            Id::from_u64(200),
+            90,
+            5,
+            Side::Buy,
+            TimeInForce::Gtc,
+            taker_user(),
+            None,
+        )
+        .expect("a non-crossing order rests");
+        assert_eq!(book.best_bid(), Some(90));
+    }
+
+    #[test]
+    fn test_exhausted_generator_rejects_market_orders_untouched() {
+        let (book, streams) = aborting_book(0);
+        let err = book
+            .submit_market_order(Id::from_u64(TAKER), 20, Side::Buy)
+            .expect_err("no trade id left");
+        assert_rejected_untouched_for_ids(&book, &streams, &err);
+        let err = book
+            .submit_market_order_by_amount(Id::from_u64(TAKER + 1), 10_000, Side::Buy)
+            .expect_err("no trade id left");
+        assert_rejected_untouched_for_ids(&book, &streams, &err);
+        let err = book
+            .match_limit_order(Id::from_u64(TAKER + 2), 20, Side::Buy, 102)
+            .expect_err("no trade id left");
+        assert_rejected_untouched_for_ids(&book, &streams, &err);
+    }
+
+    #[test]
+    fn test_exhausted_generator_keeps_the_original_on_a_crossing_modify() {
+        let (book, streams) = aborting_book(0);
+        book.add_limit_order_with_user(
+            Id::from_u64(300),
+            90,
+            5,
+            Side::Buy,
+            TimeInForce::Gtc,
+            taker_user(),
+            None,
+        )
+        .expect("rest the original");
+        streams.levels.lock().expect("level sink").clear();
+        let err = book
+            .update_order(pricelevel::OrderUpdate::UpdatePrice {
+                order_id: Id::from_u64(300),
+                new_price: Price::new(101),
+            })
+            .expect_err("the re-add could not mint a trade id");
+        assert_rejected_untouched_for_ids(&book, &streams, &err);
+        let original = book
+            .get_order(Id::from_u64(300))
+            .expect("original still rests");
+        assert_eq!(original.price(), Price::new(90));
+        assert_eq!(book.best_bid(), Some(90));
+    }
+
+    #[test]
+    fn test_abort_counters_and_latch() {
+        let (mut book, _streams) = aborting_book(2);
+        assert_eq!(book.match_aborts(), 0);
+        assert!(!book.trade_ids_exhausted());
+        let _ = book.submit_market_order(Id::from_u64(TAKER), 20, Side::Buy);
+        assert_eq!(book.match_aborts(), 1);
+        assert_eq!(book.match_fold_failures(), 0, "the fold never failed");
+        assert!(book.trade_ids_exhausted(), "the IdSequence abort latches");
+        book.set_trade_id_namespace(uuid::Uuid::nil());
+        assert!(!book.trade_ids_exhausted(), "a fresh generator clears it");
+    }
+
+    /// #240: boxing `MatchAborted::source` keeps `OrderBookError` from
+    /// widening every `Result<_, OrderBookError>`.
+    #[test]
+    fn test_order_book_error_stays_within_96_bytes() {
+        assert!(std::mem::size_of::<OrderBookError>() <= 96);
     }
 
     #[test]

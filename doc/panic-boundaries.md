@@ -165,7 +165,26 @@ Residuals, stated precisely:
   allocation outcomes are not deterministic), so it usually does not
   reproduce on a fresh replay book: the replayed submit fills further and
   replay stops with `ReplayError::OutcomeMismatch`. That is by design —
-  loud, never a silent divergence.
+  loud, never a silent divergence. Such a journal is replayable at best
+  from genesis onto a book whose generator state matches; it is never
+  replayable from a mid-stream snapshot, because the snapshot package does
+  not carry the trade-id generator.
+- **Prefix reconciliation coverage.** Replay compares the committed prefix
+  only for submits the sequencer recorded through the `*_with_committed`
+  entry points and `SequencerResult::from_submit_failure`. An abort recorded
+  through `From<&OrderBookError>` (`RejectedWithCode`, code 15), and every
+  aborted `UpdateOrder`, is reconciled by reject code only.
+- **Cross-stream disagreement.** The fold-beyond-the-bound case above is
+  the only path on which the trade stream can disagree with the book, risk
+  and order-state streams. It is counted by `OrderBook::match_fold_failures`
+  and the `orderbook_match_fold_failures_total` metric.
+- **Exhausted trade-id generator.** Once the generator is exhausted the
+  book latches `OrderBook::trade_ids_exhausted` (logged once at `ERROR`,
+  `orderbook_trade_ids_exhausted_total`) and rejects every crossing submit,
+  crossing modify (before the original is cancelled) and publishing
+  `match_*` call untouched with `CapacityExceeded`. The raw `match_order*`
+  family still aborts with an empty prefix. No kill switch is engaged
+  automatically; replace the generator with `set_trade_id_namespace`.
 
 ## Ratchet
 

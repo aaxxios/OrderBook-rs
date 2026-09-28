@@ -70,6 +70,56 @@ pub const RESERVE_HIDDEN_DISCARDED_TOTAL: &str = "orderbook_reserve_hidden_disca
 
 /// Counter name: pre-trade risk accounting anomalies (#243).
 pub const RISK_ACCOUNTING_ANOMALIES_TOTAL: &str = "orderbook_risk_accounting_anomalies_total";
+/// Counter name: matching sweeps aborted by a failed price level (#240).
+pub const MATCH_ABORTS_TOTAL: &str = "orderbook_match_aborts_total";
+
+/// Counter name: price levels whose committed trades could not be folded
+/// into the taker's result (#240). The only path where the trade stream
+/// and the book / risk / order-state streams can disagree; any non-zero
+/// value needs operator attention.
+pub const MATCH_FOLD_FAILURES_TOTAL: &str = "orderbook_match_fold_failures_total";
+
+/// Counter name: books whose trade-id generator was found exhausted (#240).
+/// Incremented once per book, when the book latches the condition.
+pub const TRADE_IDS_EXHAUSTED_TOTAL: &str = "orderbook_trade_ids_exhausted_total";
+
+/// Record one aborted matching sweep (#240). No-op without `metrics`.
+#[inline]
+#[cfg(feature = "metrics")]
+pub fn record_match_abort() {
+    metrics::counter!(MATCH_ABORTS_TOTAL).increment(1);
+}
+
+/// No-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(not(feature = "metrics"))]
+pub fn record_match_abort() {}
+
+/// Record one refused fold of a level's committed trades (#240). No-op
+/// without `metrics`.
+#[inline]
+#[cfg(feature = "metrics")]
+pub fn record_match_fold_failure() {
+    metrics::counter!(MATCH_FOLD_FAILURES_TOTAL).increment(1);
+}
+
+/// No-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(not(feature = "metrics"))]
+pub fn record_match_fold_failure() {}
+
+/// Record that a book latched trade-id exhaustion (#240). Called once per
+/// book. No-op without `metrics`.
+#[inline]
+#[cfg(feature = "metrics")]
+pub fn record_trade_ids_exhausted() {
+    metrics::counter!(TRADE_IDS_EXHAUSTED_TOTAL).increment(1);
+}
+
+/// No-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(not(feature = "metrics"))]
+pub fn record_trade_ids_exhausted() {}
 
 /// Record an order rejection.
 ///
@@ -183,6 +233,9 @@ mod tests {
     #[test]
     fn helpers_are_callable_unconditionally() {
         record_reject(RejectReason::KillSwitchActive);
+        record_match_abort();
+        record_match_fold_failure();
+        record_trade_ids_exhausted();
         record_reject(RejectReason::Other(7777));
         record_depth(0, 0);
         record_depth(3, 5);

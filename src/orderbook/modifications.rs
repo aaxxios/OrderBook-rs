@@ -361,6 +361,18 @@ fn reserve_residual_would_be_discarded(
     }
 }
 
+/// The untouched rejection of a crossing taker when the book's trade-id
+/// generator is exhausted (#240): `CapacityExceeded { IdSequence }`, wire
+/// code `RejectReason::CapacityExceeded` (16).
+#[cold]
+#[inline(never)]
+pub(crate) fn trade_ids_exhausted_error() -> OrderBookError {
+    OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+        resource: CapacityResource::IdSequence,
+        additional: 1,
+    })
+}
+
 impl<T> OrderBook<T>
 where
     T: Clone + Send + Sync + Default + 'static,
@@ -494,6 +506,17 @@ where
     /// On a book holding none, a re-price of some *other* order runs
     /// shared, where the #168 self-cross dry run keeps its existing
     /// best-effort character.
+    ///
+    /// # Aborted re-adds (#240)
+    ///
+    /// A re-price that crosses while the book's trade-id generator is
+    /// exhausted is refused in the validate-first phase, **before** the
+    /// original is cancelled: the original keeps resting and the call
+    /// returns `PriceLevelError(CapacityExceeded)` (reject code 16). Any
+    /// other price-level failure during the re-add's sweep happens **after**
+    /// the original was cancelled: the committed prefix is published, the
+    /// remainder does not rest, the call returns
+    /// [`OrderBookError::MatchAborted`], and the original order is gone.
     pub fn update_order(
         &self,
         update: OrderUpdate,
@@ -612,7 +635,7 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false)?.0;
+                    let result = self.add_order_inner(new_order, false, false)?.0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Order not found
@@ -844,7 +867,7 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false)?.0;
+                    let result = self.add_order_inner(new_order, false, false)?.0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Order not found
@@ -1052,7 +1075,7 @@ where
                         "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
-                    let result = self.add_order_inner(new_order, false)?.0;
+                    let result = self.add_order_inner(new_order, false, false)?.0;
                     Ok(Some(result))
                 } else {
                     Ok(None) // Original order not found
@@ -1548,6 +1571,20 @@ where
         // + STP aware), not the raw-depth `peek_match`, so fill-or-kill stays
         // all-or-nothing and never emits a partial fill it then reports as killed (#96).
         //
+        // Exhausted trade-id generator (#240): a crossing taker would mint at
+        // least one trade id, and none is left, so its sweep would abort at
+        // the first level. Reject it untouched here instead — for the modify
+        // path this runs before the original is cancelled, so the original
+        // keeps resting. Post-only takers never trade and are exempt.
+        if !order.is_post_only()
+            && self.transaction_id_generator.is_exhausted()
+            && self.will_cross_market(order.price().as_u128(), order.side())
+        {
+            self.latch_trade_ids_exhausted();
+            return Err(trade_ids_exhausted_error());
+        }
+
+        //
         // Fill-or-kill preflight (#240): a later level can fail after earlier
         // levels committed, which would turn the FOK into a partial fill.
         // Everything the sweep can exhaust and the book can observe is
@@ -2028,6 +2065,18 @@ where
     /// Use [`Self::add_order_with_committed`] to receive the committed
     /// `TradeResult` with the error.
     ///
+    /// A fill-or-kill taker is killed in one of two shapes, both before any
+    /// mutation: not enough reachable depth is
+    /// [`OrderBookError::InsufficientLiquidity`] with
+    /// `Cancelled { InsufficientLiquidity }`; a resource shortfall (trade-id
+    /// headroom, result buffers, a failed feasibility dry run) is
+    /// [`OrderBookError::PriceLevelError`] with `Rejected` under
+    /// `RejectReason::CapacityExceeded` (16) / `CounterExhausted` (17).
+    ///
+    /// A crossing taker of any time-in-force is rejected the same untouched
+    /// way when the book's trade-id generator is exhausted
+    /// ([`Self::trade_ids_exhausted`]).
+    ///
     /// A fill-or-kill taker is preflighted before any mutation: the trade-id
     /// headroom is checked against an upper bound on its trades and its
     /// result buffers are reserved; a shortfall rejects it untouched with
@@ -2057,7 +2106,7 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, false)
+        self.add_order_inner(order, false, false)
             .map(|(order, _)| order)
             .map_err(SubmitFailure::into_error)
     }
@@ -2099,7 +2148,11 @@ where
     /// # Errors
     /// Returns [`OrderBookError::KillSwitchActive`] when the kill switch
     /// is engaged. The check runs before any cache invalidation, STP
-    /// validation, tick/lot validation, or matching work.
+    /// validation, tick/lot validation, or matching work. Returns
+    /// [`OrderBookError::MatchAborted`] when the sweep stopped at a failed
+    /// price level (#240): the committed prefix reached the trade listener
+    /// but is not returned here; use [`Self::add_order_with_committed`] to
+    /// receive it with the error.
     pub fn add_order_with_result(
         &self,
         order: OrderType<T>,
@@ -2113,7 +2166,7 @@ where
             // STPMode, so no sweep can consume one it never captured.
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true)
+        self.add_order_inner(order, true, false)
             .map_err(SubmitFailure::into_error)
     }
 
@@ -2147,18 +2200,28 @@ where
             order.is_post_only(),
             Self::is_strandable_maker(&order),
         ));
-        self.add_order_inner(order, true)
+        self.add_order_inner(order, true, true)
     }
 
     /// Shared implementation behind [`Self::add_order`] and
     /// [`Self::add_order_with_result`]. `want_result` gates `TradeResult`
     /// construction so the plain `add_order` path only pays for it when an
     /// installed trade listener needs it anyway.
+    ///
+    /// `want_committed` (set only by [`Self::add_order_with_committed`])
+    /// hands the committed `TradeResult` back inside a failure. Every other
+    /// caller drops it, so the failure paths that follow real fills (IOC
+    /// remainder, STP taker cancel, residual admission, abort) do not box a
+    /// `TradeResult` just to discard it.
     fn add_order_inner(
         &self,
         mut order: OrderType<T>,
         want_result: bool,
+        want_committed: bool,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
+        let committed = |trade_result: Option<TradeResult>| {
+            if want_committed { trade_result } else { None }
+        };
         self.check_kill_switch_or_reject(order.id())?;
         // Representability gate (#210): an unrepresentable two-tranche
         // total must be rejected before the risk gate below, which would
@@ -2365,7 +2428,7 @@ where
         // taker's terminal `Cancelled { MatchAborted }` state was recorded
         // by the sweep. The remainder must never rest, whatever the TIF.
         if let Some(err) = aborted {
-            return Err(SubmitFailure::with_committed(err, trade_result));
+            return Err(SubmitFailure::with_committed(err, committed(trade_result)));
         }
 
         // True (non-self) executed quantity. `remaining_quantity` only decrements on
@@ -2392,7 +2455,7 @@ where
                     taker_order_id: order.id(),
                     user_id: order.user_id(),
                 },
-                trade_result,
+                committed(trade_result),
             ));
         }
 
@@ -2418,7 +2481,7 @@ where
                             .quantity()
                             .saturating_sub(match_result.remaining_quantity().as_u64()),
                     },
-                    trade_result,
+                    committed(trade_result),
                 ));
             }
 
@@ -2534,7 +2597,7 @@ where
                         error = %err,
                         "risk reservation for the resting remainder failed; remainder not rested"
                     );
-                    return Err(SubmitFailure::with_committed(err, trade_result));
+                    return Err(SubmitFailure::with_committed(err, committed(trade_result)));
                 }
             };
 
@@ -2572,7 +2635,7 @@ where
                     );
                     return Err(SubmitFailure::with_committed(
                         OrderBookError::PriceLevelError(err),
-                        trade_result,
+                        committed(trade_result),
                     ));
                 }
             };

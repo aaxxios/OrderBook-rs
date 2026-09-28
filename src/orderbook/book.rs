@@ -162,6 +162,21 @@ pub struct OrderBook<T = ()> {
     /// read and the per-level captures therefore observe the same set.
     pub(super) strandable_makers_resting: AtomicUsize,
 
+    /// Matching sweeps aborted by a failed price level since the book was
+    /// built (#240). Diagnostic only: not part of the snapshot format.
+    pub(super) match_aborts: AtomicU64,
+
+    /// Price levels whose committed trades could not be folded into the
+    /// taker's result (#240): the only path where the trade stream can
+    /// disagree with the book, risk and order-state streams. Diagnostic
+    /// only: not part of the snapshot format.
+    pub(super) match_fold_failures: AtomicU64,
+
+    /// Latched the first time the book finds its trade-id generator
+    /// exhausted (#240). A latched book cannot trade again until its
+    /// generator is replaced. Not part of the snapshot format.
+    pub(super) trade_ids_exhausted: AtomicBool,
+
     /// The timestamp of market close, if applicable (for DAY orders)
     pub(super) market_close_timestamp: AtomicU64,
 
@@ -579,6 +594,9 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             strandable_makers_resting: AtomicUsize::new(0),
+            match_aborts: AtomicU64::new(0),
+            match_fold_failures: AtomicU64::new(0),
+            trade_ids_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -660,6 +678,70 @@ where
     /// [`Self::with_clock_and_namespace`] directly.
     pub fn set_trade_id_namespace(&mut self, namespace: Uuid) {
         self.transaction_id_generator = UuidGenerator::new(namespace);
+        // #240: a fresh generator clears a latched exhaustion.
+        *self.trade_ids_exhausted.get_mut() = false;
+    }
+
+    /// Number of matching sweeps this book aborted because a price level
+    /// failed mid-sweep (#240), across every submission path. A growing
+    /// value means the book is running into resource exhaustion (trade-id
+    /// sequence, level counters, allocation); see
+    /// [`OrderBookError::MatchAborted`].
+    #[must_use]
+    #[inline]
+    pub fn match_aborts(&self) -> u64 {
+        self.match_aborts.load(Ordering::Relaxed)
+    }
+
+    /// Number of price levels whose committed trades could not be folded
+    /// into the taker's result (#240). This is the only path on which the
+    /// trade stream (listener / journal) can disagree with the book, risk
+    /// and order-state streams; any non-zero value needs attention. See
+    /// `doc/panic-boundaries.md`.
+    #[must_use]
+    #[inline]
+    pub fn match_fold_failures(&self) -> u64 {
+        self.match_fold_failures.load(Ordering::Relaxed)
+    }
+
+    /// `true` once the book has found its trade-id generator exhausted
+    /// (#240). Latched: every crossing submit is then rejected untouched
+    /// (`RejectReason::CapacityExceeded`) until the generator is replaced
+    /// with [`Self::set_trade_id_namespace`]. The book does not engage the
+    /// kill switch by itself.
+    #[must_use]
+    #[inline]
+    pub fn trade_ids_exhausted(&self) -> bool {
+        self.trade_ids_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Increment a diagnostic counter with checked arithmetic. At `u64::MAX`
+    /// the counter stays put and the refusal is logged.
+    #[inline]
+    pub(super) fn bump_diagnostic_counter(counter: &AtomicU64, name: &'static str) {
+        if counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .is_err()
+        {
+            tracing::warn!(
+                counter = name,
+                "diagnostic counter at u64::MAX; not incremented"
+            );
+        }
+    }
+
+    /// Latch trade-id exhaustion (#240): the first caller logs at `ERROR`
+    /// and bumps the metric; later calls are no-ops.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn latch_trade_ids_exhausted(&self) {
+        if !self.trade_ids_exhausted.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                symbol = %self.symbol,
+                "trade-id generator exhausted: every crossing submit is rejected until the generator is replaced"
+            );
+            crate::orderbook::metrics::record_trade_ids_exhausted();
+        }
     }
 
     /// Access the currently-installed clock.
@@ -1278,6 +1360,9 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             strandable_makers_resting: AtomicUsize::new(0),
+            match_aborts: AtomicU64::new(0),
+            match_fold_failures: AtomicU64::new(0),
+            trade_ids_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1332,6 +1417,9 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             strandable_makers_resting: AtomicUsize::new(0),
+            match_aborts: AtomicU64::new(0),
+            match_fold_failures: AtomicU64::new(0),
+            trade_ids_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -3263,6 +3351,7 @@ where
             "Order book {}: Matching market order {} for {} at side {:?}",
             self.symbol, order_id, quantity, side
         );
+        self.check_trade_id_headroom(order_id, side)?;
         let outcome = {
             // #209 / #225: same gate as `match_order_with_user`, released
             // before the trades are published, as before.
@@ -3280,6 +3369,38 @@ where
             )?
         };
         self.publish_match_outcome(outcome, want_committed)
+    }
+
+    /// Reject a taker untouched when the trade-id generator is exhausted
+    /// and the opposite side holds liquidity it would trade with (#240):
+    /// its sweep could not mint a single trade id. Records
+    /// `Rejected { CapacityExceeded }` and latches
+    /// [`Self::trade_ids_exhausted`].
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::PriceLevelError`] (`CapacityExceeded { IdSequence }`).
+    #[inline]
+    pub(crate) fn check_trade_id_headroom(
+        &self,
+        order_id: Id,
+        side: Side,
+    ) -> Result<(), OrderBookError> {
+        if !self.transaction_id_generator.is_exhausted() {
+            return Ok(());
+        }
+        let opposite_empty = match side {
+            Side::Buy => self.asks.is_empty(),
+            Side::Sell => self.bids.is_empty(),
+        };
+        if opposite_empty {
+            return Ok(());
+        }
+        let source = PriceLevelError::CapacityExceeded {
+            resource: pricelevel::CapacityResource::IdSequence,
+            additional: 1,
+        };
+        Err(self.reject_untouched(order_id, source))
     }
 
     /// Publish a sweep's trades and resolve its outcome (#240).
@@ -3303,7 +3424,12 @@ where
         let want_result = want_committed && outcome.aborted.is_some();
         let committed = self.publish_trades(&outcome.result, want_result);
         match outcome.aborted {
-            Some(error) => Err(SubmitFailure::with_committed(error, committed)),
+            // Only a `*_with_committed` caller keeps the prefix; everyone
+            // else would drop it, so it is not boxed for them.
+            Some(error) => Err(SubmitFailure::with_committed(
+                error,
+                committed.filter(|_| want_committed),
+            )),
             None => Ok(outcome.result),
         }
     }
@@ -3445,6 +3571,7 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
+        self.check_trade_id_headroom(order_id, side)?;
         let outcome =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
         self.publish_match_outcome(outcome, want_committed)
@@ -3504,6 +3631,7 @@ where
             "Order book {}: Matching limit order {} for {} at side {:?} with limit price {}",
             self.symbol, order_id, quantity, side, limit_price
         );
+        self.check_trade_id_headroom(order_id, side)?;
         let outcome = {
             // #209 / #225: same gate as `match_order_with_user`, released
             // before the trades are published, as before.

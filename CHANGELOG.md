@@ -197,9 +197,14 @@ change.
   (`min(resting makers, quantity cap)`) is reserved in the result before the
   level is touched; a refused reservation aborts before that level. The taker's terminal state is
   `OrderStatus::Cancelled { filled_quantity: executed_quantity, reason:
-  CancelReason::MatchAborted }`. A failed post-only probe and a failed STP
-  queue view abort the same way (with an empty prefix) instead of
-  returning `PriceCrossing` / `PriceLevelError`. Compatibility:
+  CancelReason::MatchAborted }`. A failed STP queue view, or a refused
+  worst-case reservation for a level (taken before the STP arms touch it),
+  aborts the same way before that level is touched, with the prefix of the
+  earlier levels (empty only at the first level). A failed post-only probe
+  is a clean rejection instead: the book is provably untouched, so it
+  returns `PriceLevelError` with `Rejected { CapacityExceeded |
+  CounterExhausted }` rather than `PriceCrossing` or an abort.
+  Compatibility:
   - `OrderBookError::MatchAborted` is a new variant; `OrderBookError` is
     `#[non_exhaustive]`, so downstream matches keep compiling. Code that
     matched `PriceLevelError` to detect a sweep failure matches
@@ -245,6 +250,23 @@ change.
   sequence, epochs) are not observable, and replenishment trades beyond the
   reserved maker steps grow the buffers during the sweep; either can still
   abort a FOK mid-sweep, which then follows the `MatchAborted` rules above.
+  A partial `MatchAborted` from a `*_with_committed` call is the only
+  failure that boxes the committed `TradeResult`; the plain APIs never box
+  it.
+- **Exhausted trade-id generator and dead-book signal (#240).** A crossing
+  submit (`add_order*`, `submit_market_order*`, `match_market_order*`,
+  `match_limit_order*`) or a crossing modify (in its validate-first phase,
+  before the original is cancelled, which keeps resting) is rejected
+  untouched with `PriceLevelError(CapacityExceeded { IdSequence })`, code
+  16, once the book's trade-id generator is exhausted; post-only and
+  non-crossing orders are unaffected. New `OrderBook::match_aborts()`,
+  `OrderBook::match_fold_failures()` and `OrderBook::trade_ids_exhausted()`
+  (latched on the first exhaustion, logged once at `ERROR`, cleared by
+  `set_trade_id_namespace`); with `metrics`, the counters
+  `orderbook_match_aborts_total`, `orderbook_match_fold_failures_total` and
+  `orderbook_trade_ids_exhausted_total`. No automatic kill switch. An
+  abort during a modify's re-add for any other cause still destroys the
+  original (documented on `update_order`).
   The residuals, including poisoned pricelevel levels (empty result without
   an error) and why a journaled abort usually stops replay with
   `OutcomeMismatch`, are documented in `doc/panic-boundaries.md`.
