@@ -1352,6 +1352,36 @@ where
 ///   diverge even under identically-seeded injected clocks;
 /// - the top-level snapshot capture timestamp, as before.
 ///
+/// # Execution statistics and concurrent takers (#241)
+///
+/// The compared execution counters (`orders_executed`, `quantity_executed`,
+/// `value_executed`, `stats_degraded`) are only coherent under pricelevel
+/// 0.10's single-writer contract, and a live book lets shared-gate takers
+/// sweep one level concurrently (see `OrderBook`'s "Level statistics are
+/// advisory under concurrent takers"). The comparison stays exact anyway,
+/// and is kept, for two reasons:
+///
+/// - **The replayed side has one writer.** Replay applies journal events
+///   one at a time on the calling thread, so every level of the replayed
+///   book has at most one `record_execution` in flight and its snapshot
+///   never holds a partial execution.
+/// - **The live side's totals are exact once quiescent.** Overlapping
+///   recorders leave arithmetically exact final totals (atomic checked
+///   updates, exact rollbacks), and the live book executes the same fills
+///   per level as the replay, so a live snapshot taken with no sweep in
+///   flight carries the same counters.
+///
+/// The caller's obligation is therefore to take `expected` while no sweep
+/// is in flight on the live book, which a replay oracle needs regardless:
+/// a snapshot captured mid-sweep does not correspond to any journal prefix
+/// (its order vectors are mid-sweep too). A false divergence reported
+/// against such a snapshot is a capture-timing error, not a replay fault;
+/// dropping the counters would not make the comparison meaningful and would
+/// hide a real under-count (`stats_degraded`) or a lost fill. One residual:
+/// if a level's counters reach exhaustion, which execution gets dropped can
+/// depend on the live interleaving, and the two sides may then legitimately
+/// differ.
+///
 /// Note this tightening is a contract change for external consumers: two
 /// independently built books with equal aggregates but different maker
 /// identity or FIFO used to compare equal (pre-#208) and no longer do —

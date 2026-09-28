@@ -406,6 +406,15 @@ where
     ///
     /// In the happy case (single price level fill), complexity is O(log N).
     ///
+    /// # Concurrency
+    ///
+    /// An anonymous sweep takes the shared side of the submit gate (unless
+    /// a strandable maker rests), so two concurrent calls can match at the
+    /// same price level at once. Their trades and the level's queue stay
+    /// exact; the level's execution statistics seen by a concurrent snapshot
+    /// are advisory until both return (see [`OrderBook`]'s "Level statistics
+    /// are advisory under concurrent takers").
+    ///
     /// # Errors
     ///
     /// Same as [`Self::match_order_with_user`]. Like every raw `match_*`

@@ -506,6 +506,30 @@ change.
   handle the two new variants, and bincode end-of-input errors now
   surface as `Truncated` rather than `Bincode(String)`. JSON is unaffected.
 
+### Documentation
+
+- **Level statistics are advisory under concurrent takers (#241).**
+  pricelevel 0.10 supports exactly one concurrent writer of a level's
+  execution statistics (`orders_executed`, `quantity_executed`,
+  `value_executed`, `last_execution_time`, `sum_waiting_time`,
+  `stats_degraded`). Sweeps holding the shared submit gate (non-fill-or-kill
+  takers and matching-capable modifies on an `STPMode::None` book, anonymous
+  `match_order` sweeps) can match one level at the same time, so a level
+  snapshot taken meanwhile (`create_snapshot`, `create_snapshot_package`,
+  `snapshot_to_json`, `enriched_snapshot*`, `Serialize for OrderBook`) can
+  hold a partially recorded execution. Documented on `OrderBook`, the
+  snapshot APIs and types, `match_order`, `snapshots_match` and in
+  `doc/panic-boundaries.md`. Trades, fees, quantities, order vectors and the
+  book-derived analytics are unaffected; the aggregates are exact once the
+  overlapping sweeps return. Replay is single-threaded, so `snapshots_match`
+  keeps comparing the execution counters and stays exact against a live
+  snapshot taken with no sweep in flight. New test
+  `concurrent_level_statistics_tests` pins that contract.
+
+  **Compatibility:** documentation and a test only. No API, behaviour,
+  snapshot-format or performance change; the submit gate is unchanged
+  (decision D6).
+
 ## [0.13.1] - 2026-09-18
 
 ### Changed

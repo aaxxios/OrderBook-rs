@@ -230,6 +230,52 @@ Residuals, stated precisely:
   `MatchAborted` (their prefix published, possibly empty) instead of the
   untouched rejection.
 
+## Level statistics under concurrent takers (#241)
+
+pricelevel 0.10 (its `PriceLevelStatistics` "Writer contract", issue #153)
+supports exactly one concurrent writer of a level's execution aggregates
+(`orders_executed`, `quantity_executed`, `value_executed`,
+`last_execution_time`, `sum_waiting_time`, and the `stats_degraded` flag the
+recorder sets). Its sequence guard protects multi-field readers
+(`PriceLevel::snapshot`, serde, `Display`); it is not a writer lock.
+
+This crate does not provide that single writer. Every sweep that holds the
+shared side of the submit gate can match at the same level as another one:
+non-fill-or-kill takers and matching-capable modifies on an `STPMode::None`
+book, and anonymous match-only sweeps (`match_order`) under any mode, as long
+as no strandable maker rests. Fill-or-kill, STP-relevant submits and sweeps
+in a book holding a strandable maker take the exclusive side and never
+overlap. Decision D6: document the statistics as advisory rather than
+serialize ordinary sweeps, so there is no gate change and no performance
+cost.
+
+Stated precisely:
+
+- **Not affected:** trades, `MatchResult`, `TradeResult` (fees included),
+  level queues, quantities, order counts and order vectors, the admission /
+  removal counters (`orders_added`, `orders_removed`), and everything the book
+  derives from prices and quantities (`depth_statistics`, imbalance,
+  distribution, pressure, enriched-snapshot metrics, market impact).
+- **Advisory while sweeps overlap:** a snapshot of a level (`create_snapshot`,
+  `create_snapshot_package`, `snapshot_to_json`, `enriched_snapshot*`,
+  `impl Serialize for OrderBook`) taken while two recorders overlap on it can
+  capture a partial execution, for example `orders_executed` counting a fill
+  whose `quantity_executed` / `value_executed` has not landed. A package
+  captured then checksums and restores those values verbatim.
+- **Exact once quiescent:** every counter update is an atomic checked
+  read-modify-write and a rollback subtracts exactly what its own call added,
+  so the next snapshot with no sweep in flight reads the true totals. Readers
+  cannot hang: the sequence never stays odd once writers stop.
+- **Replay is exact.** Replay is single-threaded, so the replayed book has
+  one writer per level. `snapshots_match` keeps comparing the deterministic
+  execution counters: against a live snapshot taken with no sweep in flight
+  they are equal, and a live snapshot taken mid-sweep matches no journal
+  prefix anyway. The one residual is counter exhaustion, where which
+  execution is dropped can depend on the live interleaving.
+
+For exact statistics, capture with no sweep in flight or drive the book from
+one submitting thread (as a sequencer does).
+
 ## Ratchet
 
 Three ledgers, all mechanically enforced (`make lint`), all shrink-only:

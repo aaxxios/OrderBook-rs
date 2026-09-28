@@ -138,6 +138,67 @@ pub(crate) fn default_trade_id_namespace(symbol: &str) -> Uuid {
 
 /// The OrderBook manages a collection of price levels for both bid and ask sides.
 /// It supports adding, cancelling, and matching orders with lock-free operations where possible.
+///
+/// # Level statistics are advisory under concurrent takers (#241)
+///
+/// Every level snapshot the book hands out ([`create_snapshot`](Self::create_snapshot),
+/// [`create_snapshot_package`](Self::create_snapshot_package),
+/// [`snapshot_to_json`](Self::snapshot_to_json),
+/// [`enriched_snapshot`](Self::enriched_snapshot),
+/// [`enriched_snapshot_with_metrics`](Self::enriched_snapshot_with_metrics) and
+/// `impl Serialize for OrderBook`) embeds pricelevel's per-level
+/// `PriceLevelStatistics`, read through `PriceLevelSnapshot::statistics()`.
+/// pricelevel 0.10 supports **exactly one concurrent writer** of a level's
+/// execution aggregates (`orders_executed`, `quantity_executed`,
+/// `value_executed`, `last_execution_time`, `sum_waiting_time`, and the
+/// `stats_degraded` flag the recorder sets): its sequence guard protects
+/// readers, it is not a writer lock.
+///
+/// The book does not serialize sweeps to provide that single writer. Two
+/// sweeps that both hold the shared side of the submit gate may match at
+/// the same price level at the same time, and each calls pricelevel's
+/// `record_execution` for its own fills. That is the case for every
+/// non-fill-or-kill taker and every matching-capable modify on an
+/// [`STPMode::None`] book, and for anonymous (`Hash32::zero()`) match-only
+/// sweeps such as [`match_order`](Self::match_order) under any mode, as long
+/// as no strandable maker rests. Fill-or-kill takers, STP-relevant submits
+/// and sweeps in a book holding a strandable maker run exclusively, so they
+/// never overlap another recorder.
+///
+/// While two recorders overlap on one level, a snapshot of that level can
+/// capture a **partial execution**: for example `orders_executed` already
+/// counting a fill whose `quantity_executed` / `value_executed` has not
+/// landed yet. The contract is therefore:
+///
+/// - **Exact regardless of concurrency:** trades, `MatchResult`,
+///   `TradeResult` (fees included), every level's queue, quantities, order
+///   count and order vector, and the order-admission / removal counters
+///   (`orders_added`, `orders_removed`, plain atomic increments). None of them
+///   is derived from the execution aggregates.
+/// - **Exact once the overlapping sweeps return:** the execution aggregates
+///   themselves. Every counter update is an atomic checked read-modify-write
+///   and a rollback subtracts exactly what its own call added, so the next
+///   snapshot taken with no sweep in flight on that level reads the true
+///   totals. A snapshot read never hangs: the sequence is never left odd
+///   once the writers stop.
+/// - **Advisory while sweeps are in flight:** execution aggregates captured
+///   concurrently with shared-gate takers may lag or be torn across fields.
+///   Use them for monitoring, not for accounting or cross-field invariants
+///   (for example `value_executed / quantity_executed` as an average price).
+///   A snapshot package captured in that window checksums and, on
+///   [`restore_from_snapshot_package`](Self::restore_from_snapshot_package),
+///   installs those values verbatim; the checksum certifies integrity, not
+///   coherence.
+///
+/// For exact statistics, capture snapshots while no sweep is in flight, or
+/// drive the book from a single submitting thread (as a sequencer does).
+/// Replay is single-threaded and always exact; see
+/// `sequencer::snapshots_match` for why its statistics comparison is sound.
+/// This is a documented trade-off (decision D6): serializing ordinary
+/// sweeps would cost throughput on every book to fix a monitoring-only
+/// field. The book-derived analytics ([`depth_statistics`](Self::depth_statistics),
+/// the enriched snapshot metrics, market-impact simulation) read prices and
+/// quantities only and are unaffected.
 pub struct OrderBook<T = ()> {
     /// The symbol or identifier for this order book
     pub(super) symbol: String,
@@ -3775,6 +3836,14 @@ where
     /// Create a snapshot of the current order book state, up to `depth`
     /// price levels per side.
     ///
+    /// # Level statistics
+    ///
+    /// Each level carries pricelevel's execution statistics. Captured while
+    /// shared-gate takers sweep the same level they are **advisory** (may lag
+    /// or be torn across fields); prices, quantities and order vectors are
+    /// not affected. See [`OrderBook`]'s "Level statistics are advisory under
+    /// concurrent takers" section for the exact contract.
+    ///
     /// # Errors
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
@@ -3824,6 +3893,12 @@ where
     /// `min_order_size`, `max_order_size`) so that
     /// [`restore_from_snapshot_package`](Self::restore_from_snapshot_package)
     /// can fully reconstruct the book's state.
+    ///
+    /// The embedded level statistics follow [`create_snapshot`](Self::create_snapshot):
+    /// a package captured while shared-gate takers sweep a level carries
+    /// advisory execution statistics, and restoring it installs them
+    /// verbatim. Capture with no sweep in flight when the statistics must be
+    /// exact.
     pub fn create_snapshot_package(
         &self,
         depth: usize,
@@ -4382,6 +4457,10 @@ where
     /// # Returns
     /// `EnrichedSnapshot` with all metrics pre-calculated
     ///
+    /// The metrics are computed from prices and quantities only. The
+    /// embedded level snapshots carry execution statistics that are advisory
+    /// under concurrent takers, as for [`create_snapshot`](Self::create_snapshot).
+    ///
     /// # Performance
     /// O(N) where N is depth, single pass through data for all metrics.
     ///
@@ -4427,7 +4506,9 @@ where
     /// - `flags`: Bitflags specifying which metrics to calculate
     ///
     /// # Returns
-    /// `EnrichedSnapshot` with selected metrics calculated
+    /// `EnrichedSnapshot` with selected metrics calculated. As for
+    /// [`enriched_snapshot`](Self::enriched_snapshot), the embedded level
+    /// statistics are advisory under concurrent takers.
     ///
     /// # Errors
     ///

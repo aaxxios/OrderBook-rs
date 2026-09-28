@@ -15,6 +15,15 @@ use super::risk::RiskConfig;
 use super::stp::STPMode;
 
 /// A snapshot of the order book state at a specific point in time
+///
+/// Each level is captured coherently on its own (quantities, order count and
+/// the order vector in queue-consumption order). The level's embedded
+/// `PriceLevelStatistics` execution aggregates are **advisory** when the
+/// snapshot was taken while shared-gate takers were sweeping that level:
+/// pricelevel 0.10 supports a single concurrent recorder per level, so such a
+/// snapshot can hold a partially recorded execution. They are exact when no
+/// sweep was in flight. See `OrderBook`'s "Level statistics are advisory
+/// under concurrent takers" section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookSnapshot {
     /// The symbol or identifier for this order book
@@ -23,10 +32,12 @@ pub struct OrderBookSnapshot {
     /// Timestamp when the snapshot was created (milliseconds since epoch)
     pub timestamp: u64,
 
-    /// Snapshot of bid price levels
+    /// Snapshot of bid price levels. Per-level execution statistics are
+    /// advisory under concurrent takers (see the type docs).
     pub bids: Vec<PriceLevelSnapshot>,
 
-    /// Snapshot of ask price levels
+    /// Snapshot of ask price levels. Per-level execution statistics are
+    /// advisory under concurrent takers (see the type docs).
     pub asks: Vec<PriceLevelSnapshot>,
 }
 
@@ -185,6 +196,11 @@ pub const ORDERBOOK_SNAPSHOT_MIN_READ_VERSION: u32 = 2;
 /// All configuration fields use `#[serde(default)]` for backward
 /// compatibility — snapshots created before this version will deserialize
 /// with default values (`None` / `STPMode::None`).
+///
+/// The checksum certifies the payload's integrity, not the coherence of the
+/// level statistics it carries: a package captured while shared-gate takers
+/// were sweeping a level may hold advisory execution statistics for it (see
+/// [`OrderBookSnapshot`]), and restore installs them verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookSnapshotPackage {
     /// Version of the snapshot schema for forward compatibility.
@@ -453,10 +469,13 @@ pub struct EnrichedSnapshot {
     /// Timestamp when the snapshot was created (milliseconds since epoch)
     pub timestamp: u64,
 
-    /// Snapshot of bid price levels
+    /// Snapshot of bid price levels. Per-level execution statistics are
+    /// advisory under concurrent takers, as in [`OrderBookSnapshot`]; the
+    /// metrics below use prices and quantities only.
     pub bids: Vec<PriceLevelSnapshot>,
 
-    /// Snapshot of ask price levels
+    /// Snapshot of ask price levels. Per-level execution statistics are
+    /// advisory under concurrent takers, as in [`OrderBookSnapshot`].
     pub asks: Vec<PriceLevelSnapshot>,
 
     /// Mid price (average of best bid and best ask)

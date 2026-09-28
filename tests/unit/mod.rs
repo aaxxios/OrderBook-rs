@@ -22,6 +22,7 @@ mod book_coverage_tests;
 mod book_manager_cross_cancel_tests;
 mod clock_determinism_tests;
 mod common;
+mod concurrent_level_statistics_tests;
 mod engine_seq_monotonic_tests;
 mod evict_expired_tests;
 #[cfg(feature = "journal")]
