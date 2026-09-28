@@ -339,7 +339,8 @@ fn replay_market_order_command() {
             trade_result: orderbook_rs::TradeResult::new(
                 "TEST".to_string(),
                 pricelevel::MatchResult::new(id2, Quantity::new(5)),
-            ),
+            )
+            .expect("valid trade result"),
         },
     };
     assert!(journal.append(&market_event).is_ok());

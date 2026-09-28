@@ -66,7 +66,7 @@ fn test_fee_calculation_taker() {
     let notional = 100_000_000; // $1,000 in cents
 
     // 5 bps of $1,000 = $0.50 = 50 cents
-    let fee = schedule.calculate_fee(notional, false);
+    let fee = schedule.calculate_fee(notional, false).unwrap();
     assert_eq!(fee, 50_000);
 }
 
@@ -76,7 +76,7 @@ fn test_fee_calculation_maker_rebate() {
     let notional = 100_000_000; // $1,000 in cents
 
     // -2 bps of $1,000 = -$0.20 = -20 cents
-    let rebate = schedule.calculate_fee(notional, true);
+    let rebate = schedule.calculate_fee(notional, true).unwrap();
     assert_eq!(rebate, -20_000);
 }
 
@@ -85,8 +85,8 @@ fn test_fee_calculation_zero_fee() {
     let schedule = FeeSchedule::zero_fee();
     let notional = 100_000_000;
 
-    assert_eq!(schedule.calculate_fee(notional, true), 0);
-    assert_eq!(schedule.calculate_fee(notional, false), 0);
+    assert_eq!(schedule.calculate_fee(notional, true).unwrap(), 0);
+    assert_eq!(schedule.calculate_fee(notional, false).unwrap(), 0);
 }
 
 #[test]
@@ -94,8 +94,8 @@ fn test_fee_calculation_edge_cases() {
     let schedule = FeeSchedule::new(1, 1);
     let notional = 0;
 
-    assert_eq!(schedule.calculate_fee(notional, true), 0);
-    assert_eq!(schedule.calculate_fee(notional, false), 0);
+    assert_eq!(schedule.calculate_fee(notional, true).unwrap(), 0);
+    assert_eq!(schedule.calculate_fee(notional, false).unwrap(), 0);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn test_fee_calculation_large_values() {
     let schedule = FeeSchedule::new(1, 1);
     let notional = u128::MAX / 10_000 - 1; // Safe large value
 
-    let fee = schedule.calculate_fee(notional, false);
+    let fee = schedule.calculate_fee(notional, false).unwrap();
     assert!(fee > 0);
     assert!(fee < i128::MAX);
 }
@@ -221,18 +221,18 @@ fn test_fee_schedule_mathematical_properties() {
     let notional = 100_000; // $1,000
 
     // Test linearity: double the notional should double the fee
-    let fee1 = schedule.calculate_fee(notional, false);
-    let fee2 = schedule.calculate_fee(notional * 2, false);
+    let fee1 = schedule.calculate_fee(notional, false).unwrap();
+    let fee2 = schedule.calculate_fee(notional * 2, false).unwrap();
     assert_eq!(fee2, fee1 * 2);
 
     // Test sign consistency
-    assert!(schedule.calculate_fee(notional, false) > 0); // Taker fee positive
-    assert!(schedule.calculate_fee(notional, true) > 0); // Maker fee positive
+    assert!(schedule.calculate_fee(notional, false).unwrap() > 0); // Taker fee positive
+    assert!(schedule.calculate_fee(notional, true).unwrap() > 0); // Maker fee positive
 
     // Test with rebates
     let rebate_schedule = FeeSchedule::new(-5, 10);
-    assert!(rebate_schedule.calculate_fee(notional, true) < 0); // Maker rebate negative
-    assert!(rebate_schedule.calculate_fee(notional, false) > 0); // Taker fee positive
+    assert!(rebate_schedule.calculate_fee(notional, true).unwrap() < 0); // Maker rebate negative
+    assert!(rebate_schedule.calculate_fee(notional, false).unwrap() > 0); // Taker fee positive
 }
 
 #[test]
@@ -241,12 +241,12 @@ fn test_fee_schedule_precision() {
 
     // Test with small notional values
     let small_notional = 1;
-    let fee = schedule.calculate_fee(small_notional, false);
+    let fee = schedule.calculate_fee(small_notional, false).unwrap();
     assert_eq!(fee, 0); // Should be 0 due to integer division (1 * 1 / 10000)
 
     // Test with exact division
     let exact_notional = 10_000;
-    let fee = schedule.calculate_fee(exact_notional, false);
+    let fee = schedule.calculate_fee(exact_notional, false).unwrap();
     assert_eq!(fee, 1); // Should be exactly 1 (10000 * 1 / 10000)
 }
 
@@ -365,7 +365,7 @@ mod integration_tests {
         // taker fee: 500_000 * 5 / 10_000 = 250
         assert_eq!(tr.total_taker_fees, 250);
         // total: -100 + 250 = 150
-        assert_eq!(tr.total_fees(), 150);
+        assert_eq!(tr.total_fees().unwrap(), 150);
     }
 
     #[test]
@@ -393,7 +393,7 @@ mod integration_tests {
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].total_maker_fees, 0);
         assert_eq!(trades[0].total_taker_fees, 0);
-        assert_eq!(trades[0].total_fees(), 0);
+        assert_eq!(trades[0].total_fees().unwrap(), 0);
     }
 
     #[test]
@@ -438,12 +438,12 @@ mod integration_tests {
         //   taker: 10 * 20_000 / 10_000 = 20
         assert_eq!(tr.total_maker_fees, -9);
         assert_eq!(tr.total_taker_fees, 30);
-        assert_eq!(tr.total_fees(), 21);
+        assert_eq!(tr.total_fees().unwrap(), 21);
     }
 }
 
 #[test]
-fn test_max_guaranteed_exact_notional_admission_bound_makes_try_calculate_fee_infallible() {
+fn test_max_guaranteed_exact_notional_admission_bound_makes_calculate_fee_infallible() {
     // Admission-style contract: any notional at or below the venue-level
     // bound produces exact fees on BOTH legs; anything above it errors on
     // the binding leg. This is the enforcement pattern issue #197 asks for.
@@ -452,22 +452,20 @@ fn test_max_guaranteed_exact_notional_admission_bound_makes_try_calculate_fee_in
 
     for notional in [0u128, 1, 10_000_000, bound / 2, bound] {
         assert!(notional <= bound);
-        let maker = schedule.try_calculate_fee(notional, true);
-        let taker = schedule.try_calculate_fee(notional, false);
+        let maker = schedule.calculate_fee(notional, true);
+        let taker = schedule.calculate_fee(notional, false);
         assert!(maker.is_ok(), "maker leg must be exact at {notional}");
         assert!(taker.is_ok(), "taker leg must be exact at {notional}");
-        // The exact values agree with the saturating path below the bound.
-        assert_eq!(maker, Ok(schedule.calculate_fee(notional, true)));
-        assert_eq!(taker, Ok(schedule.calculate_fee(notional, false)));
+        assert_eq!(schedule.check_notional(notional), Ok(()));
     }
 
     // Above the bound at least one leg (here the 5-bps taker leg, which set
     // the minimum) must refuse to produce a clamped fee.
     let above = bound + 1;
-    assert!(schedule.try_calculate_fee(above, false).is_err());
+    assert!(schedule.calculate_fee(above, false).is_err());
     // The maker leg (|-2| bps) has a larger per-leg bound and is still exact.
-    assert!(schedule.try_calculate_fee(above, true).is_ok());
+    assert!(schedule.calculate_fee(above, true).is_ok());
     // Far above every per-leg bound, both legs err.
-    assert!(schedule.try_calculate_fee(u128::MAX, true).is_err());
-    assert!(schedule.try_calculate_fee(u128::MAX, false).is_err());
+    assert!(schedule.calculate_fee(u128::MAX, true).is_err());
+    assert!(schedule.calculate_fee(u128::MAX, false).is_err());
 }

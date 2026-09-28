@@ -61,6 +61,13 @@ use uuid::Uuid;
 pub struct ReplayBookConfig {
     /// Fee schedule the source book used, or `None` for no fees. Applied via
     /// [`OrderBook::set_fee_schedule`].
+    ///
+    /// Must match the source book exactly: since #244 the fee schedule
+    /// affects verdicts, not only the fees on the trades. A taker whose
+    /// worst-case notional cannot be priced under the schedule is rejected
+    /// with `RejectReason::FeeOverflow` (code 18), so replaying with a
+    /// different schedule can turn a recorded fill into a rejection (or the
+    /// reverse) and stops with [`ReplayError::OutcomeMismatch`].
     pub fee_schedule: Option<FeeSchedule>,
 
     /// Self-trade prevention mode the source book used. [`STPMode::None`]
@@ -1952,7 +1959,8 @@ mod tests {
                 trade_result: TradeResult::new(
                     "TEST".to_string(),
                     MatchResult::new(taker_id, Quantity::new(0)),
-                ),
+                )
+                .expect("valid trade result"),
             },
         };
         assert!(journal.append(&ev).is_ok());
@@ -2645,7 +2653,8 @@ mod tests {
                 trade_result: TradeResult::new(
                     "TEST".to_string(),
                     MatchResult::new(taker_id, Quantity::new(0)),
-                ),
+                )
+                .expect("valid trade result"),
             },
         };
         assert!(journal.append(&ev).is_ok());

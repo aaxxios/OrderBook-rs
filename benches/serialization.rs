@@ -12,7 +12,7 @@ use uuid::Uuid;
 fn make_trade_result() -> TradeResult {
     let order_id = Id::from_uuid(Uuid::new_v4());
     let match_result = MatchResult::new(order_id, Quantity::new(100));
-    TradeResult::new("BTC/USD".to_string(), match_result)
+    TradeResult::new("BTC/USD".to_string(), match_result).expect("valid trade result")
 }
 
 fn make_book_change() -> PriceLevelChangedEvent {

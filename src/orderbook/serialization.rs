@@ -784,7 +784,7 @@ mod tests {
     fn make_trade_result() -> TradeResult {
         let order_id = Id::from_uuid(Uuid::new_v4());
         let match_result = MatchResult::new(order_id, Quantity::new(100));
-        TradeResult::new("BTC/USD".to_string(), match_result)
+        TradeResult::new("BTC/USD".to_string(), match_result).expect("valid trade result")
     }
 
     fn make_book_change() -> PriceLevelChangedEvent {
@@ -1052,7 +1052,7 @@ mod tests {
                 mr.add_trade(trade).expect("valid fill");
                 mr.add_filled_order_id(maker).expect("filled id");
             }
-            TradeResult::new("BTC/USD".to_string(), mr)
+            TradeResult::new("BTC/USD".to_string(), mr).expect("valid trade result")
         }
 
         #[test]
@@ -1063,7 +1063,8 @@ mod tests {
             let trade = TradeResult::new(
                 "BTC/USD".to_string(),
                 MatchResult::new(order_id, Quantity::new(100)),
-            );
+            )
+            .expect("valid trade result");
             let bytes = BincodeEventSerializer::new()
                 .serialize_trade(&trade)
                 .expect("encode");

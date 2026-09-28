@@ -71,7 +71,8 @@ fn make_market_by_amount_event(
             trade_result: TradeResult::new(
                 "TEST".to_string(),
                 MatchResult::new(taker_id, Quantity::new(0)),
-            ),
+            )
+            .expect("valid trade result"),
         },
     }
 }
@@ -514,7 +515,8 @@ fn test_replay_with_namespace_config_reproduces_live_trade_ids() {
             trade_result: TradeResult::new(
                 "TEST".to_string(),
                 MatchResult::new(taker_id, Quantity::new(0)),
-            ),
+            )
+            .expect("valid trade result"),
         },
     };
     assert!(journal.append(&ev).is_ok());
@@ -579,7 +581,8 @@ fn test_repeated_replay_with_namespace_config_is_identity() {
             trade_result: TradeResult::new(
                 "TEST".to_string(),
                 MatchResult::new(taker, Quantity::new(0)),
-            ),
+            )
+            .expect("valid trade result"),
         },
     };
     assert!(journal.append(&ev).is_ok());

@@ -110,7 +110,9 @@ fn large_valid_prefix(target: usize) -> (Vec<u8>, Vec<u8>) {
     // Guard the fixture: a real encoding of the same result (no filled ids)
     // starts with these bytes, followed by a zero `filled_order_ids` length.
     let full = BincodeEventSerializer::new()
-        .serialize_trade(&orderbook_rs::TradeResult::new("BTC/USD".to_string(), mr))
+        .serialize_trade(
+            &orderbook_rs::TradeResult::new("BTC/USD".to_string(), mr).expect("valid trade result"),
+        )
         .expect("encode full trade");
     assert!(
         full.starts_with(&bytes),

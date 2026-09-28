@@ -242,7 +242,8 @@ fn json_serializer_trade_result_round_trip() {
     let trade_result = orderbook_rs::TradeResult::new(
         "BTC/USD".to_string(),
         match_result.expect("should have match result"),
-    );
+    )
+    .expect("valid trade result");
 
     // Serialize
     let bytes = serializer.serialize_trade(&trade_result);
@@ -292,7 +293,8 @@ fn bincode_serializer_trade_result_round_trip() {
     let trade_result = orderbook_rs::TradeResult::new(
         "BTC/USD".to_string(),
         match_result.expect("should have match result"),
-    );
+    )
+    .expect("valid trade result");
 
     let bytes = serializer.serialize_trade(&trade_result);
     assert!(bytes.is_ok());

@@ -278,6 +278,65 @@ Stated precisely:
 For exact statistics, capture with no sweep in flight or drive the book from
 one submitting thread (as a sequencer does).
 
+## Fee and notional arithmetic (#244)
+
+Fees and trade notionals are never clamped, saturated or dropped:
+`FeeSchedule::calculate_fee`, `TradeResult::new` / `with_fees` /
+`total_fees` and `TradeInfo::from_trade_result` return typed errors
+(`FeeOverflow`, `TradeArithmeticError`). The trade path keeps those errors
+unreachable for the trades it commits:
+
+- **Pre-check scope.** Every taker's worst-case notional must fit `u128`
+  and be priced exactly by both fee legs, or the taker is rejected
+  untouched with `OrderBookError::FeeOverflow` (reject code 18) or
+  `NotionalOverflow` (19), state `Rejected`. The worst-case notional is
+  the worst reachable price × quantity (limit buy: the limit when it
+  passes; other buys: the highest ask reached by walking the asks from the
+  best one until their visible quantity covers the order, capped by the
+  limit, so an absurd ask the order cannot reach never rejects it; sell:
+  the best bid, the highest price a sell can trade at) or, for a
+  `*_by_amount` order, the amount. A taker that cannot
+  trade (empty opposite side, non-crossing limit, post-only) passes. It
+  runs on every submission API (`add_order*`, `submit_market_order*`,
+  `submit_market_order_by_amount*`, `match_market_order*`,
+  `match_limit_order*`, the raw `match_order*`, and `update_order` before
+  the original is cancelled), with or without a trade listener.
+- **Ordering.** Under the submit gate the sweep holds, before any
+  mutation: right after the #240 trade-id check on the `match_*` /
+  `submit_market*` paths, and inside `validate_order_shape` (after the
+  exhausted-generator check, before the fill-or-kill preflight) on the
+  `add_order*` / modify paths. A validate-first modify runs it once,
+  before the original is cancelled; the re-add takes it as done, so a
+  `FeeOverflow` / `NotionalOverflow` never follows a cancel (a worse maker
+  admitted in between is left to the backstop below).
+- **Shared-gate limit.** Exact under the exclusive gate and for a single
+  writer; best effort under the shared gate, like the #240 trade-id check:
+  a maker admitted concurrently at a worse price than the pre-check saw
+  can still be reached by the sweep.
+- **Per-level backstop.** The base-quantity sweep re-checks every level
+  priced above all prices verified so far (each new level of a buy, the
+  first level of a sell). An unpriceable level aborts the sweep **before
+  it is touched**: the committed prefix of the earlier levels is published
+  like a partial fill and the submit returns `OrderBookError::MatchAborted`
+  whose source is `PriceLevelError::InvalidOperation` (reject code 15,
+  taker `Cancelled { MatchAborted }`), never `FeeOverflow`. The sequencer
+  therefore classifies it as may-have-mutated, as it does every
+  `MatchAborted`; `FeeOverflow` / `NotionalOverflow` are only raised
+  before mutation. The backstop is seeded with the highest price the
+  pre-check verified, so levels at or below it cost one comparison; it
+  also covers makers the pre-check's visible-depth walk counts but the
+  sweep skips without filling (self-trade prevention, no-progress makers).
+  A backstop abort caused by a concurrent maker under the shared gate is
+  not reproducible from the journal and replays as
+  `ReplayError::OutcomeMismatch` by design; a sequencer feeding a single
+  writer never hits it.
+- **Residual.** With the pre-check and the backstop, building the
+  `TradeResult` of a committed sweep cannot fail. It is handled rather than
+  assumed: on failure the book logs at `ERROR`, emits no `TradeResult`, and
+  counts it in `OrderBook::match_fold_failures` (and
+  `orderbook_match_fold_failures_total`), which therefore covers both
+  un-foldable level prefixes (#240) and un-buildable trade results (#244).
+
 ## Ratchet
 
 Three ledgers, all mechanically enforced (`make lint`), all shrink-only:

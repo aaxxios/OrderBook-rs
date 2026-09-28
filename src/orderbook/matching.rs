@@ -48,6 +48,19 @@ pub(crate) struct FokFeasibility {
     pub(crate) maker_steps: u64,
 }
 
+/// What admission validation (`validate_order_shape`) measured for the sweep
+/// that follows it: the fill-or-kill preflight (#240) and the highest price
+/// the trade arithmetic preflight verified (#244), which seeds the sweep's
+/// per-level backstop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ShapeVerdict {
+    /// Fill-or-kill feasibility, `None` for every other time-in-force.
+    pub(crate) fok: Option<FokFeasibility>,
+    /// Every price at or below this one prices the taker's quantity
+    /// exactly; `0` when the taker cannot trade (or is post-only).
+    pub(crate) arithmetic_verified_price: u128,
+}
+
 /// Overflow of a fill-or-kill feasibility accumulator. Every accumulator is
 /// bounded by the taker's `u64` quantity, so this is an invariant breach,
 /// reported as a typed error instead of clamping.
@@ -56,6 +69,20 @@ pub(crate) struct FokFeasibility {
 fn fok_counter_overflow() -> OrderBookError {
     OrderBookError::InvalidOperation {
         message: "fill-or-kill feasibility accumulator overflowed u64".to_string(),
+    }
+}
+
+/// The abort source for a level the sweep's arithmetic backstop refused
+/// (#244): pricelevel's `InvalidOperation`, since `MatchAborted` carries a
+/// `PriceLevelError`. Cold: only reached when a maker admitted concurrently
+/// under the shared gate outruns the preflight.
+#[cold]
+#[inline(never)]
+fn arithmetic_abort_source(price: u128, err: &OrderBookError) -> PriceLevelError {
+    PriceLevelError::InvalidOperation {
+        message: format!(
+            "level {price} not matched: worst-case notional or fee is not representable ({err})"
+        ),
     }
 }
 
@@ -442,6 +469,10 @@ where
         // has already captured and free its id for an unrelated order, and
         // the drain would then report a discard that never happened.
         let _gate = self.acquire_coherent_submit_gate(false);
+        // #244: worst-case notional / fee representability, before any
+        // mutation — identical to every publishing entry point.
+        let verified =
+            self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -450,6 +481,7 @@ where
             Hash32::zero(),
             TakerKind::Standard,
             0,
+            verified,
         )
         .and_then(MatchOutcome::into_result)
     }
@@ -496,6 +528,9 @@ where
             false,
             false,
         ));
+        // #244: see `match_order`.
+        let verified =
+            self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -504,6 +539,7 @@ where
             taker_user_id,
             TakerKind::Standard,
             0,
+            verified,
         )
         .and_then(MatchOutcome::into_result)
     }
@@ -514,6 +550,8 @@ where
     ///
     /// `reserve_steps` is the fill-or-kill preflight reservation
     /// ([`FokFeasibility::maker_steps`]); `0` for every other taker.
+    /// `arithmetic_verified_price` is what the trade arithmetic preflight
+    /// returned (#244); the sweep's backstop re-checks only levels above it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn match_order_with_user_outcome(
         &self,
@@ -524,6 +562,7 @@ where
         taker_user_id: Hash32,
         taker_kind: TakerKind,
         reserve_steps: u64,
+        arithmetic_verified_price: u128,
     ) -> Result<MatchOutcome, OrderBookError> {
         self.match_order_inner(
             order_id,
@@ -535,6 +574,7 @@ where
             taker_user_id,
             taker_kind,
             reserve_steps,
+            arithmetic_verified_price,
         )
     }
 
@@ -567,6 +607,8 @@ where
             MatchMode::QuoteAmount { amount },
             taker_user_id,
             TakerKind::Standard,
+            0,
+            // Unused: a quote-notional sweep is bounded by its amount.
             0,
         )
     }
@@ -602,6 +644,7 @@ where
     /// filled-id buffers before the first level is touched; a refused
     /// reservation rejects the taker untouched with
     /// [`OrderBookError::PriceLevelError`] (`CapacityExceeded`).
+    #[allow(clippy::too_many_arguments)]
     fn match_order_inner(
         &self,
         order_id: Id,
@@ -610,6 +653,7 @@ where
         taker_user_id: Hash32,
         taker_kind: TakerKind,
         reserve_steps: u64,
+        arithmetic_verified_price: u128,
     ) -> Result<MatchOutcome, OrderBookError> {
         self.cache.invalidate();
         let mut match_result =
@@ -708,6 +752,25 @@ where
         // A failed post-only probe (#240): no trade and no STP action can
         // have happened, so it is a clean, untouched rejection.
         let mut post_only_probe_error: Option<PriceLevelError> = None;
+        // #244 backstop: every level a base-quantity sweep trades at must
+        // keep `price × quantity` and its fees representable. The preflight
+        // (`check_trade_arithmetic`) verified every price up to
+        // `arithmetic_verified_price`, so a level at or below it costs one
+        // comparison; only a level above it (a maker admitted concurrently
+        // under the shared gate, or one the preflight's visible-depth walk
+        // did not expect to reach) is re-checked, and a failing level aborts
+        // the sweep before it is touched. The check uses the taker's total
+        // quantity, not the remaining one: `price × remaining` would not
+        // bound the notional already committed at cheaper levels, while
+        // `highest price × total quantity` bounds the whole sweep.
+        // Quote-notional sweeps are bounded by their amount, checked by the
+        // preflight.
+        let arithmetic_quantity = match mode {
+            MatchMode::BaseQty { quantity, .. } => Some(quantity),
+            MatchMode::QuoteAmount { .. } => None,
+        };
+        let arithmetic_schedule = self.active_fee_schedule();
+        let mut arithmetic_checked_price: u128 = arithmetic_verified_price;
 
         // Iterate through prices in optimal order (already sorted by SkipMap)
         // For buy orders: iterate asks in ascending order (best ask first)
@@ -787,6 +850,16 @@ where
                 }
                 // No matchable depth at this crossing level; walk on.
                 continue;
+            }
+
+            if let Some(quantity) = arithmetic_quantity
+                && price > arithmetic_checked_price
+            {
+                if let Err(err) = Self::check_notional_bound(arithmetic_schedule, price, quantity) {
+                    sweep_error = Some(arithmetic_abort_source(price, &err));
+                    break;
+                }
+                arithmetic_checked_price = price;
             }
 
             // #240: reserve the aggregate result (and the pooled filled-maker

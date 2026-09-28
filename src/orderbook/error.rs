@@ -337,6 +337,38 @@ pub enum OrderBookError {
         source: Box<PriceLevelError>,
     },
 
+    /// A taker's fee could not be computed exactly under the configured
+    /// `FeeSchedule` (#244).
+    ///
+    /// Raised before the book is touched: every taker's worst-case notional
+    /// (the worst price it can reach times its quantity, or the amount of a
+    /// quote-notional order) is checked against both legs of the schedule,
+    /// and a notional whose `notional × |bps|` does not fit `u128` is
+    /// rejected untouched instead of producing a clamped fee. Mirrors
+    /// `FeeOverflow`'s fields with primitives so this module stays a leaf.
+    /// Maps to the stable wire code `RejectReason::FeeOverflow`.
+    FeeOverflow {
+        /// The worst-case notional that could not be priced, in quote units.
+        notional: u128,
+        /// The signed fee rate in basis points that overflowed (maker or
+        /// taker).
+        bps: i32,
+        /// Largest notional guaranteed exact at that rate.
+        max_guaranteed_exact_notional: u128,
+    },
+
+    /// A taker's worst-case notional does not fit `u128` (#244): the worst
+    /// price it can reach times its quantity overflows, so neither the
+    /// trade's `quote_notional` nor its fees could be computed. Raised
+    /// before the book is touched. Maps to the stable wire code
+    /// `RejectReason::NotionalOverflow`.
+    NotionalOverflow {
+        /// The worst price the taker can reach, in price ticks.
+        price: u128,
+        /// The taker's quantity, in quantity units.
+        quantity: u64,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -523,6 +555,22 @@ impl fmt::Display for OrderBookError {
                 write!(
                     f,
                     "order {order_id} was removed but its price level then failed: {source}"
+                )
+            }
+            OrderBookError::FeeOverflow {
+                notional,
+                bps,
+                max_guaranteed_exact_notional,
+            } => {
+                write!(
+                    f,
+                    "fee overflow: worst-case notional {notional} × |{bps}| bps exceeds the u128 domain; max guaranteed-exact notional at this rate is {max_guaranteed_exact_notional}"
+                )
+            }
+            OrderBookError::NotionalOverflow { price, quantity } => {
+                write!(
+                    f,
+                    "notional overflow: worst-case price {price} × quantity {quantity} exceeds u128"
                 )
             }
             #[cfg(feature = "nats")]

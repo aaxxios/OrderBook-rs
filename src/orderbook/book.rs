@@ -877,10 +877,12 @@ where
     }
 
     /// Number of price levels whose committed trades could not be folded
-    /// into the taker's result (#240). This is the only path on which the
-    /// trade stream (listener / journal) can disagree with the book, risk
-    /// and order-state streams; any non-zero value needs attention. See
-    /// `doc/panic-boundaries.md`.
+    /// into the taker's result (#240), plus committed sweeps whose
+    /// `TradeResult` could not be priced with checked arithmetic (#244,
+    /// unreachable for sweeps this book ran). These are the only paths on
+    /// which the trade stream (listener / journal) can disagree with the
+    /// book, risk and order-state streams; any non-zero value needs
+    /// attention. See `doc/panic-boundaries.md`.
     #[must_use]
     #[inline]
     pub fn match_fold_failures(&self) -> u64 {
@@ -3547,6 +3549,8 @@ where
             );
             // #240: under the same gate the sweep holds, before any mutation.
             self.check_trade_id_headroom(order_id, side, None)?;
+            // #244: worst-case notional / fee representability, same place.
+            let verified = self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
             self.match_order_with_user_outcome(
                 order_id,
                 side,
@@ -3555,6 +3559,7 @@ where
                 user_id,
                 TakerKind::Standard,
                 0,
+                verified,
             )?
         };
         self.publish_match_outcome(outcome, want_committed)
@@ -3604,6 +3609,256 @@ where
             additional: 1,
         };
         Err(self.reject_untouched(order_id, source))
+    }
+
+    /// Worst-case trade arithmetic preflight (#244).
+    ///
+    /// Before a base-quantity taker touches the book, bound the notional its
+    /// sweep can reach — the worst price it can **reach** times `quantity` —
+    /// and verify that the notional fits `u128` and that both legs of the
+    /// configured [`FeeSchedule`] price it exactly. Every committed trade of
+    /// the sweep then has a representable notional, `quote_notional` and
+    /// fees (the per-trade fees and their sums are bounded by the fee on the
+    /// bound), so the `TradeResult` is built without clamping.
+    ///
+    /// The worst reachable price is:
+    ///
+    /// - **Buy with a limit that passes**: the limit (no level read).
+    /// - **Other buys**: asks are walked from the best one, accumulating
+    ///   their visible quantity until `quantity` is covered (or the limit
+    ///   is passed, or the side ends); the highest price visited is the
+    ///   bound. A single far-away ask that the taker cannot reach never
+    ///   rejects it, so a maker resting an absurd price cannot block
+    ///   ordinary market buys. A market buy covered by the best level reads
+    ///   one level.
+    /// - **Sell**: the best bid (cache). A sell walks bids downward, so the
+    ///   best bid is the highest price it can trade at, and fees grow with
+    ///   price.
+    ///
+    /// Visible quantity is a lower bound on what a level fills (hidden
+    /// iceberg / reserve depth at the same price only shortens the walk), so
+    /// the walk never stops before a level the sweep reaches — except for
+    /// makers the sweep skips without filling (self-trade prevention, a
+    /// maker set aside for making no progress), for which the sweep's
+    /// per-level backstop aborts instead.
+    ///
+    /// A taker that cannot trade (empty opposite side, a limit that does
+    /// not cross) always passes. No allocation.
+    ///
+    /// Callers run it under the submit gate the sweep holds, before any
+    /// mutation, next to [`Self::check_trade_id_headroom`]. Like that check
+    /// it is exact under the exclusive gate (and for a single writer) and
+    /// best-effort under the shared one: a maker admitted concurrently at a
+    /// worse price is caught by the sweep's per-level backstop, which aborts
+    /// with [`OrderBookError::MatchAborted`] before touching that level.
+    ///
+    /// # Returns
+    ///
+    /// The highest price verified: every price at or below it prices
+    /// `quantity` exactly. The sweep seeds its backstop with it, so levels at
+    /// or below cost one comparison. `0` when the taker cannot trade.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::NotionalOverflow`] when `price × quantity`
+    /// overflows `u128`; [`OrderBookError::FeeOverflow`] when a fee leg
+    /// cannot price the bound exactly. Pure: nothing is recorded.
+    #[inline]
+    pub(crate) fn check_trade_arithmetic(
+        &self,
+        side: Side,
+        quantity: u64,
+        limit_price: Option<u128>,
+    ) -> Result<u128, OrderBookError> {
+        let schedule = self.active_fee_schedule();
+        match side {
+            Side::Buy => {
+                let Some(best_ask) = self.best_ask() else {
+                    return Ok(0);
+                };
+                if let Some(limit) = limit_price {
+                    if limit < best_ask {
+                        return Ok(0);
+                    }
+                    // A limit bounds every buy trade price.
+                    if Self::check_notional_bound(schedule, limit, quantity).is_ok() {
+                        return Ok(limit);
+                    }
+                }
+                self.reachable_ask_bound(schedule, quantity, limit_price)
+            }
+            Side::Sell => {
+                let Some(best_bid) = self.best_bid() else {
+                    return Ok(0);
+                };
+                if limit_price.is_some_and(|limit| limit > best_bid) {
+                    return Ok(0);
+                }
+                Self::check_notional_bound(schedule, best_bid, quantity)?;
+                Ok(best_bid)
+            }
+        }
+    }
+
+    /// Walk the asks a buy of `quantity` can reach (capped at `limit_price`)
+    /// and verify each new highest price; see
+    /// [`Self::check_trade_arithmetic`]. Returns the highest price verified.
+    ///
+    /// # Errors
+    ///
+    /// The first reachable price whose bound fails.
+    #[inline]
+    fn reachable_ask_bound(
+        &self,
+        schedule: Option<FeeSchedule>,
+        quantity: u64,
+        limit_price: Option<u128>,
+    ) -> Result<u128, OrderBookError> {
+        let mut remaining = quantity;
+        let mut verified: u128 = 0;
+        for entry in self.asks.iter() {
+            let price = *entry.key();
+            if limit_price.is_some_and(|limit| price > limit) {
+                break;
+            }
+            if price > verified {
+                Self::check_notional_bound(schedule, price, quantity)?;
+                verified = price;
+            }
+            match remaining.checked_sub(entry.value().visible_quantity()) {
+                Some(left) if left > 0 => remaining = left,
+                // Covered by this level: nothing deeper is reachable.
+                _ => break,
+            }
+        }
+        Ok(verified)
+    }
+
+    /// Quote-notional preflight (#244): a `*_by_amount` sweep consumes at
+    /// most `amount` of notional, so `amount` is its bound. Skipped when the
+    /// opposite side is empty (nothing can trade).
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::FeeOverflow`] when a fee leg cannot price `amount`
+    /// exactly.
+    #[inline]
+    pub(crate) fn check_amount_arithmetic(
+        &self,
+        side: Side,
+        amount: u128,
+    ) -> Result<(), OrderBookError> {
+        let Some(schedule) = self.active_fee_schedule() else {
+            return Ok(());
+        };
+        let opposite_empty = match side {
+            Side::Buy => self.asks.is_empty(),
+            Side::Sell => self.bids.is_empty(),
+        };
+        if opposite_empty {
+            return Ok(());
+        }
+        schedule
+            .check_notional(amount)
+            .map_err(OrderBookError::from)
+    }
+
+    /// The configured fee schedule, or `None` when it is absent or charges
+    /// nothing (a zero schedule cannot overflow).
+    #[inline]
+    #[must_use]
+    pub(crate) fn active_fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.filter(|schedule| !schedule.is_zero_fee())
+    }
+
+    /// `price × quantity` fits `u128` and, when a schedule is active, both
+    /// of its legs price it exactly (#244).
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::NotionalOverflow`] / [`OrderBookError::FeeOverflow`].
+    #[inline]
+    pub(crate) fn check_notional_bound(
+        schedule: Option<FeeSchedule>,
+        price: u128,
+        quantity: u64,
+    ) -> Result<(), OrderBookError> {
+        let Some(notional) = price.checked_mul(u128::from(quantity)) else {
+            return Err(OrderBookError::NotionalOverflow { price, quantity });
+        };
+        match schedule {
+            Some(schedule) => schedule
+                .check_notional(notional)
+                .map_err(OrderBookError::from),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::check_trade_arithmetic`] for the `match_*` / `submit_market*`
+    /// entry points: a failure is recorded as a terminal
+    /// `Rejected { FeeOverflow | NotionalOverflow }` with the reject metric,
+    /// like every other untouched rejection. Returns the verified price the
+    /// sweep seeds its backstop with.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::check_trade_arithmetic`].
+    #[inline]
+    pub(crate) fn check_trade_arithmetic_or_reject(
+        &self,
+        order_id: Id,
+        side: Side,
+        quantity: u64,
+        limit_price: Option<u128>,
+    ) -> Result<u128, OrderBookError> {
+        self.check_trade_arithmetic(side, quantity, limit_price)
+            .map_err(|err| self.reject_arithmetic_untouched(order_id, err))
+    }
+
+    /// Record a taker rejected by the trade arithmetic preflight (#244)
+    /// before any mutation: terminal `Rejected` state with its reject code,
+    /// the reject metric, a `WARN` line. Returns the error unchanged.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn reject_arithmetic_untouched(
+        &self,
+        order_id: Id,
+        err: OrderBookError,
+    ) -> OrderBookError {
+        let reason = crate::orderbook::reject_reason::RejectReason::from(&err);
+        tracing::warn!(
+            order_id = %order_id,
+            error = %err,
+            "taker rejected: worst-case notional or fee is not representable; book untouched"
+        );
+        self.track_state(
+            order_id,
+            crate::orderbook::order_state::OrderStatus::Rejected { reason },
+        );
+        crate::orderbook::metrics::record_reject(reason);
+        err
+    }
+
+    /// Report committed trades whose `TradeResult` could not be built
+    /// (#244). Unreachable for a sweep this book ran (see
+    /// [`Self::check_trade_arithmetic`]); handled like a fold failure so the
+    /// gap between the trade stream and the book is loud and counted.
+    #[cold]
+    #[inline(never)]
+    fn report_trade_result_failure(
+        &self,
+        match_result: &MatchResult,
+        err: &crate::orderbook::trade::TradeArithmeticError,
+    ) {
+        tracing::error!(
+            symbol = %self.symbol,
+            order_id = %match_result.order_id(),
+            trade_count = match_result.trades().len(),
+            error = %err,
+            "committed trades could not be priced into a TradeResult; trade not published"
+        );
+        crate::orderbook::metrics::record_match_fold_failure();
+        Self::bump_diagnostic_counter(&self.match_fold_failures, "match_fold_failures");
     }
 
     /// Publish a sweep's trades and resolve its outcome (#240).
@@ -3657,8 +3912,25 @@ where
         if !want_result && listener.is_none() {
             return None;
         }
-        let mut trade_result =
-            TradeResult::with_fees(self.symbol.clone(), match_result.clone(), self.fee_schedule);
+        // #244: checked notional / fee arithmetic. The preflight
+        // (`check_trade_arithmetic`) and the sweep's per-level backstop keep
+        // every committed trade within a notional whose fees are
+        // representable, so this cannot fail for a sweep this book ran. It
+        // is handled rather than assumed: the trades are already committed,
+        // so a failure is reported like a fold failure (logged at `ERROR`,
+        // counted by `match_fold_failures`) and no `TradeResult` carrying a
+        // clamped or dropped fee is ever emitted.
+        let mut trade_result = match TradeResult::with_fees(
+            self.symbol.clone(),
+            match_result.clone(),
+            self.fee_schedule,
+        ) {
+            Ok(trade_result) => trade_result,
+            Err(err) => {
+                self.report_trade_result_failure(match_result, &err);
+                return None;
+            }
+        };
         trade_result.engine_seq = self.next_engine_seq();
         if let Some(listener) = listener {
             listener(&trade_result);
@@ -3776,6 +4048,9 @@ where
         );
         // #240: under the gate the sweep holds, before any mutation.
         self.check_trade_id_headroom(order_id, side, None)?;
+        // #244: the amount bounds the notional this sweep can consume.
+        self.check_amount_arithmetic(side, amount)
+            .map_err(|err| self.reject_arithmetic_untouched(order_id, err))?;
         let outcome =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
         self.publish_match_outcome(outcome, want_committed)
@@ -3844,6 +4119,9 @@ where
             // #240: under the same gate the sweep holds, before any
             // mutation; only a limit that actually crosses is refused.
             self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
+            // #244: worst-case notional / fee representability.
+            let verified =
+                self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
             self.match_order_with_user_outcome(
                 order_id,
                 side,
@@ -3852,6 +4130,7 @@ where
                 user_id,
                 TakerKind::Standard,
                 0,
+                verified,
             )?
         };
         self.publish_match_outcome(outcome, false)

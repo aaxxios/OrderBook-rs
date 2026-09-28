@@ -58,6 +58,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `MatchAborted`           | 15  |
 /// | `CapacityExceeded`       | 16  |
 /// | `CounterExhausted`       | 17  |
+/// | `FeeOverflow`            | 18  |
+/// | `NotionalOverflow`       | 19  |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -110,6 +112,14 @@ pub enum RejectReason {
     /// (`PriceLevelError::CounterExhausted`), raised before the book
     /// changed.
     CounterExhausted = 17,
+    /// The taker's fee could not be computed exactly under the configured
+    /// `FeeSchedule` at its worst-case notional; rejected before the book
+    /// changed (#244). Carried by `OrderBookError::FeeOverflow`.
+    FeeOverflow = 18,
+    /// The taker's worst-case notional (worst reachable price × quantity)
+    /// does not fit `u128`; rejected before the book changed (#244).
+    /// Carried by `OrderBookError::NotionalOverflow`.
+    NotionalOverflow = 19,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -143,6 +153,8 @@ impl RejectReason {
             Self::MatchAborted => 15,
             Self::CapacityExceeded => 16,
             Self::CounterExhausted => 17,
+            Self::FeeOverflow => 18,
+            Self::NotionalOverflow => 19,
             Self::Other(code) => code,
         }
     }
@@ -172,6 +184,8 @@ impl RejectReason {
             15 => Self::MatchAborted,
             16 => Self::CapacityExceeded,
             17 => Self::CounterExhausted,
+            18 => Self::FeeOverflow,
+            19 => Self::NotionalOverflow,
             other => Self::Other(other),
         }
     }
@@ -226,6 +240,8 @@ impl std::fmt::Display for RejectReason {
             Self::MatchAborted => write!(f, "match aborted"),
             Self::CapacityExceeded => write!(f, "capacity exceeded"),
             Self::CounterExhausted => write!(f, "counter exhausted"),
+            Self::FeeOverflow => write!(f, "fee overflow"),
+            Self::NotionalOverflow => write!(f, "notional overflow"),
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -274,6 +290,8 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::PriceLevelError(PriceLevelError::CounterExhausted { .. }) => {
                 Self::CounterExhausted
             }
+            OrderBookError::FeeOverflow { .. } => Self::FeeOverflow,
+            OrderBookError::NotionalOverflow { .. } => Self::NotionalOverflow,
             OrderBookError::PriceLevelError(_) => Self::Other(0),
             OrderBookError::OrderNotFound(_) => Self::Other(0),
             OrderBookError::InvalidOperation { .. } => Self::Other(0),
@@ -300,7 +318,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 17] {
+    fn named_variants() -> [RejectReason; 19] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -319,6 +337,8 @@ mod tests {
             RejectReason::MatchAborted,
             RejectReason::CapacityExceeded,
             RejectReason::CounterExhausted,
+            RejectReason::FeeOverflow,
+            RejectReason::NotionalOverflow,
         ]
     }
 
@@ -341,6 +361,35 @@ mod tests {
         assert_eq!(RejectReason::MatchAborted.as_u16(), 15);
         assert_eq!(RejectReason::CapacityExceeded.as_u16(), 16);
         assert_eq!(RejectReason::CounterExhausted.as_u16(), 17);
+        assert_eq!(RejectReason::FeeOverflow.as_u16(), 18);
+        assert_eq!(RejectReason::NotionalOverflow.as_u16(), 19);
+    }
+
+    /// #244: the untouched fee / notional rejections have their own codes.
+    #[test]
+    fn test_from_order_book_error_maps_fee_and_notional_overflow() {
+        let fee = OrderBookError::FeeOverflow {
+            notional: u128::MAX,
+            bps: 5,
+            max_guaranteed_exact_notional: u128::MAX / 5,
+        };
+        assert_eq!(RejectReason::from(&fee), RejectReason::FeeOverflow);
+        let notional = OrderBookError::NotionalOverflow {
+            price: u128::MAX,
+            quantity: 2,
+        };
+        assert_eq!(
+            RejectReason::from(&notional),
+            RejectReason::NotionalOverflow
+        );
+        for (code, text) in [(18u16, "fee overflow"), (19, "notional overflow")] {
+            let reason = RejectReason::from_u16(code);
+            assert!(!matches!(reason, RejectReason::Other(_)), "{code} is named");
+            assert_eq!(reason.as_u16(), code);
+            assert_eq!(reason.to_string(), text);
+        }
+        assert!(fee.to_string().contains("fee overflow"));
+        assert!(notional.to_string().contains("notional overflow"));
     }
 
     /// #230: both new errors map to a wire code, and the new code 14 round

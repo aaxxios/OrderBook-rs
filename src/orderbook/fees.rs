@@ -1,8 +1,5 @@
 //! Fee schedule implementation for OrderBook trading fees
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
 use serde::{Deserialize, Serialize};
 
 /// Denominator for basis-point fee math: 1 bps = 1 / 10_000 of the notional.
@@ -10,14 +7,12 @@ const BPS_DENOMINATOR: u128 = 10_000;
 
 /// Fee computation would overflow its `u128` intermediate product.
 ///
-/// Returned by [`FeeSchedule::try_calculate_fee`] when
-/// `notional × |bps|` overflows `u128` — exactly the case in which
-/// [`FeeSchedule::calculate_fee`] saturates the product and clamps instead
-/// of computing the fee from the true product. The clamped fee is not
-/// guaranteed exact (at isolated notionals it can still coincide with the
-/// exact value), so venues that must guarantee exact integer fees
-/// (journaled, replayable systems) can treat this error as "the engine
-/// would journal a clamped fee" and reject the input, or enforce
+/// Returned by [`FeeSchedule::calculate_fee`] when `notional × |bps|`
+/// overflows `u128`. Since 0.14.0 the engine never clamps a fee: the trade
+/// path validates every taker's worst-case notional against the configured
+/// schedule before it touches the book and rejects an unrepresentable one
+/// untouched with [`OrderBookError::FeeOverflow`](crate::OrderBookError::FeeOverflow)
+/// (#244). Venues can also enforce
 /// [`FeeSchedule::max_guaranteed_exact_notional`] at admission time so this
 /// error is provably unreachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -46,6 +41,19 @@ impl FeeOverflow {
     }
 }
 
+impl From<FeeOverflow> for crate::orderbook::error::OrderBookError {
+    /// Carry the overflow's fields into
+    /// [`OrderBookError::FeeOverflow`](crate::OrderBookError::FeeOverflow).
+    #[cold]
+    fn from(err: FeeOverflow) -> Self {
+        Self::FeeOverflow {
+            notional: err.notional,
+            bps: err.bps,
+            max_guaranteed_exact_notional: err.max_guaranteed_exact_notional,
+        }
+    }
+}
+
 /// Configurable fee schedule for maker and taker fees
 ///
 /// Fees are expressed in basis points (bps), where 1 bps = 0.01% = 0.0001.
@@ -61,8 +69,9 @@ impl FeeOverflow {
 ///
 /// // Calculate fee for a $10,000 trade
 /// let notional = 10_000_000; // $10,000 in cents/micro-units
-/// let taker_fee = schedule.calculate_fee(notional, false);
+/// let taker_fee = schedule.calculate_fee(notional, false)?;
 /// assert_eq!(taker_fee, 5_000); // 5 bps of $10,000 = $5.00
+/// # Ok::<(), orderbook_rs::FeeOverflow>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeSchedule {
@@ -108,7 +117,12 @@ impl FeeSchedule {
         }
     }
 
-    /// Calculate fee amount for a transaction
+    /// Calculate the fee for a transaction
+    ///
+    /// Returns `sign(bps) × ⌊notional × |bps| / 10_000⌋`, exact, or
+    /// [`FeeOverflow`] when the intermediate product does not fit `u128`.
+    /// Since 0.14.0 this is fallible and never clamps (#244); before it
+    /// saturated the product to a magnitude of `u128::MAX / 10_000`.
     ///
     /// # Arguments
     ///
@@ -117,7 +131,8 @@ impl FeeSchedule {
     ///
     /// # Returns
     ///
-    /// The fee amount. Positive values represent charges, negative values represent rebates.
+    /// The fee amount. Positive values represent charges, negative values
+    /// represent rebates.
     ///
     /// # Rounding
     ///
@@ -131,20 +146,15 @@ impl FeeSchedule {
     /// magnitude `7.5015` / `3.0006`, then signed). External fee reconciliation
     /// should therefore truncate-toward-zero, not round-half-up.
     ///
-    /// # Saturation
+    /// # Errors
     ///
-    /// The result is **guaranteed exact** when
-    /// `notional <= Self::max_guaranteed_exact_notional_for_bps(bps)`
-    /// (equivalently, when `notional × |bps|` fits in `u128`). Beyond that
-    /// bound the intermediate product saturates and the fee clamps to a
-    /// magnitude of `u128::MAX / 10_000` (signed per `bps`) instead of
-    /// panicking; the clamped value is **not guaranteed exact**, although at
-    /// isolated notionals it can still coincide with the true
-    /// `⌊notional × |bps| / 10_000⌋`. Callers that must distinguish a
-    /// clamped fee from a guaranteed-exact one should use
-    /// [`Self::try_calculate_fee`], or enforce
-    /// [`Self::max_guaranteed_exact_notional`] at admission time so this
-    /// saturating branch is provably unreachable.
+    /// Returns [`FeeOverflow`] if and only if `notional × |bps|` does not
+    /// fit in `u128`, i.e. iff
+    /// `notional > Self::max_guaranteed_exact_notional_for_bps(bps)`. The
+    /// bound is multiplication safety, not a tight exactness frontier: at
+    /// isolated notionals above it the exact fee would still be
+    /// representable, and this rejects conservatively there. A zero-bps
+    /// rate never errors (the fee is exactly `0` for any notional).
     ///
     /// # Examples
     ///
@@ -154,87 +164,21 @@ impl FeeSchedule {
     /// let schedule = FeeSchedule::new(-2, 5);
     ///
     /// // Taker fee: 5 bps on $10,000 = $5.00
-    /// let taker_fee = schedule.calculate_fee(10_000_000, false);
-    /// assert_eq!(taker_fee, 5_000);
+    /// assert_eq!(schedule.calculate_fee(10_000_000, false)?, 5_000);
     ///
     /// // Maker rebate: -2 bps on $10,000 = -$2.00
-    /// let maker_rebate = schedule.calculate_fee(10_000_000, true);
-    /// assert_eq!(maker_rebate, -2_000);
+    /// assert_eq!(schedule.calculate_fee(10_000_000, true)?, -2_000);
     ///
     /// // Fractional bps × notional truncates toward zero in both directions.
-    /// assert_eq!(schedule.calculate_fee(15_003, false), 7); // floor(7.5015)
-    /// assert_eq!(schedule.calculate_fee(15_003, true), -3); // -floor(3.0006)
-    /// ```
-    #[must_use = "Fee calculation result must be used"]
-    #[inline]
-    pub fn calculate_fee(&self, notional: u128, is_maker: bool) -> i128 {
-        match self.try_calculate_fee(notional, is_maker) {
-            Ok(fee) => fee,
-            Err(overflow) => {
-                // Saturated clamp, bit-identical to the historical
-                // `saturating_mul` behavior: the product caps at u128::MAX, so
-                // after `/ 10_000` the magnitude is u128::MAX / 10_000 (which
-                // always fits i128). The sign is applied afterward so a maker
-                // rebate (negative bps) is preserved.
-                let magnitude = i128::try_from(u128::MAX / BPS_DENOMINATOR).unwrap_or(i128::MAX);
-                if overflow.bps < 0 {
-                    -magnitude
-                } else {
-                    magnitude
-                }
-            }
-        }
-    }
-
-    /// Calculate the fee for a transaction, or fail instead of clamping
-    ///
-    /// Fallible variant of [`Self::calculate_fee`]: identical inputs,
-    /// identical rounding (truncation toward zero, sign applied after the
-    /// unsigned-domain magnitude), but where `calculate_fee` saturates its
-    /// intermediate product this returns [`FeeOverflow`]. An `Ok` value is
-    /// therefore always the mathematically exact
-    /// `sign(bps) × ⌊notional × |bps| / 10_000⌋` **and** equal to what
-    /// [`Self::calculate_fee`] returns for the same inputs, suitable for
-    /// journaled / replayable venues whose fee contract requires exact
-    /// integer fees.
-    ///
-    /// The error condition is the multiplication-safety bound, not exactness
-    /// itself: an `Err` means `calculate_fee` would clamp, whose result is
-    /// merely not *guaranteed* exact — at isolated notionals the clamp can
-    /// still coincide with the true fee. This variant rejects conservatively
-    /// there, because a venue admitting such an input would have the engine
-    /// journal a clamped, unverifiable fee.
-    ///
-    /// # Arguments
-    ///
-    /// * `notional` - The notional value of the trade (price × quantity)
-    /// * `is_maker` - true if this is a maker transaction, false for taker
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FeeOverflow`] if and only if `notional × |bps|` does not
-    /// fit in `u128`, i.e. iff
-    /// `notional > Self::max_guaranteed_exact_notional_for_bps(bps)`.
-    /// A zero-bps rate never errors (the fee is exactly `0` for any
-    /// notional).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use orderbook_rs::FeeSchedule;
-    ///
-    /// let schedule = FeeSchedule::new(-2, 5);
-    ///
-    /// // Exact taker fee: 5 bps on $10,000 = $5.00
-    /// let fee = schedule.try_calculate_fee(10_000_000, false)?;
-    /// assert_eq!(fee, 5_000);
+    /// assert_eq!(schedule.calculate_fee(15_003, false)?, 7); // floor(7.5015)
+    /// assert_eq!(schedule.calculate_fee(15_003, true)?, -3); // -floor(3.0006)
     ///
     /// // Beyond the guaranteed-exact bound the computation refuses to clamp.
-    /// assert!(schedule.try_calculate_fee(u128::MAX, false).is_err());
+    /// assert!(schedule.calculate_fee(u128::MAX, false).is_err());
     /// # Ok::<(), orderbook_rs::FeeOverflow>(())
     /// ```
     #[inline]
-    pub fn try_calculate_fee(&self, notional: u128, is_maker: bool) -> Result<i128, FeeOverflow> {
+    pub fn calculate_fee(&self, notional: u128, is_maker: bool) -> Result<i128, FeeOverflow> {
         let bps = if is_maker {
             self.maker_fee_bps
         } else {
@@ -244,33 +188,98 @@ impl FeeSchedule {
         // Doing this as u128 (not i128) avoids truncating a notional above
         // i128::MAX into a negative value. If the product fits in u128, the
         // post-division magnitude is at most u128::MAX / 10_000 < i128::MAX,
-        // so the i128 conversion below cannot fail — mapping it to the same
-        // error keeps exactness a checked guarantee rather than a comment.
+        // so the i128 conversion and the negation below cannot fail — mapping
+        // them to the same error keeps exactness a checked guarantee rather
+        // than a comment.
+        let overflow = || FeeOverflow::new(notional, bps);
         let product = notional
             .checked_mul(u128::from(bps.unsigned_abs()))
-            .ok_or_else(|| FeeOverflow::new(notional, bps))?;
-        let magnitude = i128::try_from(product / BPS_DENOMINATOR)
-            .map_err(|_| FeeOverflow::new(notional, bps))?;
-        Ok(if bps < 0 { -magnitude } else { magnitude })
+            .ok_or_else(overflow)?;
+        let magnitude = product
+            .checked_div(BPS_DENOMINATOR)
+            .and_then(|m| i128::try_from(m).ok())
+            .ok_or_else(overflow)?;
+        if bps < 0 {
+            magnitude.checked_neg().ok_or_else(overflow)
+        } else {
+            Ok(magnitude)
+        }
+    }
+
+    /// Calculate the fee for a transaction, or fail instead of clamping
+    ///
+    /// Identical to [`Self::calculate_fee`], which is fallible since
+    /// 0.14.0 (#244); kept as a deprecated alias for callers that adopted
+    /// the exact-fee API in 0.10.4.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::calculate_fee`].
+    #[deprecated(
+        since = "0.14.0",
+        note = "`calculate_fee` is fallible and never clamps since 0.14.0; call it instead"
+    )]
+    #[inline]
+    pub fn try_calculate_fee(&self, notional: u128, is_maker: bool) -> Result<i128, FeeOverflow> {
+        self.calculate_fee(notional, is_maker)
+    }
+
+    /// Check that both legs of this schedule can price `notional` exactly
+    ///
+    /// `Ok` when [`Self::calculate_fee`] succeeds for the maker **and** the
+    /// taker rate at `notional`; for any smaller notional it then succeeds
+    /// too, and the sum of the fees of trades whose notionals add up to at
+    /// most `notional` is representable as well. The trade path runs this on
+    /// every taker's worst-case notional before it touches the book (#244).
+    /// One checked multiplication by the larger rate magnitude, no
+    /// allocation; which leg failed is only worked out on the error path.
+    ///
+    /// # Errors
+    ///
+    /// [`FeeOverflow`] for the first leg (taker, then maker) that would
+    /// overflow.
+    #[inline]
+    pub fn check_notional(&self, notional: u128) -> Result<(), FeeOverflow> {
+        let max_bps = self
+            .taker_fee_bps
+            .unsigned_abs()
+            .max(self.maker_fee_bps.unsigned_abs());
+        match notional.checked_mul(u128::from(max_bps)) {
+            Some(_) => Ok(()),
+            None => Err(self.overflowing_leg(notional)),
+        }
+    }
+
+    /// The leg whose rate overflows at `notional`: the taker's when it does,
+    /// else the maker's (the larger magnitude, since the caller saw the
+    /// maximum overflow). Cold: only reached on a rejection.
+    #[cold]
+    #[inline(never)]
+    fn overflowing_leg(&self, notional: u128) -> FeeOverflow {
+        let taker_fits = notional
+            .checked_mul(u128::from(self.taker_fee_bps.unsigned_abs()))
+            .is_some();
+        let bps = if taker_fits {
+            self.maker_fee_bps
+        } else {
+            self.taker_fee_bps
+        };
+        FeeOverflow::new(notional, bps)
     }
 
     /// Largest notional whose fee at `bps` is guaranteed exact
     ///
     /// This is the **multiplication-safety bound** `u128::MAX / |bps|`
     /// (`u128::MAX` for a zero rate): at or below it the intermediate
-    /// product `notional × |bps|` cannot overflow, so both
-    /// [`Self::calculate_fee`] and [`Self::try_calculate_fee`] return the
-    /// exact `⌊notional × |bps| / 10_000⌋` (signed). Callers can enforce it
-    /// at admission time, making the saturating branch of
-    /// [`Self::calculate_fee`] provably unreachable.
+    /// product `notional × |bps|` cannot overflow, so
+    /// [`Self::calculate_fee`] returns the exact `⌊notional × |bps| /
+    /// 10_000⌋` (signed). Callers can enforce it at admission time, making
+    /// [`FeeOverflow`] provably unreachable.
     ///
     /// The guarantee is sufficient, not tight: above the bound the
-    /// multiplication overflows, so [`Self::try_calculate_fee`] always
-    /// rejects and [`Self::calculate_fee`] clamps — even though at isolated
-    /// notionals the clamped value can still coincide with the exact fee
-    /// (e.g. `1 << 127` at 2 bps). "Guaranteed exact" is therefore a
-    /// property of inputs at or below the bound, not a claim that every
-    /// input above it is inexact.
+    /// multiplication overflows, so [`Self::calculate_fee`] always rejects,
+    /// even though at isolated notionals the exact fee would still fit
+    /// (e.g. `1 << 127` at 2 bps).
     ///
     /// # Arguments
     ///
@@ -297,9 +306,11 @@ impl FeeSchedule {
     #[must_use]
     #[inline]
     pub const fn max_guaranteed_exact_notional_for_bps(bps: i32) -> u128 {
-        match bps.unsigned_abs() {
-            0 => u128::MAX,
-            b => u128::MAX / b as u128,
+        // `u32 as u128` is lossless; `From` is not usable in a `const fn`.
+        match u128::MAX.checked_div(bps.unsigned_abs() as u128) {
+            Some(bound) => bound,
+            // Zero rate: every notional prices exactly to `0`.
+            None => u128::MAX,
         }
     }
 
@@ -308,7 +319,7 @@ impl FeeSchedule {
     /// The minimum of [`Self::max_guaranteed_exact_notional_for_bps`] over
     /// the maker and taker rates — a single venue-level admission bound: any
     /// notional at or below it produces exact maker **and** taker fees from
-    /// [`Self::calculate_fee`] / [`Self::try_calculate_fee`]. Like the
+    /// [`Self::calculate_fee`]. Like the
     /// per-rate bound, it is a sufficient guarantee, not a tight exactness
     /// frontier.
     ///
@@ -384,15 +395,25 @@ impl FeeSchedule {
     ///
     /// # Arguments
     ///
-    /// * `maker_rebate_bps` - Maker rebate in basis points (positive value, will be negated)
+    /// * `maker_rebate_bps` - Maker rebate in basis points; its magnitude is
+    ///   used and the maker rate is `-|maker_rebate_bps|`
     /// * `taker_fee_bps` - Taker fee in basis points
+    ///
+    /// `-|x|` is representable for every `i32`, including `i32::MIN` (whose
+    /// `abs()` would overflow), so this never panics (#244).
     ///
     /// # Returns
     ///
     /// A FeeSchedule with negative maker fee (rebate) and specified taker fee
     #[must_use]
     pub fn with_maker_rebate(maker_rebate_bps: i32, taker_fee_bps: i32) -> Self {
-        Self::new(-maker_rebate_bps.abs(), taker_fee_bps)
+        let maker_fee_bps = match maker_rebate_bps.checked_neg() {
+            // A positive input: its negation.
+            Some(negated) if negated < 0 => negated,
+            // Zero, a negative input, or `i32::MIN`: already `-|x|`.
+            _ => maker_rebate_bps,
+        };
+        Self::new(maker_fee_bps, taker_fee_bps)
     }
 }
 
@@ -437,124 +458,120 @@ mod tests {
     }
 
     #[test]
+    fn test_with_maker_rebate_i32_extremes_never_panic() {
+        // `-(i32::MIN).abs()` used to overflow; `-|i32::MIN|` is i32::MIN.
+        assert_eq!(
+            FeeSchedule::with_maker_rebate(i32::MIN, 5).maker_fee_bps,
+            i32::MIN
+        );
+        assert_eq!(
+            FeeSchedule::with_maker_rebate(i32::MAX, 5).maker_fee_bps,
+            -i32::MAX
+        );
+        assert_eq!(FeeSchedule::with_maker_rebate(-4, 5).maker_fee_bps, -4);
+        assert_eq!(FeeSchedule::with_maker_rebate(0, 5).maker_fee_bps, 0);
+        assert!(!FeeSchedule::with_maker_rebate(0, 5).has_maker_rebate());
+    }
+
+    #[test]
+    fn test_calculate_fee_i32_min_rate() {
+        let schedule = FeeSchedule::with_maker_rebate(i32::MIN, 0);
+        // 10_000 × 2^31 / 10_000 = 2^31, negated.
+        assert_eq!(schedule.calculate_fee(10_000, true), Ok(-2_147_483_648));
+        assert!(schedule.calculate_fee(u128::MAX, true).is_err());
+    }
+
+    #[test]
     fn test_calculate_taker_fee() {
         let schedule = FeeSchedule::new(-2, 5);
-        let notional = 100_000_000; // $1,000 in cents
-
-        // 5 bps of $1,000 = $0.50 = 50 cents
-        let fee = schedule.calculate_fee(notional, false);
-        assert_eq!(fee, 50_000); // 50,000 cents = $500 (assuming cents as base unit)
+        assert_eq!(schedule.calculate_fee(100_000_000, false), Ok(50_000));
     }
 
     #[test]
     fn test_calculate_maker_rebate() {
         let schedule = FeeSchedule::new(-2, 5);
-        let notional = 100_000_000; // $1,000 in cents
-
-        // -2 bps of $1,000 = -$0.20 = -20 cents
-        let rebate = schedule.calculate_fee(notional, true);
-        assert_eq!(rebate, -20_000); // -20,000 cents = -$200
+        assert_eq!(schedule.calculate_fee(100_000_000, true), Ok(-20_000));
     }
 
     #[test]
-    fn test_calculate_fee_notional_above_i128_max_keeps_sign_and_magnitude() {
-        // A notional above i128::MAX previously cast to a negative i128, so a
-        // taker fee came out negative (wrong sign) and a maker rebate positive.
-        // Compute the magnitude in the u128 domain so the sign stays correct.
-        let notional = u128::MAX; // far above i128::MAX
-        let taker = FeeSchedule::new(0, 5);
-        let taker_fee = taker.calculate_fee(notional, false);
-        assert!(
-            taker_fee > 0,
-            "taker fee must stay positive, got {taker_fee}"
-        );
-        // Magnitude is u128::MAX * 5 / 10_000 (saturating mul caps at u128::MAX,
-        // which still fits i128 after the divide).
-        let expected = i128::try_from(u128::MAX.saturating_mul(5) / 10_000).unwrap_or(i128::MAX);
-        assert_eq!(taker_fee, expected);
+    fn test_calculate_fee_notional_above_i128_max_is_exact_or_rejected() {
+        // A notional above i128::MAX once cast to a negative i128. The
+        // magnitude is computed in the u128 domain, so at 1 bps the fee is
+        // exact and positive; at 5 bps the product overflows and is rejected
+        // rather than clamped (#244).
+        let notional = u128::MAX;
+        let one_bps = FeeSchedule::new(-1, 1);
+        let expected = i128::try_from(u128::MAX / 10_000).unwrap();
+        assert_eq!(one_bps.calculate_fee(notional, false), Ok(expected));
+        assert_eq!(one_bps.calculate_fee(notional, true), Ok(-expected));
 
-        let maker = FeeSchedule::new(-2, 5);
-        let rebate = maker.calculate_fee(notional, true);
-        assert!(rebate < 0, "maker rebate must stay negative, got {rebate}");
+        let five_bps = FeeSchedule::new(-2, 5);
+        assert!(five_bps.calculate_fee(notional, false).is_err());
+        assert!(five_bps.calculate_fee(notional, true).is_err());
     }
 
     #[test]
     fn test_calculate_fee_unchanged_for_realistic_inputs() {
-        // The u128-domain computation must match the old behaviour for normal
-        // notionals (both taker fee and maker rebate, including truncation).
         let schedule = FeeSchedule::new(-2, 5);
-        assert_eq!(schedule.calculate_fee(100_000_000, false), 50_000);
-        assert_eq!(schedule.calculate_fee(100_000_000, true), -20_000);
+        assert_eq!(schedule.calculate_fee(100_000_000, false), Ok(50_000));
+        assert_eq!(schedule.calculate_fee(100_000_000, true), Ok(-20_000));
         // Non-multiple-of-10_000 notional: floor(15_003 * 5 / 10_000) = 7.
-        assert_eq!(schedule.calculate_fee(15_003, false), 7);
-        // Maker rebate truncates toward zero just like the old i128 path.
-        assert_eq!(schedule.calculate_fee(15_003, true), -3);
+        assert_eq!(schedule.calculate_fee(15_003, false), Ok(7));
+        // Maker rebate truncates toward zero.
+        assert_eq!(schedule.calculate_fee(15_003, true), Ok(-3));
     }
 
     #[test]
     fn test_zero_fee_calculation() {
         let schedule = FeeSchedule::zero_fee();
-        let notional = 100_000_000;
-
-        assert_eq!(schedule.calculate_fee(notional, true), 0);
-        assert_eq!(schedule.calculate_fee(notional, false), 0);
+        assert_eq!(schedule.calculate_fee(100_000_000, true), Ok(0));
+        assert_eq!(schedule.calculate_fee(100_000_000, false), Ok(0));
     }
 
     #[test]
     fn test_large_notional() {
         let schedule = FeeSchedule::new(1, 1);
-        let notional = u128::MAX / 10_000 - 1; // Safe large value
-
-        let fee = schedule.calculate_fee(notional, false);
+        let notional = u128::MAX / 10_000 - 1;
+        let fee = schedule.calculate_fee(notional, false).unwrap();
         assert!(fee > 0);
         assert!(fee < i128::MAX);
     }
 
     #[test]
     fn test_edge_cases() {
-        let schedule = FeeSchedule::new(-10_000, 10_000); // Maximum reasonable fees
-        let notional = 10_000; // Small notional
-
-        let maker_fee = schedule.calculate_fee(notional, true);
-        let taker_fee = schedule.calculate_fee(notional, false);
-
-        assert_eq!(maker_fee, -10_000); // -100% of notional
-        assert_eq!(taker_fee, 10_000); // 100% of notional
+        let schedule = FeeSchedule::new(-10_000, 10_000);
+        assert_eq!(schedule.calculate_fee(10_000, true), Ok(-10_000));
+        assert_eq!(schedule.calculate_fee(10_000, false), Ok(10_000));
     }
 
     #[test]
-    fn test_try_calculate_fee_realistic_inputs_matches_calculate_fee() {
-        // The fallible variant is exact on realistic inputs and agrees with
-        // the infallible path, including truncation-toward-zero rounding.
+    #[allow(deprecated)]
+    fn test_try_calculate_fee_alias_matches_calculate_fee() {
         let schedule = FeeSchedule::new(-2, 5);
-        for notional in [0u128, 1, 15_003, 100_000_000, u128::MAX / 5] {
+        for notional in [0u128, 1, 15_003, 100_000_000, u128::MAX / 5, u128::MAX] {
             for is_maker in [true, false] {
-                let exact = schedule.try_calculate_fee(notional, is_maker);
-                assert_eq!(exact, Ok(schedule.calculate_fee(notional, is_maker)));
+                assert_eq!(
+                    schedule.try_calculate_fee(notional, is_maker),
+                    schedule.calculate_fee(notional, is_maker)
+                );
             }
         }
-        assert_eq!(schedule.try_calculate_fee(15_003, false), Ok(7));
-        assert_eq!(schedule.try_calculate_fee(15_003, true), Ok(-3));
     }
 
     #[test]
-    fn test_try_calculate_fee_overflow_returns_error_with_fields() {
+    fn test_calculate_fee_overflow_returns_error_with_fields() {
         let schedule = FeeSchedule::new(-2, 5);
-
-        let taker_err = schedule.try_calculate_fee(u128::MAX, false);
         assert_eq!(
-            taker_err,
+            schedule.calculate_fee(u128::MAX, false),
             Err(FeeOverflow {
                 notional: u128::MAX,
                 bps: 5,
                 max_guaranteed_exact_notional: u128::MAX / 5,
             })
         );
-
         // The maker leg reports the signed rate (-2), not its magnitude.
-        let maker_err = schedule.try_calculate_fee(u128::MAX, true);
         assert_eq!(
-            maker_err,
+            schedule.calculate_fee(u128::MAX, true),
             Err(FeeOverflow {
                 notional: u128::MAX,
                 bps: -2,
@@ -564,30 +581,42 @@ mod tests {
     }
 
     #[test]
-    fn test_try_calculate_fee_ok_at_bound_err_above_bound() {
+    fn test_calculate_fee_ok_at_bound_err_above_bound() {
         let schedule = FeeSchedule::new(-2, 5);
         let taker_bound = FeeSchedule::max_guaranteed_exact_notional_for_bps(5);
         let maker_bound = FeeSchedule::max_guaranteed_exact_notional_for_bps(-2);
 
-        // Exactly at the bound the fee is still exact and agrees with the
-        // saturating path (which does not saturate there).
-        let at_bound = schedule.try_calculate_fee(taker_bound, false);
-        assert_eq!(at_bound, Ok(schedule.calculate_fee(taker_bound, false)));
-        assert!(schedule.try_calculate_fee(taker_bound + 1, false).is_err());
-
-        let at_maker_bound = schedule.try_calculate_fee(maker_bound, true);
-        assert_eq!(
-            at_maker_bound,
-            Ok(schedule.calculate_fee(maker_bound, true))
-        );
-        assert!(schedule.try_calculate_fee(maker_bound + 1, true).is_err());
+        assert!(schedule.calculate_fee(taker_bound, false).is_ok());
+        assert!(schedule.calculate_fee(taker_bound + 1, false).is_err());
+        assert!(schedule.calculate_fee(maker_bound, true).is_ok());
+        assert!(schedule.calculate_fee(maker_bound + 1, true).is_err());
     }
 
     #[test]
-    fn test_try_calculate_fee_zero_bps_never_overflows() {
+    fn test_calculate_fee_zero_bps_never_overflows() {
         let schedule = FeeSchedule::zero_fee();
-        assert_eq!(schedule.try_calculate_fee(u128::MAX, false), Ok(0));
-        assert_eq!(schedule.try_calculate_fee(u128::MAX, true), Ok(0));
+        assert_eq!(schedule.calculate_fee(u128::MAX, false), Ok(0));
+        assert_eq!(schedule.calculate_fee(u128::MAX, true), Ok(0));
+    }
+
+    #[test]
+    fn test_check_notional_both_legs() {
+        let schedule = FeeSchedule::new(-7, 5);
+        assert_eq!(schedule.check_notional(u128::MAX / 7), Ok(()));
+        // The taker leg (5 bps) fits, the maker leg (-7 bps) does not.
+        assert_eq!(
+            schedule.check_notional(u128::MAX / 7 + 1),
+            Err(FeeOverflow {
+                notional: u128::MAX / 7 + 1,
+                bps: -7,
+                max_guaranteed_exact_notional: u128::MAX / 7,
+            })
+        );
+        assert_eq!(
+            schedule.check_notional(u128::MAX).map_err(|e| e.bps),
+            Err(5)
+        );
+        assert_eq!(FeeSchedule::zero_fee().check_notional(u128::MAX), Ok(()));
     }
 
     #[test]
@@ -631,42 +660,20 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_fee_saturates_to_documented_clamp() {
-        // Above the guaranteed-exact bound, calculate_fee clamps to the
-        // documented magnitude u128::MAX / 10_000, signed per bps.
-        let schedule = FeeSchedule::new(-2, 5);
-        let clamp = i128::try_from(u128::MAX / 10_000).unwrap_or(i128::MAX);
-        assert_eq!(schedule.calculate_fee(u128::MAX, false), clamp);
-        assert_eq!(schedule.calculate_fee(u128::MAX, true), -clamp);
-    }
-
-    #[test]
-    fn test_try_calculate_fee_rejects_conservatively_even_where_clamp_coincides() {
-        // The bound is multiplication-safety, not a tight exactness frontier:
-        // at notional 2^127 with 2 bps the product 2^128 overflows u128, so
-        // try_calculate_fee rejects — yet the legacy clamp happens to equal
-        // the true fee there, because floor((2^128 - 1) / 10_000) ==
-        // floor(2^128 / 10_000) (2^128 mod 10_000 = 1456 >= 1). This pins the
-        // documented "guaranteed exact is sufficient, not necessary" contract.
+    fn test_calculate_fee_rejects_conservatively_above_bound() {
+        // The bound is multiplication safety, not a tight exactness
+        // frontier: at notional 2^127 with 2 bps the product 2^128 overflows
+        // u128, so the fee is rejected although it would fit i128.
         let schedule = FeeSchedule::new(0, 2);
         let notional = 1u128 << 127;
         assert!(notional > FeeSchedule::max_guaranteed_exact_notional_for_bps(2));
-        assert!(schedule.try_calculate_fee(notional, false).is_err());
-
-        // Exact fee via a split that avoids the overflow: with
-        // notional = q*10_000 + r, floor(notional*2/10_000) = q*2 +
-        // floor(r*2/10_000).
-        let q = notional / 10_000;
-        let r = notional % 10_000;
-        let exact = i128::try_from(q * 2 + (r * 2) / 10_000).unwrap_or(i128::MAX);
-        // The clamp coincides with the exact value at this isolated point.
-        assert_eq!(schedule.calculate_fee(notional, false), exact);
+        assert!(schedule.calculate_fee(notional, false).is_err());
     }
 
     #[test]
     fn test_fee_overflow_display_contains_values() {
         let schedule = FeeSchedule::new(0, 5);
-        let Err(err) = schedule.try_calculate_fee(u128::MAX, false) else {
+        let Err(err) = schedule.calculate_fee(u128::MAX, false) else {
             panic!("expected overflow error");
         };
         let msg = err.to_string();
@@ -682,11 +689,8 @@ mod tests {
     #[test]
     fn test_serialization() {
         let schedule = FeeSchedule::new(-2, 5);
-
-        // Test JSON serialization
         let json = serde_json::to_string(&schedule).unwrap();
         let deserialized: FeeSchedule = serde_json::from_str(&json).unwrap();
-
         assert_eq!(schedule, deserialized);
     }
 

@@ -21,9 +21,6 @@
 //! book.reprice_special_orders();
 //! ```
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects, clippy::cast_sign_loss)]
-
 use crate::orderbook::error::OrderBookError;
 use dashmap::DashSet;
 use pricelevel::{Id, OrderType, PegReferenceType, Side};
@@ -167,8 +164,11 @@ pub struct RepricingResult {
 ///   behavior (effective step of 1)
 ///
 /// # Returns
-/// The calculated new price, or `None` if the reference price is unavailable or
-/// no valid passive resting price exists this cycle
+/// The calculated new price, or `None` if the reference price is unavailable,
+/// no valid passive resting price exists this cycle, or `reference + offset`
+/// (or its tick snap) would exceed `u128::MAX` (#244: checked, never
+/// saturated). A negative offset deeper than the reference is not an
+/// overflow: the price floors at the minimum valid resting price.
 // Each argument is a distinct, independently-sourced market input (reference
 // type, offset, side, the four reference prices, tick size); bundling them into
 // a struct would add ceremony without clarifying the pure calculation. Matches
@@ -191,11 +191,19 @@ pub fn calculate_pegged_price(
         PegReferenceType::LastTrade => last_trade?,
     };
 
-    // Apply offset (can be positive or negative)
+    // Apply offset (can be positive or negative). `unsigned_abs` is exact
+    // for every `i64`, including `i64::MIN` (whose negation overflows). A
+    // price above `u128::MAX` has no representation: skip the re-price. A
+    // negative offset larger than the reference floors at zero and then at
+    // the minimum valid price below, as documented (#244).
+    let magnitude = u128::from(offset.unsigned_abs());
     let mut new_price = if offset >= 0 {
-        reference_price.saturating_add(offset as u128)
+        reference_price.checked_add(magnitude)?
+    } else if magnitude >= reference_price {
+        // Deeper than the reference: the documented floor, not an overflow.
+        0
     } else {
-        reference_price.saturating_sub((-offset) as u128)
+        reference_price.checked_sub(magnitude)?
     };
     // The raw target the user requested (`reference ± offset`), before any
     // passive-side clamp / tick snap. Used only for the price-sliding telemetry
@@ -205,26 +213,31 @@ pub fn calculate_pegged_price(
     // Effective tick step (1 when unset / <= 1 preserves non-tick-book behavior).
     let step = tick_size.filter(|t| *t > 1).unwrap_or(1);
 
-    // Clamp to the passive side, one *tick* inside the touch so the bound is tick-aligned.
+    // Clamp to the passive side, one *tick* inside the touch so the bound is
+    // tick-aligned. When no such tick exists (`ask < step`, or `bid + step`
+    // overflows) there is no valid passive price this cycle: skip.
     match side {
         Side::Buy => {
             if let Some(ask) = best_ask {
-                new_price = new_price.min(ask.saturating_sub(step));
+                new_price = new_price.min(ask.checked_sub(step)?);
             }
         }
         Side::Sell => {
             if let Some(bid) = best_bid {
-                new_price = new_price.max(bid.saturating_add(step));
+                new_price = new_price.max(bid.checked_add(step)?);
             }
         }
     }
 
     // Snap onto the tick grid in the passive direction. Off-tick prices are rejected
     // by validate_order_shape on re-insert, which would silently abort the re-price.
+    // Rounding up past `u128::MAX` has no representation: skip.
     if step > 1 {
         new_price = match side {
-            Side::Buy => (new_price / step) * step, // round down = more passive
-            Side::Sell => new_price.div_ceil(step).saturating_mul(step), // round up = more passive
+            // round down = more passive
+            Side::Buy => new_price.checked_sub(new_price.checked_rem(step)?)?,
+            // round up = more passive
+            Side::Sell => new_price.div_ceil(step).checked_mul(step)?,
         };
     }
 
@@ -288,7 +301,9 @@ pub fn calculate_pegged_price(
 /// * `current_market_price` - Current market price (best bid for sell, best ask for buy)
 ///
 /// # Returns
-/// A tuple of (new_stop_price, new_reference_price) if adjustment is needed, None otherwise
+/// A tuple of (new_stop_price, new_reference_price) if adjustment is needed,
+/// `None` otherwise — including when the adjusted stop would fall below `0`
+/// or exceed `u128::MAX` (#244: checked, never saturated).
 pub fn calculate_trailing_stop_price(
     side: Side,
     current_stop_price: u128,
@@ -296,15 +311,17 @@ pub fn calculate_trailing_stop_price(
     last_reference_price: u128,
     current_market_price: u128,
 ) -> Option<(u128, u128)> {
-    let trail = trail_amount as u128;
+    let trail = u128::from(trail_amount);
 
     match side {
         Side::Sell => {
             // Sell trailing stop: trails below the market high
             // Only adjust upward when market makes new highs
             if current_market_price > last_reference_price {
-                // Market made a new high, adjust stop price upward
-                let new_stop_price = current_market_price.saturating_sub(trail);
+                // Market made a new high, adjust stop price upward. A trail
+                // deeper than the market price has no stop below it: no
+                // adjustment (#244; it used to clamp to 0).
+                let new_stop_price = current_market_price.checked_sub(trail)?;
                 if new_stop_price > current_stop_price {
                     return Some((new_stop_price, current_market_price));
                 }
@@ -314,8 +331,10 @@ pub fn calculate_trailing_stop_price(
             // Buy trailing stop: trails above the market low
             // Only adjust downward when market makes new lows
             if current_market_price < last_reference_price {
-                // Market made a new low, adjust stop price downward
-                let new_stop_price = current_market_price.saturating_add(trail);
+                // Market made a new low, adjust stop price downward. A stop
+                // above `u128::MAX` has no representation: no adjustment
+                // (#244; it used to clamp to `u128::MAX`).
+                let new_stop_price = current_market_price.checked_add(trail)?;
                 if new_stop_price < current_stop_price {
                     return Some((new_stop_price, current_market_price));
                 }
@@ -838,5 +857,85 @@ mod tests {
             None, // tick_size
         );
         assert_eq!(price, None);
+    }
+
+    #[test]
+    fn test_calculate_pegged_price_i64_min_offset_floors_issue_244() {
+        // `(-i64::MIN) as u128` used to overflow the negation.
+        let price = calculate_pegged_price(
+            PegReferenceType::BestBid,
+            i64::MIN,
+            Side::Buy,
+            Some(100),
+            Some(105),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(price, Some(1), "floors at the minimum valid price");
+
+        // A reference large enough to absorb |i64::MIN| subtracts exactly.
+        let reference = 1u128 << 70;
+        let price = calculate_pegged_price(
+            PegReferenceType::BestBid,
+            i64::MIN,
+            Side::Buy,
+            Some(reference),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(price, Some(reference - (1u128 << 63)));
+    }
+
+    #[test]
+    fn test_calculate_pegged_price_positive_overflow_skips_issue_244() {
+        let price = calculate_pegged_price(
+            PegReferenceType::BestAsk,
+            i64::MAX,
+            Side::Sell,
+            None,
+            Some(u128::MAX),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(price, None, "reference + offset exceeds u128::MAX");
+    }
+
+    #[test]
+    fn test_calculate_pegged_price_sell_tick_snap_overflow_skips_issue_244() {
+        // Rounding up to the tick grid would exceed u128::MAX.
+        let price = calculate_pegged_price(
+            PegReferenceType::BestAsk,
+            0,
+            Side::Sell,
+            None,
+            Some(u128::MAX - 1),
+            None,
+            None,
+            Some(1_000),
+        );
+        assert_eq!(price, None);
+    }
+
+    #[test]
+    fn test_trailing_stop_extremes_do_not_clamp_issue_244() {
+        // Sell: a trail deeper than the market has no stop below it.
+        assert_eq!(
+            calculate_trailing_stop_price(Side::Sell, 0, u64::MAX, 1, 10),
+            None
+        );
+        // Buy: a stop above u128::MAX has no representation.
+        assert_eq!(
+            calculate_trailing_stop_price(Side::Buy, u128::MAX, 10, u128::MAX, u128::MAX - 1),
+            None
+        );
+        // Ordinary values are unchanged.
+        assert_eq!(
+            calculate_trailing_stop_price(Side::Buy, 120, 5, 110, 100),
+            Some((105, 100))
+        );
     }
 }
