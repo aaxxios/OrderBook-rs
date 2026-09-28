@@ -1,8 +1,5 @@
 //! Order book snapshot for market data
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
 use bitflags::bitflags;
 use pricelevel::PriceLevelSnapshot;
 use serde::{Deserialize, Serialize};
@@ -11,6 +8,7 @@ use tracing::trace;
 
 use super::error::OrderBookError;
 use super::fees::FeeSchedule;
+use super::iterators::{checked_depth_add, checked_notional_add};
 use super::risk::RiskConfig;
 use super::stp::STPMode;
 
@@ -99,57 +97,93 @@ impl OrderBookSnapshot {
         spread
     }
 
-    /// Calculate the total volume on the bid side
-    pub fn total_bid_volume(&self) -> u64 {
-        let volume = self
-            .bids
-            .iter()
-            .map(|level| level.total_quantity().map_or(0, |q| q.as_u64()))
-            .sum();
+    /// Calculate the total volume (`visible + hidden`, in quantity units) on
+    /// the bid side.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the side total
+    ///   overflows `u64`.
+    pub fn total_bid_volume(&self) -> Result<u64, OrderBookError> {
+        let volume = total_volume(&self.bids, "snapshot bid volume")?;
         trace!("total_bid_volume: {:?}", volume);
-        volume
+        Ok(volume)
     }
 
-    /// Calculate the total volume on the ask side
-    pub fn total_ask_volume(&self) -> u64 {
-        let volume = self
-            .asks
-            .iter()
-            .map(|level| level.total_quantity().map_or(0, |q| q.as_u64()))
-            .sum();
+    /// Calculate the total volume (`visible + hidden`, in quantity units) on
+    /// the ask side.
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when the side total
+    ///   overflows `u64`.
+    pub fn total_ask_volume(&self) -> Result<u64, OrderBookError> {
+        let volume = total_volume(&self.asks, "snapshot ask volume")?;
         trace!("total_ask_volume: {:?}", volume);
-        volume
+        Ok(volume)
     }
 
-    /// Calculate the total value on the bid side (price * quantity)
-    pub fn total_bid_value(&self) -> u128 {
-        let value =
-            self.bids
-                .iter()
-                .map(|level| {
-                    level.price().as_u128().saturating_mul(u128::from(
-                        level.total_quantity().map_or(0, |q| q.as_u64()),
-                    ))
-                })
-                .sum();
+    /// Calculate the total value on the bid side (`price * quantity` summed
+    /// over the levels, in price units times quantity units).
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when a level's notional or
+    ///   the side total overflows `u128`.
+    pub fn total_bid_value(&self) -> Result<u128, OrderBookError> {
+        let value = total_value(&self.bids, "snapshot bid value")?;
         trace!("total_bid_value: {:?}", value);
-        value
+        Ok(value)
     }
 
-    /// Calculate the total value on the ask side (price * quantity)
-    pub fn total_ask_value(&self) -> u128 {
-        let value =
-            self.asks
-                .iter()
-                .map(|level| {
-                    level.price().as_u128().saturating_mul(u128::from(
-                        level.total_quantity().map_or(0, |q| q.as_u64()),
-                    ))
-                })
-                .sum();
+    /// Calculate the total value on the ask side (`price * quantity` summed
+    /// over the levels, in price units times quantity units).
+    ///
+    /// # Errors
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64`.
+    /// - [`OrderBookError::ArithmeticOverflow`] when a level's notional or
+    ///   the side total overflows `u128`.
+    pub fn total_ask_value(&self) -> Result<u128, OrderBookError> {
+        let value = total_value(&self.asks, "snapshot ask value")?;
         trace!("total_ask_value: {:?}", value);
-        value
+        Ok(value)
     }
+}
+
+/// Total quantity (`visible + hidden`) of a level snapshot, with the
+/// level's own overflow surfaced as a typed error (#245).
+#[inline]
+fn snapshot_level_total(level: &PriceLevelSnapshot) -> Result<u64, OrderBookError> {
+    Ok(level.total_quantity()?.as_u64())
+}
+
+/// Checked `u64` sum of the level totals of `levels`.
+fn total_volume(
+    levels: &[PriceLevelSnapshot],
+    operation: &'static str,
+) -> Result<u64, OrderBookError> {
+    levels.iter().try_fold(0u64, |acc, level| {
+        checked_depth_add(acc, snapshot_level_total(level)?, operation)
+    })
+}
+
+/// Checked `u128` sum of `price * level_total` over `levels`.
+fn total_value(
+    levels: &[PriceLevelSnapshot],
+    operation: &'static str,
+) -> Result<u128, OrderBookError> {
+    levels.iter().try_fold(0u128, |acc, level| {
+        checked_notional_add(
+            acc,
+            level.price().as_u128(),
+            snapshot_level_total(level)?,
+            operation,
+        )
+    })
 }
 
 /// Format version used for checksum-enabled order book snapshots.
@@ -177,6 +211,9 @@ impl OrderBookSnapshot {
 /// `Unsupported snapshot version` error — that format break is
 /// intentional, with no special-case migration path.
 pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 4;
+
+/// Length of a hex-encoded SHA-256 digest (32 bytes, two hex digits each).
+const SHA256_HEX_LEN: usize = 64;
 
 /// Oldest package format version [`OrderBookSnapshotPackage::validate`]
 /// still accepts on read. Version `2` packages predate the pricelevel
@@ -380,7 +417,7 @@ impl OrderBookSnapshotPackage {
         hasher.update(payload);
 
         let checksum_bytes = hasher.finalize();
-        let mut out = String::with_capacity(checksum_bytes.len() * 2);
+        let mut out = String::with_capacity(SHA256_HEX_LEN);
         for byte in checksum_bytes.iter() {
             use std::fmt::Write;
             write!(&mut out, "{byte:02x}").map_err(|error| OrderBookError::SerializationError {
@@ -510,6 +547,9 @@ impl EnrichedSnapshot {
     /// - `asks`: Ask price levels
     /// - `vwap_levels`: Number of levels to use for VWAP calculation
     /// - `imbalance_levels`: Number of levels to use for imbalance calculation
+    ///
+    /// # Errors
+    /// Same as [`Self::with_metrics`] with [`MetricFlags::ALL`].
     pub fn new(
         symbol: String,
         timestamp: u64,
@@ -517,7 +557,7 @@ impl EnrichedSnapshot {
         asks: Vec<PriceLevelSnapshot>,
         vwap_levels: usize,
         imbalance_levels: usize,
-    ) -> Self {
+    ) -> Result<Self, OrderBookError> {
         Self::with_metrics(
             symbol,
             timestamp,
@@ -539,6 +579,14 @@ impl EnrichedSnapshot {
     /// - `vwap_levels`: Number of levels to use for VWAP calculation
     /// - `imbalance_levels`: Number of levels to use for imbalance calculation
     /// - `flags`: Metrics to calculate
+    ///
+    /// # Errors
+    /// Only the selected metrics are computed, so only they can fail:
+    /// - [`OrderBookError::PriceLevelError`] when a level's
+    ///   `visible + hidden` total overflows `u64` (`DEPTH`, `VWAP`,
+    ///   `IMBALANCE`).
+    /// - [`OrderBookError::ArithmeticOverflow`] when a side depth (`u64`),
+    ///   a VWAP notional (`u128`) or the imbalance total (`u64`) overflows.
     pub fn with_metrics(
         symbol: String,
         timestamp: u64,
@@ -547,7 +595,7 @@ impl EnrichedSnapshot {
         vwap_levels: usize,
         imbalance_levels: usize,
         flags: MetricFlags,
-    ) -> Self {
+    ) -> Result<Self, OrderBookError> {
         // Calculate mid price if needed
         let mid_price = if flags.contains(MetricFlags::MID_PRICE) {
             Self::calculate_mid_price(&bids, &asks)
@@ -565,8 +613,8 @@ impl EnrichedSnapshot {
         // Calculate depths if needed
         let (bid_depth_total, ask_depth_total) = if flags.contains(MetricFlags::DEPTH) {
             (
-                Self::calculate_total_depth(&bids),
-                Self::calculate_total_depth(&asks),
+                Self::calculate_total_depth(&bids)?,
+                Self::calculate_total_depth(&asks)?,
             )
         } else {
             (0, 0)
@@ -575,8 +623,8 @@ impl EnrichedSnapshot {
         // Calculate VWAP if needed
         let (vwap_bid, vwap_ask) = if flags.contains(MetricFlags::VWAP) {
             (
-                Self::calculate_vwap(&bids, vwap_levels),
-                Self::calculate_vwap(&asks, vwap_levels),
+                Self::calculate_vwap(&bids, vwap_levels)?,
+                Self::calculate_vwap(&asks, vwap_levels)?,
             )
         } else {
             (None, None)
@@ -584,12 +632,12 @@ impl EnrichedSnapshot {
 
         // Calculate imbalance if needed
         let order_book_imbalance = if flags.contains(MetricFlags::IMBALANCE) {
-            Self::calculate_imbalance(&bids, &asks, imbalance_levels)
+            Self::calculate_imbalance(&bids, &asks, imbalance_levels)?
         } else {
             0.0
         };
 
-        Self {
+        Ok(Self {
             symbol,
             timestamp,
             bids,
@@ -601,7 +649,7 @@ impl EnrichedSnapshot {
             order_book_imbalance,
             vwap_bid,
             vwap_ask,
-        }
+        })
     }
 
     fn calculate_mid_price(
@@ -629,32 +677,37 @@ impl EnrichedSnapshot {
         Some((spread / mid_price) * 10000.0)
     }
 
-    fn calculate_total_depth(levels: &[PriceLevelSnapshot]) -> u64 {
-        levels
-            .iter()
-            .map(|l| l.total_quantity().map_or(0, |q| q.as_u64()))
-            .sum()
+    fn calculate_total_depth(levels: &[PriceLevelSnapshot]) -> Result<u64, OrderBookError> {
+        total_volume(levels, "enriched snapshot depth")
     }
 
-    fn calculate_vwap(levels: &[PriceLevelSnapshot], max_levels: usize) -> Option<f64> {
+    fn calculate_vwap(
+        levels: &[PriceLevelSnapshot],
+        max_levels: usize,
+    ) -> Result<Option<f64>, OrderBookError> {
         let levels_to_use = levels.iter().take(max_levels);
 
         let mut total_value = 0u128;
         let mut total_quantity = 0u64;
 
         for level in levels_to_use {
-            let quantity = level.total_quantity().map_or(0, |q| q.as_u64());
+            let quantity = snapshot_level_total(level)?;
             if quantity > 0 {
-                total_value = total_value
-                    .saturating_add(level.price().as_u128().saturating_mul(u128::from(quantity)));
-                total_quantity = total_quantity.saturating_add(quantity);
+                total_value = checked_notional_add(
+                    total_value,
+                    level.price().as_u128(),
+                    quantity,
+                    "enriched snapshot vwap notional",
+                )?;
+                total_quantity =
+                    checked_depth_add(total_quantity, quantity, "enriched snapshot vwap quantity")?;
             }
         }
 
         if total_quantity == 0 {
-            None
+            Ok(None)
         } else {
-            Some(total_value as f64 / total_quantity as f64)
+            Ok(Some(total_value as f64 / total_quantity as f64))
         }
     }
 
@@ -662,27 +715,24 @@ impl EnrichedSnapshot {
         bids: &[PriceLevelSnapshot],
         asks: &[PriceLevelSnapshot],
         max_levels: usize,
-    ) -> f64 {
-        // Saturating folds so an astronomical aggregate depth caps at u64::MAX
-        // rather than panicking in debug / wrapping in release.
-        let bid_volume: u64 = bids
-            .iter()
-            .take(max_levels)
-            .map(|l| l.total_quantity().map_or(0, |q| q.as_u64()))
-            .fold(0u64, u64::saturating_add);
+    ) -> Result<f64, OrderBookError> {
+        let bid_volume = bids
+            .get(..max_levels.min(bids.len()))
+            .map_or(Ok(0), |top| {
+                total_volume(top, "enriched snapshot imbalance")
+            })?;
+        let ask_volume = asks
+            .get(..max_levels.min(asks.len()))
+            .map_or(Ok(0), |top| {
+                total_volume(top, "enriched snapshot imbalance")
+            })?;
 
-        let ask_volume: u64 = asks
-            .iter()
-            .take(max_levels)
-            .map(|l| l.total_quantity().map_or(0, |q| q.as_u64()))
-            .fold(0u64, u64::saturating_add);
-
-        let total = bid_volume.saturating_add(ask_volume);
+        let total = checked_depth_add(bid_volume, ask_volume, "enriched snapshot imbalance")?;
 
         if total == 0 {
-            0.0
+            Ok(0.0)
         } else {
-            (bid_volume as f64 - ask_volume as f64) / total as f64
+            Ok((bid_volume as f64 - ask_volume as f64) / total as f64)
         }
     }
 }
@@ -704,28 +754,177 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_imbalance_saturates_on_extreme_volume() {
-        // Two levels whose volumes overflow u64 must saturate, not panic in
-        // debug / wrap in release.
+    fn test_calculate_imbalance_extreme_volume_returns_overflow_error() {
+        // Two levels whose volumes overflow u64 are reported (#245), not
+        // saturated, panicked on in debug or wrapped in release.
         let big = u64::MAX / 2 + 1;
         let bids = vec![level(big), level(big)];
         let asks = vec![level(1)];
-        let imbalance = EnrichedSnapshot::calculate_imbalance(&bids, &asks, 10);
-        assert!(imbalance.is_finite(), "imbalance must be finite");
-        assert!(
-            (-1.0..=1.0).contains(&imbalance),
-            "imbalance must stay in [-1, 1], got {imbalance}"
-        );
+        let err = EnrichedSnapshot::calculate_imbalance(&bids, &asks, 10)
+            .expect_err("u64 overflow must be reported");
+        assert!(matches!(err, OrderBookError::ArithmeticOverflow { .. }));
+    }
+
+    #[test]
+    fn test_calculate_imbalance_bid_plus_ask_overflow_returns_error() {
+        let bids = vec![level(u64::MAX)];
+        let asks = vec![level(1)];
+        let err = EnrichedSnapshot::calculate_imbalance(&bids, &asks, 10)
+            .expect_err("bid + ask overflow must be reported");
+        assert!(matches!(err, OrderBookError::ArithmeticOverflow { .. }));
     }
 
     #[test]
     fn test_calculate_imbalance_realistic() {
         let bids = vec![level(60)];
         let asks = vec![level(40)];
-        let imbalance = EnrichedSnapshot::calculate_imbalance(&bids, &asks, 10);
+        let imbalance = EnrichedSnapshot::calculate_imbalance(&bids, &asks, 10).expect("imbalance");
         assert!(
             (imbalance - 0.2).abs() < 1e-9,
             "(60 - 40) / 100 = 0.2, got {imbalance}"
         );
+    }
+
+    #[test]
+    fn test_calculate_imbalance_respects_level_cap() {
+        let bids = vec![level(60), level(u64::MAX)];
+        let asks = vec![level(40)];
+        // Only the top level per side is read, so the huge second bid level
+        // never enters the sum.
+        let imbalance = EnrichedSnapshot::calculate_imbalance(&bids, &asks, 1).expect("imbalance");
+        assert!((imbalance - 0.2).abs() < 1e-9);
+    }
+
+    fn level_at(price: u128, visible: u64, hidden: u64) -> PriceLevelSnapshot {
+        // `from_str` (not `json!`): a `serde_json::Value` cannot carry a
+        // `u128` above `u64::MAX`, the text parser can.
+        serde_json::from_str(&format!(
+            r#"{{"price":{price},"visible_quantity":{visible},"hidden_quantity":{hidden},"order_count":1,"orders":[]}}"#
+        ))
+        .expect("valid PriceLevelSnapshot JSON")
+    }
+
+    fn snapshot(bids: Vec<PriceLevelSnapshot>, asks: Vec<PriceLevelSnapshot>) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            symbol: "TEST".to_string(),
+            timestamp: 0,
+            bids,
+            asks,
+        }
+    }
+
+    #[test]
+    fn test_snapshot_totals_realistic() {
+        let snap = snapshot(
+            vec![level_at(100, 10, 5), level_at(99, 20, 0)],
+            vec![level_at(101, 7, 0)],
+        );
+        assert_eq!(snap.total_bid_volume().expect("volume"), 35);
+        assert_eq!(snap.total_ask_volume().expect("volume"), 7);
+        assert_eq!(snap.total_bid_value().expect("value"), 100 * 15 + 99 * 20);
+        assert_eq!(snap.total_ask_value().expect("value"), 101 * 7);
+    }
+
+    #[test]
+    fn test_snapshot_total_volume_u64_overflow_returns_error() {
+        let snap = snapshot(
+            vec![level_at(100, u64::MAX, 0), level_at(99, 1, 0)],
+            vec![level_at(101, u64::MAX, 0), level_at(102, 1, 0)],
+        );
+        assert!(matches!(
+            snap.total_bid_volume(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+        assert!(matches!(
+            snap.total_ask_volume(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_level_total_overflow_propagates_price_level_error() {
+        // visible + hidden of a single level exceeds u64.
+        let snap = snapshot(
+            vec![level_at(100, u64::MAX, 1)],
+            vec![level_at(101, u64::MAX, 1)],
+        );
+        assert!(matches!(
+            snap.total_bid_volume(),
+            Err(OrderBookError::PriceLevelError(_))
+        ));
+        assert!(matches!(
+            snap.total_ask_value(),
+            Err(OrderBookError::PriceLevelError(_))
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_total_value_u128_overflow_returns_error() {
+        // u128::MAX * 2 overflows the product.
+        let snap = snapshot(
+            vec![level_at(u128::MAX, 2, 0)],
+            vec![level_at(u128::MAX, 2, 0)],
+        );
+        assert!(matches!(
+            snap.total_bid_value(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+        assert!(matches!(
+            snap.total_ask_value(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+        // The sum overflows even when each product fits.
+        let snap = snapshot(
+            vec![level_at(u128::MAX, 1, 0), level_at(1, 1, 0)],
+            Vec::new(),
+        );
+        assert!(matches!(
+            snap.total_bid_value(),
+            Err(OrderBookError::ArithmeticOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_enriched_metrics_overflow_returns_error_only_when_selected() {
+        let bids = vec![level_at(u128::MAX, 2, 0)];
+        let asks = vec![level_at(u128::MAX, 1, 0)];
+        // VWAP notional u128::MAX * 2 overflows.
+        let err = EnrichedSnapshot::with_metrics(
+            "T".to_string(),
+            0,
+            bids.clone(),
+            asks.clone(),
+            10,
+            10,
+            MetricFlags::VWAP,
+        )
+        .expect_err("vwap overflow must be reported");
+        assert!(matches!(err, OrderBookError::ArithmeticOverflow { .. }));
+        // Not selected: no error.
+        let ok = EnrichedSnapshot::with_metrics(
+            "T".to_string(),
+            0,
+            bids.clone(),
+            asks.clone(),
+            10,
+            10,
+            MetricFlags::DEPTH | MetricFlags::IMBALANCE,
+        )
+        .expect("depth and imbalance fit");
+        assert_eq!(ok.bid_depth_total, 2);
+        assert_eq!(ok.ask_depth_total, 1);
+        assert!(ok.vwap_bid.is_none());
+
+        // Depth overflow through `new` (ALL metrics).
+        let err = EnrichedSnapshot::new(
+            "T".to_string(),
+            0,
+            vec![level_at(100, u64::MAX, 0), level_at(99, 1, 0)],
+            Vec::new(),
+            10,
+            10,
+        )
+        .expect_err("depth overflow must be reported");
+        assert!(matches!(err, OrderBookError::ArithmeticOverflow { .. }));
     }
 }

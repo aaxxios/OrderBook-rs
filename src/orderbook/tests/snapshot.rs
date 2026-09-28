@@ -117,7 +117,7 @@ mod tests {
         // Total bid volume should include visible and hidden quantities
         let expected_volume = (10 + 5) + 20; // First bid + Second bid (visible + hidden)
         assert_eq!(
-            snapshot.total_bid_volume(),
+            snapshot.total_bid_volume().unwrap(),
             expected_volume,
             "Total bid volume should sum all bid quantities"
         );
@@ -125,7 +125,7 @@ mod tests {
         // Empty book should have zero volume
         let empty_snapshot = create_empty_snapshot();
         assert_eq!(
-            empty_snapshot.total_bid_volume(),
+            empty_snapshot.total_bid_volume().unwrap(),
             0,
             "Empty book should have zero bid volume"
         );
@@ -138,7 +138,7 @@ mod tests {
         // Total ask volume should include visible and hidden quantities
         let expected_volume = 15 + (25 + 10); // First ask + Second ask (visible + hidden)
         assert_eq!(
-            snapshot.total_ask_volume(),
+            snapshot.total_ask_volume().unwrap(),
             expected_volume,
             "Total ask volume should sum all ask quantities"
         );
@@ -146,7 +146,7 @@ mod tests {
         // Empty book should have zero volume
         let empty_snapshot = create_empty_snapshot();
         assert_eq!(
-            empty_snapshot.total_ask_volume(),
+            empty_snapshot.total_ask_volume().unwrap(),
             0,
             "Empty book should have zero ask volume"
         );
@@ -159,7 +159,7 @@ mod tests {
         // Total bid value should be sum of price * total_quantity for each level
         let expected_value = 1000 * (10 + 5) + 990 * 20;
         assert_eq!(
-            snapshot.total_bid_value(),
+            snapshot.total_bid_value().unwrap(),
             expected_value,
             "Total bid value should sum price*quantity for all bids"
         );
@@ -167,7 +167,7 @@ mod tests {
         // Empty book should have zero value
         let empty_snapshot = create_empty_snapshot();
         assert_eq!(
-            empty_snapshot.total_bid_value(),
+            empty_snapshot.total_bid_value().unwrap(),
             0,
             "Empty book should have zero bid value"
         );
@@ -180,7 +180,7 @@ mod tests {
         // Total ask value should be sum of price * total_quantity for each level
         let expected_value = 1010 * 15 + 1020 * (25 + 10);
         assert_eq!(
-            snapshot.total_ask_value(),
+            snapshot.total_ask_value().unwrap(),
             expected_value,
             "Total ask value should sum price*quantity for all asks"
         );
@@ -188,7 +188,7 @@ mod tests {
         // Empty book should have zero value
         let empty_snapshot = create_empty_snapshot();
         assert_eq!(
-            empty_snapshot.total_ask_value(),
+            empty_snapshot.total_ask_value().unwrap(),
             0,
             "Empty book should have zero ask value"
         );
@@ -540,16 +540,16 @@ mod test_orderbook_snapshot {
         };
 
         // Test total_bid_volume
-        assert_eq!(snapshot.total_bid_volume(), 35); // 10 + 5 + 20
+        assert_eq!(snapshot.total_bid_volume().unwrap(), 35); // 10 + 5 + 20
 
         // Test total_ask_volume
-        assert_eq!(snapshot.total_ask_volume(), 50); // 15 + 25 + 10
+        assert_eq!(snapshot.total_ask_volume().unwrap(), 50); // 15 + 25 + 10
 
         // Test total_bid_value
-        assert_eq!(snapshot.total_bid_value(), 1000 * 15 + 990 * 20);
+        assert_eq!(snapshot.total_bid_value().unwrap(), 1000 * 15 + 990 * 20);
 
         // Test total_ask_value
-        assert_eq!(snapshot.total_ask_value(), 1010 * 15 + 1020 * 35);
+        assert_eq!(snapshot.total_ask_value().unwrap(), 1010 * 15 + 1020 * 35);
     }
 }
 
@@ -567,10 +567,10 @@ mod test_snapshot_remaining {
         };
 
         // Test volume methods on empty snapshot
-        assert_eq!(empty_snapshot.total_bid_volume(), 0);
-        assert_eq!(empty_snapshot.total_ask_volume(), 0);
-        assert_eq!(empty_snapshot.total_bid_value(), 0);
-        assert_eq!(empty_snapshot.total_ask_value(), 0);
+        assert_eq!(empty_snapshot.total_bid_volume().unwrap(), 0);
+        assert_eq!(empty_snapshot.total_ask_volume().unwrap(), 0);
+        assert_eq!(empty_snapshot.total_bid_value().unwrap(), 0);
+        assert_eq!(empty_snapshot.total_ask_value().unwrap(), 0);
     }
 
     #[test]
@@ -593,10 +593,10 @@ mod test_snapshot_remaining {
         let best_ask = snapshot.best_ask();
         let mid_price = snapshot.mid_price();
         let spread = snapshot.spread();
-        let total_bid_volume = snapshot.total_bid_volume();
-        let total_ask_volume = snapshot.total_ask_volume();
-        let total_bid_value = snapshot.total_bid_value();
-        let total_ask_value = snapshot.total_ask_value();
+        let total_bid_volume = snapshot.total_bid_volume().unwrap();
+        let total_ask_volume = snapshot.total_ask_volume().unwrap();
+        let total_bid_value = snapshot.total_bid_value().unwrap();
+        let total_ask_value = snapshot.total_ask_value().unwrap();
 
         // Verify results
         assert_eq!(best_bid, Some((1000, 10)));

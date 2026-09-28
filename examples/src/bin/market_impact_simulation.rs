@@ -16,12 +16,18 @@
 //   cargo run --bin market_impact_simulation
 //   (from the examples directory)
 
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "market impact simulation example failed");
+    }
+}
+
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Market Impact Simulation Example");
@@ -33,16 +39,17 @@ fn main() {
     display_orderbook_state(&book);
 
     // Demonstrate market impact analysis
-    demo_market_impact_analysis(&book);
+    demo_market_impact_analysis(&book)?;
 
     // Demonstrate order simulation
-    demo_order_simulation(&book);
+    demo_order_simulation(&book)?;
 
     // Demonstrate liquidity analysis
-    demo_liquidity_analysis(&book);
+    demo_liquidity_analysis(&book)?;
 
     // Practical use case: Pre-trade risk assessment
-    demo_pretrade_risk_assessment(&book);
+    demo_pretrade_risk_assessment(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
@@ -112,7 +119,7 @@ fn display_orderbook_state(book: &OrderBook) {
     }
 }
 
-fn demo_market_impact_analysis(book: &OrderBook) {
+fn demo_market_impact_analysis(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Market Impact Analysis ===");
     info!("Analyzing the impact of different order sizes");
 
@@ -121,7 +128,7 @@ fn demo_market_impact_analysis(book: &OrderBook) {
     // Analyze buy orders
     info!("\nBuy orders (executing against asks):");
     for size in &order_sizes {
-        let impact = book.market_impact(*size, Side::Buy);
+        let impact = book.market_impact(*size, Side::Buy)?;
 
         info!("\n  Order size: {} units", size);
         info!("    Average execution price: {:.2}", impact.avg_price);
@@ -149,7 +156,7 @@ fn demo_market_impact_analysis(book: &OrderBook) {
     // Analyze sell orders
     info!("\nSell orders (executing against bids):");
     for size in &order_sizes {
-        let impact = book.market_impact(*size, Side::Sell);
+        let impact = book.market_impact(*size, Side::Sell)?;
 
         info!("\n  Order size: {} units", size);
         info!("    Average execution price: {:.2}", impact.avg_price);
@@ -166,9 +173,10 @@ fn demo_market_impact_analysis(book: &OrderBook) {
             info!("    ✗ Insufficient liquidity");
         }
     }
+    Ok(())
 }
 
-fn demo_order_simulation(book: &OrderBook) {
+fn demo_order_simulation(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Order Execution Simulation ===");
     info!("Step-by-step simulation of order execution");
 
@@ -176,7 +184,7 @@ fn demo_order_simulation(book: &OrderBook) {
     let buy_quantity = 400;
     info!("\nSimulating buy order of {} units:", buy_quantity);
 
-    let simulation = book.simulate_market_order(buy_quantity, Side::Buy);
+    let simulation = book.simulate_market_order(buy_quantity, Side::Buy)?;
 
     info!("  Execution details:");
     for (i, (price, qty)) in simulation.fills.iter().enumerate() {
@@ -193,7 +201,7 @@ fn demo_order_simulation(book: &OrderBook) {
     info!("    Total filled: {} units", simulation.total_filled);
     info!("    Average price: {:.2}", simulation.avg_price);
     info!("    Remaining: {} units", simulation.remaining_quantity);
-    info!("    Total cost: {}", simulation.total_cost());
+    info!("    Total cost: {}", simulation.total_cost()?);
     info!("    Levels used: {}", simulation.levels_count());
 
     if simulation.is_fully_filled() {
@@ -206,7 +214,7 @@ fn demo_order_simulation(book: &OrderBook) {
     let sell_quantity = 400;
     info!("\nSimulating sell order of {} units:", sell_quantity);
 
-    let simulation = book.simulate_market_order(sell_quantity, Side::Sell);
+    let simulation = book.simulate_market_order(sell_quantity, Side::Sell)?;
 
     info!("  Execution details:");
     for (i, (price, qty)) in simulation.fills.iter().enumerate() {
@@ -222,10 +230,11 @@ fn demo_order_simulation(book: &OrderBook) {
     info!("\n  Summary:");
     info!("    Total filled: {} units", simulation.total_filled);
     info!("    Average price: {:.2}", simulation.avg_price);
-    info!("    Total revenue: {}", simulation.total_cost());
+    info!("    Total revenue: {}", simulation.total_cost()?);
+    Ok(())
 }
 
-fn demo_liquidity_analysis(book: &OrderBook) {
+fn demo_liquidity_analysis(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Liquidity Analysis ===");
     info!("Analyzing liquidity distribution across price ranges");
 
@@ -238,7 +247,7 @@ fn demo_liquidity_analysis(book: &OrderBook) {
     ];
 
     for (min_price, max_price, description) in bid_ranges {
-        let liquidity = book.liquidity_in_range(min_price, max_price, Side::Buy);
+        let liquidity = book.liquidity_in_range(min_price, max_price, Side::Buy)?;
         info!(
             "  {} ({}-{}): {} units",
             description, min_price, max_price, liquidity
@@ -254,7 +263,7 @@ fn demo_liquidity_analysis(book: &OrderBook) {
     ];
 
     for (min_price, max_price, description) in ask_ranges {
-        let liquidity = book.liquidity_in_range(min_price, max_price, Side::Sell);
+        let liquidity = book.liquidity_in_range(min_price, max_price, Side::Sell)?;
         info!(
             "  {} ({}-{}): {} units",
             description, min_price, max_price, liquidity
@@ -270,12 +279,13 @@ fn demo_liquidity_analysis(book: &OrderBook) {
     ];
 
     for (min_price, max_price, description) in bands {
-        let liquidity = book.liquidity_in_range(min_price, max_price, Side::Sell);
+        let liquidity = book.liquidity_in_range(min_price, max_price, Side::Sell)?;
         info!("  {}: {} units", description, liquidity);
     }
+    Ok(())
 }
 
-fn demo_pretrade_risk_assessment(book: &OrderBook) {
+fn demo_pretrade_risk_assessment(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Pre-Trade Risk Assessment ===");
     info!("Comprehensive analysis before order execution");
 
@@ -287,7 +297,7 @@ fn demo_pretrade_risk_assessment(book: &OrderBook) {
     info!("  Side: {:?}", order_side);
 
     // Step 1: Check market impact
-    let impact = book.market_impact(order_size, order_side);
+    let impact = book.market_impact(order_size, order_side)?;
 
     info!("\n1. Market Impact Assessment:");
     info!("   Average execution price: {:.2}", impact.avg_price);
@@ -312,8 +322,8 @@ fn demo_pretrade_risk_assessment(book: &OrderBook) {
     }
 
     // Step 3: Cost estimation
-    let simulation = book.simulate_market_order(order_size, order_side);
-    let total_cost = simulation.total_cost();
+    let simulation = book.simulate_market_order(order_size, order_side)?;
+    let total_cost = simulation.total_cost()?;
 
     info!("\n3. Cost Estimation:");
     info!("   Total cost: {} units", total_cost);
@@ -366,4 +376,5 @@ fn demo_pretrade_risk_assessment(book: &OrderBook) {
             simulation.avg_price, simulation.total_filled
         );
     }
+    Ok(())
 }

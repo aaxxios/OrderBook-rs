@@ -169,12 +169,12 @@ mod tests {
         // Want to be just inside 100 units of depth
         // Depth at 100: 50, at 99: 110 (50+60), so we reach target at 99
         // One tick better than 99 is 100
-        if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Buy) {
+        if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Buy).unwrap() {
             assert_eq!(price, 100);
         }
 
         // Target depth 50 or less should return 101 (one tick better than 100)
-        if let Some(price) = book.price_at_depth_adjusted(50, 1, Side::Buy) {
+        if let Some(price) = book.price_at_depth_adjusted(50, 1, Side::Buy).unwrap() {
             assert_eq!(price, 101);
         }
     }
@@ -186,7 +186,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
         // Target depth exceeds available, should return deepest price
-        if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Buy) {
+        if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Buy).unwrap() {
             assert_eq!(price, 100);
         }
     }
@@ -202,7 +202,7 @@ mod tests {
         // Want to be just inside 100 units of depth
         // Depth at 100: 50, at 101: 110, so we reach target at 101
         // One tick better than 101 is 100 (for sell, better = lower)
-        if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Sell) {
+        if let Some(price) = book.price_at_depth_adjusted(100, 1, Side::Sell).unwrap() {
             assert_eq!(price, 100);
         }
     }
@@ -214,17 +214,23 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 50, Side::Buy, TimeInForce::Gtc, None);
 
         // Zero target_depth should return None
-        assert_eq!(book.price_at_depth_adjusted(0, 1, Side::Buy), None);
+        assert_eq!(book.price_at_depth_adjusted(0, 1, Side::Buy).unwrap(), None);
 
         // Zero tick_size should return None
-        assert_eq!(book.price_at_depth_adjusted(100, 0, Side::Buy), None);
+        assert_eq!(
+            book.price_at_depth_adjusted(100, 0, Side::Buy).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn test_price_at_depth_adjusted_empty_book() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        assert_eq!(book.price_at_depth_adjusted(100, 1, Side::Buy), None);
+        assert_eq!(
+            book.price_at_depth_adjusted(100, 1, Side::Buy).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -255,7 +261,7 @@ mod tests {
 
         // Test price_at_depth_adjusted
         // Buy side depth: 100=50, 99=90, 98=140
-        if let Some(price) = book.price_at_depth_adjusted(70, 1, Side::Buy) {
+        if let Some(price) = book.price_at_depth_adjusted(70, 1, Side::Buy).unwrap() {
             assert_eq!(price, 100); // Just inside level that reaches 90
         }
     }

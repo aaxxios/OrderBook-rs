@@ -19,12 +19,18 @@
 //   cargo run --bin market_metrics
 //   (from the examples directory)
 
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "market metrics example failed");
+    }
+}
+
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Market Metrics Example");
@@ -42,16 +48,17 @@ fn main() {
     demo_spread_metrics(&book);
 
     // Demonstrate VWAP calculations
-    demo_vwap_calculations(&book);
+    demo_vwap_calculations(&book)?;
 
     // Demonstrate micro price
-    demo_micro_price(&book);
+    demo_micro_price(&book)?;
 
     // Demonstrate order book imbalance
-    demo_order_book_imbalance(&book);
+    demo_order_book_imbalance(&book)?;
 
     // Practical use case: trading signals
-    demo_trading_signals(&book);
+    demo_trading_signals(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_liquidity(symbol: &str) -> OrderBook {
@@ -165,7 +172,7 @@ fn demo_spread_metrics(book: &OrderBook) {
     }
 }
 
-fn demo_vwap_calculations(book: &OrderBook) {
+fn demo_vwap_calculations(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== VWAP (Volume-Weighted Average Price) ===");
     info!("Calculating execution price for different order sizes");
 
@@ -174,7 +181,7 @@ fn demo_vwap_calculations(book: &OrderBook) {
     let buy_quantities = vec![100, 200, 400];
 
     for quantity in buy_quantities {
-        match book.vwap(quantity, Side::Buy) {
+        match book.vwap(quantity, Side::Buy)? {
             Some(vwap) => {
                 if let Some(best_ask) = book.best_ask() {
                     let slippage = vwap - best_ask as f64;
@@ -193,7 +200,7 @@ fn demo_vwap_calculations(book: &OrderBook) {
     let sell_quantities = vec![100, 200, 400];
 
     for quantity in sell_quantities {
-        match book.vwap(quantity, Side::Sell) {
+        match book.vwap(quantity, Side::Sell)? {
             Some(vwap) => {
                 if let Some(best_bid) = book.best_bid() {
                     let slippage = best_bid as f64 - vwap;
@@ -206,13 +213,14 @@ fn demo_vwap_calculations(book: &OrderBook) {
             None => info!("  Sell {} units: Insufficient liquidity", quantity),
         }
     }
+    Ok(())
 }
 
-fn demo_micro_price(book: &OrderBook) {
+fn demo_micro_price(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Micro Price ===");
     info!("Volume-weighted price at best bid/ask levels");
 
-    if let (Some(mid), Some(micro)) = (book.mid_price(), book.micro_price()) {
+    if let (Some(mid), Some(micro)) = (book.mid_price(), book.micro_price()?) {
         info!("Mid Price:   {:.2}", mid);
         info!("Micro Price: {:.2}", micro);
 
@@ -227,18 +235,19 @@ fn demo_micro_price(book: &OrderBook) {
             info!("    More volume on ask side (selling pressure)");
         }
     }
+    Ok(())
 }
 
-fn demo_order_book_imbalance(book: &OrderBook) {
+fn demo_order_book_imbalance(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Order Book Imbalance ===");
     info!("Measuring buy/sell pressure across price levels");
 
     let level_counts = vec![1, 3, 5];
 
     for levels in level_counts {
-        let imbalance = book.order_book_imbalance(levels);
-        let bid_vol = book.total_depth_at_levels(levels, Side::Buy);
-        let ask_vol = book.total_depth_at_levels(levels, Side::Sell);
+        let imbalance = book.order_book_imbalance(levels)?;
+        let bid_vol = book.total_depth_at_levels(levels, Side::Buy)?;
+        let ask_vol = book.total_depth_at_levels(levels, Side::Sell)?;
 
         info!("\nTop {} level(s):", levels);
         info!("  Bid volume: {}", bid_vol);
@@ -257,15 +266,16 @@ fn demo_order_book_imbalance(book: &OrderBook) {
             info!("  → Balanced market");
         }
     }
+    Ok(())
 }
 
-fn demo_trading_signals(book: &OrderBook) {
+fn demo_trading_signals(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Trading Signals Generation ===");
     info!("Using metrics to generate actionable signals");
 
     let spread_bps = book.spread_bps(None).unwrap_or(f64::MAX);
-    let imbalance = book.order_book_imbalance(3);
-    let micro = book.micro_price().unwrap_or(0.0);
+    let imbalance = book.order_book_imbalance(3)?;
+    let micro = book.micro_price()?.unwrap_or(0.0);
     let mid = book.mid_price().unwrap_or(0.0);
 
     info!("\nSignal Analysis:");
@@ -309,8 +319,8 @@ fn demo_trading_signals(book: &OrderBook) {
 
     // VWAP execution recommendation
     info!("\n4. Execution Recommendation:");
-    if let Some(vwap_100) = book.vwap(100, Side::Buy) {
-        let best_ask = book.best_ask().unwrap() as f64;
+    if let (Some(vwap_100), Some(best_ask)) = (book.vwap(100, Side::Buy)?, book.best_ask()) {
+        let best_ask = best_ask as f64;
         let slippage_bps = ((vwap_100 - best_ask) / best_ask) * 10_000.0;
 
         info!("   For 100 unit buy order:");
@@ -324,4 +334,5 @@ fn demo_trading_signals(book: &OrderBook) {
             info!("   ⚠ High slippage - consider limit order");
         }
     }
+    Ok(())
 }

@@ -534,7 +534,7 @@ mod tests {
         let _ = book.add_order(create_standard_order(1100, 5, Side::Sell));
 
         // Get volumes by price
-        let (bid_volumes, ask_volumes) = book.get_volume_by_price();
+        let (bid_volumes, ask_volumes) = book.get_volume_by_price().unwrap();
 
         // Verify bid volumes
         assert_eq!(bid_volumes.len(), 2);
@@ -636,7 +636,7 @@ mod test_orderbook_book {
         let _ = book.add_limit_order(id5, 1010, 8, Side::Sell, TimeInForce::Gtc, None); // Same price
 
         // Get volumes by price
-        let (bid_volumes, ask_volumes) = book.get_volume_by_price();
+        let (bid_volumes, ask_volumes) = book.get_volume_by_price().unwrap();
 
         // Check bid volumes
         assert_eq!(bid_volumes.len(), 2);
@@ -1495,7 +1495,7 @@ mod test_book_specific {
                 .hidden_quantity_at_price(price, side)
                 .expect("level exists");
             assert_eq!(
-                book.total_quantity_at_price(price, side),
+                book.total_quantity_at_price(price, side).unwrap(),
                 Some(visible + hidden),
                 "total must equal visible + hidden at {price} on {side:?}"
             );
@@ -1524,7 +1524,7 @@ mod test_book_specific {
         for side in [Side::Buy, Side::Sell] {
             assert_eq!(book.visible_quantity_at_price(500, side), None);
             assert_eq!(book.hidden_quantity_at_price(500, side), None);
-            assert_eq!(book.total_quantity_at_price(500, side), None);
+            assert_eq!(book.total_quantity_at_price(500, side).unwrap(), None);
             assert_eq!(book.order_count_at_price(500, side), None);
         }
 
@@ -1540,7 +1540,10 @@ mod test_book_specific {
         // The iceberg at bid 99 was seeded visible=5, hidden=15.
         assert_eq!(book.visible_quantity_at_price(99, Side::Buy), Some(5));
         assert_eq!(book.hidden_quantity_at_price(99, Side::Buy), Some(15));
-        assert_eq!(book.total_quantity_at_price(99, Side::Buy), Some(20));
+        assert_eq!(
+            book.total_quantity_at_price(99, Side::Buy).unwrap(),
+            Some(20)
+        );
         assert_eq!(book.order_count_at_price(99, Side::Buy), Some(1));
     }
 

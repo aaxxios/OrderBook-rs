@@ -219,7 +219,13 @@ fn demo_order_lookup(book: &crate::OrderBook) {
     info!("  Asks: {} levels", snapshot.asks.len());
 
     // Get volume by price
-    let (bid_volumes, ask_volumes) = book.get_volume_by_price();
+    let (bid_volumes, ask_volumes) = match book.get_volume_by_price() {
+        Ok(volumes) => volumes,
+        Err(err) => {
+            tracing::error!(%err, "volume by price failed");
+            return;
+        }
+    };
 
     info!("Volume by price:");
     info!("  Bid price levels: {}", bid_volumes.len());

@@ -17,9 +17,9 @@
 //   cargo run --bin intelligent_order_placement
 //   (from the examples directory)
 
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 
 /// Fresh random order id (UUID v4).
 fn new_id() -> Id {
@@ -27,6 +27,12 @@ fn new_id() -> Id {
 }
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "intelligent order placement example failed");
+    }
+}
+
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Intelligent Order Placement Example");
@@ -47,10 +53,11 @@ fn main() {
     demo_queue_position_targeting(&book);
 
     // Demonstrate depth-based strategies
-    demo_depth_based_strategies(&book);
+    demo_depth_based_strategies(&book)?;
 
     // Practical use case: Market making strategy
-    demo_market_making_strategy(&book);
+    demo_market_making_strategy(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_depth(symbol: &str) -> OrderBook {
@@ -244,7 +251,7 @@ fn demo_queue_position_targeting(book: &OrderBook) {
     }
 }
 
-fn demo_depth_based_strategies(book: &OrderBook) {
+fn demo_depth_based_strategies(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Depth-Based Strategies ===");
     info!("Optimize order placement based on cumulative depth");
 
@@ -255,12 +262,12 @@ fn demo_depth_based_strategies(book: &OrderBook) {
     let buy_targets = vec![50, 100, 150];
 
     for target_depth in buy_targets {
-        if let Some(price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Buy) {
+        if let Some(price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Buy)? {
             info!("\n  Target: {} units of depth", target_depth);
             info!("  Suggested price: {}", price);
 
             // Calculate actual depth at this price
-            let actual_depth = calculate_depth_at_price(book, price, Side::Buy);
+            let actual_depth = calculate_depth_at_price(book, price, Side::Buy)?;
             info!("  Actual depth at price: {} units", actual_depth);
 
             if actual_depth >= target_depth {
@@ -276,17 +283,18 @@ fn demo_depth_based_strategies(book: &OrderBook) {
     let sell_targets = vec![30, 80, 120];
 
     for target_depth in sell_targets {
-        if let Some(price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Sell) {
+        if let Some(price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Sell)? {
             info!("\n  Target: {} units of depth", target_depth);
             info!("  Suggested price: {}", price);
 
-            let actual_depth = calculate_depth_at_price(book, price, Side::Sell);
+            let actual_depth = calculate_depth_at_price(book, price, Side::Sell)?;
             info!("  Actual depth at price: {} units", actual_depth);
         }
     }
+    Ok(())
 }
 
-fn demo_market_making_strategy(book: &OrderBook) {
+fn demo_market_making_strategy(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Market Making Strategy Example ===");
     info!("Practical application of intelligent order placement");
 
@@ -362,14 +370,14 @@ fn demo_market_making_strategy(book: &OrderBook) {
     info!("\n💡 Alternative: Depth-Based Approach");
     let target_depth = 100;
 
-    if let Some(bid_price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Buy) {
+    if let Some(bid_price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Buy)? {
         info!(
             "  Buy: Place at {} to be just inside {} units depth",
             bid_price, target_depth
         );
     }
 
-    if let Some(ask_price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Sell) {
+    if let Some(ask_price) = book.price_at_depth_adjusted(target_depth, tick_size, Side::Sell)? {
         info!(
             "  Sell: Place at {} to be just inside {} units depth",
             ask_price, target_depth
@@ -381,10 +389,15 @@ fn demo_market_making_strategy(book: &OrderBook) {
     info!("  2. Sometimes 1 tick worse price = much better execution");
     info!("  3. Depth-based strategies can optimize risk/reward");
     info!("  4. Monitor and adjust based on market dynamics");
+    Ok(())
 }
 
 // Helper function to calculate depth at a specific price
-fn calculate_depth_at_price(book: &OrderBook, target_price: u128, side: Side) -> u64 {
+fn calculate_depth_at_price(
+    book: &OrderBook,
+    target_price: u128,
+    side: Side,
+) -> Result<u64, OrderBookError> {
     let best_price = match side {
         Side::Buy => book.best_bid(),
         Side::Sell => book.best_ask(),
@@ -396,6 +409,6 @@ fn calculate_depth_at_price(book: &OrderBook, target_price: u128, side: Side) ->
             Side::Sell => book.liquidity_in_range(best, target_price, side),
         }
     } else {
-        0
+        Ok(0)
     }
 }

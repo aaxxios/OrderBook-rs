@@ -20,7 +20,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 110, 20, Side::Sell, TimeInForce::Gtc, None);
 
         // Buy 20 units (will consume 2 levels)
-        let impact = book.market_impact(20, Side::Buy);
+        let impact = book.market_impact(20, Side::Buy).unwrap();
 
         // Full ask-side depth (10 + 15 + 20), not capped at the requested 20.
         assert_eq!(impact.total_quantity_available, 45);
@@ -39,7 +39,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
 
         // Request more than available
-        let impact = book.market_impact(50, Side::Buy);
+        let impact = book.market_impact(50, Side::Buy).unwrap();
 
         assert_eq!(impact.total_quantity_available, 10);
         assert_eq!(impact.levels_consumed, 1);
@@ -56,7 +56,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 110, 20, Side::Sell, TimeInForce::Gtc, None);
 
         // Request only 12, which the first two levels cover.
-        let impact = book.market_impact(12, Side::Buy);
+        let impact = book.market_impact(12, Side::Buy).unwrap();
 
         // total_quantity_available reports the *true* resting depth (45), not
         // the capped fill quantity (12), so can_fill / fill_ratio are
@@ -76,7 +76,7 @@ mod tests {
     fn test_market_impact_empty_book() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        let impact = book.market_impact(100, Side::Buy);
+        let impact = book.market_impact(100, Side::Buy).unwrap();
 
         assert_eq!(impact.avg_price, 0.0);
         assert_eq!(impact.worst_price, 0);
@@ -90,7 +90,7 @@ mod tests {
 
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
 
-        let impact = book.market_impact(0, Side::Buy);
+        let impact = book.market_impact(0, Side::Buy).unwrap();
 
         assert_eq!(impact.total_quantity_available, 0);
         assert_eq!(impact.levels_consumed, 0);
@@ -106,7 +106,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 90, 20, Side::Buy, TimeInForce::Gtc, None);
 
         // Sell 20 units (will consume 2 levels)
-        let impact = book.market_impact(20, Side::Sell);
+        let impact = book.market_impact(20, Side::Sell).unwrap();
 
         // Full bid-side depth (10 + 15 + 20), not capped at the requested 20.
         assert_eq!(impact.total_quantity_available, 45);
@@ -126,7 +126,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 10100, 10, Side::Sell, TimeInForce::Gtc, None);
 
         // Buy 15 units (will go into second level)
-        let impact = book.market_impact(15, Side::Buy);
+        let impact = book.market_impact(15, Side::Buy).unwrap();
 
         // Slippage = 100, best_price = 10000, bps = (100/10000) * 10000 = 100 bps
         assert_eq!(impact.slippage, 100);
@@ -142,7 +142,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 15, Side::Sell, TimeInForce::Gtc, None);
 
         // Buy 20 units
-        let simulation = book.simulate_market_order(20, Side::Buy);
+        let simulation = book.simulate_market_order(20, Side::Buy).unwrap();
 
         assert_eq!(simulation.fills.len(), 2);
         assert_eq!(simulation.fills[0], (100, 10));
@@ -163,7 +163,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 15, Side::Sell, TimeInForce::Gtc, None);
 
         // Request more than available
-        let simulation = book.simulate_market_order(50, Side::Buy);
+        let simulation = book.simulate_market_order(50, Side::Buy).unwrap();
 
         assert_eq!(simulation.total_filled, 25);
         assert_eq!(simulation.remaining_quantity, 25);
@@ -175,7 +175,7 @@ mod tests {
     fn test_simulate_market_order_empty_book() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        let simulation = book.simulate_market_order(100, Side::Buy);
+        let simulation = book.simulate_market_order(100, Side::Buy).unwrap();
 
         assert_eq!(simulation.fills.len(), 0);
         assert_eq!(simulation.total_filled, 0);
@@ -189,10 +189,10 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Sell, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 105, 10, Side::Sell, TimeInForce::Gtc, None);
 
-        let simulation = book.simulate_market_order(20, Side::Buy);
+        let simulation = book.simulate_market_order(20, Side::Buy).unwrap();
 
         // Total cost = (100*10) + (105*10) = 2050
-        assert_eq!(simulation.total_cost(), 2050);
+        assert_eq!(simulation.total_cost().unwrap(), 2050);
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 115, 25, Side::Buy, TimeInForce::Gtc, None);
 
         // Get liquidity between 105 and 110 (inclusive)
-        let liquidity = book.liquidity_in_range(105, 110, Side::Buy);
+        let liquidity = book.liquidity_in_range(105, 110, Side::Buy).unwrap();
 
         assert_eq!(liquidity, 35); // 15 + 20
     }
@@ -220,7 +220,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 110, 20, Side::Buy, TimeInForce::Gtc, None);
 
         // Get all liquidity
-        let liquidity = book.liquidity_in_range(0, u128::MAX, Side::Buy);
+        let liquidity = book.liquidity_in_range(0, u128::MAX, Side::Buy).unwrap();
 
         assert_eq!(liquidity, 45); // 10 + 15 + 20
     }
@@ -233,7 +233,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 15, Side::Buy, TimeInForce::Gtc, None);
 
         // Range outside of available prices
-        let liquidity = book.liquidity_in_range(200, 300, Side::Buy);
+        let liquidity = book.liquidity_in_range(200, 300, Side::Buy).unwrap();
 
         assert_eq!(liquidity, 0);
     }
@@ -245,7 +245,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 100, 10, Side::Buy, TimeInForce::Gtc, None);
 
         // min_price > max_price
-        let liquidity = book.liquidity_in_range(200, 100, Side::Buy);
+        let liquidity = book.liquidity_in_range(200, 100, Side::Buy).unwrap();
 
         assert_eq!(liquidity, 0);
     }
@@ -254,7 +254,7 @@ mod tests {
     fn test_liquidity_in_range_empty_book() {
         let book: OrderBook<()> = OrderBook::new("TEST");
 
-        let liquidity = book.liquidity_in_range(100, 200, Side::Buy);
+        let liquidity = book.liquidity_in_range(100, 200, Side::Buy).unwrap();
 
         assert_eq!(liquidity, 0);
     }
@@ -268,7 +268,7 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 105, 15, Side::Sell, TimeInForce::Gtc, None);
         let _ = book.add_limit_order(new_id(), 110, 20, Side::Sell, TimeInForce::Gtc, None);
 
-        let liquidity = book.liquidity_in_range(100, 105, Side::Sell);
+        let liquidity = book.liquidity_in_range(100, 105, Side::Sell).unwrap();
 
         assert_eq!(liquidity, 25); // 10 + 15
     }
@@ -284,18 +284,18 @@ mod tests {
         let _ = book.add_limit_order(new_id(), 102, 35, Side::Sell, TimeInForce::Gtc, None);
 
         // Test market impact
-        let impact = book.market_impact(50, Side::Buy);
+        let impact = book.market_impact(50, Side::Buy).unwrap();
         // Full ask-side depth (25 + 35), not capped at the requested 50.
         assert_eq!(impact.total_quantity_available, 60);
         assert!(impact.can_fill(50));
 
         // Test simulation
-        let simulation = book.simulate_market_order(50, Side::Buy);
+        let simulation = book.simulate_market_order(50, Side::Buy).unwrap();
         assert!(simulation.is_fully_filled());
         assert_eq!(simulation.levels_count(), 2);
 
         // Test liquidity
-        let liquidity = book.liquidity_in_range(101, 102, Side::Sell);
+        let liquidity = book.liquidity_in_range(101, 102, Side::Sell).unwrap();
         assert_eq!(liquidity, 60); // 25 + 35
     }
 }

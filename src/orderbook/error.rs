@@ -369,6 +369,35 @@ pub enum OrderBookError {
         quantity: u64,
     },
 
+    /// A read-only analytics aggregate (VWAP / impact notional, cumulative
+    /// depth, side volume, histogram bound, ...) does not fit its integer
+    /// type: a `u128` price-times-quantity product or sum, or a `u64`
+    /// quantity sum, overflowed (or a difference underflowed) with
+    /// type-valid extreme inputs (#245). The analytics are pure reads, so
+    /// no book state is touched; the caller gets this error instead of a
+    /// panic (debug), a wrapped value (release) or a clamped one.
+    ///
+    /// `operation` is a static, allocation-free name of the aggregate that
+    /// overflowed (for example `"vwap notional"`). Not a reject: maps to
+    /// the wire code `RejectReason::Other(0)`.
+    ArithmeticOverflow {
+        /// Static name of the aggregate whose checked arithmetic failed.
+        operation: &'static str,
+    },
+
+    /// A read-only analytics call could not reserve its result buffer
+    /// (`Vec::try_reserve_exact` failed) (#245). The requested size is
+    /// already capped by the call's documented maximum (for example
+    /// [`MAX_DEPTH_DISTRIBUTION_BINS`](crate::orderbook::book::MAX_DEPTH_DISTRIBUTION_BINS)),
+    /// so this signals allocator exhaustion, not an unbounded request. Not
+    /// a reject: maps to the wire code `RejectReason::Other(0)`.
+    AllocationFailed {
+        /// Static name of the buffer that could not be reserved.
+        operation: &'static str,
+        /// Number of elements that could not be reserved.
+        requested: usize,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -571,6 +600,18 @@ impl fmt::Display for OrderBookError {
                 write!(
                     f,
                     "notional overflow: worst-case price {price} × quantity {quantity} exceeds u128"
+                )
+            }
+            OrderBookError::ArithmeticOverflow { operation } => {
+                write!(f, "arithmetic overflow in {operation}")
+            }
+            OrderBookError::AllocationFailed {
+                operation,
+                requested,
+            } => {
+                write!(
+                    f,
+                    "allocation failed: could not reserve {requested} elements for {operation}"
                 )
             }
             #[cfg(feature = "nats")]

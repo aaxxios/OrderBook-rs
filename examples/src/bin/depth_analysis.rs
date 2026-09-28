@@ -16,12 +16,18 @@
 //   cargo run --bin depth_analysis
 //   (from the examples directory)
 
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, OrderBookError};
 use pricelevel::{Id, Side, TimeInForce, setup_logger};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 fn main() {
+    if let Err(err) = run() {
+        error!(%err, "depth analysis example failed");
+    }
+}
+
+fn run() -> Result<(), OrderBookError> {
     // Set up logging
     let _ = setup_logger();
     info!("Depth Analysis Example");
@@ -33,16 +39,17 @@ fn main() {
     display_orderbook_state(&book);
 
     // Demonstrate price_at_depth method
-    demo_price_at_depth(&book);
+    demo_price_at_depth(&book)?;
 
     // Demonstrate cumulative_depth_to_target method
-    demo_cumulative_depth_to_target(&book);
+    demo_cumulative_depth_to_target(&book)?;
 
     // Demonstrate total_depth_at_levels method
-    demo_total_depth_at_levels(&book);
+    demo_total_depth_at_levels(&book)?;
 
     // Demonstrate practical use case: market impact estimation
-    demo_market_impact_estimation(&book);
+    demo_market_impact_estimation(&book)?;
+    Ok(())
 }
 
 fn create_orderbook_with_liquidity(symbol: &str) -> OrderBook {
@@ -119,7 +126,7 @@ fn display_orderbook_state(book: &OrderBook) {
     }
 }
 
-fn demo_price_at_depth(book: &OrderBook) {
+fn demo_price_at_depth(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== price_at_depth() Demo ===");
     info!("Finds the price level where cumulative depth reaches a target quantity");
 
@@ -128,7 +135,7 @@ fn demo_price_at_depth(book: &OrderBook) {
     let buy_targets = vec![10, 25, 50, 100, 200];
 
     for target in buy_targets {
-        match book.price_at_depth(target, Side::Buy) {
+        match book.price_at_depth(target, Side::Buy)? {
             Some(price) => info!("  Target depth {}: reached at price {}", target, price),
             None => info!("  Target depth {}: insufficient liquidity", target),
         }
@@ -139,14 +146,15 @@ fn demo_price_at_depth(book: &OrderBook) {
     let sell_targets = vec![12, 30, 60, 120, 200];
 
     for target in sell_targets {
-        match book.price_at_depth(target, Side::Sell) {
+        match book.price_at_depth(target, Side::Sell)? {
             Some(price) => info!("  Target depth {}: reached at price {}", target, price),
             None => info!("  Target depth {}: insufficient liquidity", target),
         }
     }
+    Ok(())
 }
 
-fn demo_cumulative_depth_to_target(book: &OrderBook) {
+fn demo_cumulative_depth_to_target(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== cumulative_depth_to_target() Demo ===");
     info!("Returns both the price and actual cumulative depth at target");
 
@@ -155,7 +163,7 @@ fn demo_cumulative_depth_to_target(book: &OrderBook) {
     let buy_targets = vec![10, 25, 50, 100];
 
     for target in buy_targets {
-        match book.cumulative_depth_to_target(target, Side::Buy) {
+        match book.cumulative_depth_to_target(target, Side::Buy)? {
             Some((price, actual_depth)) => {
                 info!(
                     "  Target {}: price={}, actual_depth={}",
@@ -177,7 +185,7 @@ fn demo_cumulative_depth_to_target(book: &OrderBook) {
     let sell_targets = vec![12, 30, 60, 120];
 
     for target in sell_targets {
-        match book.cumulative_depth_to_target(target, Side::Sell) {
+        match book.cumulative_depth_to_target(target, Side::Sell)? {
             Some((price, actual_depth)) => {
                 info!(
                     "  Target {}: price={}, actual_depth={}",
@@ -193,39 +201,41 @@ fn demo_cumulative_depth_to_target(book: &OrderBook) {
             None => info!("  Target {}: insufficient liquidity", target),
         }
     }
+    Ok(())
 }
 
-fn demo_total_depth_at_levels(book: &OrderBook) {
+fn demo_total_depth_at_levels(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== total_depth_at_levels() Demo ===");
     info!("Calculates total depth available in the first N price levels");
 
     // Test on buy side
     info!("\nBuy side (bids):");
     for levels in 1..=6 {
-        let depth = book.total_depth_at_levels(levels, Side::Buy);
+        let depth = book.total_depth_at_levels(levels, Side::Buy)?;
         info!("  Top {} level(s): total depth = {}", levels, depth);
     }
 
     // Test on sell side
     info!("\nSell side (asks):");
     for levels in 1..=6 {
-        let depth = book.total_depth_at_levels(levels, Side::Sell);
+        let depth = book.total_depth_at_levels(levels, Side::Sell)?;
         info!("  Top {} level(s): total depth = {}", levels, depth);
     }
 
     // Test edge cases
     info!("\nEdge cases:");
-    let zero_depth = book.total_depth_at_levels(0, Side::Buy);
+    let zero_depth = book.total_depth_at_levels(0, Side::Buy)?;
     info!("  Zero levels: {}", zero_depth);
 
-    let excessive_depth = book.total_depth_at_levels(100, Side::Buy);
+    let excessive_depth = book.total_depth_at_levels(100, Side::Buy)?;
     info!(
         "  Excessive levels (100): {} (returns all available)",
         excessive_depth
     );
+    Ok(())
 }
 
-fn demo_market_impact_estimation(book: &OrderBook) {
+fn demo_market_impact_estimation(book: &OrderBook) -> Result<(), OrderBookError> {
     info!("\n=== Practical Use Case: Market Impact Estimation ===");
     info!("Estimating the impact of executing large market orders");
 
@@ -234,7 +244,7 @@ fn demo_market_impact_estimation(book: &OrderBook) {
     info!("\nSimulating market BUY order of {} units:", buy_quantity);
 
     if let Some((worst_price, total_filled)) =
-        book.cumulative_depth_to_target(buy_quantity, Side::Sell)
+        book.cumulative_depth_to_target(buy_quantity, Side::Sell)?
     {
         if let Some(best_price) = book.best_ask() {
             let price_impact = worst_price.saturating_sub(best_price);
@@ -270,7 +280,7 @@ fn demo_market_impact_estimation(book: &OrderBook) {
     info!("\nSimulating market SELL order of {} units:", sell_quantity);
 
     if let Some((worst_price, total_filled)) =
-        book.cumulative_depth_to_target(sell_quantity, Side::Buy)
+        book.cumulative_depth_to_target(sell_quantity, Side::Buy)?
     {
         if let Some(best_price) = book.best_bid() {
             let price_impact = best_price.saturating_sub(worst_price);
@@ -307,9 +317,9 @@ fn demo_market_impact_estimation(book: &OrderBook) {
 
     info!("\nBid side depth distribution:");
     for level in 1..=5 {
-        let depth = book.total_depth_at_levels(level, Side::Buy);
+        let depth = book.total_depth_at_levels(level, Side::Buy)?;
         let prev_depth = if level > 1 {
-            book.total_depth_at_levels(level - 1, Side::Buy)
+            book.total_depth_at_levels(level - 1, Side::Buy)?
         } else {
             0
         };
@@ -322,9 +332,9 @@ fn demo_market_impact_estimation(book: &OrderBook) {
 
     info!("\nAsk side depth distribution:");
     for level in 1..=5 {
-        let depth = book.total_depth_at_levels(level, Side::Sell);
+        let depth = book.total_depth_at_levels(level, Side::Sell)?;
         let prev_depth = if level > 1 {
-            book.total_depth_at_levels(level - 1, Side::Sell)
+            book.total_depth_at_levels(level - 1, Side::Sell)?
         } else {
             0
         };
@@ -334,4 +344,5 @@ fn demo_market_impact_estimation(book: &OrderBook) {
             level, level_depth, depth
         );
     }
+    Ok(())
 }

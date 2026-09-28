@@ -461,7 +461,10 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::InvalidOperation { .. }
         | OrderBookError::SerializationError { .. }
         | OrderBookError::DeserializationError { .. }
-        | OrderBookError::ChecksumMismatch { .. } => false,
+        | OrderBookError::ChecksumMismatch { .. }
+        // Read-only analytics failures (#245): never raised by a submit.
+        | OrderBookError::ArithmeticOverflow { .. }
+        | OrderBookError::AllocationFailed { .. } => false,
         #[cfg(feature = "nats")]
         OrderBookError::NatsPublishError { .. } | OrderBookError::NatsSerializationError { .. } => {
             false
