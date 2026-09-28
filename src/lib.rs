@@ -127,6 +127,17 @@
 //!   same nanosecond can repeat one (see `default_trade_id_namespace`), so
 //!   inject a namespace when cross-restart uniqueness must be guaranteed.
 //!   Trade-id format and namespace injection for replay are unchanged.
+//! - **Limitation: level statistics are advisory under concurrent takers
+//!   (#241).** pricelevel 0.10 supports one concurrent writer of a level's
+//!   execution statistics, while takers on the shared submit gate (ordinary
+//!   takers on an `STPMode::None` book, anonymous `match_order` sweeps) can
+//!   sweep one level at once. A snapshot taken meanwhile can hold a partially
+//!   recorded execution in `orders_executed` / `quantity_executed` /
+//!   `value_executed`. Trades, fees, quantities and order vectors are
+//!   unaffected, totals are exact once the sweeps return, and single-threaded
+//!   replay (`snapshots_match`) stays exact. Capture with no sweep in flight
+//!   for exact statistics. No behaviour or API change. See
+//!   `doc/panic-boundaries.md`.
 //!
 //! ### Migration from 0.13
 //!

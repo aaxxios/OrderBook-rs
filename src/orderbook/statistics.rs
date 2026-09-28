@@ -3,6 +3,11 @@
 //! This module provides comprehensive statistical analysis of order book depth,
 //! helping quantitative traders detect market conditions, identify trends,
 //! and make informed trading decisions.
+//!
+//! Everything here is derived from level prices and quantities. None of it
+//! reads pricelevel's per-level execution statistics, so it is unaffected by
+//! their single-writer contract (see `OrderBook`'s "Level statistics are
+//! advisory under concurrent takers").
 
 use serde::{Deserialize, Serialize};
 
