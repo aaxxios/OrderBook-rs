@@ -66,6 +66,12 @@ This order book engine is built with the following design principles:
 - **Wire break for bincode `TradeResult`.** pricelevel's `MatchResult`
   gained a positional `error` field; JSON payloads and journals stay
   compatible.
+- `BincodeEventSerializer` bounds decoding of untrusted payloads (#251):
+  a string length prefix is checked against the remaining input before
+  anything is allocated (`SerializationError::Truncated`), so allocations
+  are bounded by the input length, and payloads over `DEFAULT_MAX_BINCODE_PAYLOAD_BYTES` (8 MiB,
+  configurable via `BincodeEventSerializer::with_max_payload_bytes`) are
+  rejected with `SerializationError::PayloadTooLarge`.
 
 #### Migration from 0.13
 
@@ -79,6 +85,7 @@ This order book engine is built with the following design principles:
 | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<Vec<..>, OrderBookError>>` |
 | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
 | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
+| `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

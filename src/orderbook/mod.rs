@@ -94,7 +94,9 @@ pub use sequencer::FileJournal;
 pub use sequencer::journal::{Journal, JournalEntry};
 pub use sequencer::{JournalError, SequencerCommand, SequencerEvent, SequencerResult};
 #[cfg(feature = "bincode")]
-pub use serialization::BincodeEventSerializer;
+pub use serialization::{
+    BincodeEventSerializer, DEFAULT_MAX_BINCODE_PAYLOAD_BYTES, MAX_BINCODE_PAYLOAD_BYTES_CEILING,
+};
 pub use serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use snapshot::{
     EnrichedSnapshot, MetricFlags, ORDERBOOK_SNAPSHOT_FORMAT_VERSION,

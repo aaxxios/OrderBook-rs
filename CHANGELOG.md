@@ -141,6 +141,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.0.0 release on crates.io is a tombstone whose library is a single
   `compile_error!`. No new dependencies and no feature changes.
 
+### Fixed
+
+- **Bounded bincode decoding of untrusted payloads (#251).**
+  `BincodeEventSerializer::deserialize_trade` / `deserialize_book_change`
+  decoded with an unlimited `bincode::config::standard()`, so a ~10-byte
+  payload whose `String` length prefix declared `u64::MAX` bytes made
+  bincode 2.0.1 allocate that length before checking the input
+  (capacity-overflow panic or OOM abort in the consumer). Decoding now
+  goes through bincode's borrowed serde path behind a private adapter that
+  routes `deserialize_string` / `deserialize_byte_buf` to the slicing
+  `deserialize_str` / `deserialize_bytes`: a length prefix is checked
+  against the remaining input before anything is allocated, and the copy
+  that follows is the real length, so string / byte allocations over one
+  payload never exceed its length. The same hostile payload now returns
+  `SerializationError::Truncated` after allocating 0 bytes; a 200 MiB
+  prefix inside an 8 MiB payload allocates nothing for the string. No
+  `with_limit` is used: bincode's limit charges the in-memory width of
+  every primitive (16 bytes for a one-byte `u128` varint), so it cannot be
+  set to the input length without rejecting valid payloads. Sequence /
+  map size hints are clamped to the payload length, so a hostile element
+  count (`Vec<Trade>`, `Vec<Id>`) reserves at most
+  `min(payload_len * size_of::<T>(), 1 MiB)` (1 MiB is serde's own cap)
+  before its first element runs out of input.
+- New typed `SerializationError` variants: `PayloadTooLarge { len, max }`
+  and `Truncated { additional }` (bincode end-of-input or a length prefix
+  longer than the remaining input, previously folded into
+  `Bincode(String)`).
+- New `DEFAULT_MAX_BINCODE_PAYLOAD_BYTES` (8 MiB, the largest NATS
+  `max_payload` the NATS docs recommend; about 48 000 fills in one
+  `TradeResult`) and `MAX_BINCODE_PAYLOAD_BYTES_CEILING` (64 MiB, the NATS
+  hard maximum). `BincodeEventSerializer::with_max_payload_bytes(n)`
+  configures the limit (clamped to the ceiling);
+  `max_payload_bytes()` reads it back.
+
+  **Compatibility:** bincode payloads larger than the limit (8 MiB by
+  default) are now rejected with `SerializationError::PayloadTooLarge`, on
+  decode before parsing and on encode after producing the bytes, so a
+  producer never emits what its consumer would reject. Raise it on both
+  sides with `with_max_payload_bytes` if you run NATS with a larger
+  `max_payload`. The wire format is unchanged: every payload up to the
+  limit decodes exactly as before. `BincodeEventSerializer` is no longer a
+  unit struct, so construct it with `BincodeEventSerializer::new()` or
+  `Default::default()` instead of the bare `BincodeEventSerializer`
+  expression. Code matching exhaustively on `SerializationError` must
+  handle the two new variants, and bincode end-of-input errors now
+  surface as `Truncated` rather than `Bincode(String)`. JSON is unaffected.
+
 ## [0.13.1] - 2026-09-18
 
 ### Changed

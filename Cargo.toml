@@ -201,6 +201,11 @@ path = "tests/alloc_budget.rs"
 required-features = ["alloc-counters"]
 
 [[test]]
+name = "bincode_decode_bounds"
+path = "tests/bincode_decode_bounds.rs"
+required-features = ["alloc-counters", "bincode"]
+
+[[test]]
 name = "metrics_tests"
 path = "tests/metrics/mod.rs"
 required-features = ["metrics"]
