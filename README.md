@@ -132,6 +132,26 @@ This order book engine is built with the following design principles:
   `encode_book_update` reserve with `Vec::try_reserve` and return
   `Result<(), WireError>` (new `WireError::CapacityOverflow`); the wire
   format is unchanged.
+- **Default trade-id namespace without OS entropy (#265).** Constructors
+  that are not given a namespace derive a UUIDv5 from the symbol, process
+  id, wall-clock nanoseconds and a process-wide checked counter instead of
+  calling the panicking `Uuid::new_v4()`. Namespaces are unique per book
+  within a process and are designed to differ across restarts; a restart
+  that reuses the same process id with the wall clock stepped back to the
+  same nanosecond can repeat one (see `default_trade_id_namespace`), so
+  inject a namespace when cross-restart uniqueness must be guaranteed.
+  Trade-id format and namespace injection for replay are unchanged.
+- **Limitation: level statistics are advisory under concurrent takers
+  (#241).** pricelevel 0.10 supports one concurrent writer of a level's
+  execution statistics, while takers on the shared submit gate (ordinary
+  takers on an `STPMode::None` book, anonymous `match_order` sweeps) can
+  sweep one level at once. A snapshot taken meanwhile can hold a partially
+  recorded execution in `orders_executed` / `quantity_executed` /
+  `value_executed`. Trades, fees, quantities and order vectors are
+  unaffected, totals are exact once the sweeps return, and single-threaded
+  replay (`snapshots_match`) stays exact. Capture with no sweep in flight
+  for exact statistics. No behaviour or API change. See
+  `doc/panic-boundaries.md`.
 - **Book managers are runtime-safe and stoppable (#255).**
   `BookManagerTokio::start_trade_processor` returns
   `ManagerError::NoRuntime` outside a Tokio runtime instead of panicking,
