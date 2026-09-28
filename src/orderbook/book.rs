@@ -133,6 +133,7 @@ pub(crate) fn default_trade_id_namespace(symbol: &str) -> Uuid {
     let symbol_ns = Uuid::new_v5(&root, symbol.as_bytes());
     Uuid::new_v5(&symbol_ns, &name)
 }
+
 /// Upper bound on the number of bins [`OrderBook::depth_distribution`]
 /// builds (#245). A larger `bins` request is capped to this value, so the
 /// histogram's allocation is bounded by a constant rather than by caller
