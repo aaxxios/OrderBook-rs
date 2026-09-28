@@ -26,6 +26,11 @@ pub enum WireError {
     /// The static string is a stable, tracing-friendly description of the
     /// failure site (e.g. `"NewOrder: payload size mismatch"`).
     InvalidPayload(&'static str),
+    /// An encoder could not reserve room for its fixed-size payload in the
+    /// caller's output buffer: the new capacity would exceed `isize::MAX`
+    /// bytes, or the allocator reported a failure through
+    /// [`Vec::try_reserve`]. The output buffer is left unchanged.
+    CapacityOverflow,
 }
 
 impl std::fmt::Display for WireError {
@@ -35,6 +40,7 @@ impl std::fmt::Display for WireError {
             WireError::Truncated => f.write_str("wire frame truncated"),
             WireError::UnknownKind(byte) => write!(f, "wire unknown kind: 0x{byte:02x}"),
             WireError::InvalidPayload(reason) => write!(f, "wire invalid payload: {reason}"),
+            WireError::CapacityOverflow => f.write_str("wire output buffer capacity overflow"),
         }
     }
 }

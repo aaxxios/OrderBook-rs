@@ -2,9 +2,6 @@
 //!
 //! See `doc/wire-protocol.md` for the canonical layout.
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::cast_sign_loss)]
-
 use crate::wire::error::WireError;
 use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -66,7 +63,10 @@ pub struct NewOrderWire {
     pub _pad: [u8; 5],
 }
 
-const _: () = assert!(core::mem::size_of::<NewOrderWire>() == 48);
+// Compile-time layout guard: a size drift is a type mismatch between
+// `[(); 48]` and `[(); size_of::<NewOrderWire>()]`, rejected by the compiler. It is
+// evaluated at compile time only and has no runtime (panicking) form.
+const _: [(); 48] = [(); core::mem::size_of::<NewOrderWire>()];
 
 impl NewOrderWire {
     /// Returns the packed byte representation of `self`.
@@ -131,13 +131,14 @@ impl TryFrom<&NewOrderWire> for OrderType<()> {
                 "NewOrder: non-zero reserved padding",
             ));
         }
-        if price_raw < 0 {
-            return Err(WireError::InvalidPayload("NewOrder: negative price"));
-        }
+        // A checked conversion (not an `as` cast) rejects every negative
+        // price with a typed error.
+        let price_ticks = u64::try_from(price_raw)
+            .map_err(|_| WireError::InvalidPayload("NewOrder: negative price"))?;
         // Reject `price == 0` at the trust boundary: price 0 is the cache's
         // "no best price" sentinel and a zero-priced limit order is
         // structurally meaningless. Only `price > 0` is admissible.
-        if price_raw == 0 {
+        if price_ticks == 0 {
             return Err(WireError::InvalidPayload("NewOrder: zero price"));
         }
         // Reject `qty == 0`: a zero-quantity order is structurally meaningless
@@ -181,14 +182,16 @@ impl TryFrom<&NewOrderWire> for OrderType<()> {
         // all-zero, so it never collides with `Hash32::zero()` — the "no STP"
         // sentinel — and STP applies correctly to wire-sourced orders.
         let mut user_bytes = [0u8; 32];
-        if let Some(slot) = user_bytes.get_mut(0..8) {
-            slot.copy_from_slice(&account_id.to_le_bytes());
+        // `zip` stops at the shorter side (8 bytes): no length-matching
+        // `copy_from_slice` precondition to violate.
+        for (dst, src) in user_bytes.iter_mut().zip(account_id.to_le_bytes()) {
+            *dst = src;
         }
         let user_id = Hash32::new(user_bytes);
 
         Ok(OrderType::Standard {
             id: Id::from_u64(order_id),
-            price: Price::new(u128::from(price_raw as u64)),
+            price: Price::new(u128::from(price_ticks)),
             quantity: Quantity::new(qty),
             side,
             user_id,
@@ -406,5 +409,54 @@ mod tests {
             }
             _ => panic!("expected Standard variant"),
         }
+    }
+
+    #[test]
+    fn try_from_rejects_min_price_and_accepts_max_price() {
+        let wire = NewOrderWire {
+            client_ts: 0,
+            order_id: 1,
+            account_id: 2,
+            price: i64::MIN,
+            qty: 5,
+            side: SIDE_BUY,
+            time_in_force: TIF_GTC,
+            order_type: ORDER_TYPE_STANDARD,
+            _pad: [0u8; 5],
+        };
+        let res: Result<OrderType<()>, _> = (&wire).try_into();
+        assert_eq!(
+            res.err(),
+            Some(WireError::InvalidPayload("NewOrder: negative price"))
+        );
+
+        let max = NewOrderWire {
+            price: i64::MAX,
+            ..wire
+        };
+        let order: OrderType<()> = (&max).try_into().expect("i64::MAX price converts");
+        assert_eq!(order.price().as_u128(), u128::from(i64::MAX.unsigned_abs()));
+    }
+
+    #[test]
+    fn try_from_encodes_account_id_into_low_user_bytes() {
+        let account_id = 0x0102_0304_0506_0708_u64;
+        let wire = NewOrderWire {
+            client_ts: 0,
+            order_id: 1,
+            account_id,
+            price: 100,
+            qty: 5,
+            side: SIDE_BUY,
+            time_in_force: TIF_GTC,
+            order_type: ORDER_TYPE_STANDARD,
+            _pad: [0u8; 5],
+        };
+        let order: OrderType<()> = (&wire).try_into().expect("convert");
+        let mut expected = [0u8; 32];
+        for (dst, src) in expected.iter_mut().zip(account_id.to_le_bytes()) {
+            *dst = src;
+        }
+        assert_eq!(order.user_id(), Hash32::new(expected));
     }
 }

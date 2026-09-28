@@ -13,6 +13,7 @@
 //! differs is which `kind` discriminants are valid in each direction (see
 //! [`super::MessageKind`]).
 
+use super::bytes::{read_u8, read_u32_le};
 use super::error::WireError;
 use std::io::{self, Write};
 
@@ -21,7 +22,7 @@ const LEN_PREFIX: usize = 4;
 /// Size in bytes of the kind byte.
 const KIND_SIZE: usize = 1;
 /// Minimum frame size: a `len` prefix plus a single `kind` byte (zero-byte
-/// payload).
+/// payload). Also the offset of the first payload byte.
 const MIN_FRAME_SIZE: usize = LEN_PREFIX + KIND_SIZE;
 
 /// Encodes a frame into `out`.
@@ -35,10 +36,6 @@ const MIN_FRAME_SIZE: usize = LEN_PREFIX + KIND_SIZE;
 /// returns [`io::ErrorKind::InvalidInput`] when `kind + payload` does not
 /// fit in the wire-format `u32` length prefix — guarantees the declared
 /// frame length always matches the bytes written.
-///
-/// # Panics
-///
-/// Does not panic.
 #[inline]
 pub fn encode_frame<W: Write>(kind: u8, payload: &[u8], out: &mut W) -> io::Result<()> {
     // `len` is the size of `kind + payload`. Reject payloads whose encoded
@@ -73,14 +70,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<(u8, &[u8], usize), WireError> {
     if buf.len() < MIN_FRAME_SIZE {
         return Err(WireError::Truncated);
     }
-    // SAFETY-style note: the bounds check above guarantees `buf[..4]` and
-    // `buf[4]` are in bounds. We avoid `[..]` indexing in production by
-    // using `get` everywhere; clippy::indexing_slicing is treated as a hard
-    // rule in this crate.
-    let len_bytes = buf.get(..LEN_PREFIX).ok_or(WireError::Truncated)?;
-    let mut len_arr = [0u8; LEN_PREFIX];
-    len_arr.copy_from_slice(len_bytes);
-    let body_len = u32::from_le_bytes(len_arr) as usize;
+    // Wire bytes are untrusted: every read below goes through a checked
+    // offset and `slice::get`, never indexing, `copy_from_slice` or raw
+    // offset arithmetic (Production Panic Policy).
+    let body_len = usize::try_from(read_u32_le(buf, 0)?)
+        .map_err(|_| WireError::InvalidPayload("frame length exceeds usize"))?;
 
     if body_len < KIND_SIZE {
         return Err(WireError::InvalidPayload("frame body shorter than kind"));
@@ -93,12 +87,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<(u8, &[u8], usize), WireError> {
         return Err(WireError::Truncated);
     }
 
-    let kind = *buf.get(LEN_PREFIX).ok_or(WireError::Truncated)?;
-    let payload_start = LEN_PREFIX + KIND_SIZE;
-    let payload_end = LEN_PREFIX + body_len;
-    let payload = buf
-        .get(payload_start..payload_end)
-        .ok_or(WireError::Truncated)?;
+    let kind = read_u8(buf, LEN_PREFIX)?;
+    let payload = buf.get(MIN_FRAME_SIZE..total).ok_or(WireError::Truncated)?;
     Ok((kind, payload, total))
 }
 
@@ -166,5 +156,23 @@ mod tests {
         assert_eq!(k2, 0x02);
         assert_eq!(p2, &[0xCC]);
         assert_eq!(used1 + used2, buf.len());
+    }
+
+    #[test]
+    fn max_declared_length_is_truncated_not_panic() {
+        // `len = u32::MAX` on a 6-byte buffer: the checked arithmetic and
+        // `get` reject it as truncated.
+        let buf = [0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00];
+        assert_eq!(decode_frame(&buf), Err(WireError::Truncated));
+    }
+
+    #[test]
+    fn every_short_prefix_of_a_valid_frame_is_truncated() {
+        let mut buf = Vec::new();
+        encode_frame(0x01, &[1, 2, 3, 4], &mut buf).expect("encode frame");
+        for cut in 0..buf.len() {
+            let prefix = buf.get(..cut).expect("prefix");
+            assert_eq!(decode_frame(prefix), Err(WireError::Truncated), "cut={cut}");
+        }
     }
 }

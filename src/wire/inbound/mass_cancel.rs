@@ -39,7 +39,10 @@ pub struct MassCancelWire {
     pub _pad: [u8; 7],
 }
 
-const _: () = assert!(core::mem::size_of::<MassCancelWire>() == 24);
+// Compile-time layout guard: a size drift is a type mismatch between
+// `[(); 24]` and `[(); size_of::<MassCancelWire>()]`, rejected by the compiler. It is
+// evaluated at compile time only and has no runtime (panicking) form.
+const _: [(); 24] = [(); core::mem::size_of::<MassCancelWire>()];
 
 impl MassCancelWire {
     /// Returns the packed byte representation of `self`.

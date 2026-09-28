@@ -30,18 +30,32 @@
 //! Inbound messages are `#[repr(C, packed)]` and derive the `zerocopy`
 //! traits required to validate-and-cast a `&[u8]` into a typed reference
 //! without copying. Decoding is safe (no `unsafe` is required at this
-//! layer); it returns [`WireError::InvalidPayload`] on size mismatch.
+//! layer); it returns
+//! [`WireError::InvalidPayload`](crate::wire::error::WireError::InvalidPayload)
+//! on size mismatch.
 //!
 //! # Outbound byte-cursor
 //!
 //! Outbound messages are encoded via explicit byte-cursor (`Vec<u8>` +
-//! `extend_from_slice`). Outbound is I/O-dominated, so the marginal cost
-//! of copying a few dozen bytes is negligible compared to socket
+//! `extend_from_slice`). Each encoder reserves its fixed payload size with
+//! `Vec::try_reserve` first and returns
+//! [`WireError::CapacityOverflow`](crate::wire::error::WireError::CapacityOverflow)
+//! instead of panicking when the caller's buffer cannot grow. Outbound is
+//! I/O-dominated, so the marginal cost of copying a few dozen bytes is negligible compared to socket
 //! overhead, and we keep the layout free to evolve without exposing a
 //! packed type to callers.
 //!
+//! # Untrusted input
+//!
+//! Wire bytes are untrusted. Decoders never index, never call
+//! `copy_from_slice` and never use unchecked offset arithmetic: every read
+//! goes through a checked offset and `slice::get`, so a short, oversized or
+//! malformed buffer returns a typed
+//! [`WireError`](crate::wire::error::WireError) rather than panicking.
+//!
 //! See `doc/wire-protocol.md` for the canonical layout tables.
 
+mod bytes;
 pub mod error;
 pub mod framing;
 pub mod inbound;

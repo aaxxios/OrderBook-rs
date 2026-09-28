@@ -2,9 +2,7 @@
 //!
 //! See `doc/wire-protocol.md` for the canonical layout.
 
-// panic-policy-ratchet: see #242, removed by the fix issue
-#![allow(clippy::arithmetic_side_effects)]
-
+use crate::wire::bytes::{read_i64_le, read_u64_le, reserve_payload};
 use crate::wire::error::WireError;
 
 /// Fixed payload size in bytes for a `TradePrintWire`.
@@ -38,16 +36,26 @@ pub struct TradePrintWire {
     pub ts: u64,
 }
 
-/// Encodes a `TradePrint` payload (48 bytes) into `out`.
+/// Appends a `TradePrint` payload (48 bytes) to `out`.
+///
+/// Room for the whole payload is reserved up front with
+/// [`Vec::try_reserve`], so the appends that follow never reallocate and the
+/// encoder never hits `Vec`'s capacity-overflow panic.
+///
+/// # Errors
+///
+/// Returns [`WireError::CapacityOverflow`] when `out` cannot grow by
+/// [`TRADE_PRINT_SIZE`] bytes. `out` is left unchanged in that case.
 #[inline]
-pub fn encode_trade_print(trade: &TradePrintWire, out: &mut Vec<u8>) {
-    out.reserve(TRADE_PRINT_SIZE);
+pub fn encode_trade_print(trade: &TradePrintWire, out: &mut Vec<u8>) -> Result<(), WireError> {
+    reserve_payload(out, TRADE_PRINT_SIZE)?;
     out.extend_from_slice(&trade.engine_seq.to_le_bytes());
     out.extend_from_slice(&trade.maker_id.to_le_bytes());
     out.extend_from_slice(&trade.taker_id.to_le_bytes());
     out.extend_from_slice(&trade.price.to_le_bytes());
     out.extend_from_slice(&trade.qty.to_le_bytes());
     out.extend_from_slice(&trade.ts.to_le_bytes());
+    Ok(())
 }
 
 /// Decodes a `TradePrint` payload.
@@ -64,30 +72,13 @@ pub fn decode_trade_print(payload: &[u8]) -> Result<TradePrintWire, WireError> {
             "TradePrint: payload size mismatch",
         ));
     }
-    let read_u64 = |offset: usize| -> Result<u64, WireError> {
-        let slot = payload
-            .get(offset..offset + 8)
-            .ok_or(WireError::Truncated)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(slot);
-        Ok(u64::from_le_bytes(arr))
-    };
-    let read_i64 = |offset: usize| -> Result<i64, WireError> {
-        let slot = payload
-            .get(offset..offset + 8)
-            .ok_or(WireError::Truncated)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(slot);
-        Ok(i64::from_le_bytes(arr))
-    };
-
     Ok(TradePrintWire {
-        engine_seq: read_u64(0)?,
-        maker_id: read_u64(8)?,
-        taker_id: read_u64(16)?,
-        price: read_i64(24)?,
-        qty: read_u64(32)?,
-        ts: read_u64(40)?,
+        engine_seq: read_u64_le(payload, 0)?,
+        maker_id: read_u64_le(payload, 8)?,
+        taker_id: read_u64_le(payload, 16)?,
+        price: read_i64_le(payload, 24)?,
+        qty: read_u64_le(payload, 32)?,
+        ts: read_u64_le(payload, 40)?,
     })
 }
 
@@ -108,7 +99,7 @@ mod tests {
             ts: 0,
         };
         let mut buf = Vec::new();
-        encode_trade_print(&trade, &mut buf);
+        encode_trade_print(&trade, &mut buf).expect("encode_trade_print");
         assert_eq!(buf.len(), TRADE_PRINT_SIZE);
     }
 
@@ -131,7 +122,7 @@ mod tests {
                 ts,
             };
             let mut payload = Vec::new();
-            encode_trade_print(&original, &mut payload);
+            encode_trade_print(&original, &mut payload).expect("encode_trade_print");
             let mut framed = Vec::new();
             encode_frame(0x82, &payload, &mut framed).expect("encode_frame");
 
@@ -147,6 +138,49 @@ mod tests {
         let buf = [0u8; TRADE_PRINT_SIZE - 1];
         assert!(matches!(
             decode_trade_print(&buf),
+            Err(WireError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn encode_at_capacity_edge_appends_without_disturbing_prefix() {
+        let msg = TradePrintWire {
+            engine_seq: 7,
+            maker_id: 1,
+            taker_id: 2,
+            price: -5,
+            qty: 9,
+            ts: 1_700_000_000_000,
+        };
+        // Buffer already full (len == capacity): the encoder must grow it
+        // through `try_reserve` and append after the existing prefix.
+        let mut full = Vec::with_capacity(3);
+        full.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        assert_eq!(full.len(), full.capacity());
+        encode_trade_print(&msg, &mut full).expect("encode into full buffer");
+        assert_eq!(full.get(..3), Some(&[0xAA, 0xBB, 0xCC][..]));
+        let tail = full.get(3..).expect("appended payload");
+        assert_eq!(tail.len(), TRADE_PRINT_SIZE);
+        assert_eq!(decode_trade_print(tail), Ok(msg));
+
+        // Exactly enough spare capacity: no reallocation is needed and the
+        // capacity is unchanged afterwards.
+        let mut exact = Vec::with_capacity(TRADE_PRINT_SIZE);
+        let cap = exact.capacity();
+        encode_trade_print(&msg, &mut exact).expect("encode into exact buffer");
+        assert_eq!(exact.len(), TRADE_PRINT_SIZE);
+        assert_eq!(exact.capacity(), cap);
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_payloads() {
+        assert!(matches!(
+            decode_trade_print(&[]),
+            Err(WireError::InvalidPayload(_))
+        ));
+        let long = [0u8; TRADE_PRINT_SIZE + 1];
+        assert!(matches!(
+            decode_trade_print(&long),
             Err(WireError::InvalidPayload(_))
         ));
     }

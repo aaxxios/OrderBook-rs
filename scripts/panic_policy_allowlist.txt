@@ -27,7 +27,3 @@ src/orderbook/snapshot.rs:saturating_wrapping:7
 src/orderbook/statistics.rs:saturating_wrapping:1
 src/orderbook/stp.rs:saturating_wrapping:2
 src/orderbook/trade.rs:saturating_wrapping:4
-src/wire/inbound/cancel.rs:assert:1
-src/wire/inbound/cancel_replace.rs:assert:1
-src/wire/inbound/mass_cancel.rs:assert:1
-src/wire/inbound/new_order.rs:assert:1
