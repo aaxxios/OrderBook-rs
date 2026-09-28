@@ -447,7 +447,9 @@ change.
   now use structured fields (`symbol`, `trades`, `executed_quantity`;
   `quantity`, `price`, `trade_id`) instead of formatted messages. No
   change to matching, trade events or snapshots. `manager.rs` had no
-  panic-policy ratchet entries.
+  panic-policy ratchet entries. `doc/panic-boundaries.md` lists the trade
+  handler's no-panic obligation and the `crossbeam::channel` / `tokio`
+  surface the processors use.
 
 - **Wire encoders return `Result`; wire and metrics leave the panic
   ratchet (#254).** `encode_exec_report`, `encode_trade_print` and

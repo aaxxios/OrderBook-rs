@@ -317,3 +317,69 @@ fn test_tokio_stop_trade_processor_future_is_send() {
     let future = mgr.stop_trade_processor();
     assert_send(&future);
 }
+
+// ─── Manager dropped without stop: the stop signal disarms (#255) ───────────
+
+/// Handler forwarding each event's symbol to a std channel the test reads.
+fn forwarding_handler() -> (
+    std::sync::mpsc::Receiver<String>,
+    impl FnMut(TradeEvent) + Send + 'static,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (rx, move |event: TradeEvent| {
+        let _ = tx.send(event.symbol);
+    })
+}
+
+#[test]
+fn test_std_dropped_manager_keeps_processing_removed_book_until_it_drops() {
+    let mut mgr: BookManagerStd<()> = BookManagerStd::new();
+    mgr.add_book(SYMBOL).expect("add book");
+    let (rx, handler) = forwarding_handler();
+    mgr.start_trade_processor_with(handler).expect("start");
+    let book = mgr.remove_book(SYMBOL).expect("removed book");
+    // Dropping the manager drops its stop sender: the processor must treat
+    // that as "no stop will come", not as a stop, and must not spin.
+    drop(mgr);
+
+    trade_once(&book);
+    let symbol = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("processor still handles the removed book's events");
+    assert_eq!(symbol, SYMBOL);
+
+    // Last sender gone: the processor exits and drops the handler, which
+    // disconnects the forwarding channel.
+    drop(book);
+    assert!(matches!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+}
+
+#[test]
+fn test_tokio_dropped_manager_keeps_processing_removed_book_until_it_drops() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .expect("runtime");
+    let mut mgr: BookManagerTokio<()> = BookManagerTokio::new();
+    mgr.add_book(SYMBOL).expect("add book");
+    let (rx, handler) = forwarding_handler();
+    mgr.start_trade_processor_on(runtime.handle(), handler)
+        .expect("start");
+    let book = mgr.remove_book(SYMBOL).expect("removed book");
+    drop(mgr);
+
+    trade_once(&book);
+    let symbol = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("processor still handles the removed book's events");
+    assert_eq!(symbol, SYMBOL);
+
+    drop(book);
+    assert!(matches!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+}

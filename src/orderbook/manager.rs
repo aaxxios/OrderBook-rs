@@ -39,8 +39,11 @@ use crate::orderbook::trade::{TradeEvent, TradeListener, TradeResult};
 use pricelevel::{Hash32, OrderType, Side, TimestampMs};
 use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::Poll;
 use tracing::{debug, error, info};
 
 /// Per-book outcome of [`OrderBook::evict_expired_orders`]: the evicted
@@ -50,19 +53,11 @@ type EvictResult<T> = Result<Vec<Arc<OrderType<T>>>, OrderBookError>;
 /// Name given to the `BookManagerStd` trade processor thread.
 const STD_PROCESSOR_THREAD_NAME: &str = "orderbook-trade-processor";
 
-/// Message carried on a manager's trade-event channel.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "every message but the single Shutdown is a Trade; boxing it would add \
-              one allocation per trade on the listener path for no size benefit"
-)]
-enum ProcessorMessage {
-    /// A trade event produced by one of the managed books' listeners.
-    Trade(TradeEvent),
-    /// Stop signal sent by `stop_trade_processor`: the processor handles
-    /// what is already queued and exits.
-    Shutdown,
-}
+/// Receiving half of the `BookManagerStd` trade-event channel.
+type StdEventReceiver = crossbeam::channel::Receiver<TradeEvent>;
+
+/// Receiving half of the `BookManagerStd` stop signal.
+type StdStopReceiver = crossbeam::channel::Receiver<()>;
 
 /// Dropped-event accounting shared by a manager and every trade listener it
 /// installs (#255).
@@ -113,9 +108,11 @@ fn trade_event_from(trade_result: &TradeResult) -> TradeEvent {
         trade_result: trade_result.clone(),
         // Wall-clock stamp for observability only: `TradeEvent::timestamp` is
         // not journaled and does not feed matching or replay (the engine's own
-        // time comes from the injected `Clock`). `current_time_millis` reports
-        // 0 if the system clock reads before the Unix epoch; a fallible
-        // variant is tracked in #257 and this call site will adopt it there.
+        // time comes from the injected `Clock`). The infallible
+        // `current_time_millis` is deliberate here: on an unrepresentable
+        // clock it returns its documented fallback and logs once (#257),
+        // which beats dropping or failing an otherwise valid trade event.
+        // `try_current_time_millis` is the fallible variant.
         timestamp: crate::current_time_millis(),
         engine_seq: trade_result.engine_seq,
     }
@@ -157,27 +154,46 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 }
 
 /// Body of the `BookManagerStd` trade processor thread.
-fn run_std_processor<F>(receiver: std::sync::mpsc::Receiver<ProcessorMessage>, mut handler: F)
+///
+/// Waits on the trade-event channel and the out-of-band stop signal at
+/// once. On the stop signal it handles every event already queued, then
+/// returns (dropping the receiver, so later sends fail and are counted as
+/// dropped). If the stop sender is dropped instead (the manager was dropped
+/// without `stop_trade_processor`), it keeps handling events until every
+/// trade-event sender is gone.
+fn run_std_processor<F>(events: StdEventReceiver, stop: StdStopReceiver, mut handler: F)
 where
     F: FnMut(TradeEvent),
 {
     info!("Trade processor started");
-    while let Ok(message) = receiver.recv() {
-        match message {
-            ProcessorMessage::Trade(event) => handler(event),
-            ProcessorMessage::Shutdown => {
-                // Handle whatever raced in behind the signal before exiting;
-                // once this thread returns the receiver drops and later sends
-                // fail, which the listeners count as dropped.
-                loop {
-                    match receiver.try_recv() {
-                        Ok(ProcessorMessage::Trade(event)) => handler(event),
-                        Ok(ProcessorMessage::Shutdown) => {}
-                        Err(_) => break,
-                    }
+    // Exactly two operations are registered, so a selected operation is one
+    // of them. crossbeam requires every selected operation to be completed
+    // with the receiver it was registered with (it panics otherwise), hence
+    // the exhaustive `if stop { .. } else { events }` below: no branch
+    // leaves an operation uncompleted or completes it with the wrong one.
+    let mut select = crossbeam::channel::Select::new();
+    let _events_index = select.recv(&events);
+    let stop_index = select.recv(&stop);
+    loop {
+        let operation = select.select();
+        if operation.index() == stop_index {
+            if operation.recv(&stop).is_ok() {
+                while let Ok(event) = events.try_recv() {
+                    handler(event);
                 }
-                break;
+            } else {
+                // No stop signal can come any more: drain until every
+                // trade-event sender is gone.
+                for event in events.iter() {
+                    handler(event);
+                }
             }
+            break;
+        }
+        match operation.recv(&events) {
+            Ok(event) => handler(event),
+            // Every sender (manager and book listeners) is gone.
+            Err(_) => break,
         }
     }
     info!("Trade processor stopped");
@@ -219,11 +235,12 @@ where
     fn book_count(&self) -> usize;
 }
 
-/// BookManager implementation using standard library mpsc channels.
+/// BookManager implementation for synchronous embedding: a dedicated OS
+/// thread processes trade events from a `crossbeam` MPSC channel.
 ///
 /// # Trade-event channel is unbounded by design
 ///
-/// Trade events are pushed onto a `std::sync::mpsc` channel, which is
+/// Trade events are pushed onto a `crossbeam::channel::unbounded` channel, which is
 /// **unbounded**. This is deliberate: the matching path must never block to
 /// deliver an audit event, so the producer cannot apply backpressure (a bounded
 /// channel would force the synchronous matching path to block or to silently
@@ -251,10 +268,12 @@ where
 {
     /// Collection of order books indexed by symbol
     books: HashMap<String, OrderBook<T>>,
-    /// Sender for trade events and the shutdown signal
-    trade_sender: std::sync::mpsc::Sender<ProcessorMessage>,
+    /// Sender for trade events
+    trade_sender: crossbeam::channel::Sender<TradeEvent>,
     /// Receiver for trade events (taken when processor starts)
-    trade_receiver: Option<std::sync::mpsc::Receiver<ProcessorMessage>>,
+    trade_receiver: Option<StdEventReceiver>,
+    /// Out-of-band stop signal for the running processor
+    stop_signal: Option<crossbeam::channel::Sender<()>>,
     /// Running processor thread, joined by `stop_trade_processor`
     processor: Option<std::thread::JoinHandle<()>>,
     /// Dropped-event accounting shared with every book's listener
@@ -265,14 +284,15 @@ impl<T> BookManagerStd<T>
 where
     T: Clone + Send + Sync + Default + 'static,
 {
-    /// Create a new BookManagerStd with a standard library mpsc channel.
+    /// Create a new BookManagerStd with an unbounded MPSC trade-event channel.
     pub fn new() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = crossbeam::channel::unbounded();
 
         Self {
             books: HashMap::new(),
             trade_sender: sender,
             trade_receiver: Some(receiver),
+            stop_signal: None,
             processor: None,
             drops: Arc::new(DropTracker::default()),
         }
@@ -325,16 +345,21 @@ where
             .take()
             .ok_or(ManagerError::ProcessorAlreadyStarted)?;
 
-        // The receiver is handed to the thread only once it exists, so a
-        // refused spawn leaves it here for a retry instead of dropping it
-        // with the closure.
+        // Capacity 1: the only message ever sent is the single stop signal,
+        // so `try_send` in `stop_trade_processor` never blocks or fails for
+        // lack of room.
+        let (stop_tx, stop_rx) = crossbeam::channel::bounded::<()>(1);
+
+        // The receivers are handed to the thread only once it exists, so a
+        // refused spawn leaves the trade-event receiver here for a retry
+        // instead of dropping it with the closure.
         let (handoff_tx, handoff_rx) =
-            std::sync::mpsc::channel::<std::sync::mpsc::Receiver<ProcessorMessage>>();
+            std::sync::mpsc::channel::<(StdEventReceiver, StdStopReceiver)>();
         let spawned = std::thread::Builder::new()
             .name(STD_PROCESSOR_THREAD_NAME.to_string())
             .spawn(move || {
-                if let Ok(receiver) = handoff_rx.recv() {
-                    run_std_processor(receiver, handler);
+                if let Ok((events, stop)) = handoff_rx.recv() {
+                    run_std_processor(events, stop, handler);
                 }
             });
 
@@ -352,7 +377,9 @@ where
 
         // The thread owns `handoff_rx` until it receives, so this send only
         // fails if the thread is already gone; recover the receiver then.
-        if let Err(std::sync::mpsc::SendError(receiver)) = handoff_tx.send(receiver) {
+        if let Err(std::sync::mpsc::SendError((receiver, _stop))) =
+            handoff_tx.send((receiver, stop_rx))
+        {
             self.trade_receiver = Some(receiver);
             let message = match thread.join() {
                 Ok(()) => "trade processor thread exited before start".to_string(),
@@ -365,15 +392,15 @@ where
             });
         }
 
+        self.stop_signal = Some(stop_tx);
         self.processor = Some(thread);
         Ok(())
     }
 
     /// Stop the trade processor and join its thread.
     ///
-    /// Sends a stop signal down the trade-event channel; the processor
-    /// handles every event queued before (and any that raced in right behind)
-    /// the signal, then exits. Blocks the calling thread until then. Once it
+    /// Sends an out-of-band stop signal; the processor handles every trade
+    /// event already queued in the channel, then exits. Blocks the calling thread until then. Once it
     /// has returned, trade events from the managed books are no longer
     /// processed: they are counted in
     /// [`dropped_trade_events`](Self::dropped_trade_events). The processor
@@ -392,7 +419,11 @@ where
             .take()
             .ok_or(ManagerError::ProcessorNotRunning)?;
 
-        if self.trade_sender.send(ProcessorMessage::Shutdown).is_err() {
+        let signalled = self
+            .stop_signal
+            .take()
+            .is_some_and(|stop| stop.try_send(()).is_ok());
+        if !signalled {
             debug!("trade processor exited before the stop signal");
         }
 
@@ -548,8 +579,7 @@ where
         let symbol_clone = symbol.to_string();
 
         let trade_listener: TradeListener = Arc::new(move |trade_result: &TradeResult| {
-            let message = ProcessorMessage::Trade(trade_event_from(trade_result));
-            if sender.send(message).is_err() {
+            if sender.send(trade_event_from(trade_result)).is_err() {
                 drops.record_drop(&symbol_clone);
             }
         });
@@ -631,10 +661,12 @@ where
 {
     /// Collection of order books indexed by symbol
     books: HashMap<String, OrderBook<T>>,
-    /// Sender for trade events and the shutdown signal
-    trade_sender: tokio::sync::mpsc::UnboundedSender<ProcessorMessage>,
+    /// Sender for trade events
+    trade_sender: tokio::sync::mpsc::UnboundedSender<TradeEvent>,
     /// Receiver for trade events (taken when processor starts)
-    trade_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<ProcessorMessage>>,
+    trade_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<TradeEvent>>,
+    /// Out-of-band stop signal for the running processor
+    stop_signal: Option<tokio::sync::oneshot::Sender<()>>,
     /// Running processor task, awaited by `stop_trade_processor`
     processor: Option<tokio::task::JoinHandle<()>>,
     /// Dropped-event accounting shared with every book's listener
@@ -655,6 +687,7 @@ where
             books: HashMap::new(),
             trade_sender: sender,
             trade_receiver: Some(receiver),
+            stop_signal: None,
             processor: None,
             drops: Arc::new(DropTracker::default()),
         }
@@ -741,29 +774,44 @@ where
             .take()
             .ok_or(ManagerError::ProcessorAlreadyStarted)?;
 
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let task = runtime.spawn(async move {
             info!("Trade processor started (Tokio)");
 
-            while let Some(message) = receiver.recv().await {
-                match message {
-                    ProcessorMessage::Trade(event) => handler(event),
-                    // Closing refuses new sends (the listeners count them as
-                    // dropped) while `recv` still yields what is queued, then
-                    // `None`.
-                    ProcessorMessage::Shutdown => receiver.close(),
+            let mut stop = Some(stop_rx);
+            while let Some(event) = std::future::poll_fn(|cx| {
+                // Stop signal first: on it, close the channel. Closing
+                // refuses new sends (the listeners count them as dropped)
+                // while `poll_recv` still yields everything already queued,
+                // then `None`. A dropped stop sender (the manager was dropped
+                // without `stop_trade_processor`) just disarms the signal:
+                // events are then handled until every sender is gone.
+                if let Some(signal) = stop.as_mut()
+                    && let Poll::Ready(result) = Pin::new(signal).poll(cx)
+                {
+                    stop = None;
+                    if result.is_ok() {
+                        receiver.close();
+                    }
                 }
+                receiver.poll_recv(cx)
+            })
+            .await
+            {
+                handler(event);
             }
 
             info!("Trade processor stopped (Tokio)");
         });
 
+        self.stop_signal = Some(stop_tx);
         self.processor = Some(task);
         Ok(())
     }
 
     /// Stop the trade processor and await its task.
     ///
-    /// Sends a stop signal down the trade-event channel; the task closes the
+    /// Sends an out-of-band stop signal; the task closes the trade-event
     /// channel, handles every event already queued, then exits. Once the
     /// channel is closed, trade events from the managed books are no longer
     /// processed: they are counted in
@@ -791,7 +839,11 @@ where
             .take()
             .ok_or(ManagerError::ProcessorNotRunning)?;
 
-        if self.trade_sender.send(ProcessorMessage::Shutdown).is_err() {
+        let signalled = self
+            .stop_signal
+            .take()
+            .is_some_and(|stop| stop.send(()).is_ok());
+        if !signalled {
             debug!("trade processor exited before the stop signal (Tokio)");
         }
 
@@ -930,8 +982,7 @@ where
         let symbol_clone = symbol.to_string();
 
         let trade_listener: TradeListener = Arc::new(move |trade_result: &TradeResult| {
-            let message = ProcessorMessage::Trade(trade_event_from(trade_result));
-            if sender.send(message).is_err() {
+            if sender.send(trade_event_from(trade_result)).is_err() {
                 drops.record_drop(&symbol_clone);
             }
         });

@@ -132,26 +132,15 @@ This order book engine is built with the following design principles:
   `encode_book_update` reserve with `Vec::try_reserve` and return
   `Result<(), WireError>` (new `WireError::CapacityOverflow`); the wire
   format is unchanged.
-- **Default trade-id namespace without OS entropy (#265).** Constructors
-  that are not given a namespace derive a UUIDv5 from the symbol, process
-  id, wall-clock nanoseconds and a process-wide checked counter instead of
-  calling the panicking `Uuid::new_v4()`. Namespaces are unique per book
-  within a process and are designed to differ across restarts; a restart
-  that reuses the same process id with the wall clock stepped back to the
-  same nanosecond can repeat one (see `default_trade_id_namespace`), so
-  inject a namespace when cross-restart uniqueness must be guaranteed.
-  Trade-id format and namespace injection for replay are unchanged.
-- **Limitation: level statistics are advisory under concurrent takers
-  (#241).** pricelevel 0.10 supports one concurrent writer of a level's
-  execution statistics, while takers on the shared submit gate (ordinary
-  takers on an `STPMode::None` book, anonymous `match_order` sweeps) can
-  sweep one level at once. A snapshot taken meanwhile can hold a partially
-  recorded execution in `orders_executed` / `quantity_executed` /
-  `value_executed`. Trades, fees, quantities and order vectors are
-  unaffected, totals are exact once the sweeps return, and single-threaded
-  replay (`snapshots_match`) stays exact. Capture with no sweep in flight
-  for exact statistics. No behaviour or API change. See
-  `doc/panic-boundaries.md`.
+- **Book managers are runtime-safe and stoppable (#255).**
+  `BookManagerTokio::start_trade_processor` returns
+  `ManagerError::NoRuntime` outside a Tokio runtime instead of panicking,
+  and `BookManagerStd` reports a refused thread as
+  `ManagerError::ThreadSpawn`. Both managers gain
+  `start_trade_processor_with(handler)`, `stop_trade_processor()` (joins
+  or awaits the processor after it handles queued events; a panic is
+  `ProcessorPanicked`) and `dropped_trade_events()`, plus the
+  `orderbook_manager_trade_events_dropped_total` metric.
 
 #### Migration from 0.13
 
@@ -167,6 +156,9 @@ This order book engine is built with the following design principles:
 | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |
+| `BookManagerStd::start_trade_processor() -> Result<std::thread::JoinHandle<()>, ManagerError>` | `-> Result<(), ManagerError>`; join with `stop_trade_processor()` |
+| `BookManagerTokio::start_trade_processor() -> Result<tokio::task::JoinHandle<()>, ManagerError>` (panics outside a runtime) | `-> Result<(), ManagerError>` (`NoRuntime` outside a runtime); await `stop_trade_processor()` |
+| `ManagerError { ProcessorAlreadyStarted, BookAlreadyExists }` | adds `NoRuntime`, `ThreadSpawn`, `ProcessorNotRunning`, `ProcessorPanicked`, `ProcessorCancelled` |
 | `BincodeEventSerializer` (unit struct) | `BincodeEventSerializer::new()`; `with_max_payload_bytes(n)`; `SerializationError` gains `PayloadTooLarge`, `Truncated` |
 | `BlackScholes::{price, vega, delta, gamma, theta}(params, vol) -> f64` | `-> Result<f64, IVError>` |
 | `BlackScholes::d1(spot, strike, rate, time, vol) -> f64` | `-> Result<f64, IVError>` |
