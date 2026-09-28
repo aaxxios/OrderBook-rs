@@ -3066,6 +3066,74 @@ mod tests {
         }
     }
 
+    /// #252 review: a fill must not reorder a user's resting orders.
+    /// `untrack_order_by_id` used `swap_remove`, so filling the user's first
+    /// order moved their last one to the front and `cancel_orders_by_user`
+    /// no longer followed admission order. The live result is now in
+    /// admission order and replay reconciles it by identity.
+    #[test]
+    fn test_fill_keeps_user_order_admission_order_for_by_user_cancel() {
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let live = OrderBook::<()>::new("FILLUSER");
+        let bids = [(1u64, 100u128), (2, 99), (3, 98), (4, 97)];
+        for (seq, (id, price)) in bids.into_iter().enumerate() {
+            let ev = make_add_event(
+                u64::try_from(seq).expect("seq"),
+                Id::from_u64(id),
+                price,
+                5,
+                Side::Buy,
+            );
+            if let SequencerCommand::AddOrder(order) = &ev.command {
+                live.add_order(*order).expect("live add");
+            }
+            assert!(journal.append(&ev).is_ok());
+        }
+
+        // Fill the user's first (best) bid completely.
+        let taker = Id::from_u64(50);
+        let fill = live
+            .submit_market_order(taker, 5, Side::Sell)
+            .expect("live fill");
+        assert!(
+            live.get_order(Id::from_u64(1)).is_none(),
+            "first bid filled"
+        );
+        assert!(
+            journal
+                .append(&SequencerEvent::<()> {
+                    sequence_num: 4,
+                    timestamp_ns: 0,
+                    command: SequencerCommand::MarketOrder {
+                        id: taker,
+                        quantity: 5,
+                        side: Side::Sell,
+                    },
+                    result: SequencerResult::TradeExecuted {
+                        trade_result: TradeResult::new("FILLUSER".to_string(), fill)
+                            .expect("trade result"),
+                    },
+                })
+                .is_ok()
+        );
+
+        let by_user = live.cancel_orders_by_user(Hash32::zero());
+        assert_eq!(
+            by_user.cancelled_order_ids(),
+            &[Id::from_u64(2), Id::from_u64(3), Id::from_u64(4)],
+            "admission order survives the fill"
+        );
+        append_mass_cancel(
+            &journal,
+            5,
+            SequencerCommand::CancelByUser {
+                user_id: Hash32::zero(),
+            },
+            by_user,
+        );
+        assert_replay_matches(&live, &journal, "FILLUSER");
+    }
+
     #[test]
     fn test_first_difference_positions() {
         assert_eq!(first_difference::<u8>(&[], &[]), None);

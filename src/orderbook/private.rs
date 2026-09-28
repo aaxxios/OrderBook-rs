@@ -149,12 +149,22 @@ where
     /// accessible. The scan is efficient in practice because:
     /// - Each order belongs to exactly one user (early return on first match)
     /// - The number of active users is typically small
+    ///
+    /// The removal preserves the relative order of the user's remaining ids
+    /// (`Vec::remove`, not `swap_remove`): `cancel_orders_by_user` walks this
+    /// list, and replay reconciles its result by id order (#252), so a fill
+    /// must not reorder a user's resting orders. It runs once per filled
+    /// maker; `remove` shifts at most the ids after `pos`, which the
+    /// `position` scan already bounds, so the per-call cost stays linear in
+    /// that user's list.
     pub(super) fn untrack_order_by_id(&self, order_id: &pricelevel::Id) {
         let mut user_to_remove = None;
         for mut entry in self.user_orders.iter_mut() {
             let ids = entry.value_mut();
             if let Some(pos) = ids.iter().position(|id| id == order_id) {
-                ids.swap_remove(pos);
+                // `pos` comes from `position` on this same Vec, so it is in
+                // bounds and `remove` cannot panic.
+                ids.remove(pos);
                 if ids.is_empty() {
                     user_to_remove = Some(*entry.key());
                 }

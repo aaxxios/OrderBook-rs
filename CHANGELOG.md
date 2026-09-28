@@ -114,10 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     zeroes every non-zero byte past the recovered write position (only
     dirty 4 KiB chunks are written, so the sparse tail is not
     materialised) and flushes them. A damaged entry followed by a valid
-    one is corruption inside committed data, not a torn tail: `open`
-    refuses it with `JournalError::CorruptEntry` instead of truncating and
-    later overwriting the valid entries after it. Readers never read past
-    the committed write position of the active segment.
+    one is corruption inside committed data, not a torn tail: reopen scans
+    every offset after the damage (skipping zero runs), and if any valid
+    entry follows, even behind several damaged ones, `open` refuses with
+    `JournalError::CorruptEntry` (or `InvalidEntryHeader`) and leaves the
+    file unchanged instead of truncating and later overwriting the valid
+    entries. Readers never read past the committed write position of the
+    active segment, and an active segment whose file is shorter than that
+    position (an external truncation, even on an entry boundary) is
+    `InvalidEntryHeader` instead of a silently shorter replay.
   - The writer's segment, `last_seq` and active segment start now live
     under one mutex, so `last_seq` is updated under the same guard as the
     durable write and cannot be left behind by a poisoned second lock;
@@ -146,6 +151,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   book outcomes, and are not compared. A live mass cancel with per-order
   failures normally stops replay here by design (a fresh replay book does
   not reproduce the level fault).
+- **A fill no longer reorders a user's resting orders (#252).** Removing a
+  filled maker from the `user_orders` index used `swap_remove`, which moved
+  the user's last order into the filled one's slot, so
+  `cancel_orders_by_user` did not follow admission order as documented. The
+  removal now preserves order (`Vec::remove`; still linear in that user's
+  list, as the lookup already was). Replay was consistent with the live
+  book either way; with identity reconciliation the documented order
+  matters wherever the index is rebuilt differently.
 
 - **Default trade-id namespace no longer reads panicking OS entropy
   (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
@@ -371,6 +384,11 @@ change.
     the damage, and a journal with duplicate stored sequences fails
     `verify_integrity`. Reopen can take longer on large segments: it reads
     the unused tail once to zero stale bytes.
+  - Journals written before 0.10.2 (#190), when the id order inside a
+    journaled `MassCancelled` was not reproducible across processes, now
+    fail replay loudly with `ReplayError::MassCancelMismatch` at the first
+    such mass cancel instead of passing on equal counts. Re-record them, or
+    replay them with a build before 0.14.
 
 - **pricelevel upgraded to 0.10 (#239).** The crate version moves to
   0.14.0. pricelevel 0.10 makes level snapshots, queue views, dry runs and

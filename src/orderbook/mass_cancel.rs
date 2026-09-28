@@ -719,8 +719,10 @@ where
     ///
     /// [`MassCancelResult::cancelled_order_ids`] follows the user's
     /// **admission-history order**: the `user_orders` index is a `Vec<Id>`
-    /// appended to (never reordered) as each of the user's orders is admitted
-    /// (`track_user_order`), and this method walks a copy of that `Vec`. Under a
+    /// appended to as each of the user's orders is admitted
+    /// (`track_user_order`); cancels, fills and modifies take ids out in
+    /// place without reordering the ids that remain (`retain` / `Vec::remove`,
+    /// #252), and this method walks a copy of that `Vec`. Under a
     /// serialized command stream — as replayed from the journal — that ordering
     /// is fixed and byte-identical across processes, so the emitted
     /// `SequencerResult::MassCancelled` payload is replay-stable without any
