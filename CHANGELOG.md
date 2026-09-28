@@ -70,8 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     instead of panicking; release builds still skip it.
   - The per-level budget (`remaining - executed`, the quote-notional
     `price × executed` deduction, lot rounding, the `u128` to `u64` level
-    cap) uses checked forms and `u64::try_from`. A breach of these
-    invariants aborts the sweep with its committed prefix
+    cap) uses checked forms and `u64::try_from`. These invariants cannot
+    fail on a valid book (the level cap is derived from the same budget
+    the deduction checks against), so valid traffic and existing journals
+    replay unchanged; a breach, which can only come from already corrupt
+    state, aborts the sweep with its committed prefix
     (`OrderBookError::MatchAborted`) instead of being clamped.
   - Quote-notional normalization no longer returns the un-normalized
     result, with its `u64::MAX` working bound in `remaining_quantity()`,
