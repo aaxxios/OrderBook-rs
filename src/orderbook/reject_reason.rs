@@ -125,6 +125,9 @@ pub enum RejectReason {
     /// A cancel-then-add modify's re-add failed before any trade after the
     /// original was cancelled; the original was restored at the back of
     /// its level (#247). Carried by `OrderBookError::ModifyRolledBack`.
+    /// The order is live and unchanged, so protocol adapters answer the
+    /// modify as a plain reject (FIX `35=9`), but its time priority was
+    /// lost: report that priority change separately.
     ModifyRolledBack = 20,
     /// A cancel-then-add modify's re-add failed after the original was
     /// cancelled and the order is gone: it traded first, or the original
@@ -311,6 +314,7 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::NotionalOverflow { .. } => Self::NotionalOverflow,
             OrderBookError::ModifyRolledBack { .. } => Self::ModifyRolledBack,
             OrderBookError::ModifyOrderLost { .. } => Self::ModifyOrderLost,
+            OrderBookError::OrderChangedDuringModify { .. } => Self::Other(0),
             OrderBookError::PriceLevelError(_) => Self::Other(0),
             OrderBookError::OrderNotFound(_) => Self::Other(0),
             OrderBookError::InvalidOperation { .. } => Self::Other(0),

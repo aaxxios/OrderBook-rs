@@ -1349,7 +1349,9 @@ where
         // Batch remove empty price levels
         let levels_removed = !empty_price_levels.is_empty();
         for price in &empty_price_levels {
-            match_side.remove(price);
+            // #247: re-checked under the price's stripe, so a level a
+            // concurrent submit refilled after the sweep emptied it stays.
+            self.remove_level_if_empty(side.opposite(), *price);
         }
         if levels_removed {
             // Refresh the operational depth gauges now that levels may

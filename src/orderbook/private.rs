@@ -81,7 +81,9 @@ where
             Side::Sell => &self.asks,
         };
 
-        // Get or create the price level
+        // Get or create the price level and admit under the price's stripe,
+        // so a concurrent empty-level removal cannot unlink it (#247).
+        let stripe = self.lock_level(price);
         let price_level = book_side
             .get_or_insert(price, Arc::new(PriceLevel::new(price)))
             .value()
@@ -90,6 +92,7 @@ where
         // Convert OrderType<T> to OrderType<()> for compatibility with current PriceLevel API
         let unit_order = self.convert_to_unit_type(&*order);
         let _added_order = price_level.add_order(unit_order)?;
+        drop(stripe);
 
         // notify price level changes
         self.emit_level_changed(side, &price_level);

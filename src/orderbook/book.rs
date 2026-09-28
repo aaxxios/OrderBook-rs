@@ -396,6 +396,28 @@ pub struct OrderBook<T = ()> {
     /// synchronous).
     pub(super) submit_gate: std::sync::RwLock<()>,
 
+    /// Striped per-price lock serialising the two operations that can race
+    /// on a price level's **existence** under the shared submit gate
+    /// (#247, Copilot on #285): admitting an order into a level
+    /// (`get_or_insert` + `PriceLevel::add_order`) and removing a level
+    /// that became empty from the bid / ask map.
+    ///
+    /// Without it, a remover could read `order_count() == 0`, a concurrent
+    /// submit could then admit into the same `Arc<PriceLevel>` it had just
+    /// looked up, and the remover's `SkipMap::remove` would unlink the level
+    /// with that live order inside: indexed in `order_locations` but
+    /// unreachable through `bids` / `asks`. Holding the stripe of the price
+    /// for both makes them mutually exclusive, so a level is removed only
+    /// while it is empty and nobody can be admitting into it; see
+    /// [`Self::remove_level_if_empty`].
+    ///
+    /// Matching and in-place updates never add orders and take no stripe.
+    /// A stripe is held only for one level operation, never across a
+    /// sweep, a listener call or another lock, so it cannot deadlock.
+    /// `std::sync::Mutex` over `()`: uncontended except for two operations
+    /// at prices sharing a stripe at the same instant.
+    pub(super) level_locks: [std::sync::Mutex<()>; LEVEL_LOCK_STRIPES],
+
     /// Test-only interleaving point for the per-level self-trade-prevention
     /// scan (#225).
     ///
@@ -444,6 +466,14 @@ pub struct OrderBook<T = ()> {
     /// admission fail with nothing mutated. pricelevel 0.10 has no public
     /// way to make a level refuse an admission on demand. Like its siblings
     /// it exists only in `cfg(test)` builds.
+    #[cfg(test)]
+    pub(super) modify_interleave_hook: Option<ModifyInterleaveHook<T>>,
+
+    /// Test-only fault injection for resting an order on its price level
+    /// (#247); see `rest_fault_hook`. The sibling `modify_interleave_hook`
+    /// fires inside a cancel-then-add modify just before and just after the
+    /// cancel, with the book, so a test can land a concurrent mutation in
+    /// either window.
     #[cfg(test)]
     pub(super) rest_fault_hook:
         Option<std::sync::Arc<dyn Fn(Id) -> Option<pricelevel::PriceLevelError> + Send + Sync>>,
@@ -810,6 +840,7 @@ where
             trade_ids_exhausted: AtomicBool::new(false),
             engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            level_locks: std::array::from_fn(|_| std::sync::Mutex::new(())),
             #[cfg(test)]
             stp_interleave_hook: None,
             #[cfg(test)]
@@ -818,6 +849,8 @@ where
             cancel_fault_hook: None,
             #[cfg(test)]
             rest_fault_hook: None,
+            #[cfg(test)]
+            modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1288,6 +1321,58 @@ where
             .check_limit_admission(account, price, quantity, reference)
     }
 
+    /// Lock the [`Self::level_locks`] stripe of `price` (#247). Poisoning
+    /// can only follow a panic that unwound while a stripe was held; the
+    /// protected data is `()`, so recovery is always safe (logged, as for
+    /// the submit gate). `None` is unreachable: the stripe index is
+    /// `price % LEVEL_LOCK_STRIPES`, always in range.
+    pub(super) fn lock_level(&self, price: u128) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let stripe = u128::try_from(LEVEL_LOCK_STRIPES)
+            .ok()
+            .and_then(|stripes| price.checked_rem(stripes))
+            .and_then(|index| usize::try_from(index).ok())?;
+        let lock = self.level_locks.get(stripe)?;
+        Some(lock.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("price level stripe lock poisoned by a prior panic; recovering");
+            poisoned.into_inner()
+        }))
+    }
+
+    /// Removes the `side` level at `price` from the bid / ask map if, and
+    /// only if, it is empty (#247). Returns whether a level was removed.
+    ///
+    /// This is the single place that unlinks a level while the book can be
+    /// admitting concurrently: it holds the price's stripe, so no admission
+    /// into the level can interleave (see [`Self::level_locks`]), and it
+    /// re-reads the level **under** that stripe rather than trusting an
+    /// earlier `order_count()` read or a remembered `Arc`: a level emptied
+    /// earlier may have been refilled, or removed and re-created by someone
+    /// else, and a non-empty level is never removed. The depth gauges are
+    /// the caller's to refresh.
+    pub(super) fn remove_level_if_empty(&self, side: Side, price: u128) -> bool {
+        let levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let _stripe = self.lock_level(price);
+        Self::remove_empty_level_locked(levels, price)
+    }
+
+    /// [`Self::remove_level_if_empty`] for a caller that already holds the
+    /// stripe of `price` (the mutex is not reentrant).
+    pub(super) fn remove_empty_level_locked(
+        levels: &crossbeam_skiplist::SkipMap<u128, Arc<PriceLevel>>,
+        price: u128,
+    ) -> bool {
+        let Some(entry) = levels.get(&price) else {
+            return false;
+        };
+        if entry.value().order_count() != 0 {
+            return false;
+        }
+        entry.remove()
+    }
+
     /// Acquire the shared (read) side of the submit gate (#209). Poisoning
     /// can only occur if a panic unwound while a guard was held; the
     /// protected data is `()` so recovery is always safe — log and
@@ -1687,6 +1772,7 @@ where
             trade_ids_exhausted: AtomicBool::new(false),
             engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            level_locks: std::array::from_fn(|_| std::sync::Mutex::new(())),
             #[cfg(test)]
             stp_interleave_hook: None,
             #[cfg(test)]
@@ -1695,6 +1781,8 @@ where
             cancel_fault_hook: None,
             #[cfg(test)]
             rest_fault_hook: None,
+            #[cfg(test)]
+            modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1749,6 +1837,7 @@ where
             trade_ids_exhausted: AtomicBool::new(false),
             engine_seq_exhausted: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            level_locks: std::array::from_fn(|_| std::sync::Mutex::new(())),
             #[cfg(test)]
             stp_interleave_hook: None,
             #[cfg(test)]
@@ -1757,6 +1846,8 @@ where
             cancel_fault_hook: None,
             #[cfg(test)]
             rest_fault_hook: None,
+            #[cfg(test)]
+            modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -6090,6 +6181,16 @@ struct PreparedSnapshotLevels {
     /// config.
     risk: Option<RiskRebuild>,
 }
+
+/// Number of [`OrderBook::level_locks`] stripes (#247). A power of two
+/// large enough that two unrelated prices rarely share one.
+pub(super) const LEVEL_LOCK_STRIPES: usize = 64;
+
+/// Test-only hook fired inside a cancel-then-add modify (#247); see
+/// `OrderBook::modify_interleave_hook`.
+#[cfg(test)]
+pub(super) type ModifyInterleaveHook<T> =
+    std::sync::Arc<dyn Fn(&OrderBook<T>, Id, super::modifications::ModifyPhase) + Send + Sync>;
 
 /// Test-only failure injected into a single-order cancel (#248); see
 /// `OrderBook::cancel_fault_hook`.

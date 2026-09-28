@@ -18,7 +18,7 @@
 #[cfg(test)]
 mod tests {
     use crate::orderbook::book::{CancelFault, OrderBook};
-    use crate::orderbook::modifications::OrderQuantity;
+    use crate::orderbook::modifications::{Admission, ModifyPhase, OrderQuantity, ReAddQuantity};
     use crate::orderbook::order_state::{CancelReason, OrderStateTracker, OrderStatus};
     use crate::orderbook::reject_reason::RejectReason;
     use crate::orderbook::risk::RiskConfig;
@@ -358,7 +358,8 @@ mod tests {
             timestamp: TimestampMs::new(0),
             extra_fields: (),
         };
-        let result = book.cancel_then_readd(id(1), fok);
+        let snapshot = book.get_order(id(1)).expect("resting");
+        let result = book.cancel_then_readd(id(1), &snapshot, fok, ReAddQuantity::Explicit);
         assert!(matches!(
             result,
             Err(OrderBookError::InvalidOperation { .. })
@@ -523,6 +524,269 @@ mod tests {
         assert_indexed(&book, 10, user(1));
         assert_eq!(book.order_status(id(10)), Some(OrderStatus::Open));
         assert_gone(&book, 20);
+    }
+
+    // --- concurrent mutations inside the modify (review of #285) ------------
+
+    fn standard(raw: u64, price: u128, qty: u64, side: Side, owner: Hash32) -> OrderType<()> {
+        OrderType::Standard {
+            id: id(raw),
+            price: Price::new(price),
+            quantity: Quantity::new(qty),
+            side,
+            time_in_force: TimeInForce::Gtc,
+            user_id: owner,
+            timestamp: TimestampMs::new(0),
+            extra_fields: (),
+        }
+    }
+
+    /// Runs `action` once, the first time a cancel-then-add modify reaches
+    /// `phase`. The action admits orders through the ungated inner path:
+    /// the modify already holds the submit gate.
+    fn on_modify(book: &mut OrderBook<()>, phase: ModifyPhase, action: fn(&OrderBook<()>)) {
+        let fired = Arc::new(AtomicUsize::new(0));
+        book.modify_interleave_hook = Some(Arc::new(move |book, _, at| {
+            if at == phase && fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                action(book);
+            }
+        }));
+    }
+
+    fn admit(book: &OrderBook<()>, order: OrderType<()>) {
+        book.add_order_inner(order, false, false, Admission::Submit)
+            .map(|_| ())
+            .map_err(|failure| failure.into_submit().error)
+            .expect("concurrent admission");
+    }
+
+    /// MUST 1: an opposite order that lands between the cancel and the
+    /// restore at the original's price must not let the engine rest the
+    /// original into a locked book.
+    #[test]
+    fn test_restore_that_would_lock_the_book_is_refused() {
+        let mut book = tracked_book();
+        let bid = OrderType::PostOnly {
+            id: id(1),
+            price: Price::new(100),
+            quantity: Quantity::new(5),
+            side: Side::Buy,
+            user_id: user(1),
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
+        };
+        book.add_order(bid).expect("post-only bid rests");
+        // After the cancel a sell rests at 100: the post-only re-add at 101
+        // now crosses (no trade), and restoring the bid at 100 would lock.
+        on_modify(&mut book, ModifyPhase::AfterCancel, |book| {
+            admit(book, standard(2, 100, 5, Side::Sell, user(2)));
+        });
+
+        let result = book.update_order(OrderUpdate::UpdatePrice {
+            order_id: id(1),
+            new_price: Price::new(101),
+        });
+        assert!(matches!(
+            &result,
+            Err(OrderBookError::ModifyOrderLost {
+                executed_quantity: 0,
+                source,
+                restore_error: Some(restore),
+                ..
+            }) if matches!(source.as_ref(), OrderBookError::PriceCrossing { .. })
+                && matches!(restore.as_ref(), OrderBookError::PriceCrossing { .. })
+        ));
+        assert_gone(&book, 1);
+        assert!(book.bids.is_empty(), "nothing rests at the locking price");
+        assert_eq!(book.best_ask(), Some(100));
+        assert_eq!(
+            book.order_status(id(1)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 0,
+                reason: CancelReason::RestFailed,
+            })
+        );
+    }
+
+    /// MUST 3: a taker fills 4 of 10 between the modify's read and its
+    /// cancel. `UpdatePrice` re-adds the cancelled remainder (6), never the
+    /// 10 it read, and the state counts the raced fill.
+    #[test]
+    fn test_update_price_readds_the_remainder_after_a_concurrent_fill() {
+        let mut book = tracked_book();
+        rest(&book, 1, 100, 10, Side::Sell, user(1));
+        on_modify(&mut book, ModifyPhase::BeforeCancel, |book| {
+            admit(book, standard(9, 100, 4, Side::Buy, user(9)));
+        });
+
+        let moved = book
+            .update_order(OrderUpdate::UpdatePrice {
+                order_id: id(1),
+                new_price: Price::new(101),
+            })
+            .expect("re-priced")
+            .expect("order found");
+        assert_eq!(moved.total_quantity().ok(), Some(6), "no quantity created");
+        assert_eq!(moved.price(), Price::new(101));
+        assert_eq!(
+            book.asks.get(&101).map(|l| l.value().visible_quantity()),
+            Some(6)
+        );
+        assert!(book.asks.get(&100).is_none());
+        assert_indexed(&book, 1, user(1));
+        assert_eq!(
+            book.order_status(id(1)),
+            Some(OrderStatus::PartiallyFilled {
+                original_quantity: 10,
+                filled_quantity: 4,
+            })
+        );
+    }
+
+    /// MUST 3: with an explicit new quantity the modify is not applied to
+    /// an order that changed under it; the remainder is restored.
+    #[test]
+    fn test_explicit_quantity_modify_after_a_concurrent_fill_rolls_back() {
+        for update in [
+            OrderUpdate::Replace {
+                order_id: id(1),
+                price: Price::new(101),
+                quantity: Quantity::new(8),
+                side: Side::Sell,
+            },
+            OrderUpdate::UpdatePriceAndQuantity {
+                order_id: id(1),
+                new_price: Price::new(101),
+                new_quantity: Quantity::new(8),
+            },
+        ] {
+            let mut book = tracked_book();
+            rest(&book, 1, 100, 10, Side::Sell, user(1));
+            on_modify(&mut book, ModifyPhase::BeforeCancel, |book| {
+                admit(book, standard(9, 100, 4, Side::Buy, user(9)));
+            });
+
+            let result = book.update_order(update);
+            assert!(matches!(
+                &result,
+                Err(OrderBookError::ModifyRolledBack { source, .. })
+                    if matches!(
+                        source.as_ref(),
+                        OrderBookError::OrderChangedDuringModify {
+                            read_quantity: 10,
+                            cancelled_quantity: 6,
+                            ..
+                        }
+                    )
+            ));
+            let restored = book.get_order(id(1)).expect("restored");
+            assert_eq!(restored.price(), Price::new(100));
+            assert_eq!(
+                restored.total_quantity().ok(),
+                Some(6),
+                "no quantity created"
+            );
+            assert!(book.asks.get(&101).is_none());
+            assert_indexed(&book, 1, user(1));
+        }
+    }
+
+    /// MUST 2: a lost order's terminal `filled_quantity` counts the
+    /// original's fills (4 of 10 as a taker) plus the re-add's (3).
+    #[test]
+    fn test_lost_order_terminal_state_is_cumulative() {
+        let mut book = tracked_book();
+        rest(&book, 9, 100, 4, Side::Buy, user(9));
+        rest(&book, 1, 100, 10, Side::Sell, user(1));
+        assert_eq!(
+            book.order_status(id(1)),
+            Some(OrderStatus::PartiallyFilled {
+                original_quantity: 10,
+                filled_quantity: 4,
+            })
+        );
+        rest(&book, 2, 99, 3, Side::Buy, user(2));
+        fail_admissions(&mut book, 1, |_| true);
+
+        let result = book.update_order(OrderUpdate::UpdatePrice {
+            order_id: id(1),
+            new_price: Price::new(99),
+        });
+        assert!(matches!(
+            &result,
+            Err(OrderBookError::ModifyOrderLost {
+                executed_quantity: 3,
+                restore_error: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            book.order_status(id(1)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 7,
+                reason: CancelReason::RestFailed,
+            })
+        );
+        assert_gone(&book, 1);
+    }
+
+    /// A successful re-price keeps the original's fill history instead of
+    /// resetting it to `Open`.
+    #[test]
+    fn test_readd_keeps_the_fill_history() {
+        let book = tracked_book();
+        rest(&book, 9, 100, 4, Side::Buy, user(9));
+        rest(&book, 1, 100, 10, Side::Sell, user(1));
+        book.update_order(OrderUpdate::UpdatePrice {
+            order_id: id(1),
+            new_price: Price::new(105),
+        })
+        .expect("re-priced");
+        assert_eq!(
+            book.order_status(id(1)),
+            Some(OrderStatus::PartiallyFilled {
+                original_quantity: 10,
+                filled_quantity: 4,
+            })
+        );
+    }
+
+    /// SHOULD: a rolled-back modify records no `Rejected` state for the
+    /// failed re-add: the listener sees the cancel and the restore only.
+    #[test]
+    fn test_rollback_records_no_rejection_for_the_readd() {
+        let mut book = tracked_book();
+        rest(&book, 1, 100, 5, Side::Sell, user(1));
+        fail_admissions(&mut book, 1, |attempt| attempt == 0);
+
+        let result = book.update_order(OrderUpdate::UpdatePrice {
+            order_id: id(1),
+            new_price: Price::new(101),
+        });
+        assert!(matches!(
+            result,
+            Err(OrderBookError::ModifyRolledBack { .. })
+        ));
+        let history: Vec<OrderStatus> = book
+            .order_state_tracker
+            .as_ref()
+            .and_then(|t| t.get_history(id(1)))
+            .expect("history")
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect();
+        assert_eq!(
+            history,
+            vec![
+                OrderStatus::Open,
+                OrderStatus::Cancelled {
+                    filled_quantity: 0,
+                    reason: CancelReason::UserRequested,
+                },
+                OrderStatus::Open,
+            ]
+        );
     }
 
     // --- replay ------------------------------------------------------------------

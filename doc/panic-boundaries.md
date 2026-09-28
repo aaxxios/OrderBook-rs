@@ -391,6 +391,40 @@ book resolves every such failure instead of losing the order silently:
   recorded when the failure is a duplicate id: that id's state belongs to
   the live order that owns it.
 
+The restore only rests, it never matches. Under the shared gate an
+opposite order can arrive between the cancel and the restore at a price
+the original now crosses or locks (a post-only bid at 100 re-priced to 101,
+a sell resting at 100 meanwhile, the re-add refused as post-only); resting
+the original there would have the engine itself create a locked or crossed
+book. The restore is then refused with `PriceCrossing` and the order is
+reported lost (`restore_error: PriceCrossing`, `Cancelled { RestFailed }`).
+
+A concurrent taker can also fill part of the order between the modify's
+read and its cancel. The re-add is built from the order the cancel
+**returned**, never from the earlier read, so no quantity is created:
+`UpdatePrice` moves the cancelled remainder; `UpdatePriceAndQuantity` and
+`Replace`, whose explicit quantity was chosen against a state that no
+longer exists, restore the remainder and return `ModifyRolledBack` with
+source `OrderChangedDuringModify` (the conservative option: the caller
+decides what to do with the smaller order).
+
+`filled_quantity` is cumulative in every state a re-add records (the fills
+the order-state tracker knew for the original, plus fills that raced the
+modify, plus the re-add's own). `ModifyOrderLost::executed_quantity` is the
+re-add's fills only. The tracker does not record a resting maker's partial
+fills, so "known fills" means what it recorded (a taker's pre-rest fills),
+the same convention every cancel follows.
+
+Order-state listener sequence on a rollback: `Cancelled { UserRequested }`
+for the cancel, then the restored status. A re-add failure the modify
+resolves records no `Rejected` state or reject metric of its own; a
+failure raised inside the re-add's sweep (a self-trade-prevention cancel
+with no fill, a failed post-only probe, an abort with an empty prefix) is
+recorded by the sweep and then overwritten by the restored status. For a
+protocol adapter a rollback answers the modify as a plain reject (FIX
+`35=9`, order unchanged), but the order lost its time priority, which the
+adapter must report separately.
+
 A cancel that finds the order already gone (filled or cancelled
 concurrently) returns `Ok(None)` and re-adds nothing. The fill-or-kill
 guard on the re-add is a typed `InvalidOperation` raised before the
@@ -408,6 +442,36 @@ so the re-execution normally succeeds and replay stops with
 `ReplayError::OutcomeMismatch` **by design**: loud, never a silent
 divergence. A sequencer feeding a single writer only meets them on
 resource failures.
+
+**Known limitation.** Replay stops at any journal containing a rollback or
+a lost-order modify whose cause does not reproduce on the replay book,
+which is every cause except a deterministic resource failure. Such a
+journal is replayable only up to that event; recover from a snapshot taken
+after it.
+
+## Empty price-level removal (#247)
+
+A level that becomes empty is removed from the bid / ask map by the
+single-order cancel, the in-place `UpdateQuantity`, the sweep's drain of
+emptied levels and the cleanup of a failed rest. Under the shared submit
+gate a concurrent submit can admit into the same `Arc<PriceLevel>` after
+the remover saw it empty; an unconditional `SkipMap::remove` then unlinked
+the level with that live order inside, indexed in `order_locations` but
+unreachable through `bids` / `asks`.
+
+Design: every admission into a level (`get_or_insert` plus
+`PriceLevel::add_order`) and every removal of an emptied level run under a
+striped per-price `std::sync::Mutex<()>` (`OrderBook::level_locks`, 64
+stripes by `price % 64`), and the removal re-reads the level under the
+stripe (`OrderBook::remove_level_if_empty`): it removes the entry only if it
+is still empty, so a refilled level, or one removed and re-created by
+someone else, is left in place. Matching and in-place updates never add
+orders and take no stripe. A stripe is held for one level operation only,
+never across a sweep, a listener call or another lock, so it cannot
+deadlock; poisoning is recovered like the submit gate's (the data is
+`()`). Mass cancels and eviction run under the exclusive gate and were
+already safe. Cost: one uncontended mutex per rested order and per
+removed level.
 
 ## Ratchet
 

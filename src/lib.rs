@@ -234,7 +234,10 @@
 //!   A remainder that cannot rest after trades ends
 //!   `Cancelled { RestFailed }`, and a failed self-trade-prevention maker
 //!   cancel aborts the sweep (`MatchAborted`). `OrderQuantity::total_quantity`
-//!   is checked and `PriceCrossing::opposite_price` is an `Option`.
+//!   is checked and `PriceCrossing::opposite_price` is an `Option`. A modify
+//!   never creates quantity when a fill races it, never restores into a
+//!   locked book, and keeps `filled_quantity` cumulative; an emptied price
+//!   level is never removed while a concurrent submit is admitting into it.
 //!
 //! ### Migration from 0.13
 //!
@@ -316,6 +319,8 @@
 //! | `RejectReason` codes 1 to 19 | adds `ModifyRolledBack` (20), `ModifyOrderLost` (21) |
 //! | `CancelReason` (9 variants) | adds `RestFailed` (exhaustive matches need an arm) |
 //! | remainder not rested after trades: no terminal state | `Cancelled { filled_quantity, reason: RestFailed }` |
+//! | modify after a concurrent partial fill: re-add rested the quantity read before it | `UpdatePrice` moves the remainder; `UpdatePriceAndQuantity` / `Replace`: `Err(ModifyRolledBack { source: OrderChangedDuringModify, .. })` |
+//! | re-priced partially filled order: state reset to `Open` | `PartiallyFilled` with cumulative quantities |
 //!
 //! Re-exported pricelevel items change with pricelevel 0.10:
 //! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

@@ -404,6 +404,27 @@ change.
     every `saturating_*` and raw arithmetic in `modifications.rs` is
     checked or an exact case analysis. `modifications.rs` leaves both
     panic-policy ledgers.
+  - Review of #285: a rolled-back modify never restores the original into
+    a crossed or locked book (an opposite order that arrived after the
+    cancel makes the restore fail with `PriceCrossing`: `ModifyOrderLost`,
+    `Cancelled { RestFailed }`). The re-add is built from the order the
+    cancel returned, so a concurrent fill between the modify's read and its
+    cancel no longer creates quantity (pre-existing on main): `UpdatePrice`
+    moves the remainder, `UpdatePriceAndQuantity` / `Replace` roll back
+    with source `OrderChangedDuringModify`. `filled_quantity` in every
+    state a re-add records is cumulative (the original's known fills plus
+    the re-add's), and a re-add failure the modify resolves records no
+    `Rejected` state or reject metric.
+- **Emptied price levels can no longer unlink a concurrent admission
+  (#247, Copilot on #285).** Under the shared submit gate the single-order
+  cancel, `UpdateQuantity`, the sweep's drain and a failed rest's cleanup
+  removed a level they had seen empty without re-checking, so an order a
+  concurrent submit admitted into it in between was left indexed but
+  unreachable (pre-existing on main). Admissions into a level and
+  removals of emptied levels now run under a striped per-price lock and
+  the removal re-checks emptiness under it
+  (`OrderBook::remove_level_if_empty`). Cost: one uncontended mutex per
+  rested order and per removed level.
 
 ### Changed
 
@@ -501,7 +522,8 @@ change.
   - `OrderBookError::PriceCrossing::opposite_price`: `u128` →
     `Option<u128>`; `None` where `0` used to stand for an opposite side
     that emptied before the error was built.
-  - `OrderBookError` gains `ModifyRolledBack` and `ModifyOrderLost`;
+  - `OrderBookError` gains `ModifyRolledBack`, `ModifyOrderLost` and
+    `OrderChangedDuringModify` (only ever the source of the first two);
     `RejectReason` gains `ModifyRolledBack` (20) and `ModifyOrderLost`
     (21); `CancelReason` gains `RestFailed`, appended last so the bincode
     index of every earlier variant is unchanged (exhaustive matches on
@@ -512,7 +534,9 @@ change.
     takers see different numbers.
   - Behaviour: `update_order(Cancel)` now records `Cancelled
     { UserRequested }` and releases the order's risk contribution, like
-    `cancel_order`. A modify re-add is no longer rejected by a kill switch
+    `cancel_order`. A re-priced order keeps its fill history: its state is
+    `PartiallyFilled` with cumulative quantities instead of resetting to
+    `Open`. A modify re-add is no longer rejected by a kill switch
     engaged, or a risk limit consumed, after the modify's own checks
     passed.
   - Replay: `SequencerResult::from(&err)` records both new variants as

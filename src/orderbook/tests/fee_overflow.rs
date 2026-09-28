@@ -652,7 +652,15 @@ mod tests {
             arithmetic_verified_price: 42,
         };
         let failure = book
-            .add_order_inner(crossing, false, false, Admission::ReAdd(verdict))
+            .add_order_inner(
+                crossing,
+                false,
+                false,
+                Admission::ReAdd {
+                    verdict,
+                    prior_filled: 0,
+                },
+            )
             .expect_err("the backstop refuses the unpriceable level");
         assert!(
             matches!(

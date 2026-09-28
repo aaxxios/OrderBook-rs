@@ -6,6 +6,7 @@ mod error;
 mod fee_overflow;
 mod iterator_tests;
 mod journal_compat_0_13;
+mod level_removal_race;
 mod lot_size_validation;
 mod market_impact_tests;
 mod market_metrics;
