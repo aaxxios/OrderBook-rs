@@ -348,6 +348,67 @@ unreachable for the trades it commits:
   `orderbook_match_fold_failures_total`), which therefore covers both
   un-foldable level prefixes (#240) and un-buildable trade results (#244).
 
+## Modify rollback and lost orders (#247)
+
+`UpdatePrice`, `UpdatePriceAndQuantity` and `Replace` are cancel-then-add.
+Every admission check runs on the projected order **before** the original
+is cancelled (shape, trade-id and fee / notional preflights, modify-aware
+risk, the #168 STP self-cross and #230 reserve-residual dry runs), and the
+re-add takes that verdict as its admission: it does not re-run the kill
+switch, the risk limits or the shape checks, so a kill switch engaged, a
+risk limit consumed or a clock tick between the checks and the re-add
+cannot fail it. A re-add can still fail after the cancel on a concurrent
+mutation under the shared submit gate (the id taken by another submit, a
+post-only now crossing) or a resource the book cannot observe beforehand
+(a level refusing the admission, a refused allocation, a sweep abort). The
+book resolves every such failure instead of losing the order silently:
+
+- **`OrderBookError::ModifyRolledBack` (reject code 20).** The re-add
+  failed before any trade. The original is re-rested with the same id,
+  price, quantity (as it was when cancelled) and timestamp, its risk
+  contribution is reserved again, special-order tracking is re-registered
+  and its order state is set back to what it was before the modify
+  (`Open` when it had none). It rests at the **back** of its level's queue:
+  pricelevel 0.10 assigns a fresh insertion sequence and has no public way
+  to reinstate the old one, so **time priority is lost**. The cancel and
+  re-add level events were emitted. `source` carries the re-add's error.
+- **`OrderBookError::ModifyOrderLost` (reject code 21).** The order is
+  gone, with every index consistent (no location, user-index or risk entry;
+  any level the attempt created is removed). Two shapes:
+  - the re-add traded and then failed (its remainder could not rest, or
+    self-trade prevention cancelled it): `executed_quantity > 0`,
+    `restore_error: None`. The trades are real, so restoring the original
+    would double-count them. A re-add sweep aborted by a failed level after
+    trading keeps reporting `MatchAborted` (#240) instead;
+  - the re-add failed before trading and the restore failed too:
+    `executed_quantity == 0`, `restore_error` says why.
+- **`CancelReason::RestFailed`.** The terminal state of an order the book
+  could not rest after accepting it: a lost modify whose restore failed
+  (`Cancelled { filled_quantity: prior fills, RestFailed }`), and any submit
+  whose remainder the level or the risk reservation refused after the sweep
+  traded (`Cancelled { filled_quantity: executed, RestFailed }`; a taker
+  that did not trade is `Rejected` under the error's code). No state is
+  recorded when the failure is a duplicate id: that id's state belongs to
+  the live order that owns it.
+
+A cancel that finds the order already gone (filled or cancelled
+concurrently) returns `Ok(None)` and re-adds nothing. The fill-or-kill
+guard on the re-add is a typed `InvalidOperation` raised before the
+cancel. The self-trade-prevention maker cancel (`CancelMaker` /
+`CancelBoth`) resolves a level failure like #248's single-order cancel
+(the maker still rests, or the book completes the removal) and then stops
+the sweep with the #240 abort semantics.
+
+**Replay.** `SequencerResult::from(&err)` records both variants as
+`RejectedWithCode` with `may_have_mutated: true`, and replay re-executes an
+`UpdateOrder` journaled under code 20 or 21 (as under `MatchAborted`)
+instead of skipping it, since the live book did change. Their causes (a
+concurrent mutation, a level or allocator failure) are not in the journal,
+so the re-execution normally succeeds and replay stops with
+`ReplayError::OutcomeMismatch` **by design**: loud, never a silent
+divergence. A sequencer feeding a single writer only meets them on
+resource failures.
+
 ## Ratchet
 
 Three ledgers, all mechanically enforced (`make lint`), all shrink-only:
