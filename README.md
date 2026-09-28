@@ -132,6 +132,12 @@ This order book engine is built with the following design principles:
   `encode_book_update` reserve with `Vec::try_reserve` and return
   `Result<(), WireError>` (new `WireError::CapacityOverflow`); the wire
   format is unchanged.
+- **Default trade-id namespace without OS entropy (#265).** Constructors
+  that are not given a namespace derive a UUIDv5 from the symbol, process
+  id, wall-clock nanoseconds and a process-wide checked counter instead of
+  calling the panicking `Uuid::new_v4()`. Namespaces stay unique per book
+  and across restarts; trade-id format and namespace injection for replay
+  are unchanged.
 
 #### Migration from 0.13
 

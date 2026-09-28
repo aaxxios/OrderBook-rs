@@ -54,7 +54,7 @@ exception.
 | `dashmap::DashMap` | Order index, symbol registries (`manager.rs`) | Internal `RandomState` hasher panics are not part of its public contract; growth (`RawTable` resize) aborts the process on allocator OOM, not a Rust panic | No known panic path from crate-internal usage (keys are `Id`/`String`, never attacker-controlled hash-flooding input in the trusted-input model this crate assumes) |
 | `crossbeam-skiplist::SkipMap` | Price-level index (`PriceLevelCache`, book side maps) | Node allocation aborts the process on allocator OOM, not a Rust panic | Same allocator-OOM caveat as `DashMap` |
 | `crossbeam::queue::SegQueue` | (if used on a hot path) | Allocator OOM only | — |
-| `std::collections::hash_map::RandomState` | Default hasher for the above | Does not panic in normal operation | — |
+| `std::collections::hash_map::RandomState` | Default hasher for the above and for every `HashMap`/`HashSet` (`DashMap::new`, `HashMap::new`) | Seeds its keys from OS entropy the first time a thread builds one; `std` panics if the platform entropy source is unavailable (no fallible constructor exists) | Irreducible dependency limit: the crate does not choose a hasher for these maps, and `std` exposes no fallible seeding. Crate-owned entropy is gone (#265: default trade-id namespaces no longer call `Uuid::new_v4()`), so this is the only remaining OS-entropy read |
 | `tokio` (`BookManagerTokio`, NATS publishers) | `tokio::sync::{RwLock, Mutex, mpsc, broadcast, watch, oneshot}`, `tokio::spawn`, `tokio::time` | `tokio::spawn` / `Handle::current()` panic when called outside a runtime; `broadcast::Receiver::recv` can return `Lagged`; a `JoinHandle` can return `Err(JoinError)` for a cancelled or panicked task | `rules/global_rules.md`'s Production Panic Policy requires `Handle::try_current()` over `Handle::current()` and explicit handling of `JoinError` / lagged receivers — tracked per call site by the ratchet where not yet done |
 | `tokio` time driver (NATS publishers, `nats` feature) | `tokio::time::timeout_at` / `tokio::time::sleep` inside the background task of `NatsTradePublisher` / `NatsBookChangePublisher` | Tokio panics when the runtime was built without the time driver (`enable_time` / `enable_all`); `Handle` exposes no way to check this up front | Documented runtime requirement on both publishers (`new`, `into_listener`, module docs). The runtime is passed explicitly to `new`, so no ambient-runtime lookup (`Handle::current()`) happens. A time-driver panic is confined to the spawned task and surfaced by `shutdown()` as `NatsPublisherError::TaskPanicked`; a runtime that already shut down surfaces as `NatsPublisherError::TaskCancelled`. Every `Instant` / `Duration` computation in the task is checked, builder inputs are clamped (`MAX_BATCH_WINDOW_MS`, `MAX_MIN_PUBLISH_INTERVAL_MS`, `MAX_BATCH_SIZE`, `MAX_CHANNEL_CAPACITY` = `Semaphore::MAX_PERMITS`) so `mpsc::channel` and the batch pre-allocation (`try_reserve`) cannot panic (#253) |
 | `async-nats` (`nats` feature) | JetStream publish, connection management | Network/protocol errors are typed (`async_nats::Error`); no known panic path in the publish path this crate calls | — |
@@ -115,6 +115,40 @@ boundary's limits instead of promising to prevent every external panic."
 table PriceLevel's document has for each row above (which lock, if any, is
 held across the call; what state is already committed if the callback
 unwinds).
+
+## Default trade-id namespace (#265)
+
+Constructors that are not given a namespace (`OrderBook::new`,
+`with_clock`, `with_trade_listener`, `with_trade_and_price_level_listener`
+and every constructor built on them) used `Uuid::new_v4()`, which reads OS
+entropy through `getrandom` and panics when the RNG fails. They now derive
+the namespace with `default_trade_id_namespace` (`src/orderbook/book.rs`):
+a UUIDv5 under a per-symbol UUIDv5 namespace, over the process id, the
+wall clock in nanoseconds since the UNIX epoch (`0` if the clock reads
+before the epoch) and a process-wide `AtomicU64` construction counter.
+Every input is read without a panicking path.
+
+Uniqueness argument, as documented on the function:
+
+- same process: the counter advances with `fetch_update` + `checked_add`,
+  so every construction gets a distinct value regardless of thread, symbol
+  or clock;
+- concurrent processes: distinct pids;
+- restarts: a later wall clock (and usually a different pid); a collision
+  needs the clock stepped back to the same nanosecond with the same pid
+  reissued and the same counter value (a pre-epoch clock contributes `0`,
+  leaving restarts to the pid while the clock stays broken);
+- SHA-1 over distinct names: a 122-bit collision, negligible for
+  non-adversarial input.
+
+Counter exhaustion (`u64::MAX` constructions in one process) pins the
+counter, logs a `WARN` and leaves uniqueness to the nanosecond wall clock;
+it never panics or wraps. pricelevel 0.10's fallible `Id::try_new_uuid`
+was not used: it needs a caller-supplied `EntropySource`, and the crate
+has no non-panicking OS entropy source without a new dependency. Replay
+determinism is unaffected: replay injects the recorded namespace
+(`set_trade_id_namespace`, `ReplayBookConfig`), so the default only needs
+to be unique. `Uuid::new_v4()` remains only in tests and doc examples.
 
 ## Matching sweep failures (#240)
 
