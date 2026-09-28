@@ -24,10 +24,8 @@ static GLOBAL: CountingAllocator<System> = CountingAllocator::new(System);
 const WARMUP_OPS: u64 = 1_000;
 const MEASURED_OPS: u64 = 10_000;
 // Ceiling on the median allocs/op across `WINDOWS` windows. Measured on
-// 0.13.1 (#262): per-process medians range from about 6.5 to 10.4 (debug
-// and release alike), because `DashMap`'s per-process `RandomState` and
-// `crossbeam-epoch`'s deferred-free schedule shift every window of a
-// process together. 15.0 sits about 45% above the worst observed median,
+// 0.13.1 (#262): medians range from about 6.5 to 10.4 across runs (debug
+// and release alike). 15.0 sits about 45% above the worst observed median,
 // so it catches a structural regression (an extra allocation on every op
 // is +1/op; a per-order `Vec` in the hot path is several) without
 // flipping on noise.
@@ -101,11 +99,12 @@ fn measure_window() -> f64 {
 fn alloc_budget_mixed_workload_stays_under_ceiling() {
     // The workload is deterministic (fixed ids, prices and order of
     // operations), but the process-wide allocation count is not: the
-    // counter sees every thread, `crossbeam-epoch` allocates deferred-free
-    // bags on a schedule that depends on epoch advancement, and `DashMap`
-    // shard growth depends on its per-process `RandomState`. A single
-    // window therefore swings by about 2x (#262). The median of several
-    // independent windows is stable, so the ceiling is asserted on it.
+    // counter sees every thread and `crossbeam-epoch` allocates
+    // deferred-free bags on a schedule that depends on epoch advancement.
+    // Measured on 0.13.1 (#262), one window ranged from about 5.7 to 12.3
+    // allocs/op across runs, while the median of several windows (fresh
+    // book each) stayed within about 6.5 to 10.4. The ceiling is asserted
+    // on that median.
     let mut samples: Vec<f64> = (0..WINDOWS).map(|_| measure_window()).collect();
     samples.sort_by(f64::total_cmp);
     let median = samples[WINDOWS / 2];
