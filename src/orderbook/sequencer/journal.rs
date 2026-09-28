@@ -70,9 +70,17 @@ where
     /// Implementations should flush the underlying storage to guarantee
     /// write-ahead semantics.
     ///
+    /// Sequence numbers are strictly increasing: an event whose
+    /// `sequence_num` is not greater than [`Self::last_sequence`] must be
+    /// refused with [`JournalError::NonMonotonicSequence`] before anything
+    /// is written, leaving the journal unchanged. Gaps are allowed here and
+    /// detected by replay.
+    ///
     /// # Errors
     ///
-    /// Returns [`JournalError`] if serialization, I/O, or flushing fails.
+    /// Returns [`JournalError::NonMonotonicSequence`] for a duplicate or
+    /// restarted sequence, or another [`JournalError`] if serialization,
+    /// allocation, I/O, or flushing fails.
     fn append(&self, event: &SequencerEvent<T>) -> Result<(), JournalError>;
 
     /// Read events starting from the given sequence number.
@@ -89,16 +97,23 @@ where
 
     /// Returns the sequence number of the last entry in the journal.
     ///
-    /// Returns `None` if the journal is empty.
-    #[must_use]
-    fn last_sequence(&self) -> Option<u64>;
+    /// Returns `Ok(None)` if the journal is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] when the last sequence cannot be read, for
+    /// example [`JournalError::MutexPoisoned`]. An unreadable journal is
+    /// never reported as an empty one (#252).
+    fn last_sequence(&self) -> Result<Option<u64>, JournalError>;
 
     /// Verify the integrity of the entire journal by checking every entry's
     /// CRC32 checksum.
     ///
     /// # Errors
     ///
-    /// Returns the first [`JournalError::CorruptEntry`] encountered, or an
-    /// I/O error if segment files cannot be read.
+    /// Returns the first [`JournalError::CorruptEntry`] or
+    /// [`JournalError::InvalidEntryHeader`] encountered,
+    /// [`JournalError::NonMonotonicSequence`] if stored sequences do not
+    /// strictly increase, or an I/O error if segment files cannot be read.
     fn verify_integrity(&self) -> Result<(), JournalError>;
 }

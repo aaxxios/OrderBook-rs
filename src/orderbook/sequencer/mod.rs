@@ -14,6 +14,7 @@
 //! - [`crate::orderbook::sequencer::InMemoryJournal`] — in-memory journal implementation for testing
 //! - [`crate::orderbook::sequencer::ReplayEngine`] — deterministic replay engine for event journals
 //! - [`crate::orderbook::sequencer::ReplayError`] — error type for replay operations
+//! - [`crate::orderbook::sequencer::MassCancelDivergence`] — what a replayed mass cancel disagreed on with the journal
 //! - [`crate::orderbook::sequencer::ReplayBookConfig`] — book configuration injected into a fresh book before replay (non-default-config recovery)
 //! - `FileJournal` — memory-mapped file journal implementation (requires `journal` feature)
 //!
@@ -45,7 +46,9 @@ pub use in_memory_journal::InMemoryJournal;
 pub use journal::{
     ENTRY_CRC_SIZE, ENTRY_HEADER_SIZE, ENTRY_OVERHEAD, Journal, JournalEntry, JournalReadIter,
 };
-pub use replay::{ReplayBookConfig, ReplayEngine, ReplayError, snapshots_match};
+pub use replay::{
+    MassCancelDivergence, ReplayBookConfig, ReplayEngine, ReplayError, snapshots_match,
+};
 pub use types::{
     CommittedPrefix, CommittedTrade, SequencerCommand, SequencerEvent, SequencerResult,
 };

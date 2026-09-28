@@ -88,6 +88,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above, which used to panic, wrap or clamp. `peek_match` changes
   signature (see "Changed (breaking)").
 
+- **Journals hardened against corruption and misuse (#252).**
+  - `FileJournal` rotation created segments with `create(true).truncate(true)`
+    and `append` never checked sequences, so a duplicate or restarted
+    sequence at a rotation boundary truncated an existing segment (and
+    could `SIGBUS` a reader that had it mapped). Segments are now created
+    with `create_new`; an existing file fails the append with the new
+    `JournalError::SegmentExists { path }` and is left untouched. Both
+    `FileJournal` and `InMemoryJournal` refuse a `sequence_num` that is not
+    strictly greater than the last one with the new
+    `JournalError::NonMonotonicSequence { last, attempted }`, before
+    anything is written. On reopen `FileJournal` recovers the last sequence
+    from the newest non-empty segment, so the check survives a restart.
+  - A malformed entry header ended a segment silently, so replay
+    "succeeded" on a prefix. Only a zero `entry_length` is now the end of
+    data; any other bad header (below the 20-byte minimum, past the end of
+    the segment, a truncated non-zero length field) is
+    `Some(Err(JournalError::InvalidEntryHeader { .. }))` from reads, after
+    which the iterator stops, and the same error from `verify_integrity`,
+    which also reports stored sequences that do not strictly increase
+    (`NonMonotonicSequence`). A header sequence that disagrees with the
+    CRC-valid payload is a `DeserializationError`.
+  - Torn-tail recovery left the torn bytes in place, so a later, shorter
+    append left stale bytes that decoded as the next header. Reopen now
+    zeroes every non-zero byte past the recovered write position (only
+    dirty 4 KiB chunks are written, so the sparse tail is not
+    materialised) and flushes them. A damaged entry followed by a valid
+    one is corruption inside committed data, not a torn tail: `open`
+    refuses it with `JournalError::CorruptEntry` instead of truncating and
+    later overwriting the valid entries after it. Readers never read past
+    the committed write position of the active segment.
+  - The writer's segment, `last_seq` and active segment start now live
+    under one mutex, so `last_seq` is updated under the same guard as the
+    durable write and cannot be left behind by a poisoned second lock;
+    `archive_segments_before` holds it so a rotation cannot race the
+    renames. A poisoned lock is `JournalError::MutexPoisoned` on every
+    method of both journals (it was `Io` in `InMemoryJournal`, and `None`
+    from `last_sequence`, which `ReplayEngine` reported as `EmptyJournal`).
+  - Capacity comes from the mapping length instead of file metadata; the
+    write slice, the 32-bit `entry_length` (`u32::try_from`, a payload over
+    ~4 GiB is `EntryTooLarge`), the encode buffer (`try_reserve_exact`,
+    new `JournalError::AllocationFailed { what, requested }`) and every
+    byte decode use checked forms. `file_journal.rs` leaves the
+    panic-policy ratchet (no `#![allow]`, no allowlist entry). The
+    `memmap2` mapping stays the single documented `unsafe` exception.
+- **Replay reconciles mass cancels by identity (#252).** A journaled
+  non-refused `MassCancelled` for `CancelAll` / `CancelBySide` /
+  `CancelByUser` / `CancelByPriceRange` is re-executed and the replayed
+  cancelled ids must equal the journaled ones **in order**, the orders
+  left resting by per-order failures (`failed_order_ids()`) must match in
+  order, and the replay must not refuse. A journaled eviction must evict
+  exactly its journaled ids in order. Disagreements are the new
+  `ReplayError::MassCancelMismatch { sequence_num, divergence, recorded,
+  replayed }` (`MassCancelDivergence::{Refusal, CancelledIds, FailedIds}`)
+  instead of passing on equal counts or surfacing as a generic
+  `OrderBookError`. `LevelFaultAfterRemoval` entries are fault reports, not
+  book outcomes, and are not compared. A live mass cancel with per-order
+  failures normally stops replay here by design (a fresh replay book does
+  not reproduce the level fault).
+
 - **Default trade-id namespace no longer reads panicking OS entropy
   (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
   `with_trade_and_price_level_listener` (and every constructor built on
@@ -281,6 +340,38 @@ change.
     replaying with a different one can flip a fill into a rejection or the
     reverse and stops with `ReplayError::OutcomeMismatch`.
 
+- **Journal trait and `InMemoryJournal` surface (#252).**
+  - `Journal::last_sequence(&self) -> Option<u64>` becomes
+    `-> Result<Option<u64>, JournalError>` (approved trait break):
+    implementors return `Ok(None)` for an empty journal and an error when
+    it cannot be read; callers add `?`. `ReplayEngine` maps the error to
+    `ReplayError::JournalError` instead of `EmptyJournal`.
+  - `Journal::append` must reject a non-increasing sequence with
+    `JournalError::NonMonotonicSequence`; a custom implementation should
+    do the same. Journals that rely on duplicate sequences no longer
+    append.
+  - `InMemoryJournal::with_capacity(n)` returns
+    `Result<Self, JournalError>` (`AllocationFailed`); `len()` and
+    `is_empty()` return `Result<_, JournalError>` instead of reporting 0 /
+    `true` on a poisoned lock.
+  - `JournalError` is now derived with `thiserror` (Display text
+    unchanged) and gains `NonMonotonicSequence`, `SegmentExists` and
+    `AllocationFailed` (it is `#[non_exhaustive]`). `ReplayError` gains
+    `MassCancelMismatch`; new public `MassCancelDivergence`.
+  - Behaviour: a journaled `MassCancelled` whose ids do not match the
+    replay (for example a placeholder `MassCancelResult::default()` for a
+    cancel that removed orders) now fails replay; journal the result the
+    mass cancel returned. A journaled eviction the replay book cannot
+    reproduce is `MassCancelMismatch` rather than
+    `OrderBookError(OrderNotFound)`.
+  - Compatibility: no on-disk format change. Valid journals written by
+    0.13 and earlier 0.14 builds open, verify and replay unchanged (pinned
+    by the 0.13.1 fixture). A journal holding mid-segment corruption in its
+    latest segment now fails to open instead of being silently truncated at
+    the damage, and a journal with duplicate stored sequences fails
+    `verify_integrity`. Reopen can take longer on large segments: it reads
+    the unused tail once to zero stale bytes.
+
 - **pricelevel upgraded to 0.10 (#239).** The crate version moves to
   0.14.0. pricelevel 0.10 makes level snapshots, queue views, dry runs and
   match-result growth fallible; every such result is now propagated as
@@ -380,7 +471,8 @@ change.
   - Replay of an `EvictExpiredOrders` event journaled as `MassCancelled`
     evicts exactly the journaled ids instead of re-running the sweep, so
     an order the live sweep failed to evict keeps resting; a journaled id
-    the replay book cannot evict is reported as `ReplayError::OrderBookError`.
+    the replay book cannot evict is reported as
+    `ReplayError::MassCancelMismatch` (#252).
     Without a journaled result the sweep is re-run and any failure is
     reported.
   - `SequencerResult::from(&OrderBookError)` records
@@ -391,9 +483,8 @@ change.
     the live book never performed).
   - Replay skips only a **refused** journaled mass cancel
     (`is_refused()`), not every result with failures; a mass cancel
-    journaled with per-order failures is re-executed and reported as
-    `ReplayError::OrderBookError` until #252 reconciles mass cancels by
-    identity.
+    journaled with per-order failures is re-executed and reconciled by
+    identity (#252, see Fixed).
   - Compatibility: `evict_expired_orders` (and the manager pass-throughs)
     change their success type to `EvictionResult<T>`, a second change in
     the 0.14 cycle: `len()`, `is_empty()`, `iter()` and `for order in

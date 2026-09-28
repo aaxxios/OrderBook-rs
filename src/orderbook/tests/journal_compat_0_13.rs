@@ -67,7 +67,7 @@ mod tests {
         journal
             .verify_integrity()
             .expect("0.13.1 CRCs verify under 0.14");
-        assert_eq!(journal.last_sequence(), Some(10));
+        assert_eq!(journal.last_sequence().expect("last_sequence"), Some(10));
 
         let events = read_all(&journal);
         assert_eq!(events.len(), 10, "all ten events decode");
