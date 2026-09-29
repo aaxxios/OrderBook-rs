@@ -30,10 +30,11 @@ include = [
 ]
 
 # Production Panic Policy gate (issue #242, ported from PriceLevel's issue
-# #173). This table is package-wide: it applies to every target of THIS
-# package (`src/lib.rs`, the `tests` / `alloc_budget` / `metrics_tests`
-# integration-test binaries, and the `benches` / `*_hdr` / `alloc_count`
-# bench binaries), not to the separate `examples` workspace member.
+# #173; absolute since #260). This table is package-wide: it applies to
+# every target of THIS package (`src/lib.rs`, the `tests` / `alloc_budget` /
+# `bincode_decode_bounds` / `metrics_tests` / `fee_tests` integration-test
+# binaries, and the `benches` / `*_hdr` / `alloc_count` bench binaries), not
+# to the separate `examples` workspace member.
 #
 # `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests` /
 # `allow-panic-in-tests` / `allow-indexing-slicing-in-tests`) narrows
@@ -41,37 +42,33 @@ include = [
 # so clippy's own `#[cfg(test)]` / `#[test]` detection exempts real test items
 # (co-located `#[cfg(test)] mod tests { ... }` blocks directly inside a
 # production file, the `src/orderbook/tests/` and `src/utils/tests/`
-# co-located test-module trees, and the `tests/unit`, `tests/alloc_budget.rs`,
-# `tests/metrics` integration targets, which compile with `cfg(test)` as a
-# whole). It does NOT exempt a standalone `#[cfg(test)] fn` production helper
-# that lives outside a `mod tests {}` block — clippy's heuristic is per-item,
-# not per-block, so those keep the deny. `scripts/check_panic_policy.py` is
-# the second layer that catches what clippy has no lint for at all
-# (`assert!`/`debug_assert!` families, `saturating_*`/`wrapping_*`) and
-# re-checks the forms clippy's `#[cfg(test)]` heuristic can still wrongly wave
-# through on a standalone helper (see the script header).
+# co-located test-module trees, and every `tests/` integration target, which
+# compiles with `cfg(test)` as a whole). It does NOT exempt a standalone
+# `#[cfg(test)] fn` production helper that lives outside a `mod tests {}`
+# block: clippy's heuristic is per-item, not per-block, so those keep the
+# deny. `scripts/check_panic_policy.py` is the second layer: it catches what
+# clippy has no lint for at all (`assert!`/`debug_assert!` families,
+# `saturating_*`/`wrapping_*`), re-checks the forms clippy's `#[cfg(test)]`
+# heuristic can still wrongly wave through on a standalone helper, and fails
+# on any production `#[allow]`/`#[expect]` of a lint this table denies (see
+# the script header).
 #
-# Bench (`benches/mod.rs`, each `benches/order_book/*_hdr.rs` and
-# `alloc_count.rs`) and integration-test crate roots (`tests/unit/mod.rs`,
-# `tests/alloc_budget.rs`, `tests/metrics/mod.rs`, `tests/fee_tests.rs`) carry
-# their own crate-level `#![allow(...)]` for the lints without a
-# `clippy.toml` "in tests" toggle (`arithmetic_side_effects`,
-# `cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap`,
-# `manual_assert`, `panic_in_result_fn`, `get_unwrap`, `exit`, `unreachable`,
-# `todo`, `unimplemented`) — see each file's header comment. The policy is
+# Test and bench crate roots (`benches/mod.rs`, each
+# `benches/order_book/*_hdr.rs`, `benches/order_book/alloc_count.rs`,
+# `tests/unit/mod.rs`, `tests/alloc_budget.rs`, `tests/metrics/mod.rs`,
+# `tests/fee_tests.rs`, `tests/bincode_decode_bounds.rs`) carry their own
+# crate-level `#![allow(...)]` for the lints without a `clippy.toml` "in
+# tests" toggle (`arithmetic_side_effects`, `cast_possible_truncation`,
+# `cast_sign_loss`, `cast_possible_wrap`, `manual_assert`,
+# `panic_in_result_fn`, `get_unwrap`, `exit`, `unreachable`, `todo`,
+# `unimplemented`); see each file's header comment. Co-located
+# `#[cfg(test)] mod tests` blocks get the same relief, marked
+# `// tests may panic: rules/global_rules.md § Testing`.
+#
+# NO production exceptions (issue #260): the temporary per-file
+# `#![allow(clippy::...)]` ratchet markers and count ledgers used while
+# #243-#259 fixed the pre-existing violations are gone. The policy is
 # production-only; it deliberately does not restrict test or bench code.
-#
-# RATCHET (issue #242): this crate lands the gate with hundreds of existing
-# violations across production files, fixed incrementally by issues
-# #243-#257. A production file that currently violates one or more of these
-# lints carries an inner `#![allow(clippy::<lint>, ...)]` at its top (or on
-# the `mod` item, for an inline module) with the comment
-# `// panic-policy-ratchet: see #242, removed by the fix issue`, listing ONLY
-# the lints that file actually violates today. `scripts/panic_policy_allowlist.txt`
-# is the matching ratchet for what `scripts/check_panic_policy.py` scans
-# (the assert family, `saturating_*`/`wrapping_*`). Both ratchets only ever
-# shrink: `python3 scripts/check_panic_policy.py --ratchet-report` lists every
-# clippy ratchet allow currently in the tree so a fix PR knows what to remove.
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

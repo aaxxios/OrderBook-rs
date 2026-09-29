@@ -22,7 +22,7 @@ Complete guide for using OrderBook-rs in your trading systems.
 ## Quick Links
 
 - **[Main README](../README.md)**: Project overview and performance analysis
-- **[Examples](../examples/README.md)**: 19 comprehensive examples
+- **[Examples](../examples/README.md)**: 26 runnable examples
 - **[API Documentation](https://docs.rs/orderbook-rs)**: Detailed API reference
 - **[GitHub Repository](https://github.com/joaquinbejar/OrderBook-rs)**: Source code and issues
 
@@ -32,8 +32,10 @@ Complete guide for using OrderBook-rs in your trading systems.
 
 ```
 doc/
-├── README.md           # This file - documentation index
-└── USER_GUIDE.md       # Complete user guide
+├── README.md             # This file - documentation index
+├── USER_GUIDE.md         # Complete user guide
+├── panic-boundaries.md   # Production Panic Policy: what the gate cannot certify
+└── wire-protocol.md      # Binary wire codec (feature `wire`)
 ```
 
 ---

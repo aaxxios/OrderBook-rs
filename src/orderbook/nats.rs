@@ -1,14 +1,14 @@
 //! NATS JetStream trade event publisher.
 //!
 //! This module provides [`NatsTradePublisher`], which converts trade events
-//! from the order book's [`TradeListener`] callback into NATS JetStream
+//! from the order book's [`TradeListener`](crate::orderbook::trade::TradeListener) callback into NATS JetStream
 //! messages. Each trade is published to two subjects:
 //!
 //! - `{prefix}.{symbol}` — per-symbol stream
 //! - `{prefix}.all` — aggregate stream
 //!
 //! The listener callback is non-blocking on the matching hot path: it clones
-//! the [`TradeResult`] into a bounded channel and returns immediately — no
+//! the [`TradeResult`](crate::orderbook::trade::TradeResult) into a bounded channel and returns immediately — no
 //! serialization, no `format!`, and no per-trade task spawn happen on the
 //! engine thread. A single background Tokio task drains the channel, batches
 //! and (optionally) throttles, and performs the serialization, subject
@@ -38,7 +38,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! orderbook-rs = { version = "0.6", features = ["nats"] }
+//! orderbook-rs = { version = "0.14", features = ["nats"] }
 //! ```
 
 use crate::orderbook::nats_common::{
@@ -112,7 +112,8 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 ///
 /// The publisher wraps a JetStream context and provides a non-blocking
 /// [`into_listener`](NatsTradePublisher::into_listener) method that returns a
-/// [`TradeListener`] suitable for use with [`OrderBook::trade_listener`].
+/// [`TradeListener`] suitable for use with
+/// [`OrderBook::set_trade_listener`](crate::orderbook::OrderBook::set_trade_listener).
 ///
 /// # Batching and throttling
 ///
@@ -294,7 +295,7 @@ impl NatsTradePublisher {
     /// Set the batch window duration in milliseconds.
     ///
     /// Trades are accumulated for at most this duration before being flushed.
-    /// Defaults to [`DEFAULT_BATCH_WINDOW_MS`] (1 ms).
+    /// Defaults to `DEFAULT_BATCH_WINDOW_MS` (1 ms).
     ///
     /// Values above [`MAX_BATCH_WINDOW_MS`] (60,000 ms) are **clamped** to it
     /// with a `tracing::warn!`; the builder never panics.
@@ -309,7 +310,7 @@ impl NatsTradePublisher {
     /// Set the maximum number of trades per batch.
     ///
     /// When the batch reaches this size it is flushed immediately, regardless
-    /// of the time window. Defaults to [`DEFAULT_MAX_BATCH_SIZE`] (100).
+    /// of the time window. Defaults to `DEFAULT_MAX_BATCH_SIZE` (100).
     ///
     /// The value is **clamped** into `1..=`[`MAX_BATCH_SIZE`] with a
     /// `tracing::warn!`: `0` becomes `1` (a zero batch size could not drain
@@ -324,7 +325,7 @@ impl NatsTradePublisher {
     /// Set the bounded channel capacity.
     ///
     /// When the channel is full, new trades are dropped and `dropped_events`
-    /// is incremented. Defaults to [`DEFAULT_CHANNEL_CAPACITY`] (10,000).
+    /// is incremented. Defaults to `DEFAULT_CHANNEL_CAPACITY` (10,000).
     ///
     /// A `channel_capacity` of `0`, or one above [`MAX_CHANNEL_CAPACITY`]
     /// (Tokio's semaphore limit), is invalid for a Tokio mpsc channel. Rather
@@ -342,7 +343,7 @@ impl NatsTradePublisher {
     ///
     /// When set to a value greater than 0, the background task waits at least
     /// this long between consecutive flushes. Defaults to
-    /// [`DEFAULT_MIN_PUBLISH_INTERVAL_MS`] (0, disabled).
+    /// `DEFAULT_MIN_PUBLISH_INTERVAL_MS` (0, disabled).
     ///
     /// Values above [`MAX_MIN_PUBLISH_INTERVAL_MS`] (60,000 ms) are
     /// **clamped** to it with a `tracing::warn!`.
@@ -359,7 +360,7 @@ impl NatsTradePublisher {
 
     /// Set the maximum number of retry attempts for transient NATS failures.
     ///
-    /// Defaults to [`DEFAULT_MAX_RETRIES`] (3). Set to 0 to disable retries.
+    /// Defaults to `DEFAULT_MAX_RETRIES` (3). Set to 0 to disable retries.
     /// Retry `n` (zero-based) waits a jittered delay in
     /// `[c / 2, c]` where `c = min(BASE_RETRY_DELAY_MS * 2^n, MAX_RETRY_DELAY_MS)`.
     ///

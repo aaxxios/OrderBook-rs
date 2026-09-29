@@ -1,4 +1,9 @@
 //! OrderBook implementation for managing multiple price levels and order matching.
+//!
+//! **Known limitation (#286):** trailing stops (`special_orders`) are placed
+//! as ordinary resting limit orders at their stop price instead of being
+//! held off-book until triggered. They provide liquidity at that price and
+//! cannot trail on an uncrossed book; see the `repricing` module docs.
 
 pub mod book;
 /// Pluggable timestamp source for the matching core.
@@ -67,7 +72,8 @@ pub mod nats_book_change;
 #[cfg(feature = "nats")]
 mod nats_common;
 
-/// Re-pricing logic for special order types (PeggedOrder and TrailingStop).
+/// Re-pricing logic for special order types (PeggedOrder and TrailingStop;
+/// see the module docs for the trailing-stop limitation, #286).
 #[cfg(feature = "special_orders")]
 pub mod repricing;
 

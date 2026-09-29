@@ -6,7 +6,7 @@
 //!
 //! - **Lock-Free Architecture**: Built using atomics and lock-free data structures to minimize contention and maximize throughput in high-frequency trading scenarios.
 //!
-//! - **Multiple Order Types**: Support for various order types including standard limit orders, iceberg orders, post-only, fill-or-kill, immediate-or-cancel, good-till-date, trailing stop, pegged, market-to-limit, and reserve orders with custom replenishment logic.
+//! - **Multiple Order Types**: Support for various order types including standard limit orders, iceberg orders, post-only, fill-or-kill, immediate-or-cancel, good-till-date, trailing stop, pegged, market-to-limit, and reserve orders with custom replenishment logic. **Warning (#286):** trailing stops currently rest as ordinary limit liquidity at their stop price and do not trail on an uncrossed book; do not rely on them as protective stops.
 //!
 //! - **Thread-Safe Price Levels**: Each price level can be independently and concurrently modified by multiple threads without blocking.
 //!
@@ -34,226 +34,75 @@
 //!
 //! ## What's New in Version 0.14.0 (unreleased)
 //!
-//! - Dependency floors raised to the latest semver-compatible releases
-//!   (#237). `bincode` stays on 2.0.1.
-//! - The Production Panic Policy is enforced mechanically: a clippy deny set
-//!   plus `scripts/check_panic_policy.py` in `make lint` (#242). See
-//!   `doc/panic-boundaries.md`.
-//! - **pricelevel 0.10 (#239).** Level snapshots, queue views and
-//!   match-result growth are fallible upstream; the book now propagates
-//!   those errors instead of ignoring them. `create_snapshot`,
-//!   `enriched_snapshot`, `enriched_snapshot_with_metrics` and
-//!   `evict_expired_orders` return `Result`.
-//! - **Mass cancels report failures.** `MassCancelResult::failures()` /
-//!   `has_failures()` and the new `MassCancelFailure`: a mass cancel whose
-//!   price level cannot be read cancels nothing and says so.
-//! - **Snapshot format v4.** Level statistics carry a `u128`
-//!   `value_executed`; v2 and v3 packages still restore.
-//! - **Wire break for bincode `TradeResult`.** pricelevel's `MatchResult`
-//!   gained a positional `error` field; JSON payloads and journals stay
-//!   compatible.
-//! - `BincodeEventSerializer` bounds decoding of untrusted payloads (#251):
-//!   a string length prefix is checked against the remaining input before
-//!   anything is allocated (`SerializationError::Truncated`), so allocations
-//!   are bounded by the input length, and payloads over `DEFAULT_MAX_BINCODE_PAYLOAD_BYTES` (8 MiB,
-//!   configurable via `BincodeEventSerializer::with_max_payload_bytes`) are
-//!   rejected with `SerializationError::PayloadTooLarge`.
-//! - Pre-trade risk uses checked notional arithmetic (#243): two orders whose
-//!   notional sum overflows `u128` can no longer wrap the account counter and
-//!   bypass `max_notional_per_account`, and the price band no longer passes
-//!   at extreme prices. Such admissions are now rejected with the existing
-//!   typed risk errors. Release-side underflows are logged and counted in
-//!   `OrderBook::risk_accounting_anomalies`.
-//! - **Implied-volatility inputs are validated (#256).** `SolverConfig::validate`
-//!   and `IVConfig::validate` run at every solve entry point, so an inverted
-//!   or NaN IV bound, a zero tolerance or a bad `price_scale` returns
-//!   `IVError::InvalidConfig` instead of panicking in `f64::clamp`.
-//!   Black-Scholes and the Greeks return `Result<f64, IVError>` and never hand
-//!   back NaN or infinity. `IVError` is `#[non_exhaustive]` and gains
-//!   `InvalidConfig`, `NonFiniteResult`, `ArithmeticOverflow` and
-//!   `PriceLevel`.
+//! 0.14.0 is the panic-policy release: crate-owned code no longer initiates
+//! panics and the gate enforcing it is absolute. The engine and state
+//! failures the audit found clamped, ignored or silently recovered (matching,
+//! fees and notionals, risk, modifies, mass cancels, snapshots and restore,
+//! journals and replay, wire and bincode decoding) now surface as typed
+//! errors. A few documented paths stay infallible by design and use an
+//! explicit, logged or counted fallback instead: `current_time_millis()`
+//! returns `0` / `u64::MAX` sentinels (use `try_current_time_millis()` for a
+//! `Result`), the `CountingAllocator` diagnostic counters wrap, NATS builder
+//! values are clamped with a `WARN`, undeliverable listener events are
+//! counted in `dropped_listener_events()`, and the `()`-guarded level-stripe,
+//! outbox and eviction-queue locks recover from poison with a log. It is a
+//! breaking release; see the migration table below.
+//!
+//! ### Breaking behaviour
+//!
 //! - **Aborted sweeps (#240).** A price level that fails mid-sweep stops the
 //!   sweep: the committed prefix is published like a partial fill, the
 //!   remainder never rests, and the submit returns
-//!   `OrderBookError::MatchAborted` (taker state
-//!   `Cancelled { MatchAborted }`). New reject codes `MatchAborted` (15),
-//!   `CapacityExceeded` (16), `CounterExhausted` (17).
-//! - **Journaling aborted submits.** `add_order_with_committed`,
+//!   `OrderBookError::MatchAborted` (taker state `Cancelled { MatchAborted }`).
+//!   A fill-or-kill checks trade-id headroom and reserves its result buffers
+//!   before any mutation; a shortfall rejects it untouched. With an exhausted
+//!   trade-id generator every crossing submit / modify is rejected untouched
+//!   (code 16), and a failed post-only probe is a clean `Rejected`, not an
+//!   abort. Dead-book signals: `OrderBook::match_aborts()`,
+//!   `match_fold_failures()` and the latched `trade_ids_exhausted()` (plus
+//!   `metrics` counters).
+//! - **Journaling aborted submits (#240).** `add_order_with_committed`,
 //!   `submit_market_order_with_committed` and
 //!   `submit_market_order_by_amount_with_committed` return a `SubmitFailure`
-//!   carrying the committed `TradeResult`;
-//!   `SequencerResult::from_submit_failure` records it as the new
-//!   `SequencerResult::MatchAborted`, and replay requires the same prefix
-//!   (`ReplayError::OutcomeMismatch` otherwise).
-//! - **Fill-or-kill preflight.** A FOK checks trade-id headroom and reserves
-//!   its result buffers before any mutation; a shortfall rejects it
-//!   untouched.
-//! - **Dead-book signal.** `OrderBook::match_aborts()`,
-//!   `match_fold_failures()` and the latched `trade_ids_exhausted()` (plus
-//!   `metrics` counters). With an exhausted trade-id generator every
-//!   crossing submit / modify is rejected untouched (code 16); a failed
-//!   post-only probe is also a clean `Rejected`, not an abort.
-//! - **Limitations.** A journal holding a resource-exhaustion abort replays
-//!   at best from genesis, never from a mid-stream snapshot (the trade-id
-//!   generator is not in the snapshot); the committed-prefix check only
-//!   applies to submits recorded through `*_with_committed` /
-//!   `SequencerResult::from_submit_failure`, and aborted updates are
-//!   reconciled by code only. See `doc/panic-boundaries.md`.
-//! - **NATS publishers validate their configuration (#253).** Builder values
-//!   are clamped with a `warn!` instead of panicking later (batch window and
-//!   publish interval at 60 s, batch size to `1..=65_536`, channel capacity
-//!   to Tokio's limit); retries use capped exponential backoff (5 s) with
-//!   jitter; `shutdown()` returns `Result<(), NatsPublisherError>` so a
-//!   panicked or cancelled background task is reported.
-//!
-//! - **Checked time helpers (#257).** `try_current_time_millis()` returns
-//!   `Result<u64, TimeError>` for a pre-epoch clock or a `u64` overflow;
-//!   `current_time_millis()` stays infallible with a documented, logged
-//!   fallback instead of a silent `0` / truncating cast.
-//!   `AllocSnapshot::since` (feature `alloc-counters`) returns `Option` and
-//!   rejects out-of-order snapshots instead of clamping.
-//! - **Wire codec is panic-free on untrusted bytes (#254).** Decoders read
-//!   through checked offsets instead of `copy_from_slice` and raw offset
-//!   arithmetic. `encode_exec_report`, `encode_trade_print` and
-//!   `encode_book_update` reserve with `Vec::try_reserve` and return
-//!   `Result<(), WireError>` (new `WireError::CapacityOverflow`); the wire
-//!   format is unchanged.
-//! - **Default trade-id namespace without OS entropy (#265).** Constructors
-//!   that are not given a namespace derive a UUIDv5 from the symbol, process
-//!   id, wall-clock nanoseconds and a process-wide checked counter instead of
-//!   calling the panicking `Uuid::new_v4()`. Namespaces are unique per book
-//!   within a process and are designed to differ across restarts; a restart
-//!   that reuses the same process id with the wall clock stepped back to the
-//!   same nanosecond can repeat one (see `default_trade_id_namespace`), so
-//!   inject a namespace when cross-restart uniqueness must be guaranteed.
-//!   Trade-id format and namespace injection for replay are unchanged.
-//! - **Limitation: level statistics are advisory under concurrent takers
-//!   (#241).** pricelevel 0.10 supports one concurrent writer of a level's
-//!   execution statistics, while takers on the shared submit gate (ordinary
-//!   takers on an `STPMode::None` book, anonymous `match_order` sweeps) can
-//!   sweep one level at once. A snapshot taken meanwhile can hold a partially
-//!   recorded execution in `orders_executed` / `quantity_executed` /
-//!   `value_executed`. Trades, fees, quantities and order vectors are
-//!   unaffected, totals are exact once the sweeps return, and single-threaded
-//!   replay (`snapshots_match`) stays exact. Capture with no sweep in flight
-//!   for exact statistics. No behaviour or API change. See
-//!   `doc/panic-boundaries.md`.
-//! - **Book managers are runtime-safe and stoppable (#255).**
-//!   `BookManagerTokio::start_trade_processor` returns
-//!   `ManagerError::NoRuntime` outside a Tokio runtime instead of panicking,
-//!   and `BookManagerStd` reports a refused thread as
-//!   `ManagerError::ThreadSpawn`. Both managers gain
-//!   `start_trade_processor_with(handler)`, `stop_trade_processor()` (joins
-//!   or awaits the processor after it handles queued events; a panic is
-//!   `ProcessorPanicked`) and `dropped_trade_events()`, plus the
-//!   `orderbook_manager_trade_events_dropped_total` metric.
-//! - **Gate-safe, failure-aware mass cancels (#248).** Every mass cancel
-//!   and `evict_expired_orders` holds the exclusive submit gate, so no
-//!   order admitted concurrently is dropped without an event;
-//!   `cancel_all_orders` emits its events after the book is cleared.
-//!   Per-order failures are recorded as `MassCancelFailure::OrderCancelFailed`
-//!   (the order stays resting and tracked; see `MassCancelResult::is_refused`),
-//!   `cancel_order` returns `Err` when a level refuses the removal (and
-//!   completes, then reports as `OrderBookError::OrderRemovedWithLevelFault`,
-//!   a removal the level committed before failing), and
-//!   `evict_expired_orders` returns an `EvictionResult` with the evicted
-//!   orders and per-order failures, which replay reproduces by identity.
-//! - **Checked fee and notional arithmetic (#244).** A taker whose
-//!   worst-case notional (worst reachable price × quantity, or its amount)
-//!   overflows `u128` or cannot be priced exactly by the `FeeSchedule` is
-//!   rejected before the book is touched with `OrderBookError::FeeOverflow`
-//!   (code 18) or `NotionalOverflow` (code 19), on every submission API and
-//!   with or without a listener. Fees and `quote_notional` are never
-//!   clamped or dropped: `FeeSchedule::calculate_fee`, `TradeResult::new` /
-//!   `with_fees` / `total_fees` and `TradeInfo::from_trade_result` return
-//!   `Result` (`TradeArithmeticError`). `with_maker_rebate(i32::MIN, _)` and
-//!   a pegged offset of `i64::MIN` no longer panic.
-//! - **Book analytics return `Result` with checked aggregates (#245).** VWAP,
-//!   market impact, simulation, micro price, imbalance, pressure, depth
-//!   statistics / distribution, the depth-to-target and liquidity queries,
-//!   `total_quantity_at_price`, `get_volume_by_price`, `is_thin_book`,
-//!   `find_level`, the `OrderBookSnapshot` totals, the `EnrichedSnapshot`
-//!   constructors and `OrderSimulation::total_cost` return
-//!   `Result<_, OrderBookError>`. `u128` notionals and `u64` depth sums are
-//!   checked (new `OrderBookError::ArithmeticOverflow`) instead of panicking
-//!   in debug, wrapping in release or saturating, and a level whose
-//!   `visible + hidden` total overflows surfaces as
-//!   `OrderBookError::PriceLevelError` instead of reading as an empty (or
-//!   `u64::MAX`) level. The depth iterators yield
-//!   `Result<LevelInfo, OrderBookError>` and stop after the first error.
-//!   `depth_distribution` caps `bins` at `MAX_DEPTH_DISTRIBUTION_BINS`
-//!   (4096) and reserves fallibly (`OrderBookError::AllocationFailed`).
-//!   Pegged orders referencing the mid price use the exact integer midpoint
-//!   (rounded down) instead of an `f64` round trip. The matching path is
-//!   unchanged.
-//! - **Panic-free matching loop (#246).** A `CancelMaker` fill-or-kill whose
-//!   non-self depth sums past `u64::MAX` is judged fillable instead of
-//!   panicking (debug) or being killed on a wrapped sum (release); the
-//!   thread-local matching pool degrades to fresh buffers during thread
-//!   teardown or reentrancy; the #225 STP snapshot check logs instead of
-//!   asserting; per-level budget arithmetic is checked and a breach aborts
-//!   the sweep with its committed prefix. `OrderBook::peek_match` returns
-//!   `Result<u64, OrderBookError>` and reports a level whose depth overflows
-//!   `u64` instead of reading it as empty. Valid inputs trade identically.
-//! - **Hardened journals and identity replay of mass cancels (#252).**
-//!   `FileJournal` never truncates an existing segment on rotation
-//!   (`create_new`, `JournalError::SegmentExists`), both journals refuse
-//!   non-increasing sequences (`JournalError::NonMonotonicSequence`), a
-//!   malformed entry header is an error instead of a silent end of data,
-//!   reopen zeroes a torn tail and refuses mid-segment corruption, and a
-//!   poisoned lock is `MutexPoisoned` everywhere. `Journal::last_sequence`
-//!   returns `Result<Option<u64>, JournalError>`. Replay compares a
-//!   journaled `MassCancelled` with the replayed result by order ids, in
-//!   order, and failure outcomes (`ReplayError::MassCancelMismatch`). No
-//!   on-disk format change.
-//! - **Checked counters and untrusted-restore validation (#250).**
-//!   `next_engine_seq()` returns `Result` and refuses with
-//!   `OrderBookError::EngineSeqExhausted` instead of wrapping; the engine's
-//!   emission paths suppress (and latch, `engine_seq_exhausted()`) an event
-//!   they cannot stamp (caller-owned results keep their fills, stamped
-//!   `UNSTAMPED_ENGINE_SEQ`), and the book keeps matching. Restore rejects, before
-//!   touching the live book, a crossed or locked snapshot (new
-//!   `OrderBookError::SnapshotCrossed`), an order whose `visible + hidden`
-//!   overflows `u64`, and a package whose `engine_seq` is `u64::MAX`; tick /
-//!   lot alignment is deliberately not enforced, so a book holding orders
-//!   from a previous tick or lot size still round-trips.
-//!   `OrderBookSnapshotPackage::new` propagates a failed aggregate refresh.
-//!   `spread()` / `spread_bps()` return `None` for a crossed read. The
-//!   strandable-maker count, `StubClock` (pinned at its ceiling,
-//!   `is_exhausted()`), repricing counters and the order-state tracker's
-//!   purge use checked forms; the tracker recovers a poisoned eviction queue,
-//!   keeps each order's status and history in one entry and evicts it
-//!   atomically with `DashMap::remove_if`.
+//!   carrying the committed `TradeResult`; `SequencerResult::from_submit_failure`
+//!   records it as the new `SequencerResult::MatchAborted`, and replay requires
+//!   the same prefix (`ReplayError::OutcomeMismatch` otherwise).
+//! - **Checked fee and notional arithmetic (#244).** A taker whose worst-case
+//!   notional (worst reachable price × quantity, or its amount) overflows
+//!   `u128` or cannot be priced exactly by the `FeeSchedule` is rejected
+//!   before the book is touched with `OrderBookError::FeeOverflow` (code 18)
+//!   or `NotionalOverflow` (code 19), on every submission API and with or
+//!   without a listener. Fees and `quote_notional` are never clamped or
+//!   dropped. Because the fee schedule now decides verdicts,
+//!   `ReplayBookConfig::fee_schedule` must match the source book's.
 //! - **Modifications stop swallowing mutation errors (#247).**
 //!   `update_order(OrderUpdate::Cancel)` is the same removal as
-//!   `cancel_order` (errors propagated, `Cancelled` state, risk released).
-//!   A cancel-then-add modify whose re-add fails after the cancel restores
-//!   the original at the back of its level (`OrderBookError::ModifyRolledBack`,
+//!   `cancel_order` (errors propagated, `Cancelled` state, risk released). A
+//!   cancel-then-add modify whose re-add fails after the cancel restores the
+//!   original at the back of its level (`OrderBookError::ModifyRolledBack`,
 //!   code 20) or, if it traded or cannot be restored, reports it gone with
 //!   consistent indices (`ModifyOrderLost`, code 21); replay re-executes both.
-//!   A remainder that cannot rest after trades ends
-//!   `Cancelled { RestFailed }`, and a failed self-trade-prevention maker
-//!   cancel aborts the sweep (`MatchAborted`). `OrderQuantity::total_quantity`
-//!   is checked and `PriceCrossing::opposite_price` is an `Option`. A modify
-//!   never creates quantity when a fill races it, never restores into a
-//!   locked book, and keeps `filled_quantity` cumulative; an emptied price
-//!   level is never removed while a concurrent submit is admitting into it.
-//! - **Consistent indices under concurrent crossing adds (#288).** An
-//!   order's location, user-index entry and resting state are published
-//!   before its level admits it, and every remover releases the location
-//!   (the id's ownership token) last, so a concurrent sweep that consumes
-//!   the order removes them instead of racing their insertion, a reused id
-//!   never touches a previous order's entries, and a same-id submit is
-//!   refused with `DuplicateOrderId` (now classified as possibly mutating). The risk layer
-//!   removes a fully filled maker's entry under the same lock that zeroes
-//!   it, so two sweeps sharing a maker release its open-order slot once.
-//! - **Replay-safe post-trade risk rejections (#291).** A taker whose
-//!   residual the risk layer refuses after it traded now returns
-//!   `OrderBookError::RiskRejectedAfterTrades` (code 22, journaled as
-//!   possibly mutating) instead of a pre-trade risk error replay skipped;
-//!   replay re-runs the sweep and refuses the residual, reproducing the
-//!   live trades without a `RiskConfig`. The repricers keep a reused id's
-//!   special-order registration.
+//!   A remainder that cannot rest after trades ends `Cancelled { RestFailed }`,
+//!   and a failed self-trade-prevention maker cancel aborts the sweep
+//!   (`MatchAborted`). A modify never creates quantity when a fill races it,
+//!   never restores into a locked book, and keeps `filled_quantity`
+//!   cumulative; an emptied price level is never removed while a concurrent
+//!   submit is admitting into it. An IOC remainder's `InsufficientLiquidity`
+//!   now reports the taker's total as `requested` and its executed quantity
+//!   as `available`.
+//! - **Gate-safe, failure-aware mass cancels (#248).** Every mass cancel and
+//!   `evict_expired_orders` holds the exclusive submit gate, so no order
+//!   admitted concurrently is dropped without an event; `cancel_all_orders`
+//!   emits its events after the book is cleared. `MassCancelResult::failures()`
+//!   / `has_failures()` report failures (`MassCancelFailure`): a mass cancel
+//!   whose price level cannot be read cancels nothing and says so, and a
+//!   refused order stays resting and tracked (see
+//!   `MassCancelResult::is_refused`). `cancel_order` returns `Err` when a level
+//!   refuses the removal (and completes, then reports as
+//!   `OrderBookError::OrderRemovedWithLevelFault`, a removal the level
+//!   committed before failing), and `evict_expired_orders` returns an
+//!   `EvictionResult` with the evicted orders and per-order failures, which
+//!   replay reproduces by identity.
 //! - **Listeners run after commit, outside the submit gate (#249).** Trade,
 //!   price-level and order-state listener events are buffered during the
 //!   mutation, stamped with `engine_seq` under the gate at commit and
@@ -264,13 +113,60 @@
 //!   leaves the book consistent and the gate unpoisoned
 //!   (`dropped_listener_events()`, `listener_panics()`,
 //!   `flush_listener_events()`); `pending_listener_events()` gauges the
-//!   unbounded backlog a slow listener builds. A poisoned submit gate now engages the kill
-//!   switch (`submit_gate_poisoned()`) instead of being recovered silently.
-//! - **Bounded journal recovery and NATS shutdown (#295).** Reopening a
-//!   `FileJournal` whose latest segment ends in garbage is linear in the
-//!   segment size (cheap pre-checks, capped CRC probes) instead of
-//!   effectively never returning; an empty latest segment left by a crash is
-//!   grown on open; only canonical segment names are read. Replay reports
+//!   unbounded backlog a slow listener builds. `match_market_order*` /
+//!   `match_limit_order*` now publish their trades before the gate is
+//!   released. A poisoned submit gate engages the kill switch
+//!   (`submit_gate_poisoned()`) instead of being recovered silently.
+//! - **Checked counters and untrusted-restore validation (#250).**
+//!   `next_engine_seq()` refuses with `OrderBookError::EngineSeqExhausted`
+//!   instead of wrapping; the engine's emission paths suppress (and latch,
+//!   `engine_seq_exhausted()`) an event they cannot stamp (caller-owned
+//!   results keep their fills, stamped `UNSTAMPED_ENGINE_SEQ`), and the book
+//!   keeps matching. Restore rejects, before touching the live book, a
+//!   crossed or locked snapshot (`OrderBookError::SnapshotCrossed`), an order
+//!   whose `visible + hidden` overflows `u64`, and a package whose
+//!   `engine_seq` is `u64::MAX`; tick / lot alignment is deliberately not
+//!   enforced. `OrderBookSnapshotPackage::new` propagates a failed aggregate
+//!   refresh. `spread()` / `spread_bps()` return `None` for a crossed read.
+//!   The strandable-maker count, `StubClock` (pinned at its ceiling,
+//!   `is_exhausted()`) and the repricing counters use checked forms; the
+//!   order-state tracker recovers a poisoned eviction queue and evicts an
+//!   order's status and history atomically with `DashMap::remove_if`.
+//! - **Hardened journals and identity replay of mass cancels (#252).**
+//!   `FileJournal` never truncates an existing segment on rotation
+//!   (`JournalError::SegmentExists`), both journals refuse non-increasing
+//!   sequences (`JournalError::NonMonotonicSequence`), a malformed entry
+//!   header is an error instead of a silent end of data, reopen zeroes a torn
+//!   tail and refuses (instead of truncating at) mid-segment corruption, and a
+//!   poisoned lock is `MutexPoisoned` everywhere. Replay compares a journaled
+//!   `MassCancelled` with the replayed result by order ids, in order, and
+//!   failure outcomes (`ReplayError::MassCancelMismatch`). No on-disk format
+//!   change.
+//! - **Consistent indices under concurrent crossing adds (#288).** An order's
+//!   location, user-index entry and resting state are published before its
+//!   level admits it, and every remover releases the location (the id's
+//!   ownership token) last, so a concurrent sweep that consumes the order
+//!   removes them instead of racing their insertion and a reused id never
+//!   touches a previous order's entries. A same-id submit racing a live order
+//!   is refused with `DuplicateOrderId` (possibly after trading, so it is now
+//!   journaled as may-have-mutated). The risk layer removes a fully filled
+//!   maker's entry under the same lock that zeroes it.
+//! - **Replay-safe post-trade risk rejections (#291).** A taker whose residual
+//!   the risk layer refuses after it traded returns
+//!   `OrderBookError::RiskRejectedAfterTrades` (code 22, journaled as possibly
+//!   mutating) instead of a pre-trade risk error replay skipped; replay re-runs
+//!   the sweep and refuses the residual, reproducing the live trades without a
+//!   `RiskConfig`. The repricers keep a reused id's special-order registration.
+//! - **Core boundary gaps closed (#294).** A panic under the shared side of
+//!   the submit gate (a `Clock`, metrics recorder or `tracing` subscriber
+//!   running mid-mutation) engages the kill switch and latches
+//!   `submit_gate_poisoned()` like one under the exclusive side; a sweep drain
+//!   or rest path that unwinds leaves no ghost order location; the public
+//!   `place_order_in_book` bypass is gone; a standalone `OrderStateTracker`
+//!   queues a terminal id for eviction before its listener runs; the listener
+//!   dispatcher always progresses when its buffer cannot grow;
+//!   `PriceSource::LastTrade` no longer falls back to the mid.
+//! - **Bounded journal recovery and NATS shutdown (#295).** Replay reports
 //!   `ReplayError::JournalTruncated` when the entries end before
 //!   `last_sequence()`. The NATS publishers clamp `with_max_retries` to
 //!   `MAX_PUBLISH_RETRIES` (10), stop publishing once shutdown is requested
@@ -280,16 +176,171 @@
 //!   counts errors once per batch. Wire frames above `MAX_FRAME_BODY` (4096)
 //!   are rejected, and the outbound encoders refuse values their decoders
 //!   reject.
-//! - **Core boundary gaps closed (#294).** A panic under the shared side of
-//!   the submit gate (a `Clock`, metrics recorder or `tracing` subscriber
-//!   running mid-mutation) now engages the kill switch and latches
-//!   `submit_gate_poisoned()` like one under the exclusive side; a sweep
-//!   drain or rest path that unwinds leaves no ghost order location; the public
-//!   `place_order_in_book` bypass is gone; a standalone
-//!   `OrderStateTracker` queues a terminal id for eviction before its
-//!   listener runs; the listener dispatcher always progresses when its
-//!   buffer cannot grow; `PriceSource::LastTrade` no longer falls back to
-//!   the mid.
+//!
+//! ### Breaking signatures
+//!
+//! - **pricelevel 0.10 (#239).** Level snapshots, queue views and
+//!   match-result growth are fallible upstream; the book propagates those
+//!   errors instead of ignoring them. `create_snapshot`, `enriched_snapshot`,
+//!   `enriched_snapshot_with_metrics` and `evict_expired_orders` return
+//!   `Result`.
+//! - **Book analytics return `Result` with checked aggregates (#245).** VWAP,
+//!   market impact, simulation, micro price, imbalance, pressure, depth
+//!   statistics / distribution, the depth-to-target and liquidity queries,
+//!   `total_quantity_at_price`, `get_volume_by_price`, `is_thin_book`,
+//!   `find_level`, the `OrderBookSnapshot` totals, the `EnrichedSnapshot`
+//!   constructors and `OrderSimulation::total_cost` return
+//!   `Result<_, OrderBookError>`; `u128` notionals and `u64` depth sums are
+//!   checked (`OrderBookError::ArithmeticOverflow`) instead of panicking in
+//!   debug, wrapping in release or saturating, and a level whose
+//!   `visible + hidden` total overflows surfaces as
+//!   `OrderBookError::PriceLevelError` instead of reading as an empty (or
+//!   `u64::MAX`) level. The depth iterators yield
+//!   `Result<LevelInfo, OrderBookError>` and stop after the first error.
+//!   `depth_distribution` caps `bins` at `MAX_DEPTH_DISTRIBUTION_BINS` (4096)
+//!   and reserves fallibly (`OrderBookError::AllocationFailed`). Pegged orders
+//!   referencing the mid price use the exact integer midpoint (rounded down)
+//!   instead of an `f64` round trip. The matching path is unchanged.
+//! - **Fee and trade construction (#244).** `FeeSchedule::calculate_fee`,
+//!   `TradeResult::new` / `with_fees` / `total_fees` and
+//!   `TradeInfo::from_trade_result` return `Result`
+//!   (`FeeOverflow` / `TradeArithmeticError`); `try_calculate_fee` is
+//!   deprecated. `with_maker_rebate(i32::MIN, _)` and a pegged offset of
+//!   `i64::MIN` no longer panic.
+//! - **`OrderBook::peek_match` returns `Result` (#246).** A level whose depth
+//!   overflows `u64` is reported instead of read as empty.
+//! - **Journal surface (#252).** `Journal::last_sequence` returns
+//!   `Result<Option<u64>, JournalError>`; `InMemoryJournal::with_capacity`,
+//!   `len` and `is_empty` return `Result`.
+//! - **NATS publishers (#253).** `shutdown()` returns
+//!   `Result<(), NatsPublisherError>` so a panicked or cancelled background
+//!   task is reported; builder values are clamped with a `WARN` (batch window
+//!   and publish interval at 60 s, `max_batch_size` into `1..=65_536` so `0`
+//!   now means `1`, channel capacity to Tokio's limit); retries use capped
+//!   exponential backoff (5 s) with jitter.
+//! - **Wire encoders return `Result` (#254).** `encode_exec_report`,
+//!   `encode_trade_print` and `encode_book_update` reserve with
+//!   `Vec::try_reserve` and return `Result<(), WireError>` (new
+//!   `WireError::CapacityOverflow`); the wire format is unchanged.
+//! - **Book managers are runtime-safe and stoppable (#255).**
+//!   `BookManagerTokio::start_trade_processor` returns `ManagerError::NoRuntime`
+//!   outside a Tokio runtime instead of panicking, and `BookManagerStd`
+//!   reports a refused thread as `ManagerError::ThreadSpawn`. Both managers
+//!   gain `start_trade_processor_with(handler)`, `stop_trade_processor()`
+//!   (joins or awaits the processor after it handles queued events; a panic
+//!   is `ProcessorPanicked`) and `dropped_trade_events()`, plus the
+//!   `orderbook_manager_trade_events_dropped_total` metric.
+//! - **Implied-volatility inputs are validated (#256).**
+//!   `SolverConfig::validate` and `IVConfig::validate` run at every solve
+//!   entry point, so an inverted or NaN IV bound, a zero tolerance or a bad
+//!   `price_scale` returns `IVError::InvalidConfig` instead of panicking in
+//!   `f64::clamp`. Black-Scholes and the Greeks return `Result<f64, IVError>`
+//!   and never hand back NaN or infinity. `IVError` is `#[non_exhaustive]`.
+//! - **Checked time helpers (#257).** `try_current_time_millis()` returns
+//!   `Result<u64, TimeError>` for a pre-epoch clock or a `u64` overflow;
+//!   `current_time_millis()` stays infallible with a documented, logged
+//!   fallback. `AllocSnapshot::since` (feature `alloc-counters`) returns
+//!   `Option` and rejects out-of-order snapshots instead of clamping.
+//! - **Bounded bincode decoding (#251).** `BincodeEventSerializer` is no
+//!   longer a unit struct (`BincodeEventSerializer::new()`,
+//!   `with_max_payload_bytes`) and `SerializationError` gains
+//!   `PayloadTooLarge` and `Truncated`.
+//! - **`ReplayError` is `#[non_exhaustive]` (#260).** 0.14 adds
+//!   `JournalTruncated` and `MassCancelMismatch`; later additions no longer
+//!   break downstream matches.
+//! - **Snapshot format v4.** Level statistics carry a `u128`
+//!   `value_executed`; v2 and v3 packages still restore.
+//! - **Wire break for bincode payloads.** pricelevel's `MatchResult` gained a
+//!   positional `error` field and `MassCancelResult` a `failures` field, so
+//!   bincode `TradeResult` / `MassCancelResult` payloads do not decode across
+//!   0.13 and 0.14; JSON payloads and journals stay compatible.
+//!
+//! ### Hardening
+//!
+//! - **Production Panic Policy (#242, #243 to #259, #265, #294, #295).**
+//!   Crate-owned production code no longer initiates panics: no `unwrap` /
+//!   `expect` / `panic!` / `assert!` / indexing / unchecked arithmetic /
+//!   narrowing cast / `saturating_*` on state. See `doc/panic-boundaries.md`
+//!   for what the gate cannot certify (dependencies, the two documented
+//!   `unsafe` exceptions, caller-supplied code).
+//! - **Checked pre-trade risk (#243).** Two orders whose notional sum
+//!   overflows `u128` can no longer wrap the account counter and bypass
+//!   `max_notional_per_account`, and the price band no longer passes at
+//!   extreme prices. Release-side underflows are logged and counted in
+//!   `OrderBook::risk_accounting_anomalies`.
+//! - **Panic-free matching loop (#246).** A `CancelMaker` fill-or-kill whose
+//!   non-self depth sums past `u64::MAX` is judged fillable instead of
+//!   panicking (debug) or being killed on a wrapped sum (release); the
+//!   thread-local matching pool degrades to fresh buffers during thread
+//!   teardown or reentrancy; the #225 STP snapshot check logs instead of
+//!   asserting; per-level budget arithmetic is checked and a
+//!   breach aborts the sweep with its committed prefix. Valid inputs trade
+//!   identically.
+//! - **Bounded bincode decoding of untrusted payloads (#251).** A string
+//!   length prefix is checked against the remaining input before anything is
+//!   allocated, so allocations are bounded by the input length, and payloads
+//!   over `DEFAULT_MAX_BINCODE_PAYLOAD_BYTES` (8 MiB, configurable) are
+//!   rejected with `SerializationError::PayloadTooLarge`.
+//! - **Wire codec is panic-free on untrusted bytes (#254).** Decoders read
+//!   through checked offsets instead of `copy_from_slice` and raw offset
+//!   arithmetic.
+//! - **Default trade-id namespace without OS entropy (#265).** Constructors
+//!   that are not given a namespace derive a UUIDv5 from the symbol, process
+//!   id, wall-clock nanoseconds and a process-wide checked counter instead of
+//!   calling the panicking `Uuid::new_v4()`. Namespaces are unique per book
+//!   within a process and are designed to differ across restarts; a restart
+//!   that reuses the same process id with the wall clock stepped back to the
+//!   same nanosecond can repeat one (see `default_trade_id_namespace`), so
+//!   inject a namespace when cross-restart uniqueness must be guaranteed.
+//! - **Bounded journal reopen (#295).** Reopening a `FileJournal` whose latest
+//!   segment ends in garbage is linear in the segment size (cheap pre-checks,
+//!   capped CRC probes); an empty latest segment left by a crash is grown on
+//!   open; only canonical segment names are read.
+//!
+//! ### Known limitations
+//!
+//! - **Trailing stops rest as limit liquidity (#286).** A `TrailingStop`
+//!   (`special_orders`) is placed as an ordinary resting limit order at its
+//!   stop price, not held off-book until triggered: it provides liquidity at
+//!   that price (a sell stop is a resting sell) and
+//!   `reprice_trailing_stops` cannot move it on an uncrossed book. Do not use
+//!   it as a protective stop in production until #286 lands.
+//! - **Level statistics are advisory under concurrent takers (#241).**
+//!   pricelevel 0.10 supports one concurrent writer of a level's execution
+//!   statistics, while takers on the shared submit gate can sweep one level
+//!   at once. A snapshot taken meanwhile can hold a partially recorded
+//!   execution in `orders_executed` / `quantity_executed` / `value_executed`.
+//!   Trades, fees, quantities and order vectors are unaffected, totals are
+//!   exact once the sweeps return, and single-threaded replay
+//!   (`snapshots_match`) stays exact.
+//! - **Replay of resource-exhaustion aborts (#240).** A journal holding such
+//!   an abort replays at best from genesis, never from a mid-stream snapshot
+//!   (the trade-id generator is not in the snapshot); the committed-prefix
+//!   check only applies to submits recorded through `*_with_committed` /
+//!   `SequencerResult::from_submit_failure`, and aborted updates are
+//!   reconciled by code only.
+//! - **Replay of concurrency-dependent outcomes (#247, #288).** A rolled-back
+//!   or lost modify whose cause does not reproduce, and the losing side of a
+//!   concurrent same-id submit, stop or diverge in replay (`OutcomeMismatch`,
+//!   or a `snapshots_match` difference). Unique order ids per submit are an
+//!   ingress / sequencing obligation.
+//! - **Old journals (#252).** Journals written before 0.10.2 fail replay with
+//!   `ReplayError::MassCancelMismatch` at their first mass cancel; a latest
+//!   segment holding mid-segment corruption now fails to open instead of
+//!   being silently truncated.
+//!
+//! See `doc/panic-boundaries.md` for the full statement of each.
+//!
+//! ### Tooling
+//!
+//! - **Absolute panic-policy gate (#242, #260).** A clippy deny set in
+//!   `Cargo.toml` plus `scripts/check_panic_policy.py` in `make lint`, with no
+//!   allowlist: the temporary ratchet ledgers used during the cycle were
+//!   removed.
+//! - **Dependency floors (#237).** Raised to the latest semver-compatible
+//!   releases; `bincode` stays on 2.0.1.
+//! - **Allocation budget test (#262).** `tests/alloc_budget.rs` asserts a
+//!   seven-window median and runs in CI.
 //!
 //! ### Migration from 0.13
 //!
@@ -301,7 +352,7 @@
 //! | `OrderBook::evict_expired_orders(now_ms) -> Vec<Arc<OrderType<T>>>` | `-> Result<EvictionResult<T>, OrderBookError>` (`iter()`, `len()`, `evicted_orders()`, `failures()`, `mass_cancel_result()`) |
 //! | `BookManager{Std,Tokio}::evict_expired_orders(symbol, now_ms) -> Option<Vec<..>>` | `-> Option<Result<EvictionResult<T>, OrderBookError>>` |
 //! | `BookManager{Std,Tokio}::evict_expired_across_books(now_ms) -> HashMap<String, Vec<..>>` | `-> HashMap<String, Result<EvictionResult<T>, OrderBookError>>` |
-//! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`) |
+//! | `MassCancelResult { cancelled_count, cancelled_order_ids }` | adds `failures: Vec<MassCancelFailure>` (`#[serde(default)]`); a JSON result carrying the new `order_cancel_failed` / `level_fault_after_removal` kinds does not decode on 0.13 (or pre-#248) readers |
 //! | `OrderBook::cancel_order`: level refusal → `Ok(None)` | `Err(OrderBookError::PriceLevelError(_))`, order untouched |
 //! | cancel whose level removed the order, then failed: `Ok(None)`, indices stale | removal completed, `Err(OrderBookError::OrderRemovedWithLevelFault { .. })` |
 //! | `evict_expired_orders`: per-order failure silently skipped | recorded in `EvictionResult::failures()`; the rest is still evicted |
@@ -328,7 +379,7 @@
 //! | `IVError` (exhaustive) | `#[non_exhaustive]`; adds `InvalidConfig`, `NonFiniteResult`, `ArithmeticOverflow`, `PriceLevel` |
 //! | `solve_iv` / `solve_iv_bisection` / `implied_volatility*` accept any config | reject an invalid config with `IVError::InvalidConfig` |
 //! | sweep stopped by a level failure: `Err(PriceLevelError)` (prefix unreported) | `Err(MatchAborted { .. })`, prefix published |
-//! | `CancelReason` (8 variants) | adds `MatchAborted` (exhaustive matches need an arm) |
+//! | `CancelReason` (8 variants) | adds `MatchAborted` (#240) and `RestFailed` (#247), appended (exhaustive matches need both arms) |
 //! | `Nats{Trade,BookChange}Publisher::shutdown() -> ()` | `-> Result<(), NatsPublisherError>` |
 //! | `FeeSchedule::calculate_fee(n, maker) -> i128` (clamps) | `-> Result<i128, FeeOverflow>`; `try_calculate_fee` deprecated |
 //! | `TradeResult::new(symbol, mr) -> TradeResult` | `-> Result<TradeResult, TradeArithmeticError>` |
@@ -357,7 +408,7 @@
 //! | `EnrichedSnapshot::{new, with_metrics}(..) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
 //! | `OrderSimulation::total_cost() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
 //! | `DistributionBin::width() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
-//! | `OrderBookError` (no analytics overflow variant) | adds `ArithmeticOverflow { operation }`, `AllocationFailed { operation, requested }` (wire code `Other(0)`) |
+//! | `OrderBookError` (0.13 variants) | adds `MatchAborted`, `FeeOverflow`, `NotionalOverflow`, `ArithmeticOverflow`, `AllocationFailed`, `EngineSeqExhausted`, `SnapshotCrossed`, `OrderRemovedWithLevelFault`, `ModifyRolledBack`, `ModifyOrderLost`, `OrderChangedDuringModify`, `RiskRejectedAfterTrades` (`#[non_exhaustive]`, so matches already have a wildcard arm) |
 //! | `OrderBook::peek_match(side, qty, limit) -> u64` (overflowing level read as empty) | `-> Result<u64, OrderBookError>` (`PriceLevelError` for an overflowing level) |
 //! | `Journal::last_sequence() -> Option<u64>` | `-> Result<Option<u64>, JournalError>` |
 //! | `InMemoryJournal::with_capacity(n) -> Self`; `len() -> usize`; `is_empty() -> bool` | `-> Result<Self, JournalError>`; `-> Result<usize, JournalError>`; `-> Result<bool, JournalError>` |
@@ -366,21 +417,29 @@
 //! | journaled `MassCancelled` checked by refusal / failures only | reconciled by ids and failure outcomes; `ReplayError::MassCancelMismatch` (`MassCancelDivergence`) |
 //! | `OrderBook::next_engine_seq() -> u64` (wraps at `u64::MAX`) | `-> Result<u64, OrderBookError>`; `EngineSeqExhausted` at `u64::MAX` |
 //! | `OrderBookSnapshot::refresh_aggregates()` (errors ignored) | `-> Result<(), OrderBookError>` |
-//! | `OrderBookError` (no counter-exhaustion / crossed-restore variant) | adds `EngineSeqExhausted { engine_seq }`, `SnapshotCrossed { best_bid, best_ask }` (wire code `Other(0)`) |
 //! | restore of a crossed / locked snapshot or a package with `engine_seq == u64::MAX`: accepted | rejected before any live state is touched |
 //! | `OrderBook::spread()` / `spread_bps()` / `OrderBookSnapshot::spread()` on a crossed read: `Some(0)` | `None` |
 //! | `OrderQuantity::total_quantity() -> u64` (saturating) | `-> Result<u64, OrderBookError>` (`QuantityOverflow`) |
 //! | `OrderBookError::PriceCrossing { opposite_price: u128 }` (`0` when empty) | `opposite_price: Option<u128>` |
 //! | `update_order(Cancel)`: level error ignored, indices removed anyway | same removal as `cancel_order`; errors propagated |
 //! | modify re-add failing after the cancel: `Err(..)`, original lost | `Err(ModifyRolledBack { .. })` (original restored, back of queue) or `Err(ModifyOrderLost { .. })` |
-//! | `RejectReason` codes 1 to 19 | adds `ModifyRolledBack` (20), `ModifyOrderLost` (21), `RiskRejectedAfterTrades` (22) |
+//! | `RejectReason` codes 1 to 14 | adds `MatchAborted` (15), `CapacityExceeded` (16), `CounterExhausted` (17), `FeeOverflow` (18), `NotionalOverflow` (19), `ModifyRolledBack` (20), `ModifyOrderLost` (21), `RiskRejectedAfterTrades` (22); pricelevel 0.10's `PriceLevelError::CapacityExceeded` / `CounterExhausted` map to 16 / 17, other `PriceLevelError`s stay `Other(0)`; older readers decode the new codes as `Other(n)` |
 //! | risk refusal of a residual after trades: `Err(RiskMaxNotional { .. })` / `Err(RiskMaxOpenOrders { .. })`, journaled as never mutating | `Err(RiskRejectedAfterTrades { source, .. })`, journaled as may-have-mutated and replayed |
-//! | `CancelReason` (9 variants) | adds `RestFailed` (exhaustive matches need an arm) |
 //! | remainder not rested after trades: no terminal state | `Cancelled { filled_quantity, reason: RestFailed }` |
 //! | modify after a concurrent partial fill: re-add rested the quantity read before it | `UpdatePrice` moves the remainder; `UpdatePriceAndQuantity` / `Replace`: `Err(ModifyRolledBack { source: OrderChangedDuringModify, .. })` |
 //! | re-priced partially filled order: state reset to `Open` | `PartiallyFilled` with cumulative quantities |
-//! | `ReplayError` (no truncation variant); a journal whose entries end early replays `Ok` on the prefix | adds `JournalTruncated { expected_last, reached }` (exhaustive matches need an arm) |
+//! | `ReplayError` (exhaustive) | `#[non_exhaustive]` (#260); adds `JournalTruncated { expected_last, reached }` (#295) and `MassCancelMismatch { .. }` (#252); matches need a wildcard arm |
+//! | a journal whose entries end before `last_sequence()` replays `Ok` on the prefix | `Err(ReplayError::JournalTruncated { .. })` |
 //! | `FileJournal` lists any `segment-<u64>.journal` name | only canonical `segment-<20 digits>.journal` names |
+//! | bincode `TradeResult` / `MassCancelResult` payloads written by 0.13 | do not decode under 0.14 and vice versa (positional `MatchResult::error`, `MassCancelResult::failures`): upgrade NATS producers and consumers together; JSON and journals unaffected |
+//! | `SequencerResult` (0.13 variants) | adds `MatchAborted { reason, code, committed }` (appended, `#[non_exhaustive]`): journals carrying it do not decode on older binaries |
+//! | same-id submit racing a live order: overwrites its location (last writer wins); `SequencerResult::from(DuplicateOrderId)` never mutating | refused with `DuplicateOrderId`, possibly after trading; journaled `may_have_mutated: true` (#288) |
+//! | IOC remainder `InsufficientLiquidity { requested, available }` read off the visible tranche | `requested` = taker total, `available` = executed quantity (#247) |
+//! | `ReplayBookConfig::fee_schedule` only priced fees | must match the source book's schedule: it decides `FeeOverflow` verdicts (#244) |
+//! | journals written before 0.10.2 replay mass cancels on equal counts | `ReplayError::MassCancelMismatch` at the first such mass cancel; re-record, or replay with a pre-0.14 build (#252) |
+//! | latest segment with mid-segment corruption: silently truncated at the damage on reopen | `FileJournal` refuses to open it (#252) |
+//! | `Nats{Trade,BookChange}Publisher` out-of-range builder values: later panic; `with_max_batch_size(0)` dropped buffered events on shutdown | clamped with a `WARN` (`max_batch_size` into `1..=65_536`, `0` means `1`; batch window / interval at 60 s; channel capacity to Tokio's limit) (#253) |
+//! | `match_market_order*` / `match_limit_order*` publish their trades after releasing the submit gate | before releasing it (`engine_seq` stamped at commit); the listener still runs after release (#249) |
 //! | `Nats{Trade,BookChange}Publisher::with_max_retries(n)`: any `u32` | clamped to `MAX_PUBLISH_RETRIES` (10) with a `WARN` |
 //! | shutdown drain with NATS down retries every buffered event | after the first exhausted publish the rest is counted in `dropped_events` |
 //! | `NatsPublisherError { TaskPanicked, TaskCancelled }` | adds `ShutdownTimedOut { timeout_ms }` (`shutdown_with_deadline`) |
@@ -389,6 +448,8 @@
 //! | `wire::encode_exec_report` / `encode_book_update` encode any `status` / `_pad` / `side` | `Err(WireError::InvalidPayload(..))` for values the decoders reject |
 //!
 //! Re-exported pricelevel items change with pricelevel 0.10:
+//! `MatchResult` carries the failure that stopped a level mid-match
+//! (`MatchResult::error()`, the committed prefix is kept),
 //! `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use
 //! `Trade::with_timestamp`), `UuidGenerator::next` is now `try_next`,
 //! `OrderType::match_against` / `refresh_iceberg` return `Result`, and

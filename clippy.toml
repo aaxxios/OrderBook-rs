@@ -14,7 +14,8 @@
 # production file, the whole `src/orderbook/tests/` and `src/utils/tests/`
 # co-located test-module trees, and whole integration-test crate roots
 # (`tests/unit/mod.rs`, `tests/alloc_budget.rs`, `tests/metrics/mod.rs`,
-# `tests/fee_tests.rs`, compiled with `cfg(test)` throughout). It does NOT
+# `tests/fee_tests.rs`, `tests/bincode_decode_bounds.rs`, compiled with
+# `cfg(test)` throughout). It does NOT
 # distinguish a real test from a standalone `#[cfg(test)] fn` production
 # helper living outside a `mod tests {}` block — clippy's own heuristic would
 # wrongly exempt that helper too. `scripts/check_panic_policy.py` re-checks
@@ -29,7 +30,10 @@
 # roots that need relief from them carry an explicit `#![allow(...)]` instead
 # (see each file's header comment), and a co-located `mod tests { ... }`
 # block that violates one gets the same treatment marked
-# `// tests may panic: rules/global_rules.md § Testing` (not a ratchet).
+# `// tests may panic: rules/global_rules.md § Testing`. Production code
+# gets no such relief: since #260 the gate is absolute, and
+# `scripts/check_panic_policy.py` fails on any production `#[allow]` /
+# `#[expect]` of a lint `[lints.clippy]` denies.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

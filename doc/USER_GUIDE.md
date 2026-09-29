@@ -22,7 +22,7 @@ Complete guide for using the OrderBook-rs library in your trading systems.
 OrderBook-rs is a high-performance, lock-free order book implementation for financial trading systems. It provides:
 
 - **Lock-free architecture** using crossbeam-skiplist for concurrent access
-- **Multiple order types**: Limit, Market, Iceberg, FOK, IOC
+- **Multiple order types**: Limit, Market, Iceberg, Reserve, Post-only, FOK, IOC, GTD, Pegged and Trailing stop (`special_orders`; see the trailing-stop limitation under [Order Types](#order-types))
 - **Real-time metrics**: VWAP, spread, imbalance, depth statistics
 - **Market impact simulation** for pre-trade analysis
 - **Intelligent order placement** strategies
@@ -50,15 +50,26 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-orderbook-rs = "0.4"
-pricelevel = "0.4"
+orderbook-rs = "0.14"
+pricelevel = "0.10"
 ```
+
+Optional features: `special_orders` (pegged / trailing-stop repricing),
+`journal` (memory-mapped `FileJournal`), `nats` (JetStream publishers),
+`bincode` (binary event serializer), `wire` (binary wire codec), `metrics`
+(Prometheus-style counters through the `metrics` facade) and
+`alloc-counters` (allocation counting for benches).
 
 For simplified imports, use the prelude:
 
 ```rust
 use orderbook_rs::prelude::*;
 ```
+
+The snippets below are fragments. Unless shown otherwise they run inside a
+function returning `Result<(), Box<dyn std::error::Error>>`, with `book` an
+`OrderBook<()>`. Since 0.14.0 almost every query that aggregates quantities
+or prices returns a `Result` (checked arithmetic, no panics), hence the `?`.
 
 ---
 
@@ -72,53 +83,50 @@ use orderbook_rs::prelude::*;
 // Create order book
 let book = OrderBook::<()>::new("BTC/USD");
 
-// Add buy order
-let order_id = OrderId::new();
-let result = book.add_limit_order(
-    order_id,
-    50000,  // price
-    10,     // quantity
+// Add a buy order (returns the resting order)
+book.add_limit_order(
+    OrderId::from_u64(1),
+    50_000, // price (u128, base units)
+    10,     // quantity (u64)
     Side::Buy,
     TimeInForce::Gtc,
-    None    // no extra data
-);
-
-// Add sell order
-let order_id2 = OrderId::new();
-book.add_limit_order(
-    order_id2,
-    50100,  // price
-    10,     // quantity
-    Side::Sell,
-    TimeInForce::Gtc,
-    None
+    None,   // no extra data
 )?;
 
-// Get best bid/ask
+// Add a sell order
+book.add_limit_order(
+    OrderId::from_u64(2),
+    50_100,
+    10,
+    Side::Sell,
+    TimeInForce::Gtc,
+    None,
+)?;
+
+// Best bid / ask
 if let Some(best_bid) = book.best_bid() {
-    println!("Best bid: {}", best_bid);
+    println!("Best bid: {best_bid}");
 }
 if let Some(best_ask) = book.best_ask() {
-    println!("Best ask: {}", best_ask);
+    println!("Best ask: {best_ask}");
 }
 ```
 
 ### Executing Market Orders
 
 ```rust
-// Execute market buy order
-let order_id = OrderId::new();
-let result = book.add_market_order(
-    order_id,
-    20,  // quantity
-    Side::Buy,
-    None
-)?;
+// Execute a market buy for 20 units
+let result = book.submit_market_order(OrderId::from_u64(3), 20, Side::Buy)?;
 
 // Check execution
-println!("Filled: {} units", result.filled_quantity);
-println!("Average price: {}", result.average_price());
+println!("Filled: {} units", result.executed_quantity()?.as_u64());
+println!("Unfilled: {} units", result.remaining_quantity().as_u64());
+println!("Fills: {}", result.trades().len());
 ```
+
+A market order that finds no liquidity at all returns
+`OrderBookError::InsufficientLiquidity`. `submit_market_order_by_amount`
+sweeps by quote notional instead of base quantity.
 
 ---
 
@@ -198,10 +206,24 @@ println!("Average price: {}", result.average_price());
   with `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) = 20` and rests 20 visible
   / 0 hidden — more than it first displayed
 
+**Pegged and Trailing-stop orders (`special_orders`):**
+- Pegged orders track a reference price (best bid, best ask, mid, last
+  trade) and are re-priced by `reprice_pegged_orders` /
+  `reprice_special_orders`
+- **Known limitation (#286): trailing stops rest as limit liquidity.** A
+  `TrailingStop` is placed as an ordinary resting limit order at its stop
+  price instead of being held off-book until triggered. It provides
+  liquidity at that price (a sell stop is a resting sell and trades
+  immediately when submitted below the best bid), and
+  `reprice_trailing_stops` cannot move it on an uncrossed book. Do not use
+  trailing stops as protective stops in production until #286 lands
+
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled
 - `Ioc` (Immediate-Or-Cancel): Fill immediately or cancel
 - `Fok` (Fill-Or-Kill): Fill completely or cancel entirely
+- `Gtd(ms)` / `Day`: expire at a deadline, swept by
+  `evict_expired_orders(now)`
 
 ### Sides
 
@@ -210,7 +232,8 @@ println!("Average price: {}", result.average_price());
 
 ### Price Levels
 
-Prices are represented as `u64` in base units (e.g., cents, satoshis).
+Prices are `u128` and quantities `u64`, both in base units (e.g. cents,
+satoshis).
 
 Example: $500.00 = 50000 (in cents)
 
@@ -222,7 +245,7 @@ Example: $500.00 = 50000 (in cents)
 
 ```rust
 // Limit order
-let order_id = OrderId::new();
+let order_id = OrderId::from_u64(10);
 book.add_limit_order(
     order_id,
     50000,           // price
@@ -233,7 +256,7 @@ book.add_limit_order(
 )?;
 
 // Iceberg order (visible tranche: 10, hidden tranche: 90, total: 100)
-let order_id = OrderId::new();
+let order_id = OrderId::from_u64(11);
 book.add_iceberg_order(
     order_id,
     50000,           // price
@@ -244,14 +267,8 @@ book.add_iceberg_order(
     None
 )?;
 
-// Market order
-let order_id = OrderId::new();
-book.add_market_order(
-    order_id,
-    50,              // quantity
-    Side::Buy,
-    None
-)?;
+// Market order (takes liquidity, never rests)
+book.submit_market_order(OrderId::from_u64(12), 50, Side::Sell)?;
 ```
 
 ### Modifying Orders
@@ -321,12 +338,21 @@ visible tranche and its hidden depth live, while a reserve with
 ### Cancelling Orders
 
 ```rust
-// Cancel specific order
+// Cancel a specific order: Ok(Some(order)) if it was resting,
+// Ok(None) if it was already gone
 book.cancel_order(order_id)?;
 
-// Cancel all orders on one side
-book.cancel_all_orders_for_side(Side::Buy)?;
+// Cancel all orders on one side (mass cancels return a MassCancelResult)
+let result = book.cancel_orders_by_side(Side::Buy);
+println!("Cancelled {} order(s)", result.cancelled_count());
+if result.has_failures() {
+    // A level or order the book could not cancel stays resting and tracked
+    eprintln!("Mass cancel failures: {:?}", result.failures());
+}
 ```
+
+`cancel_all_orders`, `cancel_orders_by_user` and
+`cancel_orders_by_price_range` follow the same shape.
 
 ### Querying Order Book State
 
@@ -335,16 +361,16 @@ book.cancel_all_orders_for_side(Side::Buy)?;
 let best_bid = book.best_bid();
 let best_ask = book.best_ask();
 
-// Spread
+// Spread (absolute and in basis points; `None` uses the default multiplier)
 let spread = book.spread_absolute();
-let spread_bps = book.spread_bps();
+let spread_bps = book.spread_bps(None);
 
-// Depth
-let bid_depth = book.total_depth_at_levels(Side::Buy, 5);
-let ask_depth = book.total_depth_at_levels(Side::Sell, 5);
+// Depth of the top 5 levels on each side
+let bid_depth = book.total_depth_at_levels(5, Side::Buy)?;
+let ask_depth = book.total_depth_at_levels(5, Side::Sell)?;
 
-// Check if order exists
-let exists = book.has_order(&order_id);
+// Check if an order is resting
+let exists = book.get_order(order_id).is_some();
 ```
 
 ---
@@ -356,20 +382,20 @@ let exists = book.has_order(&order_id);
 Calculate key trading metrics for decision making.
 
 ```rust
-// VWAP (Volume-Weighted Average Price)
-let vwap = book.vwap(Side::Buy, 10);  // Top 10 levels
+// VWAP to fill 100 units against the asks (buy side)
+let vwap: Option<f64> = book.vwap(100, Side::Buy)?;
 
 // Mid price
 let mid = book.mid_price();
 
 // Spread in basis points
-let spread_bps = book.spread_bps();
+let spread_bps = book.spread_bps(None);
 
-// Order book imbalance (-1.0 to 1.0)
-let imbalance = book.order_book_imbalance(5);  // Top 5 levels
+// Order book imbalance over the top 5 levels (-1.0 to 1.0)
+let imbalance = book.order_book_imbalance(5)?;
 
 // Micro price (imbalance-adjusted)
-let micro_price = book.micro_price();
+let micro_price: Option<f64> = book.micro_price()?;
 ```
 
 **Use cases:**
@@ -380,33 +406,46 @@ let micro_price = book.micro_price();
 
 ### 2. Market Impact Simulation
 
-Simulate order execution to assess pre-trade impact.
+Simulate order execution to assess pre-trade impact. Neither call mutates
+the book.
 
 ```rust
-// Simulate market order
-let simulation = book.simulate_market_order(Side::Buy, 1000);
+// Level-by-level fills a 1000-unit market buy would get
+let simulation = book.simulate_market_order(1000, Side::Buy)?;
+println!("Average price: {}", simulation.avg_price);
+println!("Filled / unfilled: {} / {}", simulation.total_filled, simulation.remaining_quantity);
+println!("Total cost: {}", simulation.total_cost()?);
 
-println!("Average price: {}", simulation.average_price);
-println!("Total cost: {}", simulation.total_cost);
-println!("Price impact: {:.2}%", simulation.price_impact_percentage);
-println!("Levels consumed: {}", simulation.levels_consumed);
+// Aggregate impact of the same order
+let impact = book.market_impact(1000, Side::Buy)?;
+println!("Slippage: {:.2} bps", impact.slippage_bps);
+println!("Levels consumed: {}", impact.levels_consumed);
 
 // Decide based on impact
-if simulation.price_impact_percentage < 0.5 {
+if impact.slippage_bps < 50.0 {
     // Execute order
-    book.add_market_order(order_id, 1000, Side::Buy, None)?;
-} else {
-    // Impact too high, use limit order instead
-    book.add_limit_order(
-        order_id,
-        simulation.average_price as u64,
+    book.submit_market_order(OrderId::from_u64(20), 1000, Side::Buy)?;
+} else if let Some(best_bid) = book.best_bid() {
+    // Impact too high: rest passively at the best bid instead of taking
+    // liquidity. Post-only guarantees the order never crosses: a price at
+    // or through the best ask would be rejected, not matched.
+    book.add_post_only_order(
+        OrderId::from_u64(20),
+        best_bid,
         1000,
         Side::Buy,
         TimeInForce::Gtc,
-        None
+        None,
     )?;
+} else {
+    // No bid to join: defer the order rather than guess a price.
 }
 ```
+
+Note that a limit buy at `impact.worst_price` would **not** rest: that
+price is on the ask side, so the order crosses and executes the same
+sweep. Use it only deliberately, as a marketable limit that caps the
+execution price (for example with `TimeInForce::Ioc`).
 
 **Use cases:**
 - Pre-trade risk assessment
@@ -419,18 +458,18 @@ if simulation.price_impact_percentage < 0.5 {
 Optimize order placement for market makers and smart routing.
 
 ```rust
-// Get queue position at specific price
-let queue_ahead = book.queue_ahead_at_price(50000, Side::Buy);
-println!("Orders ahead: {}", queue_ahead);
+// Orders queued ahead at a specific price
+let queue_ahead = book.queue_ahead_at_price(50_000, Side::Buy);
+println!("Orders ahead: {queue_ahead}");
 
-// Calculate price N ticks inside
-let price = book.price_n_ticks_inside(Side::Buy, 3);  // 3 ticks inside best bid
+// Price 3 ticks inside the best bid (tick size 1)
+let price = book.price_n_ticks_inside(3, 1, Side::Buy);
 
-// Find price for queue position
-let target_price = book.price_for_queue_position(Side::Buy, 100);
+// Price at which an order would be at queue position 100
+let target_price = book.price_for_queue_position(100, Side::Buy);
 
-// Get depth-adjusted price
-let adjusted_price = book.price_at_depth_adjusted(Side::Buy, 1000, 0.95);
+// Price reaching 1000 units of depth, snapped to a tick size of 1
+let adjusted_price = book.price_at_depth_adjusted(1000, 1, Side::Buy)?;
 ```
 
 **Use cases:**
@@ -441,30 +480,39 @@ let adjusted_price = book.price_at_depth_adjusted(Side::Buy, 1000, 0.95);
 
 ### 4. Functional Iterators
 
-Efficient, lazy evaluation for depth analysis.
+Lazy iteration over levels, best price first. Every item is a
+`Result<LevelInfo, OrderBookError>` (a level whose `visible + hidden`
+total overflows is reported, not read as empty), and an iterator stops
+after its first error.
 
 ```rust
-// Iterate until cumulative depth reached
-let levels: Vec<_> = book
-    .levels_until_depth(Side::Buy, 1000)
-    .collect();
+// Levels until 1000 units of cumulative depth are reached
+let levels: Vec<LevelInfo> = book
+    .levels_until_depth(1000, Side::Buy)
+    .collect::<Result<_, _>>()?;
 
-// Iterate with cumulative depth tracking
-for level in book.levels_with_cumulative_depth(Side::Sell, 10) {
-    println!("Price: {}, Size: {}, Cumulative: {}", 
-             level.price, level.size, level.cumulative);
+// Cumulative depth tracking over the top 10 ask levels
+for level in book.levels_with_cumulative_depth(Side::Sell).take(10) {
+    let level = level?;
+    println!(
+        "Price: {}, Size: {}, Cumulative: {}",
+        level.price, level.quantity, level.cumulative_depth
+    );
 }
 
-// Iterate within price range
-let levels: Vec<_> = book
-    .levels_in_range(Side::Buy, 49000, 50000)
-    .collect();
+// Levels within a price range
+let in_range: Vec<LevelInfo> = book
+    .levels_in_range(49_000, 50_000, Side::Buy)
+    .collect::<Result<_, _>>()?;
 
-// Combine with functional operations
-let total_volume: u64 = book
-    .levels_until_depth(Side::Buy, 5000)
-    .map(|level| level.size)
-    .sum();
+// Combine with functional operations (checked sum)
+let total_volume = book
+    .levels_until_depth(5000, Side::Buy)
+    .try_fold(0u64, |acc, level| {
+        let level = level?;
+        acc.checked_add(level.quantity)
+            .ok_or(OrderBookError::ArithmeticOverflow { operation: "sum level quantities" })
+    })?;
 ```
 
 **Benefits:**
@@ -478,9 +526,8 @@ let total_volume: u64 = book
 Comprehensive statistical analysis for market condition detection.
 
 ```rust
-// Depth statistics
-let stats = book.depth_statistics(Side::Buy, 10);
-
+// Depth statistics over the top 10 bid levels (0 = all levels)
+let stats = book.depth_statistics(Side::Buy, 10)?;
 println!("Total volume: {}", stats.total_volume);
 println!("Average level size: {:.2}", stats.avg_level_size);
 println!("Weighted avg price: {:.2}", stats.weighted_avg_price);
@@ -488,20 +535,20 @@ println!("Std dev: {:.2}", stats.std_dev_level_size);
 println!("Min/Max: {} / {}", stats.min_level_size, stats.max_level_size);
 
 // Market pressure
-let (buy_pressure, sell_pressure) = book.buy_sell_pressure();
-println!("Buy pressure: {}, Sell pressure: {}", buy_pressure, sell_pressure);
+let (buy_pressure, sell_pressure) = book.buy_sell_pressure()?;
+println!("Buy pressure: {buy_pressure}, Sell pressure: {sell_pressure}");
 
-// Thin book detection
-let is_thin = book.is_thin_book(1000, 5);  // Threshold: 1000, levels: 5
-if is_thin {
-    println!("⚠️ Low liquidity detected!");
+// Thin book detection (threshold 1000 units over the top 5 levels)
+if book.is_thin_book(1000, 5)? {
+    println!("Low liquidity detected");
 }
 
-// Depth distribution
-let distribution = book.depth_distribution(Side::Buy, 5);
-for bin in distribution {
-    println!("Price range: {} - {}, Volume: {}, Levels: {}", 
-             bin.min_price, bin.max_price, bin.volume, bin.level_count);
+// Depth distribution in 5 bins (capped at MAX_DEPTH_DISTRIBUTION_BINS)
+for bin in book.depth_distribution(Side::Buy, 5)? {
+    println!(
+        "Price range: {} - {}, Volume: {}, Levels: {}",
+        bin.min_price, bin.max_price, bin.volume, bin.level_count
+    );
 }
 ```
 
@@ -516,9 +563,8 @@ for bin in distribution {
 Pre-calculated metrics in snapshots for high-frequency trading.
 
 ```rust
-// Snapshot with all metrics
-let snapshot = book.enriched_snapshot(10);
-
+// Snapshot of the top 10 levels with every metric
+let snapshot = book.enriched_snapshot(10)?;
 println!("Mid price: {:?}", snapshot.mid_price);
 println!("Spread: {:?} bps", snapshot.spread_bps);
 println!("Bid depth: {}", snapshot.bid_depth_total);
@@ -527,13 +573,10 @@ println!("Imbalance: {}", snapshot.order_book_imbalance);
 println!("VWAP bid: {:?}", snapshot.vwap_bid);
 println!("VWAP ask: {:?}", snapshot.vwap_ask);
 
-// Custom metrics for performance
+// Only the metrics you need
 use orderbook_rs::MetricFlags;
 
-let snapshot = book.enriched_snapshot_with_metrics(
-    10,
-    MetricFlags::MID_PRICE | MetricFlags::SPREAD
-);
+let snapshot = book.enriched_snapshot_with_metrics(10, MetricFlags::MID_PRICE | MetricFlags::SPREAD)?;
 
 // Serialize for distribution
 let json = serde_json::to_string(&snapshot)?;
@@ -553,39 +596,43 @@ let json = serde_json::to_string(&snapshot)?;
 ### 1. Choose the Right Data Types
 
 ```rust
-// Use u64 for prices and quantities (base units)
-let price: u64 = 50000;  // $500.00 in cents
+// Integer base units for prices (u128) and quantities (u64)
+let price: u128 = 50_000; // $500.00 in cents
 let quantity: u64 = 100;
 
-// Use f64 only for calculated metrics
-let vwap: f64 = book.vwap(Side::Buy, 10).unwrap_or(0.0);
+// f64 only for calculated metrics
+let vwap: f64 = book.vwap(quantity, Side::Buy)?.unwrap_or(0.0);
 ```
 
 ### 2. Minimize Allocations
 
 ```rust
-// Use iterators instead of collecting
-let sum: u64 = book
-    .levels_until_depth(Side::Buy, 1000)
-    .map(|level| level.size)
-    .sum();  // No allocation
+// Fold over the iterator instead of collecting
+let sum = book
+    .levels_until_depth(1000, Side::Buy)
+    .try_fold(0u64, |acc, level| {
+        let level = level?;
+        acc.checked_add(level.quantity)
+            .ok_or(OrderBookError::ArithmeticOverflow { operation: "sum level quantities" })
+    })?; // No allocation
 
 // Instead of:
-let levels: Vec<_> = book.levels_until_depth(Side::Buy, 1000).collect();
-let sum: u64 = levels.iter().map(|level| level.size).sum();  // Allocates Vec
+let levels: Vec<LevelInfo> = book
+    .levels_until_depth(1000, Side::Buy)
+    .collect::<Result<_, _>>()?; // Allocates a Vec
 ```
 
 ### 3. Use Enriched Snapshots for Multiple Metrics
 
 ```rust
-// ❌ Inefficient: Multiple passes
+// Inefficient: multiple passes
 let mid = book.mid_price();
-let spread = book.spread_bps();
-let depth = book.total_depth_at_levels(Side::Buy, 10);
-let vwap = book.vwap(Side::Buy, 10);
+let spread = book.spread_bps(None);
+let depth = book.total_depth_at_levels(10, Side::Buy)?;
+let vwap = book.vwap(100, Side::Buy)?;
 
-// ✅ Efficient: Single pass
-let snapshot = book.enriched_snapshot(10);
+// Efficient: single pass
+let snapshot = book.enriched_snapshot(10)?;
 let mid = snapshot.mid_price;
 let spread = snapshot.spread_bps;
 let depth = snapshot.bid_depth_total;
@@ -595,11 +642,11 @@ let vwap = snapshot.vwap_bid;
 ### 4. Batch Operations
 
 ```rust
-// Add multiple orders efficiently
-let orders = vec![
-    (OrderId::new(), 50000, 10),
-    (OrderId::new(), 49990, 20),
-    (OrderId::new(), 49980, 30),
+// Add multiple orders
+let orders = [
+    (OrderId::from_u64(100), 50_000, 10),
+    (OrderId::from_u64(101), 49_990, 20),
+    (OrderId::from_u64(102), 49_980, 30),
 ];
 
 for (id, price, qty) in orders {
@@ -611,10 +658,10 @@ for (id, price, qty) in orders {
 
 ```rust
 // Only analyze what you need
-let stats = book.depth_statistics(Side::Buy, 5);  // Top 5 levels only
+let stats = book.depth_statistics(Side::Buy, 5)?; // Top 5 levels only
 
 // Instead of:
-let stats = book.depth_statistics(Side::Buy, 0);  // All levels (slower)
+let stats = book.depth_statistics(Side::Buy, 0)?; // 0 = all levels (slower)
 ```
 
 ---
@@ -627,17 +674,24 @@ let stats = book.depth_statistics(Side::Buy, 0);  // All levels (slower)
 use orderbook_rs::OrderBookError;
 
 match book.add_limit_order(order_id, price, qty, Side::Buy, TimeInForce::Gtc, None) {
-    Ok(result) => {
+    Ok(_order) => {
         println!("Order added successfully");
     }
     Err(OrderBookError::DuplicateOrderId { order_id }) => {
-        eprintln!("Order {} already exists", order_id);
+        eprintln!("Order {order_id} already exists");
     }
     Err(e) => {
-        eprintln!("Error: {}", e);
+        // `OrderBookError` is #[non_exhaustive]: keep a catch-all arm
+        eprintln!("Error: {e}");
     }
 }
 ```
+
+Every rejection maps to a stable wire code through
+`RejectReason::from(&err)` (for example `DuplicateOrderId` is 12,
+`MatchAborted` 15, `FeeOverflow` 18). A `MatchAborted`, `ModifyRolledBack`,
+`ModifyOrderLost` or `RiskRejectedAfterTrades` error can follow real
+trades: check its fields before assuming nothing happened.
 
 ### 2. Trade Notifications
 
@@ -656,7 +710,7 @@ book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
 }));
 
 let book = Arc::new(book);
-book.submit_market_order(OrderId::new(), 100, Side::Buy)?;
+book.submit_market_order(OrderId::from_u64(200), 100, Side::Buy)?;
 
 while let Ok((seq, fills)) = rx.try_recv() {
     println!("engine_seq {seq}: {fills} fill(s)");
@@ -679,19 +733,30 @@ of the book, so pushing onto a channel is still the recommended shape.
 
 ### 3. State Management
 
+Use a snapshot **package** for persistence: it carries the format version
+(currently 4; versions 2 to 4 restore), a checksum, and the book's
+configuration (fees, STP mode, tick / lot size, order-size limits, risk
+config, kill switch, `engine_seq`), and restore validates all of it before
+touching the live book.
+
 ```rust
-// Create snapshot for persistence
-let snapshot = book.create_snapshot(10);
-let json = serde_json::to_string(&snapshot)?;
+use orderbook_rs::orderbook::OrderBookSnapshotPackage;
 
-// Save to file/database
-std::fs::write("orderbook_snapshot.json", json)?;
+// Capture every level (usize::MAX = no depth limit) and persist
+let package = book.create_snapshot_package(usize::MAX)?;
+std::fs::write("orderbook_snapshot.json", package.to_json()?)?;
 
-// Restore later
+// Restore later into a book you own (`&mut self`)
 let json = std::fs::read_to_string("orderbook_snapshot.json")?;
-let snapshot: OrderBookSnapshot = serde_json::from_str(&json)?;
-book.restore_from_snapshot(snapshot)?;
+let package = OrderBookSnapshotPackage::from_json(&json)?;
+let mut restored = OrderBook::<()>::new("BTC/USD");
+restored.restore_from_snapshot_package(package)?;
 ```
+
+`create_snapshot(depth)` / `restore_from_snapshot(snapshot)` still exist
+for the levels and orders alone, without configuration, version or
+checksum. A crossed or locked snapshot is rejected on restore
+(`OrderBookError::SnapshotCrossed`).
 
 ### 4. Concurrent Access
 
@@ -706,7 +771,7 @@ let book_clone = Arc::clone(&book);
 std::thread::spawn(move || {
     // Use book_clone in thread
     let _ = book_clone.add_limit_order(
-        OrderId::new(),
+        OrderId::from_u64(300),
         50000,
         10,
         Side::Buy,
@@ -795,7 +860,8 @@ including from inside a listener callback.
 ```rust
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `OrderBook<T>` needs `T: Default + Clone + Send + Sync + 'static`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct OrderMetadata {
     user_id: String,
     strategy: String,
@@ -809,12 +875,12 @@ let metadata = OrderMetadata {
 };
 
 book.add_limit_order(
-    OrderId::new(),
-    50000,
+    OrderId::from_u64(400),
+    50_000,
     10,
     Side::Buy,
     TimeInForce::Gtc,
-    Some(metadata)
+    Some(metadata),
 )?;
 ```
 
@@ -827,42 +893,40 @@ book.add_limit_order(
 ```rust
 use orderbook_rs::prelude::*;
 
-fn market_maker_strategy(book: &OrderBook) -> Result<(), OrderBookError> {
-    // Get current market state
-    let snapshot = book.enriched_snapshot(5);
-    
+fn market_maker_strategy(book: &OrderBook<()>, next_id: u64) -> Result<(), OrderBookError> {
+    // Current market state
+    let snapshot = book.enriched_snapshot(5)?;
+
     if let (Some(mid), Some(spread_bps)) = (snapshot.mid_price, snapshot.spread_bps) {
-        // Only make markets if spread is tight enough
+        // Only make markets if the spread is tight enough
         if spread_bps < 20.0 {
             let offset = 5.0;
-            let bid_price = (mid - offset) as u64;
-            let ask_price = (mid + offset) as u64;
-            
-            // Place orders
+            let bid_price = (mid - offset) as u128;
+            let ask_price = (mid + offset) as u128;
+
             book.add_limit_order(
-                OrderId::new(),
+                OrderId::from_u64(next_id),
                 bid_price,
                 10,
                 Side::Buy,
                 TimeInForce::Gtc,
-                None
+                None,
             )?;
-            
             book.add_limit_order(
-                OrderId::new(),
+                OrderId::from_u64(next_id + 1),
                 ask_price,
                 10,
                 Side::Sell,
                 TimeInForce::Gtc,
-                None
+                None,
             )?;
-            
-            println!("Market making: bid @ {}, ask @ {}", bid_price, ask_price);
+
+            println!("Market making: bid @ {bid_price}, ask @ {ask_price}");
         } else {
-            println!("Spread too wide: {:.2} bps", spread_bps);
+            println!("Spread too wide: {spread_bps:.2} bps");
         }
     }
-    
+
     Ok(())
 }
 ```
@@ -870,50 +934,35 @@ fn market_maker_strategy(book: &OrderBook) -> Result<(), OrderBookError> {
 ### Example 2: Smart Order Execution
 
 ```rust
+use orderbook_rs::prelude::*;
+
 fn execute_large_order(
-    book: &OrderBook,
+    book: &OrderBook<()>,
+    id: OrderId,
     quantity: u64,
-    side: Side
+    side: Side,
 ) -> Result<(), OrderBookError> {
-    // Simulate to assess impact
-    let simulation = book.simulate_market_order(side, quantity);
-    
-    println!("Simulation results:");
-    println!("  Average price: {}", simulation.average_price);
-    println!("  Price impact: {:.2}%", simulation.price_impact_percentage);
-    
-    // Decide execution strategy
-    if simulation.price_impact_percentage < 0.5 {
-        // Low impact: use market order
-        println!("Executing market order");
-        book.add_market_order(OrderId::new(), quantity, side, None)?;
-    } else if simulation.price_impact_percentage < 2.0 {
-        // Medium impact: use limit order at VWAP
-        println!("Executing limit order at VWAP");
-        book.add_limit_order(
-            OrderId::new(),
-            simulation.average_price as u64,
-            quantity,
-            side,
-            TimeInForce::Gtc,
-            None
-        )?;
+    // Assess impact first (read-only)
+    let impact = book.market_impact(quantity, side)?;
+    println!("Average price: {}", impact.avg_price);
+    println!("Slippage: {:.2} bps", impact.slippage_bps);
+
+    if impact.slippage_bps < 50.0 {
+        // Low impact: market order
+        book.submit_market_order(id, quantity, side)?;
     } else {
-        // High impact: split order
-        println!("Splitting order due to high impact");
-        let chunk_size = quantity / 4;
-        for _ in 0..4 {
-            book.add_limit_order(
-                OrderId::new(),
-                simulation.average_price as u64,
-                chunk_size,
-                side,
-                TimeInForce::Gtc,
-                None
-            )?;
+        // High impact: join our own side's best price passively. Post-only
+        // guarantees it rests (a crossing price is rejected, not matched);
+        // with no price to join, defer the order.
+        let passive_price = match side {
+            Side::Buy => book.best_bid(),
+            Side::Sell => book.best_ask(),
+        };
+        if let Some(price) = passive_price {
+            book.add_post_only_order(id, price, quantity, side, TimeInForce::Gtc, None)?;
         }
     }
-    
+
     Ok(())
 }
 ```
@@ -921,34 +970,28 @@ fn execute_large_order(
 ### Example 3: Liquidity Monitoring
 
 ```rust
-fn monitor_liquidity(book: &OrderBook) {
-    let stats_bid = book.depth_statistics(Side::Buy, 10);
-    let stats_ask = book.depth_statistics(Side::Sell, 10);
-    
+use orderbook_rs::prelude::*;
+
+fn monitor_liquidity(book: &OrderBook<()>) -> Result<(), OrderBookError> {
+    let stats_bid = book.depth_statistics(Side::Buy, 10)?;
+    let stats_ask = book.depth_statistics(Side::Sell, 10)?;
+
     println!("Liquidity Report:");
-    println!("  Bid side:");
-    println!("    Total volume: {}", stats_bid.total_volume);
-    println!("    Std dev: {:.2}", stats_bid.std_dev_level_size);
-    
-    println!("  Ask side:");
-    println!("    Total volume: {}", stats_ask.total_volume);
-    println!("    Std dev: {:.2}", stats_ask.std_dev_level_size);
-    
-    // Check for thin book
-    if book.is_thin_book(1000, 5) {
-        println!("⚠️ WARNING: Thin book detected!");
-        println!("  Recommendation: Reduce position sizes");
+    println!("  Bid volume: {} (std dev {:.2})", stats_bid.total_volume, stats_bid.std_dev_level_size);
+    println!("  Ask volume: {} (std dev {:.2})", stats_ask.total_volume, stats_ask.std_dev_level_size);
+
+    if book.is_thin_book(1000, 5)? {
+        println!("WARNING: thin book detected; reduce position sizes");
     }
-    
-    // Check for imbalance
-    let imbalance = book.order_book_imbalance(5);
-    if imbalance.abs() > 0.3 {
-        if imbalance > 0.0 {
-            println!("📈 Strong buy pressure detected");
-        } else {
-            println!("📉 Strong sell pressure detected");
-        }
+
+    let imbalance = book.order_book_imbalance(5)?;
+    if imbalance > 0.3 {
+        println!("Strong buy pressure detected");
+    } else if imbalance < -0.3 {
+        println!("Strong sell pressure detected");
     }
+
+    Ok(())
 }
 ```
 
@@ -961,29 +1004,28 @@ fn monitor_liquidity(book: &OrderBook) {
 **Issue: Order not added**
 
 ```rust
-// Check for duplicate order ID
+// Check for a duplicate order ID
 match book.add_limit_order(order_id, price, qty, Side::Buy, TimeInForce::Gtc, None) {
     Err(OrderBookError::DuplicateOrderId { .. }) => {
-        // Generate new ID
-        let new_id = OrderId::new();
-        book.add_limit_order(new_id, price, qty, Side::Buy, TimeInForce::Gtc, None)?;
+        // Use a fresh id
+        book.add_limit_order(OrderId::from_u64(500), price, qty, Side::Buy, TimeInForce::Gtc, None)?;
     }
-    Ok(result) => { /* success */ }
-    Err(e) => eprintln!("Error: {}", e),
+    Ok(_order) => { /* success */ }
+    Err(e) => eprintln!("Error: {e}"),
 }
 ```
 
 **Issue: Market order not filled**
 
 ```rust
-// Check available liquidity first
-let depth = book.total_depth_at_levels(Side::Sell, 0);  // All levels
+// Check available liquidity first (usize::MAX = every level)
+let depth = book.total_depth_at_levels(usize::MAX, Side::Sell)?;
 if depth < quantity {
-    println!("Insufficient liquidity: {} available, {} needed", depth, quantity);
-    // Use limit order instead
+    println!("Insufficient liquidity: {depth} available, {quantity} needed");
+    // Rest a limit order instead
     book.add_limit_order(order_id, price, quantity, Side::Buy, TimeInForce::Gtc, None)?;
 } else {
-    book.add_market_order(order_id, quantity, Side::Buy, None)?;
+    book.submit_market_order(order_id, quantity, Side::Buy)?;
 }
 ```
 
@@ -991,23 +1033,23 @@ if depth < quantity {
 
 ```rust
 // Use enriched snapshots instead of multiple metric calls
-// ❌ Slow
+// Slow
 let mid = book.mid_price();
-let spread = book.spread_bps();
-let vwap = book.vwap(Side::Buy, 10);
+let spread = book.spread_bps(None);
+let vwap = book.vwap(100, Side::Buy)?;
 
-// ✅ Fast
-let snapshot = book.enriched_snapshot(10);
+// Fast
+let snapshot = book.enriched_snapshot(10)?;
 ```
 
 **Issue: Memory usage**
 
 ```rust
 // Limit snapshot depth
-let snapshot = book.create_snapshot(10);  // Only top 10 levels
+let snapshot = book.create_snapshot(10)?; // Only the top 10 levels per side
 
 // Instead of:
-let snapshot = book.create_snapshot(0);  // All levels (high memory)
+let snapshot = book.create_snapshot(usize::MAX)?; // Every level (high memory)
 ```
 
 **Issue: A listener callback is slow or blocks**
@@ -1031,21 +1073,28 @@ This applies to `TradeListener`, `PriceLevelChangedListener` and
 ### Debug Tips
 
 ```rust
-// Enable logging
-std::env::set_var("RUST_LOG", "debug");
-tracing_subscriber::fmt::init();
+// Enable logging (set RUST_LOG=debug in the environment; needs the
+// `tracing-subscriber` crate with its `env-filter` feature in your binary;
+// the library never installs a subscriber itself)
+tracing_subscriber::fmt()
+    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    .init();
 
 // Check order book state
-println!("Bid levels: {}", book.bid_levels());
-println!("Ask levels: {}", book.ask_levels());
-println!("Total orders: {}", book.bid_levels() + book.ask_levels());
+let snapshot = book.create_snapshot(usize::MAX)?;
+println!("Bid levels: {}", snapshot.bids.len());
+println!("Ask levels: {}", snapshot.asks.len());
+println!("Total orders: {}", book.get_all_orders().len());
 
-// Verify order exists
-if book.has_order(&order_id) {
-    println!("Order {} exists", order_id);
-} else {
-    println!("Order {} not found", order_id);
+// Verify an order exists
+match book.get_order(order_id) {
+    Some(order) => println!("Order {order_id} rests: {order:?}"),
+    None => println!("Order {order_id} not found"),
 }
+
+// Operational health
+println!("Kill switch engaged: {}", book.is_kill_switch_engaged());
+println!("Listener panics: {}", book.listener_panics());
 ```
 
 ---
@@ -1098,6 +1147,6 @@ For issues, questions, or contributions:
 
 ---
 
-**Version:** 0.4.8  
-**Last Updated:** October 2025  
+**Version:** 0.14.0  
+**Last Updated:** September 2026  
 **License:** MIT

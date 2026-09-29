@@ -33,11 +33,8 @@ src/.DS_Store
 # never ship in the published crate either way.
 /scripts/*
 !/scripts/check_panic_policy.py
-!/scripts/check_clippy_ratchet.py
 !/scripts/panic_policy_fixtures/
 !/scripts/panic_policy_fixtures/*.rs
-!/scripts/panic_policy_allowlist.txt
-!/scripts/clippy_ratchet.txt
 !/scripts/bench_compare.sh
 
 # `scripts/bench_compare.sh` (issue #258) writes raw per-round JSON,

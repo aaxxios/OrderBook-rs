@@ -22,7 +22,18 @@ Every frame on the wire has the layout:
 
 - `len` is the byte length of `kind + payload`. **It does NOT include
   the 4-byte `len` prefix itself.** The minimum legal `len` is `1`
-  (kind byte present, zero-byte payload).
+  (kind byte present, zero-byte payload); the maximum is
+  `MAX_FRAME_BODY` (**4096**, `src/wire/framing.rs`). Every message
+  defined today has a fixed payload of at most 48 bytes, so the cap
+  leaves room for forward-compatible additions.
+- `decode_frame` rejects a `len` of `0` or above `MAX_FRAME_BODY` with
+  `WireError::InvalidPayload` as soon as it has the 5-byte header,
+  instead of waiting for (or buffering) up to 4 GiB of a hostile or
+  corrupt length prefix; a buffer shorter than the declared frame is
+  `WireError::Truncated` (read more bytes and retry). `encode_frame`
+  refuses (`io::ErrorKind::InvalidInput`) a `kind + payload` above
+  `MAX_FRAME_BODY`, so every emitted frame is one `decode_frame` accepts
+  (#295).
 - All multi-byte integers on the wire are **little-endian**.
 - Frames have no separator and no trailer — the next frame begins
   immediately after the previous one. Decoders should advance their
@@ -114,6 +125,22 @@ Outbound is I/O-dominated, so the cost of a few dozen bytes of explicit
 field-by-field copying into a `Vec<u8>` is dwarfed by socket overhead,
 and the layout stays free to evolve without exposing a packed type to
 callers.
+
+**Encoder validation (#254, #295).** Every outbound encoder
+(`encode_exec_report`, `encode_trade_print`, `encode_book_update`)
+returns `Result<(), WireError>` and leaves `out` unchanged on error:
+
+- the payload is reserved up front with `Vec::try_reserve`; a buffer that
+  cannot grow is `WireError::CapacityOverflow` (never a capacity-overflow
+  panic);
+- values the matching decoder rejects are refused with
+  `WireError::InvalidPayload` instead of being emitted: an `ExecReport`
+  whose `status` is not one of the `STATUS_*` codes or whose `_pad` is
+  non-zero, and a `BookUpdate` whose `side` is neither `0` nor `1`.
+
+Decoders read through checked offsets (`slice::get`, `checked_add`) and
+return `WireError::Truncated` / `InvalidPayload` on malformed input; they
+never index, slice unchecked or panic on untrusted bytes.
 
 ### `ExecReport` (`0x81`) — 44 B
 
