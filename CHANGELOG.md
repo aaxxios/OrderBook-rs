@@ -513,14 +513,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `MatchRequirements::trade_ids_required` instead of an upper bound, so
     a FOK that fits the remaining trade ids is no longer refused (for
     example two trades against two remaining ids, previously refused as
-    needing three), and replenishment trades are reserved up front. Levels
-    where STP `CancelMaker` cancels makers first keep the conservative
-    bound (see `doc/panic-boundaries.md`).
-  - **Level fold with `MatchResult::try_absorb` (PriceLevel#219).** The
-    first traded level of a base-quantity sweep is absorbed by adopting the
-    level's own buffers, so the aggregate result no longer allocates (or
-    over-reserves `min(makers, quantity)` on a deep level) for it; later
-    levels reserve trades and filled ids separately. Allocation counts
+    needing three), and replenishment trades are reserved up front. An
+    STP `CancelTaker` / `CancelBoth` pre-match counts what the dry run
+    fills for it, not the visible depth counted ahead of the same-user
+    maker, so a maker that cannot deliver its counted depth no longer lets
+    a FOK fill an earlier level and then be cancelled. Levels where STP
+    `CancelMaker` cancels makers first keep the conservative bound (see
+    `doc/panic-boundaries.md`).
+  - **Level fold with `MatchResult::try_absorb` (PriceLevel#219).** A
+    level asked for exactly the aggregate's remaining quantity is absorbed;
+    when the aggregate holds no trades or filled ids yet, the absorb adopts
+    the level's own buffers without reserving or allocating (or
+    over-reserving `min(makers, quantity)` on a deep level). In practice
+    that is the first traded level of a non-FOK base-quantity sweep. A FOK
+    reserves its whole sweep up front; quote-notional levels and STP
+    pre-matches asked for less than the remainder are copied into a
+    reserved aggregate; later levels reserve trades and filled ids
+    separately. Allocation counts
     (`cargo bench --features alloc-counters --bench alloc_count`, new
     crossing scenarios): a one-level crossing add that partially fills a
     maker drops from 6.00 to 4.00 allocs/op (2,080 to 1,200 B/op); a 500-unit

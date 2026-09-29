@@ -247,8 +247,10 @@ matched, the pooled filled-maker buffer is reserved for
 trade and filled-id vectors (split reservations, PriceLevel#219) for the same
 bound **unless** the aggregate is still empty and the fold will absorb: then
 `try_absorb` adopts the level's own buffers, which cannot fail and allocates
-nothing, so the first traded level of a base-quantity sweep needs no
-aggregate reservation. A refused reservation aborts the sweep **before** the
+nothing. In practice that is the first traded level of a non-FOK
+base-quantity sweep (a FOK reserves its whole sweep up front, and a
+quote-notional level or an STP pre-match asked for less than the remainder
+takes the reserved copy path). A refused reservation aborts the sweep **before** the
 level is touched, with the prefix of the earlier levels. A level that failed
 mid-match hands its error to the aggregate when it is absorbed; the abort
 path rebuilds the published prefix without it, so the committed
@@ -262,7 +264,10 @@ quantity the sweep will ask of it, and must be matchable in full: not
 poisoned (`PriceLevel::is_poisoned`), its counters with headroom
 (`MatchRequirements::check` against `PriceLevel::counter_headroom`: the FIFO
 queue sequence replenishments take, the topology and mutation epochs), and
-no maker step the sweep would stop at (`MatchRequirements::stop_error`). The
+no maker step the sweep would stop at (`MatchRequirements::stop_error`). A
+self-trade prevention `CancelTaker` / `CancelBoth` pre-match counts the dry
+run's fill for `min(quantity, safe_quantity)`, not the visible depth
+`safe_quantity` counts ahead of the same-user maker. The
 trade-id headroom is checked against the exact sum of
 `MatchRequirements::trade_ids_required`, and the result buffers are reserved
 for the exact trade count (at least the per-level reservation above), so no
@@ -327,7 +332,11 @@ Residuals, stated precisely:
   loud, never a silent divergence. Such a journal is replayable at best
   from genesis onto a book whose generator state matches; it is never
   replayable from a mid-stream snapshot, because the snapshot package does
-  not carry the trade-id generator.
+  not carry the trade-id generator. Likewise, a release that changes the
+  fill-or-kill preflight's precision (for example #293, which admits a FOK
+  that exactly fits the remaining trade ids and rejects one it previously
+  let abort mid-sweep) makes cross-version replay of a journal recorded
+  before it report `OutcomeMismatch` at that submit, by design.
 - **Prefix reconciliation coverage.** Replay compares the committed prefix
   only for submits the sequencer recorded through the `*_with_committed`
   entry points and `SequencerResult::from_submit_failure`. An abort recorded
