@@ -24,6 +24,14 @@
 // loop. `record_batch` times `BATCH` sweeps per `Instant` pair and
 // records the per-op average instead; see `hdr_common::record_batch`
 // for the trade-off.
+//
+// Liquidity (issue #259): the ladder holds about 27 500 lots, and 100 000
+// takers of up to 20 lots empty it after about 2 200 of them; before
+// #259 the remaining ~98 % of the samples timed a market order rejected
+// by an empty book. The ladder is now re-seeded (unmeasured, between
+// batches) whenever the resting quantity could not cover a full batch
+// of the largest taker, so every measured taker trades. Numbers are
+// not comparable with pre-#259 runs of this bench.
 
 #[path = "hdr_common.rs"]
 mod common;
@@ -46,23 +54,30 @@ fn main() {
     let maker = owner(0xAA);
     let taker = owner(0xBB);
 
-    // Seed RESTING_PER_LEVEL asks at each of NUM_LEVELS prices.
+    // Seed RESTING_PER_LEVEL asks at each of NUM_LEVELS prices; re-run
+    // (unmeasured) whenever the ladder runs low, see the note above.
     let mut next_id = 1u64;
-    for level in 0..NUM_LEVELS {
-        let price = (100 + level) as u128;
-        for _ in 0..RESTING_PER_LEVEL {
-            let _ = book.add_limit_order_with_user(
-                Id::from_u64(next_id),
-                price,
-                rng.range(1, 10),
-                Side::Sell,
-                TimeInForce::Gtc,
-                maker,
-                None,
-            );
-            next_id += 1;
+    let mut resting = 0u64;
+    let seed = |rng: &mut Rng, next_id: &mut u64, resting: &mut u64| {
+        for level in 0..NUM_LEVELS {
+            let price = (100 + level) as u128;
+            for _ in 0..RESTING_PER_LEVEL {
+                let qty = rng.range(1, 10);
+                let _ = book.add_limit_order_with_user(
+                    Id::from_u64(*next_id),
+                    price,
+                    qty,
+                    Side::Sell,
+                    TimeInForce::Gtc,
+                    maker,
+                    None,
+                );
+                *next_id += 1;
+                *resting += qty;
+            }
         }
-    }
+    };
+    seed(&mut rng, &mut next_id, &mut resting);
 
     // Aggressive Buy sweeps. Each sweeps 5..=20 lots — usually clears
     // a few orders within the same price level. Batched `BATCH` at a
@@ -70,10 +85,19 @@ fn main() {
     let mut done = 0u64;
     while done < MEASURED_OPS {
         let k = BATCH.min(MEASURED_OPS - done);
-        record_batch(&mut hist, k, |j| {
+        if resting < k * 20 {
+            seed(&mut rng, &mut next_id, &mut resting);
+        }
+        record_batch(&mut hist, k, |_| {
             let qty = rng.range(5, 20);
-            let id = Id::from_u64(next_id + done + j);
-            let _ = book.submit_market_order_with_user(id, qty, Side::Buy, taker);
+            let id = Id::from_u64(next_id);
+            next_id += 1;
+            let result = book.submit_market_order_with_user(id, qty, Side::Buy, taker);
+            let filled = result
+                .ok()
+                .and_then(|r| r.executed_quantity().ok())
+                .map_or(0, |q| q.as_u64());
+            resting = resting.saturating_sub(filled);
         });
         done += k;
     }
