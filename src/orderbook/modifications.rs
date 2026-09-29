@@ -2585,6 +2585,15 @@ where
         // untouched. A modify never re-adds one: `update_order` handles
         // pending stops itself.
         if matches!(order, OrderType::TrailingStop { .. }) {
+            // A re-add can run under the shared gate, where no stop may be
+            // admitted; none reaches here (no stop rests on a level), so
+            // refuse it rather than rely on that.
+            if matches!(admission, Admission::ReAdd { .. }) {
+                return Err(OrderBookError::StopOrdersUnsupported {
+                    order_id: order.id(),
+                }
+                .into());
+            }
             return self
                 .admit_trailing_stop(order, admission.records_rejections())
                 .map(|order| (order, None))
