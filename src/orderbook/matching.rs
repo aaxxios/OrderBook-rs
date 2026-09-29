@@ -88,6 +88,13 @@ pub(crate) enum FeasibilityScope {
     /// A depth estimate only ([`OrderBook::check_modify_reserve_residual`]):
     /// the fillable quantity is what matters, failures are left to the
     /// sweep itself.
+    ///
+    /// Deliberately relaxes `PriceLevel::match_requirements`' precondition
+    /// (every mutator of the level excluded until the last match): only
+    /// `MatchRequirements::fillable` is read, which is the same dry run as
+    /// `PriceLevel::matchable_quantity` and just as advisory when another
+    /// submit can run under the shared gate. No counter, trade-id or
+    /// reservation decision is taken from it.
     DepthOnly,
 }
 
@@ -2588,12 +2595,17 @@ where
                         }
                         (Some(non_self), false, None)
                     }
-                    // The taker is cancelled at the first same-user order: it can
-                    // fill at most `safe_quantity` (visible-only, matching the real
-                    // sweep's cap) here, then stops.
+                    // The taker is cancelled at the first same-user order: the
+                    // sweep pre-matches `min(cap, safe_quantity)` here, then
+                    // stops. `safe_quantity` only sums the visible depth ahead
+                    // of the same-user maker; what the pre-match takes is the
+                    // dry run's fill for that request (a maker that makes no
+                    // progress, or a replenish-overflow stop, delivers less
+                    // than it shows), exactly as the modify precheck
+                    // `check_modify_stp_self_cross` bounds it.
                     STPAction::CancelTaker { safe_quantity }
                     | STPAction::CancelBoth { safe_quantity, .. } => {
-                        (Some(safe_quantity), true, Some(cap.min(safe_quantity)))
+                        (None, true, Some(cap.min(safe_quantity)))
                     }
                 }
             } else {
@@ -2615,7 +2627,8 @@ where
                             return Err(OrderBookError::PriceLevelError(err.clone()));
                         }
                     }
-                    let taken = cap.min(reachable.unwrap_or(requirements.fillable()));
+                    // The authoritative dry-run fill, never counted depth.
+                    let taken = match_qty.min(requirements.fillable());
                     // The sweep reserves `min(makers, match_qty)` before it
                     // touches the level (`reserve_level_fold`); the fold then
                     // needs the exact trade count, which replenishments can

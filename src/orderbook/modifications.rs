@@ -2077,6 +2077,13 @@ where
     /// Auto-replenishing reserves, icebergs, single-tranche kinds and
     /// non-crossing re-prices never reach the walk.
     ///
+    /// The walk runs in [`FeasibilityScope::DepthOnly`] scope, which
+    /// deliberately relaxes `PriceLevel::match_requirements`' exclusivity
+    /// precondition: only the fillable quantity is used, the same advisory
+    /// dry run as `PriceLevel::matchable_quantity`, so the estimate would
+    /// stay sound (advisory, never a counter or reservation decision) even
+    /// if this check ever ran under the shared gate.
+    ///
     /// # Errors
     /// [`OrderBookError::ReserveResidualWouldBeDiscarded`] carrying the
     /// order id, the projected visible tranche, the crossable quantity, the
