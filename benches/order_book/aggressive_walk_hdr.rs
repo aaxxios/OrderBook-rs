@@ -82,23 +82,39 @@ fn main() {
     // Aggressive Buy sweeps. Each sweeps 5..=20 lots — usually clears
     // a few orders within the same price level. Batched `BATCH` at a
     // time (see the methodology note above).
+    // Inputs are drawn before the clock and each `MatchResult` is kept in
+    // a buffer reserved before it, so the timed batch holds only the
+    // sweeps: result inspection (`executed_quantity`) and the drops run
+    // after the clock stops (#259 PR review).
+    let mut inputs = Vec::with_capacity(BATCH as usize);
+    let mut results = Vec::with_capacity(BATCH as usize);
     let mut done = 0u64;
     while done < MEASURED_OPS {
         let k = BATCH.min(MEASURED_OPS - done);
         if resting < k * 20 {
             seed(&mut rng, &mut next_id, &mut resting);
         }
-        record_batch(&mut hist, k, |_| {
-            let qty = rng.range(5, 20);
-            let id = Id::from_u64(next_id);
-            next_id += 1;
-            let result = book.submit_market_order_with_user(id, qty, Side::Buy, taker);
+        inputs.clear();
+        inputs.extend((0..k).map(|_| rng.range(5, 20)));
+        results.clear();
+        let first = next_id;
+        record_batch(&mut hist, k, |j| {
+            let id = Id::from_u64(first + j);
+            results.push(book.submit_market_order_with_user(
+                id,
+                inputs[j as usize],
+                Side::Buy,
+                taker,
+            ));
+        });
+        next_id += k;
+        for result in results.drain(..) {
             let filled = result
                 .ok()
                 .and_then(|r| r.executed_quantity().ok())
                 .map_or(0, |q| q.as_u64());
             resting = resting.saturating_sub(filled);
-        });
+        }
         done += k;
     }
 
