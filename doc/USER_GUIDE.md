@@ -425,18 +425,27 @@ println!("Levels consumed: {}", impact.levels_consumed);
 if impact.slippage_bps < 50.0 {
     // Execute order
     book.submit_market_order(OrderId::from_u64(20), 1000, Side::Buy)?;
-} else {
-    // Impact too high: rest a limit order at the worst price the sweep would reach
-    book.add_limit_order(
+} else if let Some(best_bid) = book.best_bid() {
+    // Impact too high: rest passively at the best bid instead of taking
+    // liquidity. Post-only guarantees the order never crosses: a price at
+    // or through the best ask would be rejected, not matched.
+    book.add_post_only_order(
         OrderId::from_u64(20),
-        impact.worst_price,
+        best_bid,
         1000,
         Side::Buy,
         TimeInForce::Gtc,
         None,
     )?;
+} else {
+    // No bid to join: defer the order rather than guess a price.
 }
 ```
+
+Note that a limit buy at `impact.worst_price` would **not** rest: that
+price is on the ask side, so the order crosses and executes the same
+sweep. Use it only deliberately, as a marketable limit that caps the
+execution price (for example with `TimeInForce::Ioc`).
 
 **Use cases:**
 - Pre-trade risk assessment
@@ -942,8 +951,16 @@ fn execute_large_order(
         // Low impact: market order
         book.submit_market_order(id, quantity, side)?;
     } else {
-        // High impact: rest a limit order at the worst price the sweep would reach
-        book.add_limit_order(id, impact.worst_price, quantity, side, TimeInForce::Gtc, None)?;
+        // High impact: join our own side's best price passively. Post-only
+        // guarantees it rests (a crossing price is rejected, not matched);
+        // with no price to join, defer the order.
+        let passive_price = match side {
+            Side::Buy => book.best_bid(),
+            Side::Sell => book.best_ask(),
+        };
+        if let Some(price) = passive_price {
+            book.add_post_only_order(id, price, quantity, side, TimeInForce::Gtc, None)?;
+        }
     }
 
     Ok(())
