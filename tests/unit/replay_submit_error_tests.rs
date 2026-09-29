@@ -803,7 +803,9 @@ fn pre_mutation_other_rejection_is_still_skipped() {
 /// `may_have_mutated` is derived from the typed error, and only the errors
 /// the engine can return after changing the book are flagged: the
 /// unfillable IOC / market remainder, the STP-cancelled taker and the
-/// residual-admission failure. Everything else is raised by an admission
+/// residual-admission failure, including a duplicate id, which since #288
+/// can be raised when the remainder claims its id after a sweep traded.
+/// Everything else is raised by an admission
 /// check, an operational gate or an internal path that runs before the
 /// book is touched.
 #[test]
@@ -842,6 +844,9 @@ fn may_have_mutated_is_set_for_exactly_the_post_mutation_errors() {
             )),
             restore_error: None,
         },
+        OrderBookError::DuplicateOrderId {
+            order_id: Id::from_u64(1),
+        },
     ];
     let pre_mutation = [
         OrderBookError::KillSwitchActive,
@@ -858,9 +863,6 @@ fn may_have_mutated_is_set_for_exactly_the_post_mutation_errors() {
         OrderBookError::InvalidTickSize {
             price: 105,
             tick_size: 10,
-        },
-        OrderBookError::DuplicateOrderId {
-            order_id: Id::from_u64(1),
         },
         OrderBookError::InvalidOperation {
             message: "Order has already expired".to_string(),
