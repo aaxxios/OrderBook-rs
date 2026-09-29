@@ -769,6 +769,86 @@ mod tests {
         assert_eq!(*seqs, (0..6).collect::<Vec<u64>>());
     }
 
+    /// A panic in the middle of a dispatcher's multi-batch run: the rest of
+    /// the panicking batch is dropped, the untouched batch after it goes
+    /// back to the head of the outbox and is delivered, in order, by the
+    /// next dispatch.
+    #[test]
+    fn panic_mid_run_requeues_the_untouched_batches_in_order() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut book = OrderBook::<()>::new("EMIT");
+        let level_log = Arc::clone(&log);
+        let entered = Mutex::new(Some(entered_tx));
+        book.set_price_level_listener(Arc::new(move |event: PriceLevelChangedEvent| {
+            push(&level_log, format_level(&event));
+            if let Some(tx) = entered.lock().expect("entered").take() {
+                tx.send(()).expect("signal");
+                release_rx
+                    .lock()
+                    .expect("release")
+                    .recv()
+                    .expect("released");
+            }
+        }));
+        let state_log = Arc::clone(&log);
+        let mut tracker = OrderStateTracker::new();
+        tracker.set_listener(Arc::new(
+            move |id: Id, old: &OrderStatus, new: &OrderStatus| {
+                if id == Id::from_u64(3) {
+                    panic!("state listener bug");
+                }
+                push(&state_log, format!("S {id} {old} -> {new}"));
+            },
+        ));
+        book.set_order_state_tracker(tracker);
+        let book = Arc::new(book);
+
+        // Thread D becomes the dispatcher and stalls in order 1's level event.
+        let stalled = Arc::clone(&book);
+        let dispatcher = thread::spawn(move || {
+            let _ = stalled.add_order(limit(1, 90, 1, Side::Buy, TimeInForce::Gtc));
+        });
+        entered_rx.recv().expect("listener entered");
+        // Three batches queue behind it: [S2, L2], [S3, L3], [S4, L4].
+        for id in 2..=4 {
+            book.add_order(limit(
+                id,
+                90 - u128::from(id),
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+            ))
+            .expect("queued add");
+        }
+        assert_eq!(book.pending_listener_events(), 6);
+        release_tx.send(()).expect("release");
+        assert!(dispatcher.join().is_err(), "the panic unwinds out of D");
+        assert_eq!(book.listener_panics(), 1);
+        assert_eq!(
+            book.dropped_listener_events(),
+            1,
+            "L3 after the panicking S3"
+        );
+        assert_eq!(book.pending_listener_events(), 2, "batch 4 was requeued");
+
+        book.flush_listener_events();
+        assert_eq!(book.pending_listener_events(), 0);
+        let got = log.lock().expect("log").clone();
+        let expect = [
+            "S 00000000-0000-0001-0000-000000000000 Open -> Open",
+            "L seq=0 Buy 90 q=1",
+            "S 00000000-0000-0002-0000-000000000000 Open -> Open",
+            "L seq=1 Buy 88 q=1",
+            "S 00000000-0000-0004-0000-000000000000 Open -> Open",
+            "L seq=3 Buy 86 q=1",
+        ];
+        assert_eq!(got, expect);
+        assert!(!book.submit_gate.is_poisoned());
+    }
+
     /// `flush_listener_events` is a no-op on a quiet book and never
     /// dispatches while another thread holds the role.
     #[test]
