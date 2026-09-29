@@ -4,13 +4,20 @@
 //! `orderbook-rs` checkouts (issues #258 / #259).
 //!
 //! Each scenario returns a `Histogram<u64>` of per-op nanosecond
-//! latencies. Only the operation under test is timed: seeding, refills
-//! and the drop of anything the operation returns happen outside the
-//! `Instant` pair. Scenarios whose single op is at or near the host
-//! clock tick (about 41.67 ns on Apple silicon) use [`record_batch`],
-//! which times `BATCH` ops per `Instant` pair and records the per-op
-//! average; scenarios well above the tick use [`record`], one sample
-//! per op. Every scenario says which it uses and why.
+//! latencies. Only the operation under test is timed (#259 PR review):
+//!
+//! - every op's inputs (ids, prices, quantities, sides, owners, the op
+//!   kind of the mixed stream) are drawn **before** the clock starts;
+//! - every op's output (the returned order, match result, cancel result
+//!   or mass-cancel result) is kept and dropped **after** the clock
+//!   stops ([`record`] returns it; [`record_batch_into`] pushes it into a
+//!   buffer reserved before the clock, one `Vec::push` per op);
+//! - seeding, refills and setup-time assertions run outside the clock.
+//!
+//! Scenarios whose single op is at or near the host clock tick (about
+//! 41.67 ns on Apple silicon) use [`record_batch_into`], which times
+//! `BATCH` ops per `Instant` pair and records the per-op average;
+//! scenarios well above the tick use [`record`], one sample per op.
 
 use hdrhistogram::Histogram;
 use orderbook_rs::Id;
@@ -20,8 +27,8 @@ use std::time::Instant;
 
 use crate::adapter::{
     Book, add_limit_order_with_user, cancel_all, cancel_order, create_snapshot, journal_of_adds,
-    new_book, new_listener_book, new_stp_book, owner, replay, restore, snapshot_package,
-    submit_market_order_with_user,
+    new_book, new_listener_book, new_stp_book, owner, replay, resting_orders, restore,
+    snapshot_package, submit_market_order_with_user,
 };
 use crate::rng::Rng;
 
@@ -32,7 +39,8 @@ pub fn new_histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("hist bounds")
 }
 
-/// Times one op; the op's return value is dropped after the clock stops.
+/// Times one op; its return value is handed back so the caller drops it
+/// after the clock stopped.
 fn record<R, F: FnOnce() -> R>(h: &mut Histogram<u64>, f: F) -> R {
     let t0 = Instant::now();
     let out = std::hint::black_box(f());
@@ -42,11 +50,19 @@ fn record<R, F: FnOnce() -> R>(h: &mut Histogram<u64>, f: F) -> R {
 }
 
 /// Times `k` ops in one `Instant` pair and records the per-op average.
-fn record_batch<F: FnMut(u64)>(h: &mut Histogram<u64>, k: u64, mut f: F) {
+/// Each op's output is pushed into `out` (capacity reserved before the
+/// clock) and dropped by the caller after it; `out` is cleared first.
+fn record_batch_into<R, F: FnMut(u64) -> R>(
+    h: &mut Histogram<u64>,
+    k: u64,
+    out: &mut Vec<R>,
+    mut f: F,
+) {
+    out.clear();
+    out.reserve(k as usize);
     let t0 = Instant::now();
     for i in 0..k {
-        f(i);
-        std::hint::black_box(());
+        out.push(std::hint::black_box(f(i)));
     }
     let elapsed = t0.elapsed().as_nanos() as u64;
     let per_op = elapsed.checked_div(k).unwrap_or(elapsed).max(1);
@@ -61,6 +77,15 @@ fn pick_owner(rng: &mut Rng) -> [u8; 32] {
     owner(((rng.next() % OWNERS as u64) as u8) + 1)
 }
 
+/// One of `n` owners (`n <= 65 536`), for the non-crossing seeds.
+fn wide_owner(rng: &mut Rng, n: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    let k = (rng.next() % n) as u16;
+    bytes[..2].copy_from_slice(&k.to_le_bytes());
+    bytes[2] = 0x5A;
+    bytes
+}
+
 fn pick_side(rng: &mut Rng) -> Side {
     if rng.next().is_multiple_of(2) {
         Side::Buy
@@ -69,53 +94,120 @@ fn pick_side(rng: &mut Rng) -> Side {
     }
 }
 
-/// `hdr_common::submit_gtc`: a GTC limit at a random price in `99..=101`
-/// on a random side. The band is tight on purpose, so a good share of
-/// these CROSS the opposite side (this is not a purely passive add).
-fn submit_one(book: &Book, rng: &mut Rng, id: u64) {
-    let price = rng.range(99, 101) as u128;
-    let qty = rng.range(1, 100);
-    let side = pick_side(rng);
-    add_limit_order_with_user(book, Id::from_u64(id), price, qty, side, pick_owner(rng));
+/// A fully drawn limit submission.
+#[derive(Clone, Copy)]
+struct Submit {
+    id: u64,
+    price: u128,
+    qty: u64,
+    side: Side,
+    user: [u8; 32],
+}
+
+impl Submit {
+    /// `hdr_common::submit_gtc`: a GTC limit at a random price in
+    /// `99..=101` on a random side. The band is tight on purpose, so a
+    /// good share of these CROSS the opposite side (not a passive add).
+    fn gtc(rng: &mut Rng, id: u64) -> Self {
+        let price = rng.range(99, 101) as u128;
+        let qty = rng.range(1, 100);
+        let side = pick_side(rng);
+        let user = pick_owner(rng);
+        Self {
+            id,
+            price,
+            qty,
+            side,
+            user,
+        }
+    }
+
+    #[inline]
+    fn apply(self, book: &Book) -> impl Sized {
+        add_limit_order_with_user(
+            book,
+            Id::from_u64(self.id),
+            self.price,
+            self.qty,
+            self.side,
+            self.user,
+        )
+    }
 }
 
 /// `add_only_hdr`: 200k warmup + N measured `submit_gtc` calls, one
-/// sample per op (hundreds of ns, well above the tick).
+/// sample per op (hundreds of ns, well above the tick). The measured
+/// submissions are drawn before the measurement loop.
 pub fn add_only(warmup_ops: u64, measured_ops: u64) -> Histogram<u64> {
     let book = new_book("BENCH");
     let mut rng = Rng::new(SEED);
     let mut hist = new_histogram();
 
     for i in 0..warmup_ops {
-        submit_one(&book, &mut rng, i);
+        drop(Submit::gtc(&mut rng, i + 1).apply(&book));
     }
-    for i in 0..measured_ops {
-        let id = warmup_ops + i;
-        record(&mut hist, || submit_one(&book, &mut rng, id));
+    let ops: Vec<Submit> = (0..measured_ops)
+        .map(|i| Submit::gtc(&mut rng, warmup_ops + i + 1))
+        .collect();
+    for op in &ops {
+        let out = record(&mut hist, || op.apply(&book));
+        drop(out);
     }
     hist
 }
 
-/// `cancel_only_hdr`: pre-loaded book, sequential cancels, batched
-/// (a single cancel is at or below the tick).
+/// A non-crossing book of `orders` resting orders (bids on 900..=999,
+/// asks on 1 001..=1 100) spread over `owners` owners, with ids
+/// `first_id..`. Asserts every order rests.
+fn dense_book(book: &Book, rng: &mut Rng, first_id: u64, orders: u64, owners: u64) -> Vec<Id> {
+    let before = resting_orders(book);
+    let mut ids = Vec::with_capacity(orders as usize);
+    for i in 0..orders {
+        let id = Id::from_u64(first_id + i);
+        let side = pick_side(rng);
+        let offset = rng.range(0, 99) as u128;
+        let price = match side {
+            Side::Buy => 900 + offset,
+            Side::Sell => 1_001 + offset,
+        };
+        let qty = rng.range(1, 100);
+        let user = wide_owner(rng, owners);
+        drop(add_limit_order_with_user(book, id, price, qty, side, user));
+        ids.push(id);
+    }
+    assert_eq!(
+        resting_orders(book) - before,
+        orders as usize,
+        "seed must rest every order"
+    );
+    ids
+}
+
+/// Owners of the cancel / mass-cancel seeds: enough that no owner's
+/// `user_orders` list is long (a cancel removes its id from that list
+/// with an order-preserving `Vec::remove`, linear in the list, on both
+/// versions; with 4 owners and 200 000 orders that shift would dominate).
+const SEED_OWNERS: u64 = 4_096;
+
+/// Pre-loaded NON-crossing book (every seeded order rests, asserted),
+/// then every order cancelled in insertion order, batched (a single
+/// cancel is near the tick). Before the #259 PR review this was seeded
+/// with the crossing `submit_gtc` stream, which leaves about 11 % of the
+/// ids resting, so most timed cancels were misses.
 pub fn cancel_only(preload_ops: u64) -> Histogram<u64> {
     let book = new_book("BENCH");
     let mut rng = Rng::new(SEED);
     let mut hist = new_histogram();
+    let ids = dense_book(&book, &mut rng, 1, preload_ops, SEED_OWNERS);
 
-    for i in 0..preload_ops {
-        submit_one(&book, &mut rng, i + 1);
-    }
-
-    let mut next = 0u64;
-    while next < preload_ops {
-        let base = next;
-        let k = BATCH.min(preload_ops - next);
-        record_batch(&mut hist, k, |j| {
-            cancel_order(&book, Id::from_u64(base + j + 1));
+    let mut out = Vec::new();
+    for chunk in ids.chunks(BATCH as usize) {
+        record_batch_into(&mut hist, chunk.len() as u64, &mut out, |j| {
+            cancel_order(&book, chunk[j as usize])
         });
-        next += k;
+        out.clear();
     }
+    assert_eq!(resting_orders(&book), 0, "every cancel must hit");
     hist
 }
 
@@ -127,7 +219,9 @@ pub fn cancel_only(preload_ops: u64) -> Histogram<u64> {
 /// them and the remaining ~98 % of the samples time a market order
 /// rejected by an empty book. Here the ladder is re-seeded (unmeasured,
 /// between batches) whenever the resting quantity could not cover a
-/// full batch of the largest taker, so every measured taker trades.
+/// full batch of the largest taker, so every measured taker trades. The
+/// taker quantities are drawn before each batch and the resting-quantity
+/// bookkeeping runs after it.
 pub fn aggressive_walk(
     resting_per_level: u64,
     num_levels: u64,
@@ -146,14 +240,14 @@ pub fn aggressive_walk(
             let price = (100 + level) as u128;
             for _ in 0..resting_per_level {
                 let qty = rng.range(1, 10);
-                add_limit_order_with_user(
+                drop(add_limit_order_with_user(
                     &book,
                     Id::from_u64(*next_id),
                     price,
                     qty,
                     Side::Sell,
                     maker,
-                );
+                ));
                 *next_id += 1;
                 *resting += qty;
             }
@@ -161,64 +255,131 @@ pub fn aggressive_walk(
     };
     seed(&mut rng, &mut next_id, &mut resting);
 
+    let mut out = Vec::new();
+    let mut qtys = Vec::with_capacity(BATCH as usize);
     let mut done = 0u64;
     while done < measured_ops {
         let k = BATCH.min(measured_ops - done);
         if resting < k * 20 {
             seed(&mut rng, &mut next_id, &mut resting);
         }
-        record_batch(&mut hist, k, |_| {
-            let qty = rng.range(5, 20);
-            let id = Id::from_u64(next_id);
-            next_id += 1;
-            submit_market_order_with_user(&book, id, qty, Side::Buy, taker);
-            resting -= qty.min(resting);
+        qtys.clear();
+        qtys.extend((0..k).map(|_| rng.range(5, 20)));
+        let base = next_id;
+        record_batch_into(&mut hist, k, &mut out, |j| {
+            let id = Id::from_u64(base + j);
+            submit_market_order_with_user(&book, id, qtys[j as usize], Side::Buy, taker)
         });
+        out.clear();
+        next_id += k;
+        for qty in &qtys {
+            resting -= (*qty).min(resting);
+        }
         done += k;
     }
     hist
 }
 
-/// `mixed_70_20_10_hdr`: 70 % `submit_gtc`, 20 % cancel of a random
-/// earlier id, 10 % market order of 1..=10 lots; one sample per op.
+/// One fully drawn op of the mixed stream.
+#[derive(Clone, Copy)]
+enum MixedOp {
+    Submit(Submit),
+    Cancel(u64),
+    Market {
+        id: u64,
+        qty: u64,
+        side: Side,
+        user: [u8; 32],
+    },
+}
+
+/// Draws the next op of the `mixed_70_20_10_hdr` stream: 70 %
+/// `submit_gtc`, 20 % cancel of a random earlier id, 10 % market order
+/// of 1..=10 lots.
+fn draw_mixed(rng: &mut Rng, next_id: &mut u64) -> Option<MixedOp> {
+    let v = rng.next() % 100;
+    if v < 70 {
+        let op = Submit::gtc(rng, *next_id);
+        *next_id += 1;
+        Some(MixedOp::Submit(op))
+    } else if v < 90 {
+        (*next_id > 1).then(|| MixedOp::Cancel(rng.range(1, *next_id - 1)))
+    } else {
+        let id = *next_id;
+        *next_id += 1;
+        let qty = rng.range(1, 10);
+        let side = pick_side(rng);
+        let user = pick_owner(rng);
+        Some(MixedOp::Market {
+            id,
+            qty,
+            side,
+            user,
+        })
+    }
+}
+
+/// The output of one mixed op, dropped after the clock stops.
+enum MixedOut<A, C, M> {
+    Add(A),
+    Cancel(C),
+    Market(M),
+}
+
+#[inline]
+fn apply_mixed(book: &Book, op: &MixedOp) -> MixedOut<impl Sized, impl Sized, impl Sized> {
+    match *op {
+        MixedOp::Submit(submit) => MixedOut::Add(submit.apply(book)),
+        MixedOp::Cancel(target) => MixedOut::Cancel(cancel_order(book, Id::from_u64(target))),
+        MixedOp::Market {
+            id,
+            qty,
+            side,
+            user,
+        } => MixedOut::Market(submit_market_order_with_user(
+            book,
+            Id::from_u64(id),
+            qty,
+            side,
+            user,
+        )),
+    }
+}
+
+/// `mixed_70_20_10_hdr`: the stream is drawn in full before the
+/// measurement loop; one sample per op times only the dispatch into the
+/// book. The 20 % cancels draw a random earlier id, so some miss.
 pub fn mixed_70_20_10(warmup_ops: u64, measured_ops: u64) -> Histogram<u64> {
     let book = new_book("BENCH");
     let mut rng = Rng::new(SEED);
     let mut hist = new_histogram();
     let mut next_id = 1u64;
 
-    fn apply(book: &Book, rng: &mut Rng, next_id: &mut u64) {
-        let v = rng.next() % 100;
-        if v < 70 {
-            let id = *next_id;
-            *next_id += 1;
-            submit_one(book, rng, id);
-        } else if v < 90 {
-            if *next_id > 1 {
-                let target = rng.range(1, *next_id - 1);
-                cancel_order(book, Id::from_u64(target));
-            }
-        } else {
-            let id = Id::from_u64(*next_id);
-            *next_id += 1;
-            let qty = rng.range(1, 10);
-            let side = pick_side(rng);
-            let user = pick_owner(rng);
-            submit_market_order_with_user(book, id, qty, side, user);
+    for _ in 0..warmup_ops {
+        if let Some(op) = draw_mixed(&mut rng, &mut next_id) {
+            drop(apply_mixed(&book, &op));
         }
     }
-
-    for _ in 0..warmup_ops {
-        apply(&book, &mut rng, &mut next_id);
-    }
-    for _ in 0..measured_ops {
-        record(&mut hist, || apply(&book, &mut rng, &mut next_id));
+    let ops: Vec<Option<MixedOp>> = (0..measured_ops)
+        .map(|_| draw_mixed(&mut rng, &mut next_id))
+        .collect();
+    for op in &ops {
+        match op {
+            Some(op) => {
+                let out = record(&mut hist, || apply_mixed(&book, op));
+                drop(out);
+            }
+            // `mixed_70_20_10_hdr` times an empty closure for a cancel
+            // drawn before any id exists; keep the sample count equal.
+            None => record(&mut hist, || ()),
+        }
     }
     hist
 }
 
 /// `thin_book_sweep_hdr`: 3 asks of 1..=5 lots refilled every 5 probes
-/// (unmeasured), market-buy probes of 1..=20 lots batched 5 at a time.
+/// (unmeasured), market-buy probes of 1..=20 lots batched 5 at a time;
+/// probe quantities are drawn before each batch.
 pub fn thin_book_sweep(measured_ops: u64) -> Histogram<u64> {
     const RESTING_PER_REFILL: u64 = 3;
     const REFILL_EVERY: u64 = 5;
@@ -229,29 +390,44 @@ pub fn thin_book_sweep(measured_ops: u64) -> Histogram<u64> {
     let taker = owner(0xBB);
     let mut next_id = 1u64;
     let mut op = 0u64;
+    let mut out = Vec::new();
+    let mut qtys = Vec::with_capacity(REFILL_EVERY as usize);
 
     while op < measured_ops {
         let k = REFILL_EVERY.min(measured_ops - op);
         for _ in 0..RESTING_PER_REFILL {
             let price = rng.range(99, 101) as u128;
             let qty = rng.range(1, 5);
-            add_limit_order_with_user(&book, Id::from_u64(next_id), price, qty, Side::Sell, maker);
+            drop(add_limit_order_with_user(
+                &book,
+                Id::from_u64(next_id),
+                price,
+                qty,
+                Side::Sell,
+                maker,
+            ));
             next_id += 1;
         }
-        record_batch(&mut hist, k, |_| {
-            let id = Id::from_u64(next_id);
-            next_id += 1;
-            let qty = rng.range(1, 20);
-            submit_market_order_with_user(&book, id, qty, Side::Buy, taker);
+        qtys.clear();
+        qtys.extend((0..k).map(|_| rng.range(1, 20)));
+        let base = next_id;
+        record_batch_into(&mut hist, k, &mut out, |j| {
+            let id = Id::from_u64(base + j);
+            submit_market_order_with_user(&book, id, qtys[j as usize], Side::Buy, taker)
         });
+        out.clear();
+        next_id += k;
         op += k;
     }
     hist
 }
 
-/// `mass_cancel_burst_hdr`: `orders_per_burst` `submit_gtc` calls
-/// (unmeasured), then one timed `cancel_all_orders`. One sample is one
-/// whole burst, not one cancel.
+/// Mass cancel of a dense NON-crossing book: `orders_per_burst` orders
+/// seeded (unmeasured, every one asserted resting), then one timed
+/// `cancel_all_orders`; its result (with the cancelled-id list) is
+/// dropped after the clock. One sample is one whole burst. Before the
+/// #259 PR review the seed was the crossing `submit_gtc` stream, so
+/// much of the "10 000-order" book had traded away before the cancel.
 pub fn mass_cancel_burst(orders_per_burst: u64, bursts: u64) -> Histogram<u64> {
     let book = new_book("BENCH");
     let mut rng = Rng::new(SEED);
@@ -259,11 +435,11 @@ pub fn mass_cancel_burst(orders_per_burst: u64, bursts: u64) -> Histogram<u64> {
     let mut next_id = 1u64;
 
     for _ in 0..bursts {
-        for _ in 0..orders_per_burst {
-            submit_one(&book, &mut rng, next_id);
-            next_id += 1;
-        }
-        record(&mut hist, || cancel_all(&book));
+        dense_book(&book, &mut rng, next_id, orders_per_burst, SEED_OWNERS);
+        next_id += orders_per_burst;
+        let result = record(&mut hist, || cancel_all(&book));
+        drop(result);
+        assert_eq!(resting_orders(&book), 0, "mass cancel must empty the book");
     }
     hist
 }
@@ -282,14 +458,22 @@ pub fn stp_cancel_maker(measured_ops: u64) -> Histogram<u64> {
 
     for _ in 0..measured_ops {
         for user in [taker, other, other] {
-            add_limit_order_with_user(&book, Id::from_u64(next_id), 1_000, 5, Side::Sell, user);
+            drop(add_limit_order_with_user(
+                &book,
+                Id::from_u64(next_id),
+                1_000,
+                5,
+                Side::Sell,
+                user,
+            ));
             next_id += 1;
         }
         let id = Id::from_u64(next_id);
         next_id += 1;
-        record(&mut hist, || {
+        let out = record(&mut hist, || {
             submit_market_order_with_user(&book, id, 10, Side::Buy, taker)
         });
+        drop(out);
     }
     hist
 }
@@ -309,9 +493,15 @@ fn resting_book(orders: u64) -> (Book, Vec<Id>) {
             Side::Sell => 1_001 + offset,
         };
         let qty = rng.range(1, 100);
-        add_limit_order_with_user(&book, id, price, qty, side, pick_owner(&mut rng));
+        let user = pick_owner(&mut rng);
+        drop(add_limit_order_with_user(&book, id, price, qty, side, user));
         ids.push(id);
     }
+    assert_eq!(
+        resting_orders(&book),
+        orders as usize,
+        "seed must rest every order"
+    );
     (book, ids)
 }
 
@@ -385,26 +575,36 @@ pub fn contended_same_price_adds(
             std::thread::spawn(move || {
                 let base = (t + 1) * 1_000_000_000;
                 let mut next = base;
-                let add = |next: &mut u64| {
-                    add_limit_order_with_user(
+                for _ in 0..warmup {
+                    drop(add_limit_order_with_user(
                         &book,
-                        Id::from_u64(*next),
+                        Id::from_u64(next),
                         1_000,
                         10,
                         Side::Buy,
                         account,
-                    );
-                    *next += 1;
-                };
-                for _ in 0..warmup {
-                    add(&mut next);
+                    ));
+                    next += 1;
                 }
                 barrier.wait();
                 let mut hist = new_histogram();
+                let mut out = Vec::new();
                 let mut done = 0u64;
                 while done < per_thread {
                     let k = BATCH.min(per_thread - done);
-                    record_batch(&mut hist, k, |_| add(&mut next));
+                    let first = next;
+                    record_batch_into(&mut hist, k, &mut out, |j| {
+                        add_limit_order_with_user(
+                            &book,
+                            Id::from_u64(first + j),
+                            1_000,
+                            10,
+                            Side::Buy,
+                            account,
+                        )
+                    });
+                    out.clear();
+                    next += k;
                     done += k;
                 }
                 hist

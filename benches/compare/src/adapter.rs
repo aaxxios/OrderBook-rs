@@ -92,6 +92,10 @@ mod common {
         bytes
     }
 
+    /// Every operation returns the engine's own result so the caller can
+    /// drop it after the clock stops (#259 PR review): dropping it here
+    /// would free the returned order / match result / id list inside the
+    /// timed region.
     #[inline]
     pub fn add_limit_order_with_user(
         book: &Book,
@@ -100,26 +104,24 @@ mod common {
         qty: u64,
         side: Side,
         user: [u8; 32],
-    ) {
-        let _ = book.add_limit_order_with_user(
-            id,
-            price,
-            qty,
-            side,
-            TimeInForce::Gtc,
-            user.into(),
-            None,
-        );
+    ) -> impl Sized {
+        book.add_limit_order_with_user(id, price, qty, side, TimeInForce::Gtc, user.into(), None)
     }
 
     #[inline]
-    pub fn cancel_order(book: &Book, id: Id) {
-        let _ = book.cancel_order(id);
+    pub fn cancel_order(book: &Book, id: Id) -> impl Sized {
+        book.cancel_order(id)
     }
 
     #[inline]
-    pub fn cancel_all(book: &Book) {
-        let _ = black_box(book.cancel_all_orders());
+    pub fn cancel_all(book: &Book) -> impl Sized {
+        book.cancel_all_orders()
+    }
+
+    /// Number of resting orders (setup-time assertions only: it walks
+    /// every level).
+    pub fn resting_orders(book: &Book) -> usize {
+        book.get_all_orders().len()
     }
 
     #[inline]
@@ -129,8 +131,8 @@ mod common {
         qty: u64,
         side: Side,
         user: [u8; 32],
-    ) {
-        let _ = book.submit_market_order_with_user(id, qty, side, user.into());
+    ) -> impl Sized {
+        book.submit_market_order_with_user(id, qty, side, user.into())
     }
 
     /// Full-depth snapshot package of `book`.
