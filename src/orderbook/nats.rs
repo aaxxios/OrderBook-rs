@@ -42,10 +42,10 @@
 //! ```
 
 use crate::orderbook::nats_common::{
-    DrainGate, DropLog, LinkState, RetryPolicy, add_metric, batch_deadline, checked_reserve,
-    clamp_channel_capacity, clamp_duration_ms, clamp_max_batch_size, clamp_max_retries,
-    counter_exhausted, drain_buffered, increment_metric, new_batch_buffer, new_jitter_seed,
-    publish_with_backoff, shutdown_task, shutdown_task_with_deadline, store_slot,
+    DrainGate, DropLog, LinkState, RetryPolicy, ShutdownState, add_metric, batch_deadline,
+    checked_reserve, clamp_channel_capacity, clamp_duration_ms, clamp_max_batch_size,
+    clamp_max_retries, counter_exhausted, drain_buffered, increment_metric, new_batch_buffer,
+    new_jitter_seed, publish_with_backoff, shutdown_task, shutdown_task_with_deadline, store_slot,
     throttle_or_shutdown,
 };
 use crate::orderbook::serialization::{EventSerializer, JsonEventSerializer};
@@ -139,7 +139,7 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 /// - **events_received** — total trades received from the listener callback
 /// - **batches_published** — total drain/flush cycles performed
 /// - **dropped_events** — trades dropped because the channel was full, the
-///   background task was no longer running, or the shutdown drain gave up on
+///   background task was no longer running, or shutdown gave up on
 ///   an unreachable NATS link (see [`shutdown`](NatsTradePublisher::shutdown))
 /// - **sequence** — monotonically increasing sequence number; each publish
 ///   (symbol-specific and aggregate) receives its own unique value
@@ -240,6 +240,11 @@ pub struct NatsTradePublisher {
     /// trades, flush them, and exit. Sent by
     /// [`shutdown`](NatsTradePublisher::shutdown).
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+
+    /// Shutdown intent and the give-up latch shared with the background
+    /// task, so a flush already running when `shutdown()` is called stops
+    /// retrying against an unreachable link (#295).
+    shutdown_state: ShutdownState,
 }
 
 impl NatsTradePublisher {
@@ -282,6 +287,7 @@ impl NatsTradePublisher {
             serializer: Arc::new(JsonEventSerializer),
             task_handle: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
+            shutdown_state: ShutdownState::default(),
         }
     }
 
@@ -519,10 +525,11 @@ impl NatsTradePublisher {
     ///
     /// # Bounded with NATS down
     ///
-    /// Each publish retries at most [`MAX_PUBLISH_RETRIES`] times. During the
-    /// drain, once one publish has exhausted its retries while the link is
-    /// down, the remaining buffered trades are not published: they are
-    /// counted in `dropped_events` and the task exits. Use
+    /// Each publish retries at most [`MAX_PUBLISH_RETRIES`] times. Once
+    /// shutdown is requested (in the drain, or in a flush that was already
+    /// running when this was called), the first publish that exhausts its
+    /// retries while the link is down ends publishing: the remaining
+    /// buffered trades are counted in `dropped_events` and the task exits. Use
     /// [`shutdown_with_deadline`](Self::shutdown_with_deadline) for a hard
     /// wall-clock bound.
     ///
@@ -534,7 +541,13 @@ impl NatsTradePublisher {
     /// - [`NatsPublisherError::TaskCancelled`] if the task was cancelled,
     ///   for example because its runtime shut down first.
     pub async fn shutdown(&self) -> Result<(), NatsPublisherError> {
-        shutdown_task(&self.shutdown_tx, &self.task_handle, PUBLISHER_NAME).await
+        shutdown_task(
+            &self.shutdown_state,
+            &self.shutdown_tx,
+            &self.task_handle,
+            PUBLISHER_NAME,
+        )
+        .await
     }
 
     /// Like [`shutdown`](Self::shutdown), but waits at most `deadline` for
@@ -555,6 +568,7 @@ impl NatsTradePublisher {
         deadline: Duration,
     ) -> Result<(), NatsPublisherError> {
         shutdown_task_with_deadline(
+            &self.shutdown_state,
             &self.shutdown_tx,
             &self.task_handle,
             PUBLISHER_NAME,
@@ -625,7 +639,7 @@ impl NatsTradePublisher {
                                 Ok(Some(trade)) => batch.push(trade),
                                 Ok(None) => {
                                     // Channel closed — flush remaining and exit.
-                                    let mut gate = DrainGate::normal();
+                                    let mut gate = DrainGate::normal(&publisher.shutdown_state);
                                     Self::flush_batch(&publisher, &mut batch, &mut gate).await;
                                     return;
                                 }
@@ -641,7 +655,12 @@ impl NatsTradePublisher {
                 );
             }
 
-            Self::flush_batch(&publisher, &mut batch, &mut DrainGate::normal()).await;
+            Self::flush_batch(
+                &publisher,
+                &mut batch,
+                &mut DrainGate::normal(&publisher.shutdown_state),
+            )
+            .await;
 
             // Throttle before the next flush, raced with the shutdown signal
             // so a long interval never delays teardown.
@@ -652,7 +671,12 @@ impl NatsTradePublisher {
         }
 
         // Flush any remaining trades.
-        Self::flush_batch(&publisher, &mut batch, &mut DrainGate::normal()).await;
+        Self::flush_batch(
+            &publisher,
+            &mut batch,
+            &mut DrainGate::normal(&publisher.shutdown_state),
+        )
+        .await;
     }
 
     /// Shutdown path: close the channel to new trades, then flush the current
@@ -668,7 +692,7 @@ impl NatsTradePublisher {
         batch: &mut Vec<TradeResult>,
     ) {
         rx.close();
-        let mut gate = DrainGate::draining();
+        let mut gate = DrainGate::draining(&publisher.shutdown_state);
         loop {
             drain_buffered(rx, batch, publisher.max_batch_size);
             if batch.is_empty() {
@@ -690,7 +714,7 @@ impl NatsTradePublisher {
     async fn flush_batch(
         publisher: &Arc<Self>,
         batch: &mut Vec<TradeResult>,
-        gate: &mut DrainGate,
+        gate: &mut DrainGate<'_>,
     ) {
         if batch.is_empty() {
             return;
@@ -754,7 +778,7 @@ impl NatsTradePublisher {
         all_subject: String,
         payload: bytes::Bytes,
         (symbol_seq, all_seq): (u64, u64),
-        gate: &mut DrainGate,
+        gate: &mut DrainGate<'_>,
     ) {
         let content_type = publisher.serializer.content_type();
 
@@ -1092,6 +1116,45 @@ mod tests {
         assert_eq!(handle.dropped_events(), 49);
         assert_eq!(handle.publish_count(), 0);
         assert_eq!(handle.sequence(), 2, "one trade reserved its two sequences");
+    }
+
+    /// #295 (PR #296 review): shutdown requested while a large normal flush
+    /// is already publishing against an unreachable link stops that flush
+    /// at its first exhausted publish instead of retrying every trade.
+    #[tokio::test]
+    async fn test_shutdown_during_normal_flush_with_link_down_is_bounded() {
+        const TRADES: u64 = 200;
+        let publisher = NatsTradePublisher::new(
+            fast_failing_jetstream().await,
+            "trades".to_string(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_max_batch_size(1_000)
+        .with_max_retries(2);
+        let (handle, listener) = publisher.into_listener();
+        for _ in 0..TRADES {
+            listener(&make_trade_result("BTC/USD"));
+        }
+        // Wait until the normal flush has reserved the first trade's
+        // sequences, i.e. its first publish has started.
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.sequence() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the normal flush started publishing");
+        let begun = std::time::Instant::now();
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())));
+        assert!(begun.elapsed() < Duration::from_secs(10));
+        // Without the shared shutdown state every trade would retry both
+        // subjects (~200 x 2 x 90 ms); now at most the in-flight trade and
+        // possibly one more fail, and the rest is dropped.
+        assert!(handle.error_count() <= 2, "errors {}", handle.error_count());
+        assert!(handle.error_count() >= 1);
+        assert_eq!(handle.error_count() + handle.dropped_events(), TRADES);
+        assert_eq!(handle.publish_count(), 0);
     }
 
     /// #295: `shutdown_with_deadline` bounds teardown even at the clamped

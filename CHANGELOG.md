@@ -543,8 +543,10 @@ change.
     documented.
   - NATS: `with_max_retries` is clamped to `MAX_PUBLISH_RETRIES` (10). With
     NATS down, `shutdown()` could take days (unbounded retries, drain with
-    no deadline); the drain now stops publishing once one publish exhausts
-    its retries while the link is down and counts the remaining events in
+    no deadline); once shutdown is requested (in the drain, or in a flush
+    already running when `shutdown()` was called, via shared shutdown
+    state), the first publish that exhausts its retries while the link is
+    down stops publishing and the remaining events are counted in
     `dropped_events`. `shutdown()` is cancel-safe (a dropped future puts the
     join handle back instead of detaching the task), and
     `shutdown_with_deadline(Duration)` aborts the task after the deadline

@@ -287,8 +287,8 @@ This order book engine is built with the following design principles:
   grown on open; only canonical segment names are read. Replay reports
   `ReplayError::JournalTruncated` when the entries end before
   `last_sequence()`. The NATS publishers clamp `with_max_retries` to
-  `MAX_PUBLISH_RETRIES` (10), stop publishing during the shutdown drain
-  once the link is down (the rest is counted in `dropped_events`), have a
+  `MAX_PUBLISH_RETRIES` (10), stop publishing once shutdown is requested
+  and the link is down (the rest is counted in `dropped_events`), have a
   cancel-safe `shutdown()` and a new `shutdown_with_deadline(Duration)`.
   The book-change publisher sends `Content-Type: application/json` and
   counts errors once per batch. Wire frames above `MAX_FRAME_BODY` (4096)

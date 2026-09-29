@@ -70,10 +70,10 @@ use crate::orderbook::nats::{
     MAX_BATCH_WINDOW_MS, MAX_MIN_PUBLISH_INTERVAL_MS, NatsPublisherError,
 };
 use crate::orderbook::nats_common::{
-    DrainGate, DropLog, LinkState, RetryPolicy, add_metric, batch_deadline, checked_reserve,
-    clamp_channel_capacity, clamp_duration_ms, clamp_max_batch_size, clamp_max_retries,
-    counter_exhausted, drain_buffered, increment_metric, new_batch_buffer, new_jitter_seed,
-    publish_with_backoff, shutdown_task, shutdown_task_with_deadline, store_slot,
+    DrainGate, DropLog, LinkState, RetryPolicy, ShutdownState, add_metric, batch_deadline,
+    checked_reserve, clamp_channel_capacity, clamp_duration_ms, clamp_max_batch_size,
+    clamp_max_retries, counter_exhausted, drain_buffered, increment_metric, new_batch_buffer,
+    new_jitter_seed, publish_with_backoff, shutdown_task, shutdown_task_with_deadline, store_slot,
     throttle_or_shutdown,
 };
 use pricelevel::Side;
@@ -205,7 +205,7 @@ impl From<PriceLevelChangedEvent> for BookChangeEntry {
 /// - **events_received** — total events received from the listener callback
 /// - **batches_published** — total batches flushed to NATS
 /// - **dropped_events** — events dropped because the channel was full, the
-///   background task was no longer running, or the shutdown drain gave up on
+///   background task was no longer running, or shutdown gave up on
 ///   an unreachable NATS link
 /// - **sequence** — monotonically increasing batch sequence number
 ///
@@ -297,6 +297,11 @@ pub struct NatsBookChangePublisher {
     /// events, flush them, and exit. Sent by
     /// [`shutdown`](NatsBookChangePublisher::shutdown).
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+
+    /// Shutdown intent and the give-up latch shared with the background
+    /// task, so a flush already running when `shutdown()` is called stops
+    /// retrying against an unreachable link (#295).
+    shutdown_state: ShutdownState,
 }
 
 /// Sequence numbers assigned to one flushed batch, one per published
@@ -389,6 +394,7 @@ impl NatsBookChangePublisher {
             drop_log: DropLog::default(),
             task_handle: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
+            shutdown_state: ShutdownState::default(),
         }
     }
 
@@ -596,10 +602,11 @@ impl NatsBookChangePublisher {
     ///
     /// # Bounded with NATS down
     ///
-    /// Each publish retries at most [`MAX_PUBLISH_RETRIES`](crate::orderbook::nats::MAX_PUBLISH_RETRIES) times. During the
-    /// drain, once one publish has exhausted its retries while the link is
-    /// down, the remaining buffered events are not published: they are
-    /// counted in `dropped_events` and the task exits. Use
+    /// Each publish retries at most [`MAX_PUBLISH_RETRIES`](crate::orderbook::nats::MAX_PUBLISH_RETRIES) times. Once
+    /// shutdown is requested (in the drain, or in a flush that was already
+    /// running when this was called), the first publish that exhausts its
+    /// retries while the link is down ends publishing: the remaining
+    /// buffered events are counted in `dropped_events` and the task exits. Use
     /// [`shutdown_with_deadline`](Self::shutdown_with_deadline) for a hard
     /// wall-clock bound.
     ///
@@ -610,7 +617,13 @@ impl NatsBookChangePublisher {
     /// - [`NatsPublisherError::TaskCancelled`] if the task was cancelled,
     ///   for example because its runtime shut down first.
     pub async fn shutdown(&self) -> Result<(), NatsPublisherError> {
-        shutdown_task(&self.shutdown_tx, &self.task_handle, PUBLISHER_NAME).await
+        shutdown_task(
+            &self.shutdown_state,
+            &self.shutdown_tx,
+            &self.task_handle,
+            PUBLISHER_NAME,
+        )
+        .await
     }
 
     /// Like [`shutdown`](Self::shutdown), but waits at most `deadline` for
@@ -631,6 +644,7 @@ impl NatsBookChangePublisher {
         deadline: Duration,
     ) -> Result<(), NatsPublisherError> {
         shutdown_task_with_deadline(
+            &self.shutdown_state,
             &self.shutdown_tx,
             &self.task_handle,
             PUBLISHER_NAME,
@@ -702,7 +716,7 @@ impl NatsBookChangePublisher {
                                 Ok(Some(event)) => batch.push(BookChangeEntry::from(event)),
                                 Ok(None) => {
                                     // Channel closed — flush remaining and exit
-                                    let mut gate = DrainGate::normal();
+                                    let mut gate = DrainGate::normal(&publisher.shutdown_state);
                                     Self::flush_batch(&publisher, &mut batch, &mut gate).await;
                                     return;
                                 }
@@ -718,7 +732,12 @@ impl NatsBookChangePublisher {
                 );
             }
 
-            Self::flush_batch(&publisher, &mut batch, &mut DrainGate::normal()).await;
+            Self::flush_batch(
+                &publisher,
+                &mut batch,
+                &mut DrainGate::normal(&publisher.shutdown_state),
+            )
+            .await;
 
             // Throttle before the next flush, raced with the shutdown signal
             // so a long interval never delays teardown.
@@ -729,7 +748,12 @@ impl NatsBookChangePublisher {
         }
 
         // Flush any remaining events
-        Self::flush_batch(&publisher, &mut batch, &mut DrainGate::normal()).await;
+        Self::flush_batch(
+            &publisher,
+            &mut batch,
+            &mut DrainGate::normal(&publisher.shutdown_state),
+        )
+        .await;
     }
 
     /// Shutdown path: close the channel to new events, then flush the current
@@ -745,7 +769,7 @@ impl NatsBookChangePublisher {
         batch: &mut Vec<BookChangeEntry>,
     ) {
         rx.close();
-        let mut gate = DrainGate::draining();
+        let mut gate = DrainGate::draining(&publisher.shutdown_state);
         loop {
             drain_buffered(rx, batch, publisher.max_batch_size);
             if batch.is_empty() {
@@ -776,7 +800,7 @@ impl NatsBookChangePublisher {
     async fn flush_batch(
         publisher: &Arc<Self>,
         batch: &mut Vec<BookChangeEntry>,
-        gate: &mut DrainGate,
+        gate: &mut DrainGate<'_>,
     ) {
         if batch.is_empty() {
             return;
@@ -882,7 +906,7 @@ impl NatsBookChangePublisher {
         subject: &str,
         batch: &BookChangeBatch,
         seq: u64,
-        gate: &mut DrainGate,
+        gate: &mut DrainGate<'_>,
     ) -> bool {
         let payload = match serde_json::to_vec(batch) {
             Ok(bytes) => bytes,
@@ -1185,6 +1209,33 @@ mod tests {
         assert_eq!(handle.error_count(), 1, "the one batch that was attempted");
         assert_eq!(handle.dropped_events(), 40, "the other four batches");
         assert_eq!(handle.publish_count(), 0);
+    }
+
+    /// #295 (PR #296 review): shutdown requested while a normal flush is
+    /// already publishing against an unreachable link trips the shared
+    /// latch, so the drain that follows does not retry the next batch.
+    #[tokio::test]
+    async fn test_shutdown_during_normal_flush_with_link_down_is_bounded() {
+        let publisher = publisher().await.with_max_batch_size(5).with_max_retries(2);
+        let (handle, listener) = publisher.into_listener();
+        for seq in 0..10 {
+            listener(event(Side::Buy, seq));
+        }
+        // Wait until the first (normal) flush reserved its sequences.
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.sequence() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the normal flush started publishing");
+        let begun = std::time::Instant::now();
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())));
+        assert!(begun.elapsed() < Duration::from_secs(10));
+        assert_eq!(handle.error_count(), 1, "only the in-flight batch failed");
+        assert_eq!(handle.dropped_events(), 5, "the second batch was dropped");
+        assert_eq!(handle.sequence(), 2, "the second batch reserved nothing");
     }
 
     /// #295: `shutdown_with_deadline` returns a typed timeout and aborts

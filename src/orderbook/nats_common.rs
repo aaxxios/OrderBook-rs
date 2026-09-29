@@ -476,58 +476,96 @@ impl LinkState {
 
 // ─── Shutdown drain ─────────────────────────────────────────────────────────
 
-/// Fail-fast latch for the shutdown drain (#295).
+/// Shutdown intent shared between `shutdown()` and the background task
+/// (#295).
 ///
-/// During normal operation every publish retries up to its limit. During
-/// the shutdown drain, once one publish has exhausted its retries while the
-/// link is down, every event still buffered would only repeat that wait, so
-/// the drain stops publishing: the remaining events are counted in
-/// `dropped_events` instead. This bounds `shutdown()` with NATS unreachable
-/// to the publishes already in flight.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DrainGate {
-    /// `true` inside the shutdown drain.
-    draining: bool,
-    /// Set once the drain gave up on the link.
-    tripped: bool,
+/// `shutdown()` sets `requested` before it sends the shutdown signal, so a
+/// flush that is already running (the task only observes the signal between
+/// flushes) sees the intent at its next exhausted publish. `gave_up` latches
+/// once the task stopped publishing because the link is down; it stays set
+/// for the rest of the task's life, so neither the rest of that flush nor
+/// the drain that follows retries again.
+#[derive(Debug, Default)]
+pub(crate) struct ShutdownState {
+    /// Set by `shutdown()` / `shutdown_with_deadline()`.
+    requested: AtomicBool,
+    /// Set once the task gave up on an unreachable link during shutdown.
+    gave_up: AtomicBool,
 }
 
-impl DrainGate {
-    /// Gate for a normal flush: never trips.
+impl ShutdownState {
+    /// Records that shutdown was requested. Called before the signal is
+    /// sent.
+    #[inline]
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Whether shutdown was requested.
     #[inline]
     #[must_use]
-    pub(crate) const fn normal() -> Self {
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+/// Fail-fast latch for publishes during shutdown (#295).
+///
+/// During normal operation every publish retries up to its limit. Once
+/// shutdown is requested (inside the drain, or inside a normal flush that
+/// was already running when `shutdown()` was called), the first publish
+/// that exhausts its retries while the link is down trips the latch: every
+/// event still buffered would only repeat that wait, so nothing more is
+/// published and the remaining events are counted in `dropped_events`. This
+/// bounds `shutdown()` with NATS unreachable to the publishes already in
+/// flight.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainGate<'a> {
+    /// The publisher's shared shutdown state.
+    state: &'a ShutdownState,
+    /// `true` inside the shutdown drain (shutdown is known to be requested).
+    draining: bool,
+}
+
+impl<'a> DrainGate<'a> {
+    /// Gate for a normal flush: trips only if shutdown is requested while
+    /// the flush runs.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn normal(state: &'a ShutdownState) -> Self {
         Self {
+            state,
             draining: false,
-            tripped: false,
         }
     }
 
     /// Gate for the shutdown drain.
     #[inline]
     #[must_use]
-    pub(crate) const fn draining() -> Self {
+    pub(crate) const fn draining(state: &'a ShutdownState) -> Self {
         Self {
+            state,
             draining: true,
-            tripped: false,
         }
     }
 
-    /// Whether the drain gave up: publish nothing more.
+    /// Whether the task gave up on the link: publish nothing more.
     #[inline]
     #[must_use]
-    pub(crate) const fn is_tripped(&self) -> bool {
-        self.tripped
+    pub(crate) fn is_tripped(&self) -> bool {
+        self.state.gave_up.load(Ordering::Acquire)
     }
 
-    /// Records a publish that exhausted its retries. Inside the drain, with
-    /// the link down, trips the gate (logged once at `WARN`).
+    /// Records a publish that exhausted its retries. With shutdown requested
+    /// and the link down, trips the latch (logged once at `WARN`).
     pub(crate) fn on_publish_exhausted(&mut self, link: &LinkState, publisher: &'static str) {
-        if self.draining && !self.tripped && link.is_down() {
-            self.tripped = true;
+        if (self.draining || self.state.is_requested())
+            && link.is_down()
+            && !self.state.gave_up.swap(true, Ordering::AcqRel)
+        {
             warn!(
                 publisher,
-                "NATS link down during the shutdown drain; dropping the remaining buffered events without publishing"
+                "NATS link down during shutdown; dropping the remaining buffered events without publishing"
             );
         }
     }
@@ -784,10 +822,13 @@ fn report_join(
 /// Cancel-safe: dropping the returned future before the task finishes puts
 /// the join handle back (see [`JoinGuard`]), so a later call joins the task.
 pub(crate) async fn shutdown_task(
+    state: &ShutdownState,
     shutdown_tx: &Mutex<Option<oneshot::Sender<()>>>,
     task_handle: &Mutex<Option<JoinHandle<()>>>,
     publisher: &'static str,
 ) -> Result<(), NatsPublisherError> {
+    // Intent first, so a flush already running sees it (see `DrainGate`).
+    state.request();
     signal_shutdown(shutdown_tx, publisher);
     let mut guard = JoinGuard {
         slot: task_handle,
@@ -811,11 +852,14 @@ pub(crate) async fn shutdown_task(
 /// panicked or was cancelled on its own reports that outcome instead. Also
 /// cancel-safe.
 pub(crate) async fn shutdown_task_with_deadline(
+    state: &ShutdownState,
     shutdown_tx: &Mutex<Option<oneshot::Sender<()>>>,
     task_handle: &Mutex<Option<JoinHandle<()>>>,
     publisher: &'static str,
     deadline: Duration,
 ) -> Result<(), NatsPublisherError> {
+    // Intent first, so a flush already running sees it (see `DrainGate`).
+    state.request();
     signal_shutdown(shutdown_tx, publisher);
     let mut guard = JoinGuard {
         slot: task_handle,
@@ -1122,7 +1166,13 @@ mod tests {
                 panic!("task boom");
             }),
         );
-        let result = shutdown_task(&shutdown_tx, &task_handle, "test").await;
+        let result = shutdown_task(
+            &ShutdownState::default(),
+            &shutdown_tx,
+            &task_handle,
+            "test",
+        )
+        .await;
         assert_eq!(
             result,
             Err(NatsPublisherError::TaskPanicked {
@@ -1131,7 +1181,13 @@ mod tests {
         );
         // The failure is reported once; a second call is a no-op.
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Ok(())
         );
     }
@@ -1149,7 +1205,13 @@ mod tests {
             }),
         );
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Ok(())
         );
     }
@@ -1162,7 +1224,13 @@ mod tests {
         handle.abort();
         store_slot(&task_handle, handle);
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Err(NatsPublisherError::TaskCancelled)
         );
     }
@@ -1187,13 +1255,24 @@ mod tests {
         );
         let first = tokio::time::timeout(
             Duration::from_millis(10),
-            shutdown_task(&shutdown_tx, &task_handle, "test"),
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test",
+            ),
         )
         .await;
         assert!(first.is_err(), "the first shutdown was cancelled");
         assert!(!finished.load(Ordering::SeqCst));
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Ok(())
         );
         assert!(
@@ -1209,6 +1288,7 @@ mod tests {
         store_slot(&task_handle, tokio::spawn(std::future::pending::<()>()));
         assert_eq!(
             shutdown_task_with_deadline(
+                &ShutdownState::default(),
                 &shutdown_tx,
                 &task_handle,
                 "test",
@@ -1221,7 +1301,14 @@ mod tests {
         // A huge deadline does not overflow the timer.
         store_slot(&task_handle, tokio::spawn(async {}));
         assert_eq!(
-            shutdown_task_with_deadline(&shutdown_tx, &task_handle, "test", Duration::MAX).await,
+            shutdown_task_with_deadline(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test",
+                Duration::MAX
+            )
+            .await,
             Ok(())
         );
     }
@@ -1244,14 +1331,24 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_gate_trips_only_while_draining_with_link_down() {
+    fn test_drain_gate_trips_only_with_shutdown_requested_and_link_down() {
         let link = LinkState::default();
-        let mut normal = DrainGate::normal();
         link.down.store(true, Ordering::Relaxed);
-        normal.on_publish_exhausted(&link, "test");
-        assert!(!normal.is_tripped(), "normal flushes never give up");
 
-        let mut draining = DrainGate::draining();
+        let state = ShutdownState::default();
+        let mut normal = DrainGate::normal(&state);
+        normal.on_publish_exhausted(&link, "test");
+        assert!(!normal.is_tripped(), "no shutdown requested: keep retrying");
+
+        // Shutdown requested while a normal flush runs: the next exhausted
+        // publish trips it, and the latch is shared with the drain.
+        state.request();
+        normal.on_publish_exhausted(&link, "test");
+        assert!(normal.is_tripped());
+        assert!(DrainGate::draining(&state).is_tripped());
+
+        let fresh = ShutdownState::default();
+        let mut draining = DrainGate::draining(&fresh);
         link.down.store(false, Ordering::Relaxed);
         draining.on_publish_exhausted(&link, "test");
         assert!(!draining.is_tripped(), "link up: keep draining");
