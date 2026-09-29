@@ -598,7 +598,10 @@ its refusal touches nothing). A refusal before any trade keeps the plain
 risk error and its pre-mutation classification. A risk-map collision on
 the id is the #288 duplicate race and stays `DuplicateOrderId`. A modify's
 re-add refused this way is `ModifyOrderLost` with this error as `source`
-(replayed by code, as every `ModifyOrderLost`).
+(journaled as code 21, which only carries the outer reason: replay
+re-executes the modify without a `RiskConfig`, the residual rests, and
+replay stops with `ReplayError::OutcomeMismatch`, the same documented
+limit as every `ModifyOrderLost` (#247); it never diverges silently).
 
 Replay re-executes an `AddOrder` recorded under code 22 through a
 crate-internal admission that runs every check and the sweep exactly like
