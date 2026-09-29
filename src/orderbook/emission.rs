@@ -87,10 +87,15 @@
 //!
 //! # Limit
 //!
-//! One scope per thread. A gated call on another book made by caller code
-//! that runs inside a mutation (a `Clock`, `T::clone`) finds the thread's
-//! scope taken, so its events take the immediate path: committed and
-//! delivered during that inner call, under the inner book's gate.
+//! Scopes nest per book: a gated call on another book made by caller code
+//! that runs inside a mutation (a `Clock`, `T::clone`) opens that book's
+//! scope on top of the current one and delivers its events after its own
+//! gate is released (but still inside the outer book's mutation, on this
+//! thread: its listeners must not drive the outer book). The released-
+//! ticket counter is per thread, so the inner release can make the outer
+//! scope's early-committed batches ready before the outer gate is
+//! released; they still describe committed mutations and keep their
+//! order.
 
 use super::book::OrderBook;
 use super::book_change_event::PriceLevelChangedEvent;
@@ -426,23 +431,41 @@ thread_local! {
     };
 }
 
+/// An enclosing scope saved while a nested one is open (PR #289 review).
+struct SavedScope {
+    owner: *const EventOutbox,
+    events: EventBuf,
+    ticket: Option<u64>,
+}
+
 /// Proof that [`open_scope`] opened a scope on this thread; consumed by
-/// [`close_scope`].
-pub(super) struct ScopeToken(());
+/// [`close_scope`]. Carries the enclosing scope, if any, which closing
+/// restores.
+pub(super) struct ScopeToken(Option<SavedScope>);
 
 /// Open an emission scope for `outbox` on this thread.
 ///
-/// `None` when a scope is already open (only reachable through caller code
-/// that runs inside one book's mutation and drives another book, a
-/// `Clock` or `T::clone`: that inner call's events then take the immediate
-/// path) or when the thread-local state is unavailable (thread teardown).
+/// Scopes nest (PR #289 review): caller code that runs inside one book's
+/// mutation (a `Clock`, `T::clone`) and drives another book opens that
+/// book's scope on top. The enclosing scope is saved in the token and
+/// restored when the inner one closes, so the inner book buffers its own
+/// events and dispatches them only after **its** gate is released, like
+/// any other call. The non-nested path saves nothing. `None` only when the
+/// thread-local state is unavailable (thread teardown); events then take
+/// the immediate path.
 fn open_scope(outbox: &EventOutbox) -> Option<ScopeToken> {
     EMISSION
         .try_with(|cell| {
             let mut tls = cell.try_borrow_mut().ok()?;
-            if !tls.owner.is_null() {
-                return None;
-            }
+            let saved = if tls.owner.is_null() {
+                None
+            } else {
+                Some(SavedScope {
+                    owner: tls.owner,
+                    events: std::mem::take(&mut tls.events),
+                    ticket: tls.ticket.take(),
+                })
+            };
             tls.owner = std::ptr::from_ref(outbox);
             tls.ticket = None;
             if tls.events.events.capacity() == 0
@@ -450,25 +473,34 @@ fn open_scope(outbox: &EventOutbox) -> Option<ScopeToken> {
             {
                 tls.events = buffer;
             }
-            Some(ScopeToken(()))
+            Some(ScopeToken(saved))
         })
         .ok()
         .flatten()
 }
 
-/// Close the scope `token` opened and hand back its unstamped events and
-/// early-commit ticket. An empty buffer stays in place for reuse.
-fn close_scope(_token: ScopeToken) -> Option<(EventBuf, Option<u64>)> {
+/// Close the scope `token` opened, restore the enclosing one (if any), and
+/// hand back the closed scope's unstamped events and early-commit ticket.
+/// An empty buffer stays in place for reuse when there is nothing to
+/// restore.
+fn close_scope(token: ScopeToken) -> Option<(EventBuf, Option<u64>)> {
     EMISSION
         .try_with(|cell| {
             let mut tls = cell.try_borrow_mut().ok()?;
-            tls.owner = std::ptr::null();
             let ticket = tls.ticket.take();
             let events = if tls.events.is_empty() {
                 EventBuf::default()
             } else {
                 std::mem::take(&mut tls.events)
             };
+            match token.0 {
+                Some(saved) => {
+                    tls.owner = saved.owner;
+                    tls.events = saved.events;
+                    tls.ticket = saved.ticket;
+                }
+                None => tls.owner = std::ptr::null(),
+            }
             Some((events, ticket))
         })
         .ok()
@@ -1192,5 +1224,35 @@ mod tests {
         let token = open_scope(&outbox).expect("scope");
         assert!(outbox.pool.is_empty(), "taken from the pool");
         let _ = close_scope(token);
+    }
+
+    /// Scopes nest per book (PR #289 review): an inner book's scope buffers
+    /// only its own events, and closing it restores the outer book's scope
+    /// with the outer events intact.
+    #[test]
+    fn nested_scope_saves_and_restores_the_outer_one() {
+        let outer = EventOutbox::default();
+        let inner = EventOutbox::default();
+        let state = |raw: u64| {
+            Incoming::Event(PendingEvent::State {
+                order_id: Id::from_u64(raw),
+                old: OrderStatus::Open,
+                new: OrderStatus::Open,
+            })
+        };
+        let outer_token = open_scope(&outer).expect("outer scope");
+        assert!(push_in_scope(&outer, state(1)).is_none());
+        let inner_token = open_scope(&inner).expect("inner scope");
+        assert!(push_in_scope(&inner, state(2)).is_none());
+        assert!(
+            push_in_scope(&outer, state(9)).is_some(),
+            "the outer book is not the current scope while the inner is open"
+        );
+        let (inner_events, _) = close_scope(inner_token).expect("close inner");
+        assert_eq!(inner_events.len(), 1);
+        assert!(push_in_scope(&outer, state(3)).is_none(), "outer restored");
+        let (outer_events, _) = close_scope(outer_token).expect("close outer");
+        assert_eq!(outer_events.len(), 2, "events 1 and 3");
+        assert!(push_in_scope(&outer, state(4)).is_some(), "no scope open");
     }
 }

@@ -849,6 +849,108 @@ mod tests {
         assert!(!book.submit_gate.is_poisoned());
     }
 
+    /// A `Clock` that, the first time book A's tracker reads it (inside
+    /// A's mutation, under A's gate), submits an order to book B.
+    struct DrivingClock {
+        target: Arc<OnceLock<Weak<OrderBook<()>>>>,
+        fired: AtomicBool,
+    }
+
+    impl std::fmt::Debug for DrivingClock {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DrivingClock")
+        }
+    }
+
+    impl crate::orderbook::clock::Clock for DrivingClock {
+        fn now_millis(&self) -> TimestampMs {
+            if !self.fired.swap(true, Ordering::SeqCst)
+                && let Some(book_b) = self.target.get().and_then(Weak::upgrade)
+            {
+                let _ =
+                    book_b.add_order(limit_for(100, 50, 1, Side::Buy, TimeInForce::Gtc, user(7)));
+            }
+            TimestampMs::new(0)
+        }
+    }
+
+    /// PR #289 review: caller code running inside book A's mutation (here
+    /// A's tracker clock) drives book B, whose listener re-enters B. B's
+    /// events must be buffered in B's own (nested) scope and delivered
+    /// after B's gate is released: no deadlock (B's gate is exclusive: STP
+    /// is on), and each book's stream stays strictly increasing.
+    #[test]
+    fn nested_scope_for_another_book_defers_its_dispatch_past_its_gate() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let b_seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_gate_free = Arc::new(Mutex::new(Vec::new()));
+            let b_slot: Arc<OnceLock<Weak<OrderBook<()>>>> = Arc::new(OnceLock::new());
+
+            let mut book_b = OrderBook::<()>::new("B");
+            book_b.set_stp_mode(STPMode::CancelTaker);
+            let seqs = Arc::clone(&b_seqs);
+            let gate_free = Arc::clone(&b_gate_free);
+            let inner_slot = Arc::clone(&b_slot);
+            book_b.set_price_level_listener(Arc::new(move |event: PriceLevelChangedEvent| {
+                seqs.lock().expect("seqs").push(event.engine_seq);
+                let Some(book) = inner_slot.get().and_then(Weak::upgrade) else {
+                    return;
+                };
+                gate_free
+                    .lock()
+                    .expect("gate")
+                    .push(book.submit_gate.try_write().is_ok());
+                if event.price == 50 {
+                    // Re-enter B from B's listener.
+                    let _ =
+                        book.add_order(limit_for(101, 49, 1, Side::Buy, TimeInForce::Gtc, user(8)));
+                }
+            }));
+            let book_b = Arc::new(book_b);
+            b_slot.set(Arc::downgrade(&book_b)).expect("slot");
+
+            let a_seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+            let mut book_a = OrderBook::<()>::new("A");
+            let seqs_a = Arc::clone(&a_seqs);
+            book_a.set_price_level_listener(Arc::new(move |event: PriceLevelChangedEvent| {
+                seqs_a.lock().expect("seqs").push(event.engine_seq);
+            }));
+            let clock_slot: Arc<OnceLock<Weak<OrderBook<()>>>> = Arc::new(OnceLock::new());
+            clock_slot.set(Arc::downgrade(&book_b)).expect("clock slot");
+            book_a.set_order_state_tracker(OrderStateTracker::with_clock(Arc::new(DrivingClock {
+                target: clock_slot,
+                fired: AtomicBool::new(false),
+            })));
+            book_a
+                .add_order(limit(1, 90, 1, Side::Buy, TimeInForce::Gtc))
+                .expect("A add");
+            book_a
+                .add_order(limit(2, 91, 1, Side::Buy, TimeInForce::Gtc))
+                .expect("A add 2");
+            done_tx
+                .send((
+                    b_seqs.lock().expect("seqs").clone(),
+                    b_gate_free.lock().expect("gate").clone(),
+                    a_seqs.lock().expect("seqs").clone(),
+                    book_b.get_order(Id::from_u64(101)).is_some(),
+                ))
+                .expect("send");
+        });
+        let (b_seqs, b_gate_free, a_seqs, nested_rests) = done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("book B's listener deadlocked under B's gate");
+        worker.join().expect("worker");
+        assert!(nested_rests, "B's listener re-entered B");
+        assert_eq!(b_seqs, vec![0, 1], "B's stream, strictly increasing");
+        assert_eq!(
+            b_gate_free,
+            vec![true, true],
+            "delivered after B's gate release"
+        );
+        assert_eq!(a_seqs, vec![0, 1], "A's stream unaffected");
+    }
+
     /// `flush_listener_events` is a no-op on a quiet book and never
     /// dispatches while another thread holds the role.
     #[test]

@@ -766,10 +766,15 @@ one 1 ns histogram bucket); with listeners, mixed and market-order workloads sta
 `CHANGELOG.md` entry for #249; the maintainer accepted this cost for the
 guarantee.
 
-**Limits.** One emission scope per thread: a gated call on book B made by
-caller code running inside book A's mutation (a `Clock`, `T::clone`)
-finds the scope taken, so B's events take the immediate path and are
-delivered during that inner call, under B's gate. The dispatcher role is
+**Limits.** Emission scopes nest per book (PR #289 review): a gated call
+on book B made by caller code running inside book A's mutation (a
+`Clock`, `T::clone`) opens B's scope on top of A's, so B buffers its own
+events and delivers them after B's gate is released, and A's scope is
+restored intact. B's listeners then still run inside A's mutation on
+that thread, so they must not drive A (A's gate may be held
+exclusively). The released-ticket counter is per thread, so B's release
+can make A's early-committed batches ready before A releases its gate;
+they describe committed mutations and keep their order. The dispatcher role is
 not bounded: under sustained load from other threads one thread can keep
 delivering for longer than its own call needed.
 
