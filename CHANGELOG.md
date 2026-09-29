@@ -768,6 +768,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Performance: measured and recovered for 0.14.0 (#259).** Two engine
+  fixes, no behaviour or format change:
+  - A fully filled maker is removed from the `user_orders` index by its
+    owner, which the order-location index now carries
+    (`OrderLocation { price, side, user_id }`), instead of a scan over every
+    user's entry (O(active users) per filled maker, one shard guard
+    allocated per shard visited, hash-seed dependent). Order-preserving
+    removal (#252) and location-last release (#288) are kept.
+    `get_order_locations_arc` and the `Serialize` output keep their
+    `(price, side)` shape.
+  - A passive add to an existing price level no longer builds and drops a
+    whole `PriceLevel` (`SkipMap::get_or_insert` evaluated its value
+    eagerly; a pricelevel 0.10 level owns a DashMap whose shard array is
+    about 16 KB on an 18-core host). `get_or_insert_with` builds a level
+    only for a new price.
+
+  Allocation profile (`alloc_count`): passive add on one level 6.3 allocs /
+  18.3 KB per op to 3.3 / 0.95 KB; full-fill cross 18 to 128 allocs per op
+  (seed dependent) to 3.0; one-level market sweep 44 to 119 to 2.0;
+  mixed 70/20/10 16.5 to 32.4 allocs / 9.4 KB to 3.35 / 3.3 KB.
+
+  HEAD against v0.13.1 (`scripts/bench_compare.sh`, 7 interleaved rounds,
+  same harness on both sides, p50 median): `add_only` -44 %,
+  `mixed_70_20_10` -48 %, `snapshot_restore_10k` -64 %, `replay_10k`
+  -56 %, `contended_add_4t` -37 %, `contended_add_8t` -6.5 %. Three rows
+  regress beyond threshold and are reported, not fixed: `cancel_only`
+  +8 ns per cancel (+3 ns from #249's emission scope, +5 ns from #294's
+  unwind-aware gate guard), `snapshot_create_10k` +5.9 % (arrives with
+  pricelevel 0.10's snapshot walk) and `contended_add_listeners_8t`
+  (+26 %: #247 stripes and #249's ordered outbox; accepted in those
+  issues at +4.9 % / +6.7 %, measured larger here). Full tables, noise
+  verdicts and raw rounds: `BENCHMARKS.md`, `BENCH.md` "0.13.1 → 0.14.0
+  delta" and `doc/bench/0.14.0/`.
+- **Benchmark harness (#259).** `benches/compare` covers fourteen
+  scenarios on both versions (adds, cancels, walks, mixed, thin book,
+  mass cancel, STP, snapshot create / restore, replay, contended adds with
+  and without listeners); `scripts/bench_compare.sh` records per-run load,
+  reports p50 / p99 and a per-class verdict (+3 % uncontended, +5 %
+  contended, NOISY above 10 pp spread, one-tick rule for single-op
+  timing). `aggressive_walk_hdr` and `notional_walk_hdr` keep their ask
+  ladder stocked: before, about 98 % of their samples timed a market order
+  rejected by an empty book, so their numbers are not comparable with
+  earlier runs.
+
 - **The Production Panic Policy gate is absolute (#260).** The temporary
   ratchet ledgers used during the cycle (`scripts/panic_policy_allowlist.txt`,
   `scripts/clippy_ratchet.txt`, `scripts/check_clippy_ratchet.py`, the

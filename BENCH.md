@@ -56,6 +56,50 @@ stable across 0.9.0 → 0.12.0 — the pricelevel 0.9 hardening and the
 > taker no longer reserves the level — `bytes_alloc/op` is back to the
 > low-KB range.
 
+### 0.14.0 allocation profile (#259)
+
+Three runs per point on the host in "Run conditions" below;
+`allocs/op` / `bytes_alloc/op`. "before" is `main` at `5447250`
+(pricelevel 0.10.1, all 0.14.0 correctness work merged), "after" is the
+0.14.0 candidate with the two #259 fixes. A range is the spread over the
+three runs.
+
+| scenario | before | after |
+|---|---|---|
+| `alloc_count_mixed_70_20_10` | 16.5 to 32.4 / 9.4 to 9.8 KB | 3.35 / 3.3 KB |
+| `alloc_count_add_only_one_level_with_user` | 6.29 / 18.3 KB | 3.28 / 0.95 KB |
+| `alloc_count_add_only_one_level_no_user` | 6.28 / 18.2 KB | 3.28 / 0.94 KB |
+| `alloc_count_add_only_distinct_levels_with_user` | 8.14 / 18.3 KB | 8.14 / 18.4 KB |
+| `alloc_count_cross_one_level_full_fill` | 18.0 to 128.0 / 1.4 to 4.1 KB | 3.02 / 1.07 KB |
+| `alloc_count_cross_one_level_partial_fill` | 4.00 / 1.2 KB | 4.00 / 1.2 KB |
+| `alloc_count_cross_deep_level_large_taker` | 4.00 / 88.3 KB | 4.00 / 88.3 KB |
+| `alloc_count_market_sweep_one_level` | 44.0 to 119.0 / 1.2 to 3.0 KB | 2.03 / 0.24 KB |
+| `alloc_count_market_sweep_three_levels` | 209 to 248 / 6.3 to 7.2 KB | 8.10 / 1.4 KB |
+
+- **Fill path (fix 1).** Each fully filled maker was removed from the
+  `user_orders` index by `untrack_order_by_id`, a `DashMap::iter_mut`
+  scan over every user entry: O(active users) per filled maker, one
+  shard-guard allocation per shard visited, and a visit count set by the
+  per-process hash seed, hence the 18-to-128 swing. The order-location
+  index now carries the owner and the fill path untracks by key.
+- **Passive add (fix 2).** The "~18 KB and ~6 allocations per passive
+  add" lead (#262) was `SkipMap::get_or_insert(price,
+  Arc::new(PriceLevel::new(price)))` in `rest_on_level`: the value is
+  evaluated eagerly, so every add to an existing level built and dropped
+  a whole `PriceLevel` (its order map's DashMap shard array is 16 KB on
+  an 18-core host, plus the level and its statistics). Fixed with
+  `get_or_insert_with`. What remains per passive add is the order's two
+  `Arc<OrderType>` (the level's copy and the one returned to the caller)
+  and one order-queue skiplist node.
+- **Left in pricelevel (reported upstream, not fixable here).** A NEW
+  level still costs about 17.4 KB (`distinct_levels`: 16 KB of it is the
+  per-level `DashMap::new()` shard array, sized `4 × available
+  parallelism` shards rounded up to a power of two). A crossing taker
+  pre-sizes its `MatchResult` to `min(taker qty, level order count)`
+  trades and ids even when one large maker absorbs it
+  (`cross_deep_level_large_taker`: 72 KB of `Trade` + 16 KB of ids for
+  one trade).
+
 The integration test `tests/alloc_budget.rs` runs a smaller 10 000-op
 slice and asserts `allocs/op` stays under a fixed ceiling to catch
 order-of-magnitude regressions in CI.
@@ -203,10 +247,17 @@ baseline, candidate, ...; `--rounds 3` minimum for a real comparison —
 see #259). `benches/compare/src/adapter.rs` isolates every
 version-specific API detail behind `v0_13` / `head` Cargo features so
 `workloads.rs` — the actual benchmark code — is byte-identical on both
-sides; today's three scenarios (`add_only`, `cancel_only`,
-`aggressive_walk`) call nothing that differs between the `v0.13.1` tag
-and `HEAD`, so both feature arms currently have the same body, but the
-seam is there for the next API break.
+sides. Since #259 it drives fourteen scenarios: `add_only`,
+`cancel_only`, `aggressive_walk`, `mixed_70_20_10`, `thin_book_sweep`,
+`mass_cancel_burst`, `stp_cancel_maker`, `snapshot_create_10k`,
+`snapshot_restore_10k`, `replay_10k` and same-price, same-account adds
+from 4 / 8 threads with and without no-op listeners
+(`contended_add[_listeners]_{4,8}t`). The two feature arms share every
+call except `create_snapshot` (a plain value on `v0.13.1`, a `Result`
+on 0.14.0). Snapshot and replay outputs are returned from the timed
+closure and dropped after the clock stops; `snapshot_restore_10k`
+clones its package and builds the empty target book before the clock
+starts.
 
 **Pitfall found in PR review: don't give the compare crate its own
 `pricelevel` dependency.** Every scenario attaches a `user_id`, which
@@ -229,7 +280,10 @@ this crate never needs to name `pricelevel::Hash32`, or depend on
 `pricelevel` at all.
 
 Each round's raw output plus a `summary.md` / `summary.csv` (median
-`p50` per side, round-to-round spread as a percentage, delta, verdict)
+`p50` and `p99` per side, round-to-round `p50` spread as a percentage,
+deltas, verdict and verdict counts), a `load.csv` with the load average
+before and after every run (`--max-load X` waits for the 1-minute load
+to drop below `X` first)
 and `system_info.md` (CPU, cores, RAM, OS, rustc, load average
 before/after, each side's resolved `Cargo.lock`) land in a fresh
 `bench-results/<UTC timestamp>/` directory at the repo root —
@@ -242,9 +296,14 @@ hand, the same way every existing table in these two files was
 produced.
 
 **Noise policy.** A row whose round-to-round spread exceeds 10
-percentage points on either side is marked `NOISY (inconclusive)` —
+percentage points on either side is marked `NOISY` (inconclusive) —
 never a pass, regardless of the delta — and must be re-measured (more
-rounds, a quieter host) before drawing any conclusion. This mirrors the
+rounds, a quieter host) before drawing any conclusion. Otherwise the
+verdict is per class: a median `p50` delta above +3 % (uncontended) or
++5 % (contended) is a `REGRESSION`, except on a single-op-timed row
+(`timer: single`) whose `p50` moved by at most one clock tick
+(41.67 ns), which is not a measured regression. A delta inside the
+threshold is reported as "within threshold", never as "no change". This mirrors the
 `reserve_sweep_dense_nonauto` handling elsewhere in this document (nine
 runs reported as a range, not a point estimate, because this scenario's
 single-threaded p50 is bimodal across this host's performance/
@@ -260,31 +319,44 @@ every flag.
 
 | Item | Value |
 |---|---|
-| Host | Apple M4 Max, macOS (Darwin 25.5.0, `arm64`) |
+| Host | Apple M5 Max, 18 cores, 128 GiB, macOS 27.0 (Darwin 27.0.0, `arm64`) |
 | Pinning | None |
-| Toolchain | `rustc 1.97.0` (stable) |
+| Toolchain | `rustc 1.98.1` (stable) |
 | Profile | `--release` (Cargo `bench` profile = `release` clone) |
 | `RUSTFLAGS` | unset |
 | Allocator | system allocator |
-| Date | 2026-07-15 |
-| Crate version | `0.12.0` (`pricelevel` `0.9.1`) |
+| Date | 2026-09-29 |
+| Crate version | `0.14.0` candidate (`pricelevel` `0.10.1`), branch `issue-259-performance` |
+| Load average | 6.6 to 7.2 (1 min) during the run: a desktop host, not a bench rig |
+
+The eight headline tables below were re-measured for 0.14.0 (#259); the
+`stp_contention` and `reserve_sweep` tables keep the measurement context
+stated in their own sections. Absolute numbers moved between hosts
+(0.12.0 was measured on an M4 Max): compare versions with the
+cross-version harness ("0.13.1 → 0.14.0 delta" below), never across
+these tables and older ones.
 
 ## Headline numbers
 
 All values in nanoseconds. **Closed-loop service time** — see
 "Coordinated omission" above.
 
-### `add_only` — pure passive limit submission, no crossings
+### `add_only` — limit submission into a tight band
 
-200 000 warmup + 1 000 000 measured.
+200 000 warmup + 1 000 000 measured `submit_gtc` calls (random side,
+price `99..=101`). Despite the historical "no crossings" label, the band
+is tight on both sides, so a good share of these adds **cross** and
+trade; the scenario measures limit entry as a whole, not a purely
+passive add (`alloc_count_add_only_*` isolates that, see "Allocation
+profile").
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 917 |
-| p99    | 62 847 |
-| p99.9  | 97 727 |
-| p99.99 | 130 495 |
-| max    | 195 583 |
+| p50    | 750 |
+| p99    | 37 055 |
+| p99.9  | 81 727 |
+| p99.99 | 164 607 |
+| max    | 553 471 |
 
 **Where the tail comes from.** The book grows monotonically across the
 measurement window, so each insert must walk the `SkipMap` to the
@@ -299,11 +371,11 @@ working set outgrows L1.
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 41 |
-| p99    | 19 007 |
-| p99.9  | 24 047 |
-| p99.99 | 27 055 |
-| max    | 834 559 |
+| p50    | 29 |
+| p99    | 5 175 |
+| p99.9  | 7 583 |
+| p99.99 | 14 983 |
+| max    | 54 079 |
 
 **Where the tail comes from.** `DashMap::remove` on the order index is
 a shard-local lock acquisition; the median is dominated by that
@@ -314,22 +386,29 @@ shard back to back, plus rare allocator returns of large
 
 ### `aggressive_walk` — taker market orders sweep multi-level book
 
-50 levels × 100 resting orders pre-loaded, then 100 000 aggressive
-buys with qty `5..=20`.
+50 levels × 100 resting orders, then 100 000 aggressive buys with qty
+`5..=20`, batched 32 per `Instant` pair. Since #259 the ladder is
+re-seeded (unmeasured, between batches) whenever it could not cover a
+full batch: before, it held about 27 500 lots and was empty after about
+2 200 takers, so ~98 % of the samples (and the historical 42 ns p50)
+timed a market order rejected by an empty book.
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 42 |
-| p99    | 3 335 |
-| p99.9  | 6 795 |
-| p99.99 | 8 839 |
-| max    | 18 671 |
+| p50    | 2 709 |
+| p99    | 6 615 |
+| p99.9  | 7 179 |
+| p99.99 | 7 323 |
+| max    | 7 323 |
 
 **Where the tail comes from.** The fill loop iterates per-order at
-each level until the requested quantity is consumed. Median is fast
-because most sweeps fill within a single level. Tail is driven by
-sweeps that span multiple levels and drop several `Arc<PriceLevel>`s
-at once.
+each level until the requested quantity is consumed; with makers of
+1..=10 lots a taker usually fills 2 to 4 makers. The per-trade id is a
+UUID v5 (SHA-1) from pricelevel's `UuidGenerator`, about a fifth of the
+sweep's CPU time in a profile; the rest is the level's order queue,
+the per-fill `MatchResult` bookkeeping and the filled-maker release.
+Tail: sweeps that span a level boundary and drop an emptied
+`Arc<PriceLevel>`.
 
 ### `notional_walk` — quote-notional market orders sweep multi-level book
 
@@ -337,20 +416,21 @@ at once.
 notional buys with budgets `500..2000` quote ticks
 (`match_market_order_by_amount` path) — same book shape as
 `aggressive_walk` for direct comparison of the two sweep entry points.
+Re-seeded like `aggressive_walk` since #259.
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 42 |
-| p99    | 2 543 |
-| p99.9  | 4 959 |
-| p99.99 | 6 919 |
-| max    | 18 463 |
+| p50    | 2 105 |
+| p99    | 6 303 |
+| p99.9  | 7 123 |
+| p99.99 | 7 627 |
+| max    | 7 627 |
 
 **Where the tail comes from.** Same fill loop as `aggressive_walk`
 plus one `u128` divide per level (budget → per-level qty cap) and one
-multiply per fill. Both medians sit at the same `~42 ns`, confirming
-the notional arithmetic is not the bottleneck; the tail tracks
-multi-level walks exactly like the base-qty sweep.
+multiply per fill. A budget of `500..2000` quote ticks buys 5 to 20
+lots at price 100 but fewer as the sweep walks up the ladder (prices
+100 to 149), hence a lower median than `aggressive_walk`.
 
 ### `mixed_70_20_10` — 70 % submit, 20 % cancel, 10 % aggressive
 
@@ -358,11 +438,11 @@ multi-level walks exactly like the base-qty sweep.
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 833 |
-| p99    | 31 679 |
-| p99.9  | 52 031 |
-| p99.99 | 72 063 |
-| max    | 128 511 |
+| p50    | 542 |
+| p99    | 15 671 |
+| p99.9  | 26 799 |
+| p99.99 | 44 255 |
+| max    | 181 631 |
 
 **Where the tail comes from.** Mix of all three previous tails. The
 median tracks `add_only` (because submits are 70 % of the workload).
@@ -376,11 +456,11 @@ Refills 3 resting asks every 5 ops; 200 000 IOC buy probes with qty
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 42 |
-| p99    | 4 543 |
-| p99.9  | 5 667 |
-| p99.99 | 12 751 |
-| max    | 26 335 |
+| p50    | 375 |
+| p99    | 1 225 |
+| p99.9  | 4 627 |
+| p99.99 | 11 703 |
+| max    | 21 183 |
 
 **Where the tail comes from.** Most probes either fully fill the
 small resting depth or partial-fill and short-circuit. The p99 is
@@ -395,11 +475,11 @@ wall-clock guard rather than a per-op tail.
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 32 591 |
-| p99    | 42 271 |
-| p99.9  | 54 463 |
-| p99.99 | 54 463 |
-| max    | 54 463 |
+| p50    | 39 263 |
+| p99    | 142 719 |
+| p99.9  | 261 503 |
+| p99.99 | 261 503 |
+| max    | 261 503 |
 
 **Where the tail comes from.** Burst latency scales linearly with the
 book depth; on a tight host the median is ~19 µs to drain 10 000
@@ -429,11 +509,11 @@ post-fix, sustained-liquidity numbers.
 
 | Quantile | Latency (ns) |
 |---|---|
-| p50    | 1 208 |
-| p99    | 4 835 |
-| p99.9  | 5 543 |
-| p99.99 | 9 503 |
-| max    | 21 551 |
+| p50    | 2 751 |
+| p99    | 5 127 |
+| p99.9  | 21 679 |
+| p99.99 | 43 807 |
+| max    | 102 079 |
 
 **Where the tail comes from.** Every measured op runs the per-level
 self-trade scan and cancels the same-user maker inline over the pooled
@@ -804,6 +884,96 @@ sides. All values in ns.
   as an improvement; this scenario's tail is noisy run to run.
 - **`mixed_70_20_10` p99 / p99.9 read about 6 % higher** on 0.13.0,
   within this scenario's own run-to-run spread.
+
+## 0.13.1 → 0.14.0 delta
+
+`scripts/bench_compare.sh --baseline v0.13.1 --candidate HEAD --rounds 7`
+(#259): the same `benches/compare` source built in two worktrees with
+separate `CARGO_TARGET_DIR`s, seven interleaved rounds, host and
+toolchain as in "Run conditions" above; `pricelevel` resolves to
+`0.9.2` on `v0.13.1` and `0.10.1` on HEAD (both `Cargo.lock` files, the
+per-round JSON, the load log and the summary are in
+[`doc/bench/0.14.0/`](doc/bench/0.14.0/)). Values are the median over
+the seven rounds of each round's p50, in ns; spread is the round-to-round
+`(max - min) / median` of p50.
+
+| scenario | v0.13.1 p50 (spread) | 0.14.0 p50 (spread) | p50 delta | p99 delta | verdict |
+|---|---|---|---|---|---|
+| `add_only` | 1 125 (7.4 pp) | 625 (6.7 pp) | -44.4 % | -49.8 % | OK |
+| `cancel_only` | 20 (15.0 pp) | 28 (3.6 pp) | +40.0 % | -32.1 % | REGRESSION (see below) |
+| `aggressive_walk` | 2 993 (64.1 pp) | 2 529 (5.1 pp) | -15.5 % | +42.8 % | NOISY |
+| `mixed_70_20_10` | 959 (8.7 pp) | 500 (8.2 pp) | -47.9 % | -47.7 % | OK |
+| `thin_book_sweep` | 691 (64.0 pp) | 350 (4.6 pp) | -49.3 % | -25.3 % | NOISY |
+| `mass_cancel_burst` | 32 047 (16.6 pp) | 29 375 (12.5 pp) | -8.3 % | -14.8 % | OK after re-measure (see below) |
+| `stp_cancel_maker` | 3 333 (36.3 pp) | 2 083 (8.0 pp) | -37.5 % | -22.6 % | NOISY |
+| `snapshot_create_10k` | 383 487 (4.2 pp) | 406 015 (7.8 pp) | +5.9 % | +8.5 % | REGRESSION (see below) |
+| `snapshot_restore_10k` | 11 165 695 (4.0 pp) | 3 997 695 (5.9 pp) | -64.2 % | -63.6 % | OK |
+| `replay_10k` | 9 207 807 (4.7 pp) | 4 050 943 (8.5 pp) | -56.0 % | -54.7 % | OK |
+| `contended_add_4t` | 2 205 (5.4 pp) | 1 391 (6.0 pp) | -36.9 % | -26.5 % | OK |
+| `contended_add_8t` | 3 739 (7.2 pp) | 3 497 (6.5 pp) | -6.5 % | -0.6 % | OK |
+| `contended_add_listeners_4t` | 2 031 (20.4 pp) | 1 567 (4.6 pp) | -22.8 % | -8.2 % | NOISY |
+| `contended_add_listeners_8t` | 3 855 (8.8 pp) | 4 847 (11.4 pp) | +25.7 % | +32.0 % | REGRESSION (see below) |
+
+Totals: 7 OK, 3 REGRESSION, 4 NOISY.
+
+- **The two #259 fixes** (see "0.14.0 allocation profile" above) are
+  most of the improvement: measured alone against `main` at `5447250`
+  (5 interleaved rounds each), the fill-path fix moved
+  `stp_cancel_maker` 2 959 → 2 042 ns and `thin_book_sweep` 833 → 350 ns
+  (every candidate round below every baseline round), and the passive-add
+  fix moved `add_only` 1 084 → 625 ns, `mixed_70_20_10` 958 → 500 ns,
+  `contended_add_4t` 2 321 → 1 347 ns and `contended_add_8t`
+  4 111 → 3 381 ns. Snapshot restore and replay were already faster on
+  `main` than on `v0.13.1` (pricelevel 0.10's restore path).
+- **NOISY rows: v0.13.1 is bimodal, 0.14.0 is not.** `v0.13.1` still
+  untracks filled makers with the O(active users) `iter_mut` scan, whose
+  cost depends on the per-process hash seed, so every scenario that fills
+  makers swings from process to process on the baseline side (for
+  example `thin_book_sweep` 308 to 750 ns, `aggressive_walk` 2 053 to
+  3 973 ns) while 0.14.0 stays inside 5 to 8 pp. More rounds do not
+  shrink a per-process spread, so these rows stay inconclusive by
+  policy. Read literally: `stp_cancel_maker` (2 042 to 2 209 against
+  2 625 to 3 835) and `contended_add_listeners_4t` (1 532 to 1 604
+  against 1 673 to 2 087) are faster in every round;
+  `aggressive_walk` and `thin_book_sweep` are inside the baseline's
+  range. `aggressive_walk`'s p99 reads +43 %; not attributed.
+- **`mass_cancel_burst`.** NOISY in this run (16.6 / 12.5 pp); an
+  earlier five-round run of the same pair on the same day measured
+  30 799 → 28 591 ns with spreads of 1.6 / 1.3 pp (-7.2 %, OK).
+- **`cancel_only` +8 ns per cancel: REGRESSION, not fixed.** The baseline
+  spread comes from one round (22 ns against 19 to 20); every 0.14.0
+  round (27 to 28 ns) is above every baseline round. Bisected over the
+  release with the same harness: flat at 20 ns up to `c59d74f`, 23 ns
+  after #249 (the listener-emission scope opened and closed per gated
+  call), 27 to 28 ns after #294 (`85d1fea`, the unwind-aware submit
+  gate guard). A miss-path microbenchmark (20 M cancels of absent ids)
+  measures 14.6 ns on `e0762f4` and 17.5 ns on `85d1fea`; removing the
+  guard's two `std::thread::panicking()` checks recovers about 2.5 ns
+  of that (15.2 ns), at the cost of #294's kill-switch-on-unwind
+  guarantee, so they stay. The remainder is code layout around the
+  larger guard. The cancel itself is still a few tens of ns; the
+  maintainer decides whether to accept it.
+- **`snapshot_create_10k` +5.9 %: REGRESSION, not fixed.** Bisected: it
+  arrives with the pricelevel 0.10 upgrade (`c1a4cbb`, 372 → 398 µs)
+  and nothing in orderbook-rs after it moves it. A time profile puts
+  92 % of the call in `PriceLevel::snapshot` → `OrderQueue::snapshot_by_seq`
+  / `collect_pairs`, on both versions a collect-and-sort of `(seq, order)`
+  pairs; pricelevel 0.10 adds a fallible, capacity-checked push per order
+  and a checked aggregate fold (`SnapshotAggregates::from_orders`) on top.
+  No single hotspot; the added work is spread over those steps and is
+  pricelevel's. Upstream issue text in the #259 report.
+- **`contended_add_listeners_8t` +25.7 %: REGRESSION, not fixed.** The
+  candidate spread (11.4 pp) makes the row NOISY by policy, but every
+  0.14.0 round (4 523 to 5 075 ns) is above every `v0.13.1` round (3 629
+  to 3 967 ns). Bisected (five rounds per point, busier host): `v0.13.1`
+  4 053 → `898a825` 4 207 → #247 level stripes (`4a21d2b`) 4 391 →
+  `c59d74f` 4 539 → #249 ordered outbox (`4567530`) 4 999 → `main`
+  4 899 → 0.14.0 4 643. The two steps are the ones accepted in #247
+  (+4.9 %) and #249 (+6.7 % at 8 threads); on this host and harness they
+  add up to more, and the #259 fixes recover part of it. Every thread
+  adds at one price for one account and the listener does nothing, so
+  the lock handoffs are the whole difference. The listener-free
+  `contended_add_8t` is 6.5 % faster than `v0.13.1`.
 
 ## Limitations
 
