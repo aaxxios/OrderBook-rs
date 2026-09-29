@@ -962,7 +962,10 @@ are documented with their subsystems (`Journal<T>` row above,
    `panic_any` / `resume_unwind`, `saturating_*` / `wrapping_*`, the
    panicking forms inside production-adjacent `#[cfg(test)]` seams, and any
    production `#[allow]` / `#[expect]` (inner, outer or inside `cfg_attr`)
-   of a lint `[lints.clippy]` denies.
+   of a lint `[lints.clippy]` denies, or of a clippy group containing one
+   (`clippy::restriction`, `clippy::pedantic`, and `clippy::all` as a
+   conservative catch-all; the script records each denied lint's groups
+   and refuses a denied lint it has no groups for).
 
 There is no allowlist: any finding fails. The only exception form is an
 inline `// panic-policy-allow-saturating: <reason>` marker on a reviewed,

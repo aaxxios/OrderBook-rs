@@ -104,8 +104,10 @@ the gate. The only exception form is the inline
 file and no per-file clippy `allow` escape hatch: this script also fails on
 a production `#[allow(clippy::<lint>)]` / `#[expect(clippy::<lint>)]` (inner
 or outer, including inside `cfg_attr`) naming any lint that Cargo.toml's
-`[lints.clippy]` table denies, or the `clippy::all` / `clippy::restriction`
-groups, outside the test spans described above. Test and bench crate roots
+`[lints.clippy]` table denies, or any clippy group containing one
+(`clippy::restriction`, `clippy::pedantic`, and conservatively
+`clippy::all`; see `_DENIED_LINT_GROUPS`), outside the test spans described
+above. Test and bench crate roots
 (`tests/`, `benches/`) are not scanned: the policy is production-only.
 
 Usage:
@@ -252,12 +254,56 @@ _INDEXING_EXCLUDED_KEYWORDS = frozenset(
 # back into production code is a local `#[allow(clippy::<lint>)]` /
 # `#[expect(clippy::<lint>)]` (or the inner `#![...]` form, or either one
 # inside a `cfg_attr`). The gate is absolute, so any such attribute naming a
-# lint that Cargo.toml's `[lints.clippy]` table denies (or the
-# `clippy::all` / `clippy::restriction` groups that contain them) fails,
-# unless it sits inside one of the exempt test spans. Allows of lints the
-# table does NOT deny (`clippy::too_many_arguments`, `clippy::type_complexity`,
-# ...) are style choices, not panic-policy escapes, and stay legal.
-_DENIED_CLIPPY_GROUPS = frozenset({"all", "restriction"})
+# lint that Cargo.toml's `[lints.clippy]` table denies, or any clippy group
+# that contains one, fails unless it sits inside one of the exempt test
+# spans. Allows of lints the table does NOT deny
+# (`clippy::too_many_arguments`, `clippy::type_complexity`, ...) are style
+# choices, not panic-policy escapes, and stay legal.
+#
+# Group membership of every denied lint, verified against the pinned clippy
+# (0.1.98, `clippy-driver -W help`, "Lint groups provided by plugins"):
+# twelve are `restriction`, the three narrowing casts and `manual_assert`
+# are `pedantic`; none is in `correctness`, `suspicious`, `style`,
+# `complexity`, `perf`, `nursery` or `cargo`. `clippy::all` (the default
+# groups) contains none of them either, but is kept as a conservative
+# catch-all. `denied_clippy_groups` refuses a denied lint missing from this
+# table, so a newly denied lint forces its groups to be recorded here.
+_DENIED_LINT_GROUPS: dict[str, frozenset[str]] = {
+    "unwrap_used": frozenset({"restriction"}),
+    "expect_used": frozenset({"restriction"}),
+    "panic": frozenset({"restriction"}),
+    "unreachable": frozenset({"restriction"}),
+    "todo": frozenset({"restriction"}),
+    "unimplemented": frozenset({"restriction"}),
+    "indexing_slicing": frozenset({"restriction"}),
+    "string_slice": frozenset({"restriction"}),
+    "arithmetic_side_effects": frozenset({"restriction"}),
+    "panic_in_result_fn": frozenset({"restriction"}),
+    "get_unwrap": frozenset({"restriction"}),
+    "exit": frozenset({"restriction"}),
+    "cast_possible_truncation": frozenset({"pedantic"}),
+    "cast_sign_loss": frozenset({"pedantic"}),
+    "cast_possible_wrap": frozenset({"pedantic"}),
+    "manual_assert": frozenset({"pedantic"}),
+}
+_ALWAYS_DENIED_GROUPS = frozenset({"all"})
+
+
+def denied_clippy_groups(denied: frozenset[str]) -> frozenset[str]:
+    """Every clippy group that contains at least one lint of `denied`, plus
+    `clippy::all`. A denied lint with no recorded groups is a hard error:
+    silently treating it as group-less would let `#[allow(clippy::<its
+    group>)]` through."""
+    missing = sorted(lint for lint in denied if lint not in _DENIED_LINT_GROUPS)
+    if missing:
+        raise SystemExit(
+            "check_panic_policy: no clippy group recorded for denied lint(s) "
+            f"{', '.join(missing)}; add them to _DENIED_LINT_GROUPS"
+        )
+    groups: set[str] = set(_ALWAYS_DENIED_GROUPS)
+    for lint in denied:
+        groups |= _DENIED_LINT_GROUPS[lint]
+    return frozenset(groups)
 _LINTS_CLIPPY_HEADER = re.compile(r"^\s*\[lints\.clippy\]\s*$")
 _TABLE_HEADER = re.compile(r"^\s*\[")
 _LINT_LEVEL_LINE = re.compile(
@@ -313,7 +359,7 @@ def find_denied_clippy_allows(masked: str, denied: frozenset[str]) -> list[tuple
     `allow(...)` / `expect(...)` of an attribute (`#[...]` or `#![...]`,
     including nested in `cfg_attr(...)`)."""
     hits: list[tuple[int, str]] = []
-    forbidden = denied | _DENIED_CLIPPY_GROUPS
+    forbidden = denied | denied_clippy_groups(denied)
     for attr in _ATTR_OPEN.finditer(masked):
         open_bracket = attr.end() - 1
         close_bracket = _matching_close(masked, open_bracket, "[", "]")

@@ -730,7 +730,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/check_panic_policy.py` has no allowlist any more (its
   `--write-allowlist` / `--ratchet-report` modes are gone): any finding
   fails, and it now also fails on a production `#[allow]` / `#[expect]`
-  (inner, outer or inside `cfg_attr`) of a lint `[lints.clippy]` denies.
+  (inner, outer or inside `cfg_attr`) of a lint `[lints.clippy]` denies,
+  or of a group containing one (`clippy::restriction`, `clippy::pedantic`,
+  and `clippy::all` as a catch-all).
   The inline `panic-policy-allow-saturating` marker is the only exception
   form. Tooling only: no public API or behaviour change.
 - `tests/alloc_budget.rs` (feature `alloc-counters`) now asserts the median
