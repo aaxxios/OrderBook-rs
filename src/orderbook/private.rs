@@ -71,9 +71,10 @@ where
     /// Places a resting order in the book, updates its location.
     ///
     /// Raw placement: no matching, risk or order-state bookkeeping. The
-    /// location and the user index are published before the level admits
-    /// the order, so a concurrent sweep that consumes it finds and removes
-    /// them (#288); a level refusal withdraws them again.
+    /// location (the id's ownership token) and the user index are
+    /// published before the level admits the order, so a concurrent sweep
+    /// that consumes it finds and removes them (#288); a level refusal
+    /// untracks the user entry and then releases the location.
     ///
     /// # Errors
     ///
@@ -120,9 +121,11 @@ where
         let unit_order = self.convert_to_unit_type(&*order);
         if let Err(err) = price_level.add_order(unit_order) {
             drop(stripe);
+            // Untrack while this placement still owns the id, then release
+            // it (#288).
+            self.untrack_user_order(order.user_id(), &order_id);
             self.order_locations
                 .remove_if(&order_id, |_, location| *location == (price, side));
-            self.untrack_user_order(order.user_id(), &order_id);
             self.remove_level_if_empty(side, price);
             return Err(err.into());
         }
@@ -156,12 +159,15 @@ where
         user_id: pricelevel::Hash32,
         order_id: &pricelevel::Id,
     ) {
-        if let Some(mut entry) = self.user_orders.get_mut(&user_id) {
-            entry.value_mut().retain(|id| id != order_id);
-            if entry.value().is_empty() {
-                drop(entry);
-                self.user_orders.remove(&user_id);
+        let emptied = match self.user_orders.get_mut(&user_id) {
+            Some(mut entry) => {
+                entry.value_mut().retain(|id| id != order_id);
+                entry.value().is_empty()
             }
+            None => false,
+        };
+        if emptied {
+            self.remove_user_if_empty(user_id);
         }
     }
 
@@ -195,8 +201,20 @@ where
             }
         }
         if let Some(user_id) = user_to_remove {
-            self.user_orders.remove(&user_id);
+            self.remove_user_if_empty(user_id);
         }
+    }
+
+    /// Drops `user_id`'s `user_orders` entry if it is still empty (#288).
+    ///
+    /// The emptying guard is released before this runs, so a concurrent
+    /// admission for the same user can push a new id in between; an
+    /// unconditional `remove` would delete that live entry. `remove_if`
+    /// re-checks emptiness under the shard's write lock.
+    #[inline]
+    fn remove_user_if_empty(&self, user_id: pricelevel::Hash32) {
+        self.user_orders
+            .remove_if(&user_id, |_, ids| ids.is_empty());
     }
 
     /// Record an order state transition if a tracker is configured,

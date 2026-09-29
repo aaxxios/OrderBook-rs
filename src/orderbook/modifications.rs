@@ -913,8 +913,9 @@ where
                     // If the price level is now empty, remove it
                     if is_empty {
                         self.remove_level_if_empty(side, price);
-                        self.order_locations.remove(&order_id);
+                        // #288: untrack before releasing the id.
                         self.untrack_order_by_id(&order_id);
+                        self.order_locations.remove(&order_id);
                     }
 
                     self.cache.invalidate();
@@ -1256,9 +1257,6 @@ where
             },
         );
 
-        // Remove the order from the locations map
-        self.order_locations.remove(&order_id);
-
         // Pre-trade risk hook: drop the per-account counter contribution
         // before the order leaves the index. The risk state stores
         // `account` and `remaining_qty` itself, so this needs no order
@@ -1294,6 +1292,11 @@ where
             self.special_order_tracker
                 .unregister_trailing_stop(&order_id);
         }
+
+        // Release the id last (#288): the location is its ownership token,
+        // so a new same-id admission can only start once every index of
+        // this order is gone.
+        self.order_locations.remove(&order_id);
     }
 
     /// Asks `price_level` to remove `order_id`. In `cfg(test)` builds the
@@ -2889,7 +2892,9 @@ where
     /// logged at `ERROR`.
     ///
     /// - A duplicate id (a same-id order won a concurrent admission race)
-    ///   records nothing: the id's state belongs to that live order.
+    ///   records no state: the id's state belongs to that live order, and
+    ///   writing a terminal one would end it on the tracker. A loser that
+    ///   traded is counted in the reject metric (#288).
     /// - Otherwise, a taker that traded ends
     ///   `Cancelled { filled_quantity, reason: RestFailed }`, with
     ///   `filled_quantity` cumulative for a modify's re-add (the original's
@@ -2907,7 +2912,14 @@ where
         admission: Admission,
     ) -> AdmitFailure {
         let err = failure.into_error();
-        if !matches!(err, OrderBookError::DuplicateOrderId { .. }) {
+        if matches!(err, OrderBookError::DuplicateOrderId { .. }) {
+            // #288: the id is owned by the admission that won the race, so
+            // its state is not touched; a loser that traded is still a
+            // reject after fills and is counted like the arms below.
+            if filled_qty > 0 {
+                crate::orderbook::metrics::record_reject(RejectReason::from(&err));
+            }
+        } else {
             if filled_qty > 0 {
                 self.track_state(
                     order.id(),
@@ -2945,33 +2957,36 @@ where
     /// order that no longer rested. So (#288):
     ///
     /// - published **before** the admission: the #243 risk reservation,
-    ///   the location (claimed atomically, so a same-id order that won a
-    ///   concurrent admission race is refused here instead of being
-    ///   overwritten), special-order tracking and `state`. A sweep that
-    ///   consumes the order finds them and removes them, and its `Filled`
-    ///   lands after `state`;
-    /// - published **after** it: the user index entry, followed by a
-    ///   re-check of the location. Every remover (the sweep's drain, the
-    ///   single-order cancel) drops the location before it untracks the
-    ///   user entry, so if the location is still this order's the
-    ///   remover's untrack is ordered after the push and removes it; if it
-    ///   is gone the remover may have untracked first, and this call
-    ///   untracks the entry itself (idempotent). Pushing the entry before
-    ///   the admission would need no re-check, but measured 7% slower on
-    ///   two threads admitting for one account (`concurrent_add_limit_orders`);
-    /// - the strandable-maker count (a strandable maker always rests under
-    ///   the exclusive gate, so no sweep overlaps it), the level event and
-    ///   the depth gauges.
+    ///   the location, the user-index entry and `state`. The location is
+    ///   claimed atomically and acts as the id's ownership token: a same-id
+    ///   order that won a concurrent admission race is refused here
+    ///   instead of being overwritten, and every remover (the sweep's
+    ///   drain, a cancel, this method's own rollback) untracks the user
+    ///   entry and releases the risk entry **before** it releases the
+    ///   location. A user-index entry for an id therefore only ever exists
+    ///   while one admission owns that id, so a reuse of the id can never
+    ///   see, or have removed, a previous admission's entry. A sweep that
+    ///   consumes the order finds all of them and records its `Filled`
+    ///   after `state`;
+    /// - published **after** it: special-order tracking (as before #288:
+    ///   the repricers unregister any tracked id `get_order` cannot find,
+    ///   so registering an order that is not on its level yet could lose
+    ///   it for good; a registration that lands after a concurrent cancel
+    ///   is instead cleaned up by the next repricing pass), the
+    ///   strandable-maker count (a strandable maker always rests under the
+    ///   exclusive gate, so no sweep overlaps it), the level event and the
+    ///   depth gauges.
     ///
     /// # Errors
     ///
     /// [`RestFailure::Risk`] when the risk reservation is refused and
-    /// [`RestFailure::Duplicate`] when another live order holds the id;
+    /// [`RestFailure::Duplicate`] when another admission owns the id;
     /// neither records `state` or touches the book. [`RestFailure::Level`]
-    /// when the level refuses the order: every index published above is
-    /// withdrawn, the reservation is released and a level this call left
-    /// empty is removed, so no phantom level or index is exposed. `state`
-    /// was already recorded; the caller records the terminal state over it.
+    /// when the level refuses the order: the user-index entry and the
+    /// reservation are withdrawn, then the location is released, and a
+    /// level this call left empty is removed, so no phantom level or index
+    /// is exposed. `state` was already recorded; the caller records the
+    /// terminal state over it.
     fn rest_on_level(
         &self,
         order: &OrderType<T>,
@@ -2999,9 +3014,9 @@ where
             .on_admission(order_id, order.user_id(), price, quantity)
             .map_err(RestFailure::Risk)?;
 
-        // #288: claim the location before the order becomes matchable. The
-        // map's shard guard is dropped at the end of the `match`, before
-        // anything else is locked.
+        // #288: claim the id before the order becomes matchable. The map's
+        // shard guard is dropped at the end of the `match`, before anything
+        // else is locked.
         let claimed = match self.order_locations.entry(order_id) {
             dashmap::Entry::Occupied(_) => false,
             dashmap::Entry::Vacant(slot) => {
@@ -3013,8 +3028,7 @@ where
             self.risk_state.release_reservation(risk_reservation);
             return Err(RestFailure::Duplicate(order_id));
         }
-        #[cfg(feature = "special_orders")]
-        self.register_special_order(order);
+        self.track_user_order(order.user_id(), order_id);
         self.track_state(order_id, state);
 
         // #247: admission into the level runs under the shared side of the
@@ -3048,16 +3062,6 @@ where
         if let Some(hook) = self.rest_interleave_hook.as_ref() {
             hook(order_id);
         }
-        // #288: see the method docs for why the re-check makes this safe
-        // against a sweep or cancel that removed the order meanwhile.
-        self.track_user_order(order.user_id(), order_id);
-        if self
-            .order_locations
-            .get(&order_id)
-            .is_none_or(|location| *location != (price, side))
-        {
-            self.untrack_user_order(order.user_id(), &order_id);
-        }
         // #230: this is the single point where the book rests an order on a
         // level (the untouched submit, the partially-filled residual and a
         // restored modify original), so flagging here covers the whole
@@ -3071,14 +3075,28 @@ where
         // gauge reflects current state. No-op when the `metrics` feature is
         // disabled.
         self.record_depth_metric();
+
+        // Register special orders for re-pricing tracking, now that
+        // `get_order` finds the order (see the method docs).
+        #[cfg(feature = "special_orders")]
+        match order {
+            OrderType::PeggedOrder { id, .. } => {
+                self.special_order_tracker.register_pegged_order(*id);
+            }
+            OrderType::TrailingStop { id, .. } => {
+                self.special_order_tracker.register_trailing_stop(*id);
+            }
+            _ => {}
+        }
         Ok(admitted)
     }
 
     /// Withdraws what [`Self::rest_on_level`] published before an
-    /// admission its level then refused (#288): the location, special-order
-    /// tracking and the risk reservation. The order never rested, so no
-    /// sweep or cancel can have removed any of them; the location is still
-    /// removed only if it is still this order's.
+    /// admission its level then refused (#288): the user-index entry and
+    /// the risk reservation while this admission still owns the id, then
+    /// the location that owns it. The order never rested, so no sweep or
+    /// cancel can have removed any of them, and no other admission can
+    /// have claimed the id meanwhile.
     #[cold]
     #[inline(never)]
     fn withdraw_unrested(
@@ -3089,33 +3107,12 @@ where
         risk_reservation: crate::orderbook::risk::RiskReservation,
     ) {
         let order_id = order.id();
-        self.order_locations
-            .remove_if(&order_id, |_, location| *location == (price, side));
-        #[cfg(feature = "special_orders")]
-        {
-            self.special_order_tracker
-                .unregister_pegged_order(&order_id);
-            self.special_order_tracker
-                .unregister_trailing_stop(&order_id);
-        }
+        self.untrack_user_order(order.user_id(), &order_id);
         // Keyed by the reservation's generation, so this can never
         // release a same-id order's entry (#243 review).
         self.risk_state.release_reservation(risk_reservation);
-    }
-
-    /// Registers a pegged or trailing-stop order for re-pricing.
-    #[cfg(feature = "special_orders")]
-    #[inline]
-    fn register_special_order(&self, order: &OrderType<T>) {
-        match order {
-            OrderType::PeggedOrder { id, .. } => {
-                self.special_order_tracker.register_pegged_order(*id);
-            }
-            OrderType::TrailingStop { id, .. } => {
-                self.special_order_tracker.register_trailing_stop(*id);
-            }
-            _ => {}
-        }
+        self.order_locations
+            .remove_if(&order_id, |_, location| *location == (price, side));
     }
 
     /// Adds `order` to `level`. In `cfg(test)` builds the `rest_fault_hook`
@@ -3324,6 +3321,12 @@ where
             if matches!(source, OrderBookError::MatchAborted { .. }) {
                 return source;
             }
+            // `add_order_inner` recorded the terminal
+            // `Cancelled { RestFailed }` (cumulative), except for a
+            // `DuplicateOrderId`: the id now belongs to the live order that
+            // won the admission race, so its state is left to that order
+            // (#288). The re-add's fills are in the reject metric and in
+            // `executed_quantity`.
             tracing::error!(
                 symbol = %self.symbol,
                 %order_id,

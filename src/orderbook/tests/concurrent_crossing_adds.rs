@@ -17,8 +17,11 @@ mod tests {
     use crate::orderbook::risk::RiskConfig;
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
     use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::Duration;
 
     const THREADS: u64 = 8;
     const OPS_PER_THREAD: u64 = 400;
@@ -226,14 +229,29 @@ mod tests {
             let expected = per_account.get(counters.key()).copied().unwrap_or((0, 0));
             assert_eq!(
                 (
-                    counters
-                        .open_count
-                        .load(std::sync::atomic::Ordering::SeqCst),
+                    counters.open_count.load(Ordering::SeqCst),
                     counters.resting_notional.load()
                 ),
                 expected,
                 "risk counters of an account (anomalies {})",
                 book.risk_accounting_anomalies()
+            );
+        }
+        // Reverse pass: every account with resting orders has its counters
+        // (an eviction racing an admission must not drop a live account).
+        for (account, expected) in &per_account {
+            let counters = book
+                .risk_state
+                .counters
+                .get(account)
+                .unwrap_or_else(|| panic!("account {account} rests orders without counters"));
+            assert_eq!(
+                (
+                    counters.open_count.load(Ordering::SeqCst),
+                    counters.resting_notional.load()
+                ),
+                *expected,
+                "risk counters of account {account}"
             );
         }
         assert_eq!(
@@ -267,27 +285,42 @@ mod tests {
         );
     }
 
+    /// Hung-test detector only: every rendezvous is expected to complete
+    /// immediately, so a timeout means a deadlock or a hook that was never
+    /// reached, never a slow machine taking a different branch.
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Parks the thread resting order `parked` right after its level
     /// admitted it (the order is matchable from then on), runs `during` on
-    /// the calling thread, then lets the resting thread finish.
+    /// the calling thread, then lets the resting thread finish. Channel
+    /// rendezvous with a timeout, so a regression that never reaches the
+    /// hook fails instead of hanging the suite.
     fn with_rest_parked(
         mut book: OrderBook<()>,
         parked: OrderType<()>,
         during: impl FnOnce(&OrderBook<()>),
     ) -> Arc<OrderBook<()>> {
         let parked_id = parked.id();
-        let admitted = Arc::new(Barrier::new(2));
-        let resume = Arc::new(Barrier::new(2));
+        let (admitted_tx, admitted_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
         {
-            let admitted = Arc::clone(&admitted);
-            let resume = Arc::clone(&resume);
+            let admitted_tx = Mutex::new(admitted_tx);
+            let resume_rx = Mutex::new(resume_rx);
             // Parks the first admission of `parked_id` only, so a later
-            // same-id admission cannot deadlock the barriers.
-            let fired = std::sync::atomic::AtomicBool::new(false);
+            // same-id admission passes straight through.
+            let fired = AtomicBool::new(false);
             book.rest_interleave_hook = Some(Arc::new(move |order_id: Id| {
-                if order_id == parked_id && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    admitted.wait();
-                    resume.wait();
+                if order_id == parked_id && !fired.swap(true, Ordering::SeqCst) {
+                    admitted_tx
+                        .lock()
+                        .expect("admitted sender")
+                        .send(())
+                        .expect("the test thread is waiting");
+                    resume_rx
+                        .lock()
+                        .expect("resume receiver")
+                        .recv_timeout(RENDEZVOUS_TIMEOUT)
+                        .expect("resumed by the test thread");
                 }
             }));
         }
@@ -296,9 +329,11 @@ mod tests {
             let book = Arc::clone(&book);
             thread::spawn(move || book.add_order(parked))
         };
-        admitted.wait();
+        admitted_rx
+            .recv_timeout(RENDEZVOUS_TIMEOUT)
+            .expect("the parked order reached the hook");
         during(&book);
-        resume.wait();
+        resume_tx.send(()).expect("the rester is parked");
         rester
             .join()
             .expect("rester")
@@ -372,6 +407,41 @@ mod tests {
             Some(OrderStatus::Cancelled { .. })
         ));
         assert!(book.asks.is_empty(), "the emptied level was removed");
+        assert_book_consistent(&book);
+    }
+
+    /// Copilot on #290: the id is reused while the first admission is
+    /// still parked. A sweep consumes the parked order, a new order with the
+    /// same id (another user, same price and side) rests, then the parked
+    /// thread finishes. The user index must hold the id exactly once, under
+    /// the new order's user.
+    #[test]
+    fn test_id_reused_mid_rest_keeps_one_user_entry() {
+        let reused = Id::from_u64(1);
+        let book = with_rest_parked(book(), order(1, 0, Side::Sell, 100, 3), |book| {
+            book.add_order(order(2, 1, Side::Buy, 100, 3))
+                .expect("the sweep consumes the parked order");
+            assert!(book.order_locations.get(&reused).is_none(), "id released");
+            book.add_order(order(1, 2, Side::Sell, 100, 4))
+                .expect("the freed id is reusable");
+        });
+        let entries: Vec<(Hash32, usize)> = book
+            .user_orders
+            .iter()
+            .map(|entry| {
+                (
+                    *entry.key(),
+                    entry.value().iter().filter(|id| **id == reused).count(),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        assert_eq!(entries, vec![(user(2), 1)], "one entry, the new owner's");
+        assert_eq!(
+            book.get_order(reused)
+                .map(|o| o.visible_quantity().as_u64()),
+            Some(4)
+        );
         assert_book_consistent(&book);
     }
 

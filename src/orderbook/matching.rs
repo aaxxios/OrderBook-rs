@@ -1405,8 +1405,10 @@ where
                 // the same order rather than an id reused in between.
                 self.note_removed_strandable_maker();
             }
-            self.order_locations.remove(filled_id);
+            // #288: untrack before releasing the id (the location is its
+            // ownership token, see `rest_on_level`).
             self.untrack_order_by_id(filled_id);
+            self.order_locations.remove(filled_id);
         }
 
         // Return vectors to pool for reuse. `stp_orders` only entered the pool
