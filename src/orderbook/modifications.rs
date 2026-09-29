@@ -3255,16 +3255,21 @@ where
 
         // #247: admission into the level runs under the shared side of the
         // price's stripe, so a concurrent removal of the level (it was
-        // empty a moment ago) either completes before `get_or_insert` (a
-        // fresh level is created) or waits and then sees this order and
+        // empty a moment ago) either completes before `get_or_insert_with`
+        // (a fresh level is created) or waits and then sees this order and
         // leaves the level in place. Concurrent admissions do not exclude
         // each other. Released before the listener runs.
         // PR #297 review: the unit conversion (`T::default()`, caller
         // code) runs before the stripe is taken, so no caller code of ours
         // runs under the stripe. The claim guard covers it.
+        // #259: `get_or_insert_with`, not `get_or_insert`: the level is only
+        // built when the price has none. An eager `PriceLevel::new` built
+        // and dropped a whole level (its order map's shard array is about
+        // 16 KB) on every add to an existing level.
         let unit_order = self.convert_to_unit_type(order);
         let stripe = self.lock_level(price);
-        let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
+        let price_level =
+            price_levels.get_or_insert_with(price, || Arc::new(PriceLevel::new(price)));
         let level = price_level.value();
 
         // Admission into the level is validated upstream since pricelevel
