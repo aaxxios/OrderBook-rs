@@ -18,28 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `clippy.toml` exempts real tests. `scripts/check_panic_policy.py` (`make
   lint-panic`, part of `make lint` and `make pre-push`) catches what clippy
   cannot: the `assert!` / `debug_assert!` family, `saturating_*` /
-  `wrapping_*`, `std::process::exit` / `abort`, and production-reachable
-  `#[cfg(test)]` seams. `doc/panic-boundaries.md` documents irreducible
-  dependency limits, the single `unsafe` exception (`memmap2`, feature
-  `journal`) and the no-panic obligations of caller-supplied code.
-- **Panic-policy ratchet (#242).** Existing violations are tolerated at
-  their current count and may only shrink: 17 production files carry a
-  narrow `#![allow(clippy::...)] // panic-policy-ratchet` line
-  (`--ratchet-report` lists them) and `scripts/panic_policy_allowlist.txt`
-  holds the script-only forms. A count above or below the recorded value
-  fails the gate, so each fix issue (#243 to #265) removes its entries.
-  Tooling only: no public API or behaviour change.
+  `wrapping_*`, `std::process::exit` / `abort`, `catch_unwind` /
+  `panic_any` / `resume_unwind` (tests may still use all three), and
+  production-reachable `#[cfg(test)]` seams. `doc/panic-boundaries.md`
+  documents irreducible dependency limits, the two documented `unsafe`
+  exceptions (`memmap2` under feature `journal`, `CountingAllocator` under
+  feature `alloc-counters`) and the no-panic obligations of
+  caller-supplied code. The temporary ratchet ledgers used during the
+  cycle were removed (#260); the gate is absolute (see Changed).
 - `rules/global_rules.md` is now tracked; the policy script and fixtures
   are un-ignored in `.gitignore` (not part of the published package).
-- **Clippy ratchet count ledger (#242 follow-up, PR #266 review).** A
-  per-file `#![allow(clippy::...)]` ratchet line is not itself a counted
-  ratchet: `scripts/check_clippy_ratchet.py` (`make lint-clippy-ratchet`,
-  part of `make lint`) closes that by re-running clippy against a scratch
-  copy of the crate with those markers stripped, gated on
-  `scripts/clippy_ratchet.txt` with the same exact-count discipline as
-  `panic_policy_allowlist.txt`. `check_panic_policy.py` also now denies
-  `catch_unwind`, `panic_any` and `resume_unwind` in production (tests may
-  still use all three).
 - `OrderBook::risk_accounting_anomalies()` and
   `RiskState::accounting_anomalies()`, plus the
   `orderbook_risk_accounting_anomalies_total` counter under the `metrics`
@@ -47,613 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release larger than an account counter, a fill larger than a maker's
   tracked remainder, a post-trade counter increment that would overflow).
   Expected to stay at zero; every anomaly is also logged.
-
-### Fixed
-
-- **Core boundary gaps found by the final audit (#294).** Engine
-  consistency around caller-supplied code; no panic was reachable with
-  valid input.
-  - An unwind under the **shared** side of the submit gate left no trace
-    (a `RwLockReadGuard` never poisons): a panicking `Clock`, metrics
-    recorder, `tracing` subscriber or `T::default()` running mid-mutation
-    in an ordinary submit, cancel or modify left the book possibly
-    inconsistent and still accepting flow. `SubmitGateGuard`'s drop now
-    checks `std::thread::panicking()` (once per drop, against the value
-    at acquisition, like std's own poison flag) and, on either side,
-    engages the kill switch and latches `submit_gate_poisoned()` before
-    the gate is released, logging once at `ERROR`.
-  - The sweep drain ran the per-maker caller code (`track_state`'s
-    `Clock` and `record_reject`, the strandable-maker `INFO`,
-    `record_reserve_hidden_discarded`) before each maker's index cleanup,
-    so an unwind left ghost locations and user-index entries for every
-    maker not cleaned yet. A drop guard now releases the indices of every
-    maker not released yet while the drain unwinds. The per-maker order
-    (state recorded, then location released) is kept on purpose: the
-    location is the id's ownership token (#288), and releasing it first
-    would let a same-id order admitted meanwhile have its resting state
-    overwritten by the old order's `Filled`. Event order is unchanged.
-  - The rest path claims an order's location and publishes its
-    user-index entry, risk reservation and resting state before the level
-    admits it (#288), running caller code in between (`Clock`, metrics,
-    `T::default()`). A panic there left all of them, and possibly a new
-    empty level, behind for an order no level holds. A drop guard now
-    withdraws them: the recorded state first (clock-free), then in #288's
-    release order the user index and reservation, then the location, so
-    every rollback happens while the attempt still owns the id and a
-    same-id order admitted concurrently cannot have its own transition
-    popped; it then removes the empty level. Review follow-up (PR #297):
-    `T::default()` (the unit conversion) now runs before the level stripe
-    is taken; and a panic raised by the gate guard's own commit phase
-    (caller `tracing` code under the held gate, inside the guard's drop)
-    is caught by a commit sentinel that engages the kill switch and
-    latches `submit_gate_poisoned()`.
-  - A standalone `OrderStateTracker::transition` invoked its listener
-    before queuing a terminal id for eviction, so a panicking listener
-    left the id retained forever. The id is queued first.
-  - The listener dispatcher could spin forever when its delivery buffer
-    persistently refused to grow (`try_reserve`): the head batch stayed
-    ready and was never taken. It is now delivered in place.
-  - Dead code: the unused `next_order_id` counter is gone and the
-    drop-only submit-gate guard fields are `_`-prefixed instead of
-    `#[allow(dead_code)]`.
-
-  Cost, measured against main 4567530 with interleaved rounds (medians,
-  on a loaded machine): one `thread::panicking()` read per gate
-  acquisition and per drop, and no allocation in the drain.
-  `aggressive_walk_hdr` p50 / p99 / p99.9 +0.0% / -1.4% / +1.6% (10
-  rounds); `add_limit_orders` +0.6%, `add_limit_orders_with_listeners`
-  +0.6%, `match_market_against_limit` -2.3%,
-  `match_market_against_limit_with_listeners` +0.6%,
-  `match_market_against_iceberg` -0.9% (5 rounds). The rest-path claim
-  guard, against main e0762f4: `add_only_hdr` p50 / p99 / p99.9
-  +1.9% / -3.4% / -3.7% (8 rounds); `add_limit_orders` +0.7%,
-  `add_limit_orders_with_listeners` +1.1%, `match_market_against_limit`
-  +0.8% (4 rounds). All within noise.
-
-- **Panic-free matching, STP and matching pool (#246).** The last
-  panicking forms in `matching.rs`, `stp.rs` and `pool.rs` are gone and
-  the three files leave both panic-policy ledgers:
-  - The `STPMode::CancelMaker` fill-or-kill walk summed the non-self depth
-    with `.sum()`: resting depth past `u64::MAX` (legal with a large
-    visible tranche plus an iceberg's hidden tranche) panicked in debug
-    and, in release, wrapped into a false kill. It now accumulates
-    `min(cap, depth)` with checked adds, so such a level reads as exactly
-    the taker's cap and the FOK fills. The STP `safe_quantity` scan uses
-    the same bounded accumulator (`min(Σ visible, u64::MAX)`), exact for
-    every consumer.
-  - The thread-local matching pool is reached with `LocalKey::try_with`
-    and `RefCell::try_borrow_mut`: a sweep run from a thread-local
-    destructor after the pool was torn down, or a reentrant pool access,
-    uses fresh buffers instead of panicking.
-  - The three `debug_assert!`s on the #225 STP snapshot invariant are now
-    a debug-build check that logs at `ERROR` (maker id, price, site)
-    instead of panicking; release builds still skip it.
-  - The per-level budget (`remaining - executed`, the quote-notional
-    `price × executed` deduction, lot rounding, the `u128` to `u64` level
-    cap) uses checked forms and `u64::try_from`. These invariants cannot
-    fail on a valid book (the level cap is derived from the same budget
-    the deduction checks against), so valid traffic and existing journals
-    replay unchanged; a breach, which can only come from already corrupt
-    state, aborts the sweep with its committed prefix
-    (`OrderBookError::MatchAborted`) instead of being clamped.
-  - Quote-notional normalization no longer returns the un-normalized
-    result, with its `u64::MAX` working bound in `remaining_quantity()`,
-    as a success when the rebuild fails: the committed trades are
-    reported as `MatchAborted` and the failure is logged.
-
-  Compatibility: identical trades, fees, events and order states for
-  every valid input; no snapshot, journal or wire format change
-  (`ORDERBOOK_SNAPSHOT_FORMAT_VERSION` stays 4) and no replay impact. The
-  only behaviour changes are on the overflow and invariant-breach paths
-  above, which used to panic, wrap or clamp. `peek_match` changes
-  signature (see "Changed (breaking)").
-
-- **Journals hardened against corruption and misuse (#252).**
-  - `FileJournal` rotation created segments with `create(true).truncate(true)`
-    and `append` never checked sequences, so a duplicate or restarted
-    sequence at a rotation boundary truncated an existing segment (and
-    could `SIGBUS` a reader that had it mapped). Segments are now created
-    with `create_new`; an existing file fails the append with the new
-    `JournalError::SegmentExists { path }` and is left untouched. Both
-    `FileJournal` and `InMemoryJournal` refuse a `sequence_num` that is not
-    strictly greater than the last one with the new
-    `JournalError::NonMonotonicSequence { last, attempted }`, before
-    anything is written. On reopen `FileJournal` recovers the last sequence
-    from the newest non-empty segment, so the check survives a restart.
-  - A malformed entry header ended a segment silently, so replay
-    "succeeded" on a prefix. Only a zero `entry_length` is now the end of
-    data; any other bad header (below the 20-byte minimum, past the end of
-    the segment, a truncated non-zero length field) is
-    `Some(Err(JournalError::InvalidEntryHeader { .. }))` from reads, after
-    which the iterator stops, and the same error from `verify_integrity`,
-    which also reports stored sequences that do not strictly increase
-    (`NonMonotonicSequence`). A header sequence that disagrees with the
-    CRC-valid payload is a `DeserializationError`.
-  - Torn-tail recovery left the torn bytes in place, so a later, shorter
-    append left stale bytes that decoded as the next header. Reopen now
-    zeroes every non-zero byte past the recovered write position (only
-    dirty 4 KiB chunks are written, so the sparse tail is not
-    materialised) and flushes them. A damaged entry followed by a valid
-    one is corruption inside committed data, not a torn tail: reopen scans
-    every offset after the damage (skipping zero runs), and if any valid
-    entry follows, even behind several damaged ones, `open` refuses with
-    `JournalError::CorruptEntry` (or `InvalidEntryHeader`) and leaves the
-    file unchanged instead of truncating and later overwriting the valid
-    entries. Readers never read past the committed write position of the
-    active segment, and an active segment whose file is shorter than that
-    position (an external truncation, even on an entry boundary) is
-    `InvalidEntryHeader` instead of a silently shorter replay.
-  - The writer's segment, `last_seq` and active segment start now live
-    under one mutex, so `last_seq` is updated under the same guard as the
-    durable write and cannot be left behind by a poisoned second lock;
-    `archive_segments_before` holds it so a rotation cannot race the
-    renames. A poisoned lock is `JournalError::MutexPoisoned` on every
-    method of both journals (it was `Io` in `InMemoryJournal`, and `None`
-    from `last_sequence`, which `ReplayEngine` reported as `EmptyJournal`).
-  - Capacity comes from the mapping length instead of file metadata; the
-    write slice, the 32-bit `entry_length` (`u32::try_from`, a payload over
-    ~4 GiB is `EntryTooLarge`), the encode buffer (`try_reserve_exact`,
-    new `JournalError::AllocationFailed { what, requested }`) and every
-    byte decode use checked forms. `file_journal.rs` leaves the
-    panic-policy ratchet (no `#![allow]`, no allowlist entry). The
-    `memmap2` mapping stays the single documented `unsafe` exception.
-- **Replay reconciles mass cancels by identity (#252).** A journaled
-  non-refused `MassCancelled` for `CancelAll` / `CancelBySide` /
-  `CancelByUser` / `CancelByPriceRange` is re-executed and the replayed
-  cancelled ids must equal the journaled ones **in order**, the orders
-  left resting by per-order failures (`failed_order_ids()`) must match in
-  order, and the replay must not refuse. A journaled eviction must evict
-  exactly its journaled ids in order. Disagreements are the new
-  `ReplayError::MassCancelMismatch { sequence_num, divergence, recorded,
-  replayed }` (`MassCancelDivergence::{Refusal, CancelledIds, FailedIds}`)
-  instead of passing on equal counts or surfacing as a generic
-  `OrderBookError`. `LevelFaultAfterRemoval` entries are fault reports, not
-  book outcomes, and are not compared. A live mass cancel with per-order
-  failures normally stops replay here by design (a fresh replay book does
-  not reproduce the level fault).
-- **A fill no longer reorders a user's resting orders (#252).** Removing a
-  filled maker from the `user_orders` index used `swap_remove`, which moved
-  the user's last order into the filled one's slot, so
-  `cancel_orders_by_user` did not follow admission order as documented. The
-  removal now preserves order (`Vec::remove`; still linear in that user's
-  list, as the lookup already was). Replay was consistent with the live
-  book either way; with identity reconciliation the documented order
-  matters wherever the index is rebuilt differently.
-
-- **Checked counters, snapshot restore validation and remaining core forms
-  (#250).** `engine_seq` was minted with a wrapping `fetch_add` and is
-  restored verbatim from an untrusted snapshot package, so a package
-  carrying `u64::MAX` made the next event wrap to `0`.
-  `OrderBook::next_engine_seq()` now returns `Result<u64, OrderBookError>`
-  and refuses with the new `OrderBookError::EngineSeqExhausted { engine_seq }`
-  instead of wrapping (the last mintable value is `u64::MAX - 1`). The
-  engine's own emission paths run after the mutation, so on exhaustion they
-  suppress the listener `TradeResult` / `PriceLevelChangedEvent` (logged
-  once at `ERROR`, reported by the new `OrderBook::engine_seq_exhausted()`)
-  instead of stamping a wrapped sequence; the book keeps matching. A
-  caller-owned result is never affected: `add_order_with_result` and the
-  `*_with_committed` APIs still return their committed fills, stamped with
-  the new `UNSTAMPED_ENGINE_SEQ` (`u64::MAX`, never minted). All
-  `PriceLevelChangedEvent` emissions now go through one helper.
-  Snapshot restore, both `restore_from_snapshot` and
-  `restore_from_snapshot_package`, now rejects in the prepare phase, before
-  any live state is touched: a crossed or locked book (best bid >= best ask,
-  new `OrderBookError::SnapshotCrossed { best_bid, best_ask }`); an order
-  whose `visible + hidden` does not fit `u64` (`QuantityOverflow`, now
-  checked for every order, not only when risk is rebuilt; pricelevel's level
-  validation already refuses it first as `PriceLevelError`); and, on the
-  package path, `engine_seq == u64::MAX` (`EngineSeqExhausted`). A package
-  restore clears the exhaustion latch. `OrderBookSnapshot::refresh_aggregates`
-  returns `Result` and `OrderBookSnapshotPackage::new` propagates its error
-  instead of checksumming stale aggregates. `spread()` (book and snapshot)
-  and `spread_bps()` return `None` for a crossed read instead of a clamped
-  `0`. The strandable-maker count, `StubClock`, the order-state tracker's
-  purge cutoff and purge count, the repricing counters and the trade /
-  depth metric casts use checked forms: the strandable count refuses (and
-  logs at `WARN`) an increment past `usize::MAX` or a decrement at zero;
-  `StubClock` stops at its last representable value instead of wrapping
-  (`StubClock::is_exhausted()`, logged once); a retention window reaching
-  before the clock's epoch purges nothing. The order-state tracker
-  recovers a poisoned terminal-queue mutex (the queue is an eviction hint,
-  re-checked per id) instead of silently skipping eviction forever. Each
-  order's status and history now live in one map entry, so a transition
-  updates both atomically and an eviction (`DashMap::remove_if` on that
-  entry) removes exactly the lifecycle it checked: an id re-activated or
-  re-terminated concurrently is never evicted or split from its history.
-  The eviction queue lock is never held while a map lock is taken.
-  `book.rs`, `order_state.rs` and `snapshot.rs` leave both ratchet ledgers.
-  Compatibility: `next_engine_seq()` and
-  `OrderBookSnapshot::refresh_aggregates()` change signature (see the
-  migration table). `OrderBookError` gains `EngineSeqExhausted` and
-  `SnapshotCrossed` (wire code `RejectReason::Other(0)`; the enum is
-  `#[non_exhaustive]`). Restore now rejects packages and snapshots that
-  earlier versions accepted: crossed or locked books (a live book never
-  rests one; such a state only came from hand-merged or corrupted
-  snapshots, including the #194 recovery fixture with a trailing stop
-  inside the market) and packages with `engine_seq == u64::MAX`. Tick and
-  lot alignment is deliberately not enforced on restore, because a live
-  book keeps orders admitted under a previous tick or lot size (see
-  `set_lot_size`), and its snapshot must keep restoring. `spread()` /
-  `spread_bps()` can return `None` where they used to return `Some(0)`.
-  An `OrderStateTracker::purge_terminal_older_than` window longer
-  than the clock's current value no longer purges entries stamped at `0`.
-  No snapshot, journal or wire format change:
-  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged.
-
-- **Default trade-id namespace no longer reads panicking OS entropy
-  (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
-  `with_trade_and_price_level_listener` (and every constructor built on
-  them) minted the trade-id namespace with `Uuid::new_v4()`, which panics
-  through `getrandom` when the OS RNG fails. The namespace is now a UUIDv5
-  derived from the symbol, the process id, the wall clock in nanoseconds
-  (`0` before the epoch) and a process-wide `checked_add` construction
-  counter: distinct for every book in a process, across concurrent
-  processes and across restarts (argument in the function docs and
-  `doc/panic-boundaries.md`). No `Uuid::new_v4()` remains in production
-  code; std's `RandomState` seeding (behind `HashMap` / `DashMap`) is the
-  documented remaining OS-entropy read.
-  Compatibility: constructor signatures are unchanged and still
-  infallible. Default namespaces are UUID version 5 instead of version 4
-  and are still unique per book; trade ids keep their format (UUIDv5 over
-  namespace + counter). `set_trade_id_namespace`,
-  `with_clock_and_namespace` and `ReplayBookConfig` injection are
-  unchanged, so replay is unaffected. No wire, journal or snapshot format
-  change.
-
-- **Checked time and allocation-counter helpers (#257).**
-  `current_time_millis()` narrowed the `u128` millisecond count to `u64`
-  with `as` and silently returned `0` for a clock set before the UNIX
-  epoch. The new `try_current_time_millis() -> Result<u64, TimeError>`
-  converts with `u64::try_from` and reports `TimeError::ClockBeforeEpoch`
-  or `TimeError::MillisOverflow`. `current_time_millis()` stays infallible
-  (its production callers, `MonotonicClock::now_millis`, the book-manager
-  trade listeners and the NATS book-change batch timestamp, have no error
-  channel) and now documents its fallback: `0` before the epoch, `u64::MAX`
-  on overflow (instead of a truncated value), each logged once per process
-  with `tracing::warn!`. Matching still takes time only from the injected
-  `Clock`; no wall-clock read was added. `AllocSnapshot::since` (feature
-  `alloc-counters`) uses `checked_sub` and returns `Option<AllocSnapshot>`,
-  `None` when the snapshots are out of order, instead of clamping to zero.
-  `src/utils/mod.rs` gates its test module with `#[cfg(test)]`. The utils
-  entries leave `scripts/clippy_ratchet.txt` and
-  `scripts/panic_policy_allowlist.txt`.
-  Compatibility: `current_time_millis()` keeps its signature and returns
-  the same value on any sane clock; `try_current_time_millis` and
-  `TimeError` are additive (re-exported from the crate root and the
-  prelude). `AllocSnapshot::since` is source-breaking for
-  `alloc-counters` users: add `.expect(..)` or handle `None`. No wire,
-  journal or snapshot format change.
-- **Fee and notional arithmetic on the trade path is checked (#244).**
-  Fees and trade notionals used to clamp or vanish on overflow:
-  `FeeSchedule::calculate_fee` clamped the fee, `TradeResult::with_fees`
-  dropped a fee whose running total overflowed, `TradeResult::total_fees`
-  clamped even a negative overflow to `+i128::MAX`, `quote_notional`
-  saturated, and `TradeInfo::from_trade_result` reported a failed
-  `executed_quantity()` as `0`. Every one of them is now checked and
-  typed. Fee representability is validated **before** the book is
-  touched: each taker's worst-case notional (worst reachable price ×
-  quantity; for a limit buy the limit, else the highest ask it can reach; for a
-  sell the best bid; for a `*_by_amount` order the amount) must fit `u128`
-  and be priced exactly by both fee legs, or the taker is rejected
-  untouched with `OrderBookError::FeeOverflow` (reject code 18) or
-  `OrderBookError::NotionalOverflow` (code 19), state
-  `Rejected { FeeOverflow | NotionalOverflow }`. The check runs under the
-  submit gate next to the #240 trade-id check, on every submission API
-  (`add_order*`, `submit_market_order*`, `submit_market_order_by_amount*`,
-  `match_market_order*`, `match_limit_order*`, the raw `match_order*`, and
-  `update_order` before the original is cancelled), with or without a
-  trade listener. Under the shared submit gate it is best effort, like the
-  #240 check: a maker admitted concurrently at a worse price is caught by a
-  per-level backstop in the sweep, which aborts with `MatchAborted` before
-  touching that level. The bound is the worst **reachable** price: a buy
-  walks the asks from the best one until their visible quantity covers
-  its size, so an absurd ask resting far behind the touch cannot make
-  ordinary buys fail. Cost on the common path: one or two cached best-price
-  reads, one level read for a buy that fails the limit fast path, and one
-  or two checked multiplications; no allocation. The sweep's backstop is
-  seeded with the verified price, so levels at or below it cost one
-  comparison. A non-crossing or post-only order is never checked against
-  its notional.
-- **`FeeSchedule::with_maker_rebate(i32::MIN, _)` no longer panics
-  (#244).** `-maker_rebate_bps.abs()` overflowed; the maker rate is now
-  `-|x|`, which is representable for every `i32`.
-- **Repricing arithmetic is checked (#244).** A pegged offset of
-  `i64::MIN` no longer overflows its negation (`unsigned_abs`); a pegged
-  price or tick snap above `u128::MAX` and a trailing stop below `0` or
-  above `u128::MAX` now skip the re-price (`None`) instead of saturating.
-  A negative offset deeper than the reference still floors at the minimum
-  valid price, as documented.
-- **Pre-trade risk uses checked notional arithmetic (#243).** The
-  per-account `resting_notional` counter was updated with a wrapping
-  `fetch_add` and the notional check used `saturating_*`, so two orders
-  whose notional sum exceeded `u128::MAX` could wrap the counter to a
-  small value and bypass `max_notional_per_account`. Every counter update
-  is now a compare-and-swap loop with `checked_add` / `checked_sub`, and
-  admission is all or nothing: the resting remainder's contribution is
-  reserved before the order is placed on its level and released if the
-  placement fails.
-- **Price band no longer passes at extreme prices (#243).** Both sides of
-  the band comparison saturated to `u128::MAX` at extreme prices and
-  compared equal, so any deviation passed. The comparison is now exact
-  over the whole `u128` domain, with the common path unchanged.
-- **Release-side underflows are visible (#243).** A fill, cancel or
-  quantity decrease that would take a risk counter below zero (a double
-  release) used to floor silently. It still sets the counter to zero, the
-  only value that keeps the account usable, but now logs a `WARN` with the
-  order, account and counter and increments the anomaly count. A fill
-  larger than the tracked remainder releases only the tracked remainder.
-  The maker-price `debug_assert_eq!` in `on_fill` is now a `WARN`.
-- **Risk reservations cannot be released by a same-id loser (#243
-  review).** `on_admission` claims the order id and the counters under the
-  order map's shard lock, rejects an id that is already tracked before
-  touching any counter, and returns a generation-tagged reservation; the
-  cleanup after a failed level placement releases only the entry carrying
-  that generation. Before, a concurrent same-id submission could overwrite
-  the winner's entry and its cleanup then released it, leaving the resting
-  winner untracked.
-- **Discarded reserve remainders are released (#243 review).** A
-  non-auto-replenishing reserve maker removed after its visible tranche is
-  exhausted (#230) kept its discarded hidden quantity booked in the
-  account's risk counters forever (pre-existing on 0.13), counting against
-  `max_open_orders_per_account` and `max_notional_per_account`. The
-  matcher now releases it in the same removal.
-- **Quantity increases reserve risk before the level changes (#243
-  review).** An in-place quantity increase now pre-books its notional
-  before the price level applies it and settles or rolls it back once the
-  level answers, so a risk overflow is a rejection with the order
-  unchanged instead of a divergence between the book and the risk state.
-- **Snapshot restore computes risk aggregates in the prepare phase
-  (#243, prepares #250).** When the package carries a risk config, the
-  per-account open-order counts and resting notional are accumulated with
-  checked arithmetic before any live state changes, so an overflowing
-  package fails with a typed error and leaves the book untouched instead
-  of being clamped in the commit phase.
-
-**Compatibility.** Only books with a `RiskConfig` installed are affected.
-An admission that previously wrapped the notional counter, or passed the
-price band because both sides saturated, is now rejected with the
-existing typed errors (`RiskMaxNotional`, `RiskMaxOpenOrders`,
-`RiskPriceBand`; same `RejectReason` codes). This applies even when the
-corresponding limit is `None`: an exposure the counters cannot represent
-is rejected with `limit = u128::MAX` (or `u64::MAX` for the open-order
-count), and `attempted = u128::MAX` when `price × quantity` itself
-overflows. `restore_from_snapshot_package` / `restore_from_snapshot_json`
-can now return `RiskMaxNotional`, `RiskMaxOpenOrders` or
-`QuantityOverflow` for a package whose risk aggregates overflow. No
-snapshot format change; realistic prices and quantities see no behaviour
-change.
-
-- **Modifications stop swallowing mutation errors (#247).**
-  - `update_order(OrderUpdate::Cancel)` ignored the level's answer and
-    removed the order's location and user-index entries anyway, leaving a
-    refused order resting but unreachable; it also never recorded the
-    `Cancelled` state, released the risk contribution or unregistered
-    special-order tracking. It now runs the same removal as `cancel_order`:
-    a refusal returns `Err(PriceLevelError)` with the order untouched, a
-    removal the level committed then failed completes and returns
-    `OrderRemovedWithLevelFault` (#248), and a success records
-    `Cancelled { UserRequested }` and releases risk.
-  - A cancel-then-add modify (`UpdatePrice`, `UpdatePriceAndQuantity`,
-    `Replace`) whose re-add failed after the original was cancelled lost the
-    order. The re-add now takes the validate-first verdict as its admission
-    (the kill-switch, risk-limit and shape checks are not re-run after the
-    cancel), and a failure that still happens (a concurrent mutation under
-    the shared gate, a failing level or allocation) is resolved: if nothing
-    traded, the original is restored with the same id, price, quantity and
-    timestamp at the **back** of its level (time priority lost) and the call
-    returns `OrderBookError::ModifyRolledBack`; if the restore fails too, or
-    the re-added order traded before failing, the call returns
-    `OrderBookError::ModifyOrderLost` and the indices hold no trace of the
-    order. A re-add sweep aborted by a failed level after trading still
-    returns `MatchAborted`. A modify whose cancel finds the order already
-    gone (filled concurrently) now returns `Ok(None)` instead of re-adding
-    it.
-  - A submit whose remainder could not be rested after irreversible trades
-    (level admission or risk reservation refused) returned `Err` with no
-    terminal state; the taker now ends
-    `Cancelled { filled_quantity, reason: RestFailed }` (or `Rejected`
-    when it did not trade).
-  - A self-trade-prevention maker cancel (`CancelMaker` / `CancelBoth`)
-    that the level failed was skipped silently and the sweep went on. It is
-    now resolved like a single-order cancel (the maker still rests, or the
-    removal is completed) and stops the sweep with the #240 abort
-    semantics: prefix published, taker `Cancelled { MatchAborted }`,
-    `Err(MatchAborted)`.
-  - The three `debug_assert!`s guarding the modify re-add against
-    fill-or-kill are a typed `InvalidOperation` raised before the cancel;
-    every `saturating_*` and raw arithmetic in `modifications.rs` is
-    checked or an exact case analysis. `modifications.rs` leaves both
-    panic-policy ledgers.
-  - Review of #285: a rolled-back modify never restores the original into
-    a crossed or locked book (an opposite order that arrived after the
-    cancel makes the restore fail with `PriceCrossing`: `ModifyOrderLost`,
-    `Cancelled { RestFailed }`). The re-add is built from the order the
-    cancel returned, so a concurrent fill between the modify's read and its
-    cancel no longer creates quantity (pre-existing on main): `UpdatePrice`
-    moves the remainder, `UpdatePriceAndQuantity` / `Replace` roll back
-    with source `OrderChangedDuringModify`. `filled_quantity` in every
-    state a re-add records is cumulative (the original's known fills plus
-    the re-add's), and a re-add failure the modify resolves records no
-    `Rejected` state or reject metric.
-- **Emptied price levels can no longer unlink a concurrent admission
-  (#247, Copilot on #285).** Under the shared submit gate the single-order
-  cancel, `UpdateQuantity`, the sweep's drain and a failed rest's cleanup
-  removed a level they had seen empty without re-checking, so an order a
-  concurrent submit admitted into it in between was left indexed but
-  unreachable (pre-existing on main). Admissions into a level and
-  removals of emptied levels now run under a striped per-price
-  reader-writer lock (admission shared, removal exclusive) and the removal
-  re-checks emptiness under it (`OrderBook::remove_level_if_empty`).
-  Concurrent admissions at the same price still run in parallel; cost is
-  one uncontended shared acquire per rested order and one exclusive
-  acquire per removed level.
-- **Concurrent crossing adds no longer leave an order indexed but not
-  resting (#288).** Under the shared submit gate (`STPMode::None`, no
-  strandable maker) an order's location, user-index entry and
-  `Open` / `PartiallyFilled` state were published only **after** its
-  level admitted it. A concurrent sweep could consume the order in that
-  window: its drain found no index to remove, and the resting thread then
-  inserted a location and user-index entry for an order that no longer
-  rested, and overwrote the maker's `Filled` state with `Open`
-  (pre-existing on main; 100/100 runs of the new 8-thread stress test
-  failed). `rest_on_level` now publishes the location (claimed atomically
-  with `DashMap::entry`), the user-index entry and the resting state
-  before the level admits the order, and withdraws them if the level
-  refuses it. The location is the id's ownership token: every remover
-  (sweep drain, cancel, zero-quantity update, rollbacks) releases it
-  last, so a reused id never sees or removes a previous order's user or
-  risk entry, and emptied `user_orders` entries are dropped only if still
-  empty. Special orders are still registered after the admission, so a
-  repricing pass cannot unregister an order that is being admitted. No
-  new lock. The same fix reordered the raw `place_order_in_book`.
-- **Risk open-order count no longer double-released by two sweeps
-  sharing a maker (#288).** The fill hook of the risk layer marked a fully filled
-  maker's entry exhausted and removed it in two steps; the other sweep's
-  `on_maker_removed` could take the zeroed entry in between and release a
-  second open-order slot for the same order, leaving the account's
-  `open_count` below its resting orders with no anomaly counted. The
-  full-fill removal now happens under the same entry lock.
-
-  Compatibility:
-  - A same-id submit racing a live order is now refused with
-    `DuplicateOrderId` when it would rest, even without a `RiskConfig`
-    (it used to overwrite the other order's location, last writer wins).
-    As before, it may have traded first. `place_order_in_book` returns
-    `DuplicateOrderId` for an id already located on the book instead of
-    overwriting its location.
-  - `SequencerResult::from` classifies `DuplicateOrderId` as
-    `may_have_mutated: true`: the loser of a concurrent same-id race can
-    fail with it after trading (it also counts in the reject metric then,
-    without an order state, which belongs to the winner). Replay was
-    already re-executing these rejections. Replay cannot reproduce such a
-    race (the loser's trades are missing from the replayed book); unique
-    ids per submit are an ingress / sequencing obligation.
-  - A cancel that arrives while an order is being rested now finds it as
-    soon as its level admits it (it used to return `Ok(None)` until the
-    bookkeeping finished).
-  - The order-state listener sees an order's `Open` / `PartiallyFilled`
-    before the level event of its admission. If the level then refuses
-    the order (a resource failure: counter capacity, a poisoned level),
-    that state is followed by the terminal one (`Rejected` or
-    `Cancelled { RestFailed }`), and a rolled-back modify shows the
-    re-add's accepted state ahead of the restore's
-    (`Open, Cancelled, Open, Open` instead of `Open, Cancelled, Open`).
-- **Post-trade risk rejections replay faithfully (#291).** A taker that
-  traded and then had its residual's risk reservation refused (concurrent
-  admissions on the same account, an unrepresentable counter) returned the
-  plain `RiskMaxNotional` / `RiskMaxOpenOrders` error, which
-  `SequencerResult::from` classified as never mutating and replay skipped
-  (a `RiskConfig` is not part of `ReplayBookConfig`): the replayed book
-  silently kept liquidity the live book had consumed. The failure is now
-  `OrderBookError::RiskRejectedAfterTrades { order_id, executed_quantity,
-  source }` (new reject code `RiskRejectedAfterTrades` = 22,
-  `may_have_mutated: true`), and replay re-executes such an `AddOrder`
-  with its residual refused instead of rested, which reproduces the live
-  trades without the risk configuration. A replay that cannot reproduce
-  it (the sweep fills everything or trades nothing) stops with
-  `ReplayError::OutcomeMismatch`.
-- **Repricers no longer drop a reused id's special-order tracking
-  (#291).** `reprice_pegged_orders` / `reprice_trailing_stops` released
-  the registration of any id `get_order` could not find; a same-id order
-  admitted in between lost its registration and was never repriced. The
-  release is now conditional, under the tracker's shard lock, on no order
-  owning the id (the #288 location claim).
-
-  Compatibility:
-  - A risk refusal after trades is `Err(RiskRejectedAfterTrades { .. })`
-    wrapping the former error (`source`); the reject metric and
-    `RejectReason::from` report code 22 for it. A risk refusal before any
-    trade is unchanged. Both new variants are additive: `OrderBookError`
-    and `RejectReason` are `#[non_exhaustive]`, so downstream matches
-    already carry a wildcard arm.
-  - A modify re-add refused this way still returns `ModifyOrderLost`, now
-    with `RiskRejectedAfterTrades` as its `source`.
-  - Journals written before this release recorded the post-trade case
-    under a pre-trade risk code with `may_have_mutated: false`; replay
-    still skips those, and only `snapshots_match` detects the gap.
-- **Bounded journal recovery and NATS shutdown (#295).** Two liveness bugs
-  and several hardening items from the final audit (#260):
-  - `FileJournal::open` on a latest segment whose tail is garbage probed
-    every byte offset and CRC'd each candidate over the rest of the
-    segment (on the order of 10^14 bytes hashed for 256 MB): it
-    effectively never returned. The forward scan that tells a torn tail
-    from mid-segment corruption now filters candidates with
-    allocation-free checks first (framing inside the segment, a sequence
-    strictly above the last good entry, a payload starting with
-    `{"sequence_num":<header sequence>,` and ending with `}`) and
-    CRC-checks at most 64 of them, hashing at most 256 MiB. Random garbage
-    opens in time linear in the segment size (treated as a torn tail,
-    since no valid entry can follow); a tail that exhausts the budget is
-    refused with the damaged entry's `CorruptEntry` / `InvalidEntryHeader`.
-    #252's rule is unchanged: a later valid entry still refuses the open.
-  - A zero-length latest segment (crash between `create_new` and
-    `set_len`) made every append fail with `SegmentExists`; it is now grown
-    to the segment size on open. A failed `msync` of an append re-zeroes
-    the bytes it copied (best effort) before returning the error. A reader
-    whose segment is shorter than its limit gets `InvalidEntryHeader`
-    instead of a silent end. `list_segments` accepts only canonical names
-    (`segment-` + 20 digits + `.journal`, round-tripped), so a stray
-    `segment-5.journal` or `segment-+0…0.journal` can no longer alias a real
-    segment, and it sorts and dedupes.
-  - Replay compares the iteration with `last_sequence()` read before it:
-    a journal whose newest segment vanished returned `Ok` on a truncated
-    prefix and now fails with `ReplayError::JournalTruncated`.
-  - `InMemoryJournal` stores events behind `Arc` and clones `T` outside its
-    read lock; its JSON / CRC parity limits with `FileJournal` are
-    documented.
-  - NATS: `with_max_retries` is clamped to `MAX_PUBLISH_RETRIES` (10). With
-    NATS down, `shutdown()` could take days (unbounded retries, drain with
-    no deadline); once shutdown is requested (in the drain, or in a flush
-    already running when `shutdown()` was called, via shared shutdown
-    state), the first publish that exhausts its retries while the link is
-    down stops publishing and the remaining events are counted in
-    `dropped_events`. `shutdown()` is cancel-safe (a dropped future puts the
-    join handle back instead of detaching the task), and
-    `shutdown_with_deadline(Duration)` aborts the task after the deadline
-    (`NatsPublisherError::ShutdownTimedOut`).
-  - `NatsBookChangePublisher` sends `Content-Type: application/json`
-    (batches are always JSON; the `EventSerializer` trait does not cover
-    batches) and counts `error_count` once per batch, matching the trade
-    publisher's once-per-trade rule.
-  - Wire: `decode_frame` rejects a `len` above `MAX_FRAME_BODY` (4096) with
-    `InvalidPayload` from the header alone (it used to report `Truncated`
-    for up to 4 GiB), and `encode_frame` refuses such a frame.
-    `encode_exec_report` rejects an unknown `status` or non-zero `_pad`, and
-    `encode_book_update` an unknown `side`, with `InvalidPayload` instead of
-    emitting frames their own decoders reject.
-  - `CountingAllocator` (feature `alloc-counters`) documents that its
-    diagnostic counters wrap (no allocation, panic or CAS loop inside the
-    allocator); `doc/panic-boundaries.md` lists it next to `memmap2` as the
-    second documented `unsafe` exception.
-
-  Compatibility:
-  - `ReplayError` is not `#[non_exhaustive]`: the new `JournalTruncated`
-    variant needs an arm in exhaustive matches. A replay that used to
-    succeed on a truncated journal now fails.
-  - `NatsPublisherError` is `#[non_exhaustive]`; `ShutdownTimedOut` is
-    additive. `MAX_PUBLISH_RETRIES` and `wire::MAX_FRAME_BODY` are new
-    public constants.
-  - Callers passing `with_max_retries` above 10 get 10 (and a `WARN`).
-  - `NatsBookChangePublisher::error_count()` is smaller for multi-subject
-    failures (once per batch instead of once per subject). During a
-    shutdown with NATS down, events that used to be retried are now in
-    `dropped_events`.
-  - Book-change messages carry an extra `Content-Type` header; payloads are
-    unchanged.
-  - Wire frames longer than 4096 bytes (none are defined) are refused on
-    both sides; encoder inputs the decoders already rejected now fail at
-    encode time.
-  - Non-canonical segment file names are ignored by `FileJournal` (it never
-    wrote any). No on-disk format change; `ORDERBOOK_SNAPSHOT_FORMAT_VERSION`
-    is unchanged.
-
-### Changed
-
-- `tests/alloc_budget.rs` (feature `alloc-counters`) now asserts the median
-  over seven independent measured windows against a ceiling of 15.0
-  allocs/op, derived from the measured per-process range (about 6.5 to
-  10.4) instead of a single window against 10.0, which flipped on noise.
-  CI now runs it (#262). Test-only change.
 
 ### Changed (breaking)
 
@@ -1150,9 +531,7 @@ change.
   forward). A Black-Scholes overflow mid-iteration surfaces as
   `NonFiniteResult` instead of `InvalidParams`. `IVParams::is_atm` returns
   `false` for a non-finite or non-positive strike instead of dividing by
-  it. Results for valid inputs are unchanged. The IV files leave the
-  panic-policy ratchet (`scripts/clippy_ratchet.txt` loses its two
-  `implied_volatility` entries).
+  it. Results for valid inputs are unchanged.
 - **NATS publishers validate configuration and surface task failures
   (#253).** Applies to `NatsTradePublisher` and `NatsBookChangePublisher`.
   - `shutdown()` returns `Result<(), NatsPublisherError>` instead of `()`.
@@ -1241,13 +620,11 @@ change.
   book's listener is dropped, as before. The default processor's log lines
   now use structured fields (`symbol`, `trades`, `executed_quantity`;
   `quantity`, `price`, `trade_id`) instead of formatted messages. No
-  change to matching, trade events or snapshots. `manager.rs` had no
-  panic-policy ratchet entries. `doc/panic-boundaries.md` lists the trade
-  handler's no-panic obligation and the `crossbeam::channel` / `tokio`
+  change to matching, trade events or snapshots.
+  `doc/panic-boundaries.md` lists the trade handler's no-panic obligation and the `crossbeam::channel` / `tokio`
   surface the processors use.
 
-- **Wire encoders return `Result`; wire and metrics leave the panic
-  ratchet (#254).** `encode_exec_report`, `encode_trade_print` and
+- **Wire encoders return `Result` (#254).** `encode_exec_report`, `encode_trade_print` and
   `encode_book_update` (feature `wire`) reserved their fixed payload with
   `Vec::reserve`, which panics with "capacity overflow" when the caller's
   buffer cannot grow. They now reserve with `Vec::try_reserve` and return
@@ -1264,11 +641,7 @@ change.
   `const _: () = assert!(..)`: still rejected at compile time, no
   `assert!` form. `src/orderbook/metrics.rs` documents the caller-installed
   `metrics` recorder boundary (must not panic; owns its counter overflow
-  semantics); it needed no code change. Removed ledger entries: four from
-  `scripts/clippy_ratchet.txt` (`new_order.rs` `cast_sign_loss`,
-  `book_update.rs` / `exec_report.rs` / `trade_print.rs`
-  `arithmetic_side_effects`) and four `assert` entries from
-  `scripts/panic_policy_allowlist.txt`.
+  semantics); it needed no code change.
 
   **Compatibility:** the wire format is unchanged: every frame and payload
   encodes and decodes byte-for-byte as before, and malformed input returns
@@ -1329,15 +702,6 @@ change.
     the previous value on a settled book, the true distance (instead of `0`)
     if the best price moves between the cache read and the walk.
 
-  Removed ledger entries: `scripts/panic_policy_allowlist.txt` drops
-  `iterators.rs`, `market_impact.rs` and `statistics.rs` and lowers
-  `book.rs` `saturating_wrapping` 26 to 3 and `snapshot.rs` 7 to 1 (the
-  remaining `spread` / counter forms belong to #250);
-  `scripts/clippy_ratchet.txt` drops `book.rs` `cast_possible_truncation`
-  and `cast_sign_loss`, lowers `book.rs` `arithmetic_side_effects` 32 to 4
-  and `indexing_slicing` 12 to 6, and drops `snapshot.rs` entirely (its
-  ratchet marker is gone).
-
   **Compatibility:** source-breaking for callers of the listed functions:
   add `?` (or handle the error) and handle each iterator item (`level?`,
   or `collect::<Result<Vec<_>, _>>()?`). Values are unchanged for every
@@ -1353,6 +717,22 @@ change.
 
 ### Changed
 
+- **The Production Panic Policy gate is absolute (#260).** The temporary
+  ratchet ledgers used during the cycle (`scripts/panic_policy_allowlist.txt`,
+  `scripts/clippy_ratchet.txt`, `scripts/check_clippy_ratchet.py`, the
+  `make lint-clippy-ratchet` target and the per-file
+  `// panic-policy-ratchet` allows) were removed once every entry was fixed.
+  `scripts/check_panic_policy.py` has no allowlist any more (its
+  `--write-allowlist` / `--ratchet-report` modes are gone): any finding
+  fails, and it now also fails on a production `#[allow]` / `#[expect]`
+  (inner, outer or inside `cfg_attr`) of a lint `[lints.clippy]` denies.
+  The inline `panic-policy-allow-saturating` marker is the only exception
+  form. Tooling only: no public API or behaviour change.
+- `tests/alloc_budget.rs` (feature `alloc-counters`) now asserts the median
+  over seven independent measured windows against a ceiling of 15.0
+  allocs/op, derived from the measured per-process range (about 6.5 to
+  10.4) instead of a single window against 10.0, which flipped on noise.
+  CI now runs it (#262). Test-only change.
 - **Behaviour from pricelevel 0.10.** `PriceLevel::new` starts
   `first_arrival_time` at `0` (unstamped) instead of the wall clock, so
   identical input yields identical level snapshot checksums.
@@ -1364,7 +744,6 @@ change.
   0.13.1 capture.
 - Snapshot restore materializes every level's orders in its validation
   phase, so the commit phase stays infallible.
-
 - Dependency floors raised to the latest semver-compatible releases: uuid
   1.26.1, serde_json 1.0.151, serde 1.0.229, crossbeam 0.8.5, bitflags
   2.13.2, thiserror 2.0.21, bytes 1.12.1, crc32fast 1.5.2, memmap2 0.9.11,
@@ -1374,6 +753,597 @@ change.
   `compile_error!`. No new dependencies and no feature changes.
 
 ### Fixed
+
+- **Core boundary gaps found by the final audit (#294).** Engine
+  consistency around caller-supplied code; no panic was reachable with
+  valid input.
+  - An unwind under the **shared** side of the submit gate left no trace
+    (a `RwLockReadGuard` never poisons): a panicking `Clock`, metrics
+    recorder, `tracing` subscriber or `T::default()` running mid-mutation
+    in an ordinary submit, cancel or modify left the book possibly
+    inconsistent and still accepting flow. `SubmitGateGuard`'s drop now
+    checks `std::thread::panicking()` (once per drop, against the value
+    at acquisition, like std's own poison flag) and, on either side,
+    engages the kill switch and latches `submit_gate_poisoned()` before
+    the gate is released, logging once at `ERROR`.
+  - The sweep drain ran the per-maker caller code (`track_state`'s
+    `Clock` and `record_reject`, the strandable-maker `INFO`,
+    `record_reserve_hidden_discarded`) before each maker's index cleanup,
+    so an unwind left ghost locations and user-index entries for every
+    maker not cleaned yet. A drop guard now releases the indices of every
+    maker not released yet while the drain unwinds. The per-maker order
+    (state recorded, then location released) is kept on purpose: the
+    location is the id's ownership token (#288), and releasing it first
+    would let a same-id order admitted meanwhile have its resting state
+    overwritten by the old order's `Filled`. Event order is unchanged.
+  - The rest path claims an order's location and publishes its
+    user-index entry, risk reservation and resting state before the level
+    admits it (#288), running caller code in between (`Clock`, metrics,
+    `T::default()`). A panic there left all of them, and possibly a new
+    empty level, behind for an order no level holds. A drop guard now
+    withdraws them: the recorded state first (clock-free), then in #288's
+    release order the user index and reservation, then the location, so
+    every rollback happens while the attempt still owns the id and a
+    same-id order admitted concurrently cannot have its own transition
+    popped; it then removes the empty level. Review follow-up (PR #297):
+    `T::default()` (the unit conversion) now runs before the level stripe
+    is taken; and a panic raised by the gate guard's own commit phase
+    (caller `tracing` code under the held gate, inside the guard's drop)
+    is caught by a commit sentinel that engages the kill switch and
+    latches `submit_gate_poisoned()`.
+  - A standalone `OrderStateTracker::transition` invoked its listener
+    before queuing a terminal id for eviction, so a panicking listener
+    left the id retained forever. The id is queued first.
+  - The listener dispatcher could spin forever when its delivery buffer
+    persistently refused to grow (`try_reserve`): the head batch stayed
+    ready and was never taken. It is now delivered in place.
+  - Dead code: the unused `next_order_id` counter is gone and the
+    drop-only submit-gate guard fields are `_`-prefixed instead of
+    `#[allow(dead_code)]`.
+
+  Cost, measured against main 4567530 with interleaved rounds (medians,
+  on a loaded machine): one `thread::panicking()` read per gate
+  acquisition and per drop, and no allocation in the drain.
+  `aggressive_walk_hdr` p50 / p99 / p99.9 +0.0% / -1.4% / +1.6% (10
+  rounds); `add_limit_orders` +0.6%, `add_limit_orders_with_listeners`
+  +0.6%, `match_market_against_limit` -2.3%,
+  `match_market_against_limit_with_listeners` +0.6%,
+  `match_market_against_iceberg` -0.9% (5 rounds). The rest-path claim
+  guard, against main e0762f4: `add_only_hdr` p50 / p99 / p99.9
+  +1.9% / -3.4% / -3.7% (8 rounds); `add_limit_orders` +0.7%,
+  `add_limit_orders_with_listeners` +1.1%, `match_market_against_limit`
+  +0.8% (4 rounds). All within noise.
+
+- **Panic-free matching, STP and matching pool (#246).** The last
+  panicking forms in `matching.rs`, `stp.rs` and `pool.rs` are gone:
+  - The `STPMode::CancelMaker` fill-or-kill walk summed the non-self depth
+    with `.sum()`: resting depth past `u64::MAX` (legal with a large
+    visible tranche plus an iceberg's hidden tranche) panicked in debug
+    and, in release, wrapped into a false kill. It now accumulates
+    `min(cap, depth)` with checked adds, so such a level reads as exactly
+    the taker's cap and the FOK fills. The STP `safe_quantity` scan uses
+    the same bounded accumulator (`min(Σ visible, u64::MAX)`), exact for
+    every consumer.
+  - The thread-local matching pool is reached with `LocalKey::try_with`
+    and `RefCell::try_borrow_mut`: a sweep run from a thread-local
+    destructor after the pool was torn down, or a reentrant pool access,
+    uses fresh buffers instead of panicking.
+  - The three `debug_assert!`s on the #225 STP snapshot invariant are now
+    a debug-build check that logs at `ERROR` (maker id, price, site)
+    instead of panicking; release builds still skip it.
+  - The per-level budget (`remaining - executed`, the quote-notional
+    `price × executed` deduction, lot rounding, the `u128` to `u64` level
+    cap) uses checked forms and `u64::try_from`. These invariants cannot
+    fail on a valid book (the level cap is derived from the same budget
+    the deduction checks against), so valid traffic and existing journals
+    replay unchanged; a breach, which can only come from already corrupt
+    state, aborts the sweep with its committed prefix
+    (`OrderBookError::MatchAborted`) instead of being clamped.
+  - Quote-notional normalization no longer returns the un-normalized
+    result, with its `u64::MAX` working bound in `remaining_quantity()`,
+    as a success when the rebuild fails: the committed trades are
+    reported as `MatchAborted` and the failure is logged.
+
+  Compatibility: identical trades, fees, events and order states for
+  every valid input; no snapshot, journal or wire format change
+  (`ORDERBOOK_SNAPSHOT_FORMAT_VERSION` stays 4) and no replay impact. The
+  only behaviour changes are on the overflow and invariant-breach paths
+  above, which used to panic, wrap or clamp. `peek_match` changes
+  signature (see "Changed (breaking)").
+
+- **Journals hardened against corruption and misuse (#252).**
+  - `FileJournal` rotation created segments with `create(true).truncate(true)`
+    and `append` never checked sequences, so a duplicate or restarted
+    sequence at a rotation boundary truncated an existing segment (and
+    could `SIGBUS` a reader that had it mapped). Segments are now created
+    with `create_new`; an existing file fails the append with the new
+    `JournalError::SegmentExists { path }` and is left untouched. Both
+    `FileJournal` and `InMemoryJournal` refuse a `sequence_num` that is not
+    strictly greater than the last one with the new
+    `JournalError::NonMonotonicSequence { last, attempted }`, before
+    anything is written. On reopen `FileJournal` recovers the last sequence
+    from the newest non-empty segment, so the check survives a restart.
+  - A malformed entry header ended a segment silently, so replay
+    "succeeded" on a prefix. Only a zero `entry_length` is now the end of
+    data; any other bad header (below the 20-byte minimum, past the end of
+    the segment, a truncated non-zero length field) is
+    `Some(Err(JournalError::InvalidEntryHeader { .. }))` from reads, after
+    which the iterator stops, and the same error from `verify_integrity`,
+    which also reports stored sequences that do not strictly increase
+    (`NonMonotonicSequence`). A header sequence that disagrees with the
+    CRC-valid payload is a `DeserializationError`.
+  - Torn-tail recovery left the torn bytes in place, so a later, shorter
+    append left stale bytes that decoded as the next header. Reopen now
+    zeroes every non-zero byte past the recovered write position (only
+    dirty 4 KiB chunks are written, so the sparse tail is not
+    materialised) and flushes them. A damaged entry followed by a valid
+    one is corruption inside committed data, not a torn tail: reopen scans
+    every offset after the damage (skipping zero runs), and if any valid
+    entry follows, even behind several damaged ones, `open` refuses with
+    `JournalError::CorruptEntry` (or `InvalidEntryHeader`) and leaves the
+    file unchanged instead of truncating and later overwriting the valid
+    entries. Readers never read past the committed write position of the
+    active segment, and an active segment whose file is shorter than that
+    position (an external truncation, even on an entry boundary) is
+    `InvalidEntryHeader` instead of a silently shorter replay.
+  - The writer's segment, `last_seq` and active segment start now live
+    under one mutex, so `last_seq` is updated under the same guard as the
+    durable write and cannot be left behind by a poisoned second lock;
+    `archive_segments_before` holds it so a rotation cannot race the
+    renames. A poisoned lock is `JournalError::MutexPoisoned` on every
+    method of both journals (it was `Io` in `InMemoryJournal`, and `None`
+    from `last_sequence`, which `ReplayEngine` reported as `EmptyJournal`).
+  - Capacity comes from the mapping length instead of file metadata; the
+    write slice, the 32-bit `entry_length` (`u32::try_from`, a payload over
+    ~4 GiB is `EntryTooLarge`), the encode buffer (`try_reserve_exact`,
+    new `JournalError::AllocationFailed { what, requested }`) and every
+    byte decode use checked forms. The `memmap2` mapping stays a
+    documented `unsafe` exception.
+- **Replay reconciles mass cancels by identity (#252).** A journaled
+  non-refused `MassCancelled` for `CancelAll` / `CancelBySide` /
+  `CancelByUser` / `CancelByPriceRange` is re-executed and the replayed
+  cancelled ids must equal the journaled ones **in order**, the orders
+  left resting by per-order failures (`failed_order_ids()`) must match in
+  order, and the replay must not refuse. A journaled eviction must evict
+  exactly its journaled ids in order. Disagreements are the new
+  `ReplayError::MassCancelMismatch { sequence_num, divergence, recorded,
+  replayed }` (`MassCancelDivergence::{Refusal, CancelledIds, FailedIds}`)
+  instead of passing on equal counts or surfacing as a generic
+  `OrderBookError`. `LevelFaultAfterRemoval` entries are fault reports, not
+  book outcomes, and are not compared. A live mass cancel with per-order
+  failures normally stops replay here by design (a fresh replay book does
+  not reproduce the level fault).
+- **A fill no longer reorders a user's resting orders (#252).** Removing a
+  filled maker from the `user_orders` index used `swap_remove`, which moved
+  the user's last order into the filled one's slot, so
+  `cancel_orders_by_user` did not follow admission order as documented. The
+  removal now preserves order (`Vec::remove`; still linear in that user's
+  list, as the lookup already was). Replay was consistent with the live
+  book either way; with identity reconciliation the documented order
+  matters wherever the index is rebuilt differently.
+
+- **Checked counters, snapshot restore validation and remaining core forms
+  (#250).** `engine_seq` was minted with a wrapping `fetch_add` and is
+  restored verbatim from an untrusted snapshot package, so a package
+  carrying `u64::MAX` made the next event wrap to `0`.
+  `OrderBook::next_engine_seq()` now returns `Result<u64, OrderBookError>`
+  and refuses with the new `OrderBookError::EngineSeqExhausted { engine_seq }`
+  instead of wrapping (the last mintable value is `u64::MAX - 1`). The
+  engine's own emission paths run after the mutation, so on exhaustion they
+  suppress the listener `TradeResult` / `PriceLevelChangedEvent` (logged
+  once at `ERROR`, reported by the new `OrderBook::engine_seq_exhausted()`)
+  instead of stamping a wrapped sequence; the book keeps matching. A
+  caller-owned result is never affected: `add_order_with_result` and the
+  `*_with_committed` APIs still return their committed fills, stamped with
+  the new `UNSTAMPED_ENGINE_SEQ` (`u64::MAX`, never minted). All
+  `PriceLevelChangedEvent` emissions now go through one helper.
+  Snapshot restore, both `restore_from_snapshot` and
+  `restore_from_snapshot_package`, now rejects in the prepare phase, before
+  any live state is touched: a crossed or locked book (best bid >= best ask,
+  new `OrderBookError::SnapshotCrossed { best_bid, best_ask }`); an order
+  whose `visible + hidden` does not fit `u64` (`QuantityOverflow`, now
+  checked for every order, not only when risk is rebuilt; pricelevel's level
+  validation already refuses it first as `PriceLevelError`); and, on the
+  package path, `engine_seq == u64::MAX` (`EngineSeqExhausted`). A package
+  restore clears the exhaustion latch. `OrderBookSnapshot::refresh_aggregates`
+  returns `Result` and `OrderBookSnapshotPackage::new` propagates its error
+  instead of checksumming stale aggregates. `spread()` (book and snapshot)
+  and `spread_bps()` return `None` for a crossed read instead of a clamped
+  `0`. The strandable-maker count, `StubClock`, the order-state tracker's
+  purge cutoff and purge count, the repricing counters and the trade /
+  depth metric casts use checked forms: the strandable count refuses (and
+  logs at `WARN`) an increment past `usize::MAX` or a decrement at zero;
+  `StubClock` stops at its last representable value instead of wrapping
+  (`StubClock::is_exhausted()`, logged once); a retention window reaching
+  before the clock's epoch purges nothing. The order-state tracker
+  recovers a poisoned terminal-queue mutex (the queue is an eviction hint,
+  re-checked per id) instead of silently skipping eviction forever. Each
+  order's status and history now live in one map entry, so a transition
+  updates both atomically and an eviction (`DashMap::remove_if` on that
+  entry) removes exactly the lifecycle it checked: an id re-activated or
+  re-terminated concurrently is never evicted or split from its history.
+  The eviction queue lock is never held while a map lock is taken.
+  Compatibility: `next_engine_seq()` and
+  `OrderBookSnapshot::refresh_aggregates()` change signature (see the
+  migration table). `OrderBookError` gains `EngineSeqExhausted` and
+  `SnapshotCrossed` (wire code `RejectReason::Other(0)`; the enum is
+  `#[non_exhaustive]`). Restore now rejects packages and snapshots that
+  earlier versions accepted: crossed or locked books (a live book never
+  rests one; such a state only came from hand-merged or corrupted
+  snapshots, including the #194 recovery fixture with a trailing stop
+  inside the market) and packages with `engine_seq == u64::MAX`. Tick and
+  lot alignment is deliberately not enforced on restore, because a live
+  book keeps orders admitted under a previous tick or lot size (see
+  `set_lot_size`), and its snapshot must keep restoring. `spread()` /
+  `spread_bps()` can return `None` where they used to return `Some(0)`.
+  An `OrderStateTracker::purge_terminal_older_than` window longer
+  than the clock's current value no longer purges entries stamped at `0`.
+  No snapshot, journal or wire format change:
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged.
+
+- **Default trade-id namespace no longer reads panicking OS entropy
+  (#265).** `OrderBook::new`, `with_clock`, `with_trade_listener`,
+  `with_trade_and_price_level_listener` (and every constructor built on
+  them) minted the trade-id namespace with `Uuid::new_v4()`, which panics
+  through `getrandom` when the OS RNG fails. The namespace is now a UUIDv5
+  derived from the symbol, the process id, the wall clock in nanoseconds
+  (`0` before the epoch) and a process-wide `checked_add` construction
+  counter: distinct for every book in a process, across concurrent
+  processes and across restarts (argument in the function docs and
+  `doc/panic-boundaries.md`). No `Uuid::new_v4()` remains in production
+  code; std's `RandomState` seeding (behind `HashMap` / `DashMap`) is the
+  documented remaining OS-entropy read.
+  Compatibility: constructor signatures are unchanged and still
+  infallible. Default namespaces are UUID version 5 instead of version 4
+  and are still unique per book; trade ids keep their format (UUIDv5 over
+  namespace + counter). `set_trade_id_namespace`,
+  `with_clock_and_namespace` and `ReplayBookConfig` injection are
+  unchanged, so replay is unaffected. No wire, journal or snapshot format
+  change.
+
+- **Checked time and allocation-counter helpers (#257).**
+  `current_time_millis()` narrowed the `u128` millisecond count to `u64`
+  with `as` and silently returned `0` for a clock set before the UNIX
+  epoch. The new `try_current_time_millis() -> Result<u64, TimeError>`
+  converts with `u64::try_from` and reports `TimeError::ClockBeforeEpoch`
+  or `TimeError::MillisOverflow`. `current_time_millis()` stays infallible
+  (its production callers, `MonotonicClock::now_millis`, the book-manager
+  trade listeners and the NATS book-change batch timestamp, have no error
+  channel) and now documents its fallback: `0` before the epoch, `u64::MAX`
+  on overflow (instead of a truncated value), each logged once per process
+  with `tracing::warn!`. Matching still takes time only from the injected
+  `Clock`; no wall-clock read was added. `AllocSnapshot::since` (feature
+  `alloc-counters`) uses `checked_sub` and returns `Option<AllocSnapshot>`,
+  `None` when the snapshots are out of order, instead of clamping to zero.
+  `src/utils/mod.rs` gates its test module with `#[cfg(test)]`.
+  Compatibility: `current_time_millis()` keeps its signature and returns
+  the same value on any sane clock; `try_current_time_millis` and
+  `TimeError` are additive (re-exported from the crate root and the
+  prelude). `AllocSnapshot::since` is source-breaking for
+  `alloc-counters` users: add `.expect(..)` or handle `None`. No wire,
+  journal or snapshot format change.
+- **Fee and notional arithmetic on the trade path is checked (#244).**
+  Fees and trade notionals used to clamp or vanish on overflow:
+  `FeeSchedule::calculate_fee` clamped the fee, `TradeResult::with_fees`
+  dropped a fee whose running total overflowed, `TradeResult::total_fees`
+  clamped even a negative overflow to `+i128::MAX`, `quote_notional`
+  saturated, and `TradeInfo::from_trade_result` reported a failed
+  `executed_quantity()` as `0`. Every one of them is now checked and
+  typed. Fee representability is validated **before** the book is
+  touched: each taker's worst-case notional (worst reachable price ×
+  quantity; for a limit buy the limit, else the highest ask it can reach; for a
+  sell the best bid; for a `*_by_amount` order the amount) must fit `u128`
+  and be priced exactly by both fee legs, or the taker is rejected
+  untouched with `OrderBookError::FeeOverflow` (reject code 18) or
+  `OrderBookError::NotionalOverflow` (code 19), state
+  `Rejected { FeeOverflow | NotionalOverflow }`. The check runs under the
+  submit gate next to the #240 trade-id check, on every submission API
+  (`add_order*`, `submit_market_order*`, `submit_market_order_by_amount*`,
+  `match_market_order*`, `match_limit_order*`, the raw `match_order*`, and
+  `update_order` before the original is cancelled), with or without a
+  trade listener. Under the shared submit gate it is best effort, like the
+  #240 check: a maker admitted concurrently at a worse price is caught by a
+  per-level backstop in the sweep, which aborts with `MatchAborted` before
+  touching that level. The bound is the worst **reachable** price: a buy
+  walks the asks from the best one until their visible quantity covers
+  its size, so an absurd ask resting far behind the touch cannot make
+  ordinary buys fail. Cost on the common path: one or two cached best-price
+  reads, one level read for a buy that fails the limit fast path, and one
+  or two checked multiplications; no allocation. The sweep's backstop is
+  seeded with the verified price, so levels at or below it cost one
+  comparison. A non-crossing or post-only order is never checked against
+  its notional.
+- **`FeeSchedule::with_maker_rebate(i32::MIN, _)` no longer panics
+  (#244).** `-maker_rebate_bps.abs()` overflowed; the maker rate is now
+  `-|x|`, which is representable for every `i32`.
+- **Repricing arithmetic is checked (#244).** A pegged offset of
+  `i64::MIN` no longer overflows its negation (`unsigned_abs`); a pegged
+  price or tick snap above `u128::MAX` and a trailing stop below `0` or
+  above `u128::MAX` now skip the re-price (`None`) instead of saturating.
+  A negative offset deeper than the reference still floors at the minimum
+  valid price, as documented.
+- **Pre-trade risk uses checked notional arithmetic (#243).** The
+  per-account `resting_notional` counter was updated with a wrapping
+  `fetch_add` and the notional check used `saturating_*`, so two orders
+  whose notional sum exceeded `u128::MAX` could wrap the counter to a
+  small value and bypass `max_notional_per_account`. Every counter update
+  is now a compare-and-swap loop with `checked_add` / `checked_sub`, and
+  admission is all or nothing: the resting remainder's contribution is
+  reserved before the order is placed on its level and released if the
+  placement fails.
+- **Price band no longer passes at extreme prices (#243).** Both sides of
+  the band comparison saturated to `u128::MAX` at extreme prices and
+  compared equal, so any deviation passed. The comparison is now exact
+  over the whole `u128` domain, with the common path unchanged.
+- **Release-side underflows are visible (#243).** A fill, cancel or
+  quantity decrease that would take a risk counter below zero (a double
+  release) used to floor silently. It still sets the counter to zero, the
+  only value that keeps the account usable, but now logs a `WARN` with the
+  order, account and counter and increments the anomaly count. A fill
+  larger than the tracked remainder releases only the tracked remainder.
+  The maker-price `debug_assert_eq!` in `on_fill` is now a `WARN`.
+- **Risk reservations cannot be released by a same-id loser (#243
+  review).** `on_admission` claims the order id and the counters under the
+  order map's shard lock, rejects an id that is already tracked before
+  touching any counter, and returns a generation-tagged reservation; the
+  cleanup after a failed level placement releases only the entry carrying
+  that generation. Before, a concurrent same-id submission could overwrite
+  the winner's entry and its cleanup then released it, leaving the resting
+  winner untracked.
+- **Discarded reserve remainders are released (#243 review).** A
+  non-auto-replenishing reserve maker removed after its visible tranche is
+  exhausted (#230) kept its discarded hidden quantity booked in the
+  account's risk counters forever (pre-existing on 0.13), counting against
+  `max_open_orders_per_account` and `max_notional_per_account`. The
+  matcher now releases it in the same removal.
+- **Quantity increases reserve risk before the level changes (#243
+  review).** An in-place quantity increase now pre-books its notional
+  before the price level applies it and settles or rolls it back once the
+  level answers, so a risk overflow is a rejection with the order
+  unchanged instead of a divergence between the book and the risk state.
+- **Snapshot restore computes risk aggregates in the prepare phase
+  (#243, prepares #250).** When the package carries a risk config, the
+  per-account open-order counts and resting notional are accumulated with
+  checked arithmetic before any live state changes, so an overflowing
+  package fails with a typed error and leaves the book untouched instead
+  of being clamped in the commit phase.
+
+**Compatibility.** Only books with a `RiskConfig` installed are affected.
+An admission that previously wrapped the notional counter, or passed the
+price band because both sides saturated, is now rejected with the
+existing typed errors (`RiskMaxNotional`, `RiskMaxOpenOrders`,
+`RiskPriceBand`; same `RejectReason` codes). This applies even when the
+corresponding limit is `None`: an exposure the counters cannot represent
+is rejected with `limit = u128::MAX` (or `u64::MAX` for the open-order
+count), and `attempted = u128::MAX` when `price × quantity` itself
+overflows. `restore_from_snapshot_package` / `restore_from_snapshot_json`
+can now return `RiskMaxNotional`, `RiskMaxOpenOrders` or
+`QuantityOverflow` for a package whose risk aggregates overflow. No
+snapshot format change; realistic prices and quantities see no behaviour
+change.
+
+- **Modifications stop swallowing mutation errors (#247).**
+  - `update_order(OrderUpdate::Cancel)` ignored the level's answer and
+    removed the order's location and user-index entries anyway, leaving a
+    refused order resting but unreachable; it also never recorded the
+    `Cancelled` state, released the risk contribution or unregistered
+    special-order tracking. It now runs the same removal as `cancel_order`:
+    a refusal returns `Err(PriceLevelError)` with the order untouched, a
+    removal the level committed then failed completes and returns
+    `OrderRemovedWithLevelFault` (#248), and a success records
+    `Cancelled { UserRequested }` and releases risk.
+  - A cancel-then-add modify (`UpdatePrice`, `UpdatePriceAndQuantity`,
+    `Replace`) whose re-add failed after the original was cancelled lost the
+    order. The re-add now takes the validate-first verdict as its admission
+    (the kill-switch, risk-limit and shape checks are not re-run after the
+    cancel), and a failure that still happens (a concurrent mutation under
+    the shared gate, a failing level or allocation) is resolved: if nothing
+    traded, the original is restored with the same id, price, quantity and
+    timestamp at the **back** of its level (time priority lost) and the call
+    returns `OrderBookError::ModifyRolledBack`; if the restore fails too, or
+    the re-added order traded before failing, the call returns
+    `OrderBookError::ModifyOrderLost` and the indices hold no trace of the
+    order. A re-add sweep aborted by a failed level after trading still
+    returns `MatchAborted`. A modify whose cancel finds the order already
+    gone (filled concurrently) now returns `Ok(None)` instead of re-adding
+    it.
+  - A submit whose remainder could not be rested after irreversible trades
+    (level admission or risk reservation refused) returned `Err` with no
+    terminal state; the taker now ends
+    `Cancelled { filled_quantity, reason: RestFailed }` (or `Rejected`
+    when it did not trade).
+  - A self-trade-prevention maker cancel (`CancelMaker` / `CancelBoth`)
+    that the level failed was skipped silently and the sweep went on. It is
+    now resolved like a single-order cancel (the maker still rests, or the
+    removal is completed) and stops the sweep with the #240 abort
+    semantics: prefix published, taker `Cancelled { MatchAborted }`,
+    `Err(MatchAborted)`.
+  - The three `debug_assert!`s guarding the modify re-add against
+    fill-or-kill are a typed `InvalidOperation` raised before the cancel;
+    every `saturating_*` and raw arithmetic in `modifications.rs` is
+    checked or an exact case analysis.
+  - Review of #285: a rolled-back modify never restores the original into
+    a crossed or locked book (an opposite order that arrived after the
+    cancel makes the restore fail with `PriceCrossing`: `ModifyOrderLost`,
+    `Cancelled { RestFailed }`). The re-add is built from the order the
+    cancel returned, so a concurrent fill between the modify's read and its
+    cancel no longer creates quantity (pre-existing on main): `UpdatePrice`
+    moves the remainder, `UpdatePriceAndQuantity` / `Replace` roll back
+    with source `OrderChangedDuringModify`. `filled_quantity` in every
+    state a re-add records is cumulative (the original's known fills plus
+    the re-add's), and a re-add failure the modify resolves records no
+    `Rejected` state or reject metric.
+- **Emptied price levels can no longer unlink a concurrent admission
+  (#247, Copilot on #285).** Under the shared submit gate the single-order
+  cancel, `UpdateQuantity`, the sweep's drain and a failed rest's cleanup
+  removed a level they had seen empty without re-checking, so an order a
+  concurrent submit admitted into it in between was left indexed but
+  unreachable (pre-existing on main). Admissions into a level and
+  removals of emptied levels now run under a striped per-price
+  reader-writer lock (admission shared, removal exclusive) and the removal
+  re-checks emptiness under it (`OrderBook::remove_level_if_empty`).
+  Concurrent admissions at the same price still run in parallel; cost is
+  one uncontended shared acquire per rested order and one exclusive
+  acquire per removed level.
+- **Concurrent crossing adds no longer leave an order indexed but not
+  resting (#288).** Under the shared submit gate (`STPMode::None`, no
+  strandable maker) an order's location, user-index entry and
+  `Open` / `PartiallyFilled` state were published only **after** its
+  level admitted it. A concurrent sweep could consume the order in that
+  window: its drain found no index to remove, and the resting thread then
+  inserted a location and user-index entry for an order that no longer
+  rested, and overwrote the maker's `Filled` state with `Open`
+  (pre-existing on main; 100/100 runs of the new 8-thread stress test
+  failed). `rest_on_level` now publishes the location (claimed atomically
+  with `DashMap::entry`), the user-index entry and the resting state
+  before the level admits the order, and withdraws them if the level
+  refuses it. The location is the id's ownership token: every remover
+  (sweep drain, cancel, zero-quantity update, rollbacks) releases it
+  last, so a reused id never sees or removes a previous order's user or
+  risk entry, and emptied `user_orders` entries are dropped only if still
+  empty. Special orders are still registered after the admission, so a
+  repricing pass cannot unregister an order that is being admitted. No
+  new lock. The same fix reordered the raw `place_order_in_book`.
+- **Risk open-order count no longer double-released by two sweeps
+  sharing a maker (#288).** The fill hook of the risk layer marked a fully filled
+  maker's entry exhausted and removed it in two steps; the other sweep's
+  `on_maker_removed` could take the zeroed entry in between and release a
+  second open-order slot for the same order, leaving the account's
+  `open_count` below its resting orders with no anomaly counted. The
+  full-fill removal now happens under the same entry lock.
+
+  Compatibility:
+  - A same-id submit racing a live order is now refused with
+    `DuplicateOrderId` when it would rest, even without a `RiskConfig`
+    (it used to overwrite the other order's location, last writer wins).
+    As before, it may have traded first. `place_order_in_book` returns
+    `DuplicateOrderId` for an id already located on the book instead of
+    overwriting its location.
+  - `SequencerResult::from` classifies `DuplicateOrderId` as
+    `may_have_mutated: true`: the loser of a concurrent same-id race can
+    fail with it after trading (it also counts in the reject metric then,
+    without an order state, which belongs to the winner). Replay was
+    already re-executing these rejections. Replay cannot reproduce such a
+    race (the loser's trades are missing from the replayed book); unique
+    ids per submit are an ingress / sequencing obligation.
+  - A cancel that arrives while an order is being rested now finds it as
+    soon as its level admits it (it used to return `Ok(None)` until the
+    bookkeeping finished).
+  - The order-state listener sees an order's `Open` / `PartiallyFilled`
+    before the level event of its admission. If the level then refuses
+    the order (a resource failure: counter capacity, a poisoned level),
+    that state is followed by the terminal one (`Rejected` or
+    `Cancelled { RestFailed }`), and a rolled-back modify shows the
+    re-add's accepted state ahead of the restore's
+    (`Open, Cancelled, Open, Open` instead of `Open, Cancelled, Open`).
+- **Post-trade risk rejections replay faithfully (#291).** A taker that
+  traded and then had its residual's risk reservation refused (concurrent
+  admissions on the same account, an unrepresentable counter) returned the
+  plain `RiskMaxNotional` / `RiskMaxOpenOrders` error, which
+  `SequencerResult::from` classified as never mutating and replay skipped
+  (a `RiskConfig` is not part of `ReplayBookConfig`): the replayed book
+  silently kept liquidity the live book had consumed. The failure is now
+  `OrderBookError::RiskRejectedAfterTrades { order_id, executed_quantity,
+  source }` (new reject code `RiskRejectedAfterTrades` = 22,
+  `may_have_mutated: true`), and replay re-executes such an `AddOrder`
+  with its residual refused instead of rested, which reproduces the live
+  trades without the risk configuration. A replay that cannot reproduce
+  it (the sweep fills everything or trades nothing) stops with
+  `ReplayError::OutcomeMismatch`.
+- **Repricers no longer drop a reused id's special-order tracking
+  (#291).** `reprice_pegged_orders` / `reprice_trailing_stops` released
+  the registration of any id `get_order` could not find; a same-id order
+  admitted in between lost its registration and was never repriced. The
+  release is now conditional, under the tracker's shard lock, on no order
+  owning the id (the #288 location claim).
+
+  Compatibility:
+  - A risk refusal after trades is `Err(RiskRejectedAfterTrades { .. })`
+    wrapping the former error (`source`); the reject metric and
+    `RejectReason::from` report code 22 for it. A risk refusal before any
+    trade is unchanged. Both new variants are additive: `OrderBookError`
+    and `RejectReason` are `#[non_exhaustive]`, so downstream matches
+    already carry a wildcard arm.
+  - A modify re-add refused this way still returns `ModifyOrderLost`, now
+    with `RiskRejectedAfterTrades` as its `source`.
+  - Journals written before this release recorded the post-trade case
+    under a pre-trade risk code with `may_have_mutated: false`; replay
+    still skips those, and only `snapshots_match` detects the gap.
+- **Bounded journal recovery and NATS shutdown (#295).** Two liveness bugs
+  and several hardening items from the final audit (#260):
+  - `FileJournal::open` on a latest segment whose tail is garbage probed
+    every byte offset and CRC'd each candidate over the rest of the
+    segment (on the order of 10^14 bytes hashed for 256 MB): it
+    effectively never returned. The forward scan that tells a torn tail
+    from mid-segment corruption now filters candidates with
+    allocation-free checks first (framing inside the segment, a sequence
+    strictly above the last good entry, a payload starting with
+    `{"sequence_num":<header sequence>,` and ending with `}`) and
+    CRC-checks at most 64 of them, hashing at most 256 MiB. Random garbage
+    opens in time linear in the segment size (treated as a torn tail,
+    since no valid entry can follow); a tail that exhausts the budget is
+    refused with the damaged entry's `CorruptEntry` / `InvalidEntryHeader`.
+    #252's rule is unchanged: a later valid entry still refuses the open.
+  - A zero-length latest segment (crash between `create_new` and
+    `set_len`) made every append fail with `SegmentExists`; it is now grown
+    to the segment size on open. A failed `msync` of an append re-zeroes
+    the bytes it copied (best effort) before returning the error. A reader
+    whose segment is shorter than its limit gets `InvalidEntryHeader`
+    instead of a silent end. `list_segments` accepts only canonical names
+    (`segment-` + 20 digits + `.journal`, round-tripped), so a stray
+    `segment-5.journal` or `segment-+0…0.journal` can no longer alias a real
+    segment, and it sorts and dedupes.
+  - Replay compares the iteration with `last_sequence()` read before it:
+    a journal whose newest segment vanished returned `Ok` on a truncated
+    prefix and now fails with `ReplayError::JournalTruncated`.
+  - `InMemoryJournal` stores events behind `Arc` and clones `T` outside its
+    read lock; its JSON / CRC parity limits with `FileJournal` are
+    documented.
+  - NATS: `with_max_retries` is clamped to `MAX_PUBLISH_RETRIES` (10). With
+    NATS down, `shutdown()` could take days (unbounded retries, drain with
+    no deadline); once shutdown is requested (in the drain, or in a flush
+    already running when `shutdown()` was called, via shared shutdown
+    state), the first publish that exhausts its retries while the link is
+    down stops publishing and the remaining events are counted in
+    `dropped_events`. `shutdown()` is cancel-safe (a dropped future puts the
+    join handle back instead of detaching the task), and
+    `shutdown_with_deadline(Duration)` aborts the task after the deadline
+    (`NatsPublisherError::ShutdownTimedOut`).
+  - `NatsBookChangePublisher` sends `Content-Type: application/json`
+    (batches are always JSON; the `EventSerializer` trait does not cover
+    batches) and counts `error_count` once per batch, matching the trade
+    publisher's once-per-trade rule.
+  - Wire: `decode_frame` rejects a `len` above `MAX_FRAME_BODY` (4096) with
+    `InvalidPayload` from the header alone (it used to report `Truncated`
+    for up to 4 GiB), and `encode_frame` refuses such a frame.
+    `encode_exec_report` rejects an unknown `status` or non-zero `_pad`, and
+    `encode_book_update` an unknown `side`, with `InvalidPayload` instead of
+    emitting frames their own decoders reject.
+  - `CountingAllocator` (feature `alloc-counters`) documents that its
+    diagnostic counters wrap (no allocation, panic or CAS loop inside the
+    allocator); `doc/panic-boundaries.md` lists it next to `memmap2` as the
+    second documented `unsafe` exception.
+
+  Compatibility:
+  - `ReplayError` is not `#[non_exhaustive]`: the new `JournalTruncated`
+    variant needs an arm in exhaustive matches. A replay that used to
+    succeed on a truncated journal now fails.
+  - `NatsPublisherError` is `#[non_exhaustive]`; `ShutdownTimedOut` is
+    additive. `MAX_PUBLISH_RETRIES` and `wire::MAX_FRAME_BODY` are new
+    public constants.
+  - Callers passing `with_max_retries` above 10 get 10 (and a `WARN`).
+  - `NatsBookChangePublisher::error_count()` is smaller for multi-subject
+    failures (once per batch instead of once per subject). During a
+    shutdown with NATS down, events that used to be retried are now in
+    `dropped_events`.
+  - Book-change messages carry an extra `Content-Type` header; payloads are
+    unchanged.
+  - Wire frames longer than 4096 bytes (none are defined) are refused on
+    both sides; encoder inputs the decoders already rejected now fail at
+    encode time.
+  - Non-canonical segment file names are ignored by `FileJournal` (it never
+    wrote any). No on-disk format change; `ORDERBOOK_SNAPSHOT_FORMAT_VERSION`
+    is unchanged.
 
 - **Bounded bincode decoding of untrusted payloads (#251).**
   `BincodeEventSerializer::deserialize_trade` / `deserialize_book_change`
