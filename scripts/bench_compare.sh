@@ -247,6 +247,7 @@ THRESHOLD_PCT = {"uncontended": 3.0, "contended": 5.0}
 # in steps of this size, so a delta of at most one tick is not a
 # measured regression.
 TICK_NS = 41.67
+MIN_SEPARATED_ROUNDS = 5
 
 # side -> scenario -> list of per-round rows
 data = {"baseline": {}, "candidate": {}}
@@ -302,10 +303,28 @@ for scenario in scenarios:
     delta = (c_med - b_med) / b_med * 100 if b_med else 0.0
     delta99 = (c99 - b99) / b99 * 100 if b99 else 0.0
     threshold = THRESHOLD_PCT.get(cls, 3.0)
+    b_vals = [row["p50"] for row in b]
+    c_vals = [row["p50"] for row in c]
+    one_tick = timer == "single" and (c_med - b_med) <= TICK_NS + 0.5
+    # Separation rule (#259): with >= MIN_SEPARATED_ROUNDS rounds per side
+    # and disjoint per-round p50 ranges, the direction is conclusive even
+    # when a side's spread exceeds the noise limit (the chance of full
+    # separation between two samples of 5 from one distribution is
+    # 2 / C(10, 5) < 1 %). A slower candidate beyond the threshold is then
+    # a REGRESSION; a faster one is FASTER, reported apart from OK so a
+    # noisy row never reads as a plain pass.
+    separated = min(len(b_vals), len(c_vals)) >= MIN_SEPARATED_ROUNDS and (
+        min(c_vals) > max(b_vals) or max(c_vals) < min(b_vals)
+    )
     if b_spread > NOISY_PP or c_spread > NOISY_PP:
-        verdict = "NOISY"
+        if separated and min(c_vals) > max(b_vals) and delta > threshold and not one_tick:
+            verdict = "REGRESSION (separated)"
+        elif separated and max(c_vals) < min(b_vals):
+            verdict = "FASTER (separated)"
+        else:
+            verdict = "NOISY"
     elif delta > threshold:
-        if timer == "single" and (c_med - b_med) <= TICK_NS + 0.5:
+        if one_tick:
             verdict = "OK (<= 1 tick)"
         else:
             verdict = "REGRESSION"
@@ -329,7 +348,10 @@ summary_md.write_text(
     "# Bench comparison summary\n\n"
     f"{rounds} interleaved rounds. p50 / p99 in ns, median across rounds; \"spread\" is the "
     "round-to-round `(max - min) / median` of p50 as a percentage. A row with either side's "
-    "spread > 10 pp is NOISY: inconclusive, never a pass; re-measure it. Otherwise a p50 "
+    "spread > 10 pp is NOISY: inconclusive, never a pass; re-measure it. Exception (separation "
+    "rule): with >= 5 rounds per side and disjoint per-round p50 ranges, such a row is "
+    "REGRESSION (separated) when the candidate is slower beyond the threshold, or FASTER "
+    "(separated), counted apart from OK. Otherwise a p50 "
     "delta above +3 % (uncontended) / +5 % (contended) is a REGRESSION, except for a "
     "single-op-timed row whose p50 moved by at most one clock tick (41.67 ns). See BENCH.md "
     "\"Methodology\".\n\n"
