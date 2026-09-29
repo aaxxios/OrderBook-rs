@@ -14,7 +14,8 @@
 //!    them), so steady-state buffering does not allocate beyond what an
 //!    event already carries (a `TradeResult`'s trade list).
 //! 2. **Stamp under the gate.** Just before the gate is released the scope
-//!    is committed into the book's [`EventOutbox`]: under the outbox mutex
+//!    is committed into the book's [`EventOutbox`]: under the outbox lock
+//!    (a spin flag in front of a mutex only the flag holder takes)
 //!    every event that carries an `engine_seq` is stamped (the same checked
 //!    mint and exhaustion handling as before). Stamping and publishing the
 //!    batch in one critical section makes delivery order equal

@@ -676,8 +676,12 @@ poisoned the gate, which the book then recovered silently.
    head stops the dispatcher and its owner dispatches it after releasing
    the gate. The flag, the released counters and the queue's non-empty flag
    are `SeqCst`, and a dispatcher that steps down re-checks the head, so no
-   ready batch is stranded. A committing call takes the outbox mutex once
-   (plus one drain lock when it has to dispatch queued batches).
+   ready batch is stranded. A committing call takes the outbox lock once
+   (plus a share of the dispatcher's drain locks: measured 1.23
+   acquisitions per add at 8 threads). The lock is a test-and-test-and-set
+   spin flag (exponential backoff, then yield) in front of a `std` mutex
+   only the flag holder takes: a contended `std` mutex parks waiters in
+   the kernel on macOS, which dominated the contended commit path.
 
 A result-returning submit (`add_order_with_result`, `*_with_committed`)
 needs its `TradeResult`'s `engine_seq` before it returns: at that point the
