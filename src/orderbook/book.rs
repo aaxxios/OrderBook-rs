@@ -146,6 +146,45 @@ pub const MAX_DEPTH_DISTRIBUTION_BINS: usize = 4_096;
 /// / `*_with_committed` caller, and no listener event was emitted for it.
 pub const UNSTAMPED_ENGINE_SEQ: u64 = u64::MAX;
 
+/// Where a resting order lives, plus its owner: the value of the book's
+/// order-location index.
+///
+/// The owner is carried so the fill path can remove a filled maker from the
+/// `user_orders` index with one keyed lookup: a filled maker has already left
+/// its price level, so its body (and therefore its `user_id`) is no longer
+/// reachable from the level (#259; before this the fill path scanned every
+/// user's entry to find the id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrderLocation {
+    /// The price of the level the order rests on.
+    pub(crate) price: u128,
+    /// The side of the book the order rests on.
+    pub(crate) side: Side,
+    /// The owner the order is tracked under in `user_orders`.
+    pub(crate) user_id: Hash32,
+}
+
+impl OrderLocation {
+    /// A location for an order resting at `price` on `side`, owned by
+    /// `user_id`.
+    #[must_use]
+    #[inline]
+    pub(crate) fn new(price: u128, side: Side, user_id: Hash32) -> Self {
+        Self {
+            price,
+            side,
+            user_id,
+        }
+    }
+
+    /// The `(price, side)` pair: the public shape of a location.
+    #[must_use]
+    #[inline]
+    pub(crate) fn price_side(&self) -> (u128, Side) {
+        (self.price, self.side)
+    }
+}
+
 /// The OrderBook manages a collection of price levels for both bid and ask sides.
 /// It supports adding, cancelling, and matching orders with lock-free operations where possible.
 ///
@@ -254,9 +293,11 @@ pub struct OrderBook<T = ()> {
     /// the need to sort prices during matching (optimization from O(N log N) to O(M log N))
     pub(super) asks: SkipMap<u128, Arc<PriceLevel>>,
 
-    /// A concurrent map from order ID to (price, side) for fast lookups
-    /// This avoids having to search through all price levels to find an order
-    pub(super) order_locations: DashMap<Id, (u128, Side)>,
+    /// A concurrent map from order ID to its [`OrderLocation`] (price, side
+    /// and owner) for fast lookups. This avoids having to search through all
+    /// price levels to find an order, and lets a fill untrack the maker from
+    /// `user_orders` by key instead of scanning every user (#259).
+    pub(super) order_locations: DashMap<Id, OrderLocation>,
 
     /// A concurrent map from user ID to their order IDs for fast lookup.
     /// Maintained by `add_order`, `cancel_order`, and the matching engine
@@ -691,7 +732,7 @@ where
         let order_locations: BTreeMap<String, (u128, Side)> = self
             .order_locations
             .iter()
-            .map(|entry| (entry.key().to_string(), *entry.value()))
+            .map(|entry| (entry.key().to_string(), entry.value().price_side()))
             .collect();
         state.serialize_field("order_locations", &order_locations)?;
 
@@ -4054,7 +4095,7 @@ where
     {
         // Get the order location without locking
         if let Some(location) = self.order_locations.get(&order_id) {
-            let (price, side) = *location;
+            let (price, side) = location.price_side();
 
             let price_levels = match side {
                 Side::Buy => &self.bids,
@@ -5333,7 +5374,8 @@ where
         // insertion sequence), so this walk performs no fallible call.
         for (price, side, order) in &prepared.orders {
             let (price, side) = (*price, *side);
-            self.order_locations.insert(order.id(), (price, side));
+            self.order_locations
+                .insert(order.id(), OrderLocation::new(price, side, order.user_id()));
             self.track_user_order(order.user_id(), order.id());
             // #230: the count is not carried by the snapshot; it is
             // recounted from what the restore actually installs, so
@@ -5728,7 +5770,12 @@ where
     /// resting orders.
     #[must_use]
     pub fn get_order_locations_arc(&self) -> Arc<DashMap<Id, (u128, Side)>> {
-        Arc::new(self.order_locations.clone())
+        Arc::new(
+            self.order_locations
+                .iter()
+                .map(|entry| (*entry.key(), entry.value().price_side()))
+                .collect(),
+        )
     }
 
     /// Computes comprehensive depth statistics for a side of the order book

@@ -55,7 +55,7 @@ mod tests {
                 for order in entry.value().iter_orders() {
                     resting = resting.checked_add(1).expect("count fits");
                     assert_eq!(
-                        book.order_locations.get(&order.id()).map(|loc| loc.0),
+                        book.order_locations.get(&order.id()).map(|loc| loc.price),
                         Some(*entry.key()),
                         "order {} rests on a level but is not located there",
                         order.id()

@@ -476,7 +476,7 @@ fn release_filled_maker<T: Clone + Send + Sync + Default + 'static>(
         // than an id reused in between.
         book.note_removed_strandable_maker();
     }
-    book.untrack_order_by_id(&filled_id);
+    book.untrack_located_order(&filled_id);
     book.order_locations.remove(&filled_id);
 }
 

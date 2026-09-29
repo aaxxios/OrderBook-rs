@@ -1,4 +1,4 @@
-use crate::orderbook::book::OrderBook;
+use crate::orderbook::book::{OrderBook, OrderLocation};
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::matching::MatchOutcome;
 use crate::orderbook::matching::{FeasibilityScope, ShapeVerdict, SweepReservation};
@@ -814,7 +814,10 @@ where
                 // Get the order location without locking
                 let location = self.order_locations.get(&order_id).map(|val| *val);
 
-                if let Some((old_price, _)) = location {
+                if let Some(OrderLocation {
+                    price: old_price, ..
+                }) = location
+                {
                     // If price doesn't change, do nothing
                     if old_price == new_price.as_u128() {
                         return Err(OrderBookError::InvalidOperation {
@@ -894,7 +897,12 @@ where
                 // Get order location without locking
                 let location = self.order_locations.get(&order_id).map(|val| *val);
 
-                if let Some((price, side)) = location {
+                if let Some(OrderLocation {
+                    price,
+                    side,
+                    user_id: owner,
+                }) = location
+                {
                     // Get the appropriate price levels map
                     let price_levels = match side {
                         Side::Buy => &self.bids,
@@ -996,7 +1004,7 @@ where
                     if is_empty {
                         self.remove_level_if_empty(side, price);
                         // #288: untrack before releasing the id.
-                        self.untrack_order_by_id(&order_id);
+                        self.untrack_user_order(owner, &order_id);
                         self.order_locations.remove(&order_id);
                     }
 
@@ -1235,7 +1243,7 @@ where
         // First, we find the order's location (price and side) without locking
         let location = self.order_locations.get(&order_id).map(|val| *val);
 
-        let Some((price, side)) = location else {
+        let Some(OrderLocation { price, side, .. }) = location else {
             return Ok(None);
         };
         let price_levels = match side {
@@ -1357,12 +1365,13 @@ where
             }
             RemovedOrder::Faulted(_) => {
                 // The level kept no body for the order it removed, so the
-                // owner is found by scanning the user index. The
+                // owner is read from the order's location (released
+                // below, after this, per #288). The
                 // strandable-maker count is deliberately NOT decremented:
                 // without the body it cannot tell whether the order was
                 // one, and an over-count only makes sweeps take the
                 // exclusive gate (safe), where an under-count would not be.
-                self.untrack_order_by_id(&order_id);
+                self.untrack_located_order(&order_id);
             }
         }
 
@@ -3221,7 +3230,7 @@ where
         let claimed = match self.order_locations.entry(order_id) {
             dashmap::Entry::Occupied(_) => false,
             dashmap::Entry::Vacant(slot) => {
-                slot.insert((price, side));
+                slot.insert(OrderLocation::new(price, side, order.user_id()));
                 true
             }
         };
@@ -3332,8 +3341,9 @@ where
         // Keyed by the reservation's generation, so this can never
         // release a same-id order's entry (#243 review).
         self.risk_state.release_reservation(risk_reservation);
-        self.order_locations
-            .remove_if(&order_id, |_, location| *location == (price, side));
+        self.order_locations.remove_if(&order_id, |_, location| {
+            *location == OrderLocation::new(price, side, order.user_id())
+        });
     }
 
     /// Adds `order` to `level`. In `cfg(test)` builds the `rest_fault_hook`

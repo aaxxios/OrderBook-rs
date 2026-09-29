@@ -87,8 +87,17 @@ where
     ) {
         let emptied = match self.user_orders.get_mut(&user_id) {
             Some(mut entry) => {
-                entry.value_mut().retain(|id| id != order_id);
-                entry.value().is_empty()
+                let ids = entry.value_mut();
+                // Order-preserving removal (#252): `Vec::remove`, never
+                // `swap_remove`. An id is tracked at most once per user (the
+                // location claim refuses a duplicate), so stopping at the
+                // first match removes exactly what `retain` would.
+                if let Some(pos) = ids.iter().position(|id| id == order_id) {
+                    // `pos` comes from `position` on this same Vec, so it is
+                    // in bounds and `remove` cannot panic.
+                    ids.remove(pos);
+                }
+                ids.is_empty()
             }
             None => false,
         };
@@ -97,21 +106,42 @@ where
         }
     }
 
+    /// Remove a still-located order from the `user_orders` index, keyed by
+    /// the owner its [`OrderLocation`](super::book::OrderLocation) carries.
+    ///
+    /// Used where the order already left its price level, so its body (and
+    /// `user_id`) is no longer reachable from the level: the fill path for
+    /// every fully filled maker, and a cancel whose level kept no body. One
+    /// keyed `user_orders` lookup instead of the full scan of
+    /// [`Self::untrack_order_by_id`] (#259: that scan ran once per filled
+    /// maker, cost O(active users) and allocated one guard per shard it
+    /// visited). Must run BEFORE the location is released (#288: the
+    /// location is the id's ownership token). Falls back to the scan only
+    /// if the location is already gone, which no caller reaches.
+    #[inline]
+    pub(super) fn untrack_located_order(&self, order_id: &pricelevel::Id) {
+        let owner = self
+            .order_locations
+            .get(order_id)
+            .map(|location| location.user_id);
+        match owner {
+            Some(user_id) => self.untrack_user_order(user_id, order_id),
+            None => self.untrack_order_by_id(order_id),
+        }
+    }
+
     /// Remove an order from the `user_orders` index by scanning all entries.
     ///
-    /// This is used in the matching engine where filled orders are already
-    /// removed from the price level and their `user_id` is no longer directly
-    /// accessible. The scan is efficient in practice because:
-    /// - Each order belongs to exactly one user (early return on first match)
-    /// - The number of active users is typically small
+    /// Cold fallback of [`Self::untrack_located_order`] for an order whose
+    /// location is already gone (unreachable in practice). O(active users):
+    /// it visits every `user_orders` shard until it finds the id.
     ///
     /// The removal preserves the relative order of the user's remaining ids
     /// (`Vec::remove`, not `swap_remove`): `cancel_orders_by_user` walks this
     /// list, and replay reconciles its result by id order (#252), so a fill
-    /// must not reorder a user's resting orders. It runs once per filled
-    /// maker; `remove` shifts at most the ids after `pos`, which the
-    /// `position` scan already bounds, so the per-call cost stays linear in
-    /// that user's list.
+    /// must not reorder a user's resting orders.
+    #[cold]
+    #[inline(never)]
     pub(super) fn untrack_order_by_id(&self, order_id: &pricelevel::Id) {
         let mut user_to_remove = None;
         for mut entry in self.user_orders.iter_mut() {
@@ -400,7 +430,7 @@ mod tests {
 
         // Verify order location
         let location = order_book.order_locations.get(&order_id).unwrap();
-        assert_eq!(*location.value(), (100u128, Side::Buy));
+        assert_eq!(location.value().price_side(), (100u128, Side::Buy));
 
         // Verify order in price level by checking its properties
         let price_level = order_book.bids.get(&100).unwrap();
@@ -531,5 +561,52 @@ mod tests {
             }
             _ => panic!("Expected InsufficientLiquidity error"),
         }
+    }
+
+    /// #259: the location carries the owner, and a fill untracks the maker
+    /// by that key: other users' entries are untouched, the owner's
+    /// remaining ids keep their order (#252), and the owner's entry goes
+    /// once its last maker fills.
+    #[test]
+    fn test_fill_untracks_maker_by_location_owner() {
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        let alice = Hash32::new([1; 32]);
+        let bob = Hash32::new([2; 32]);
+        let taker = Hash32::new([3; 32]);
+        for (n, owner) in [(1, alice), (2, bob), (3, alice), (4, alice)] {
+            book.add_limit_order_with_user(
+                Id::from_u64(n),
+                100,
+                5,
+                Side::Sell,
+                TimeInForce::Gtc,
+                owner,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            book.order_locations
+                .get(&Id::from_u64(3))
+                .map(|location| location.user_id),
+            Some(alice)
+        );
+
+        // Fills alice's #1 and bob's #2 in time priority.
+        book.submit_market_order_with_user(Id::from_u64(10), 10, Side::Buy, taker)
+            .unwrap();
+        assert_eq!(
+            book.user_orders.get(&alice).map(|ids| ids.clone()),
+            Some(vec![Id::from_u64(3), Id::from_u64(4)])
+        );
+        assert!(book.user_orders.get(&bob).is_none());
+        assert!(book.order_locations.get(&Id::from_u64(1)).is_none());
+        assert!(book.order_locations.get(&Id::from_u64(2)).is_none());
+
+        // Fills the rest: alice's entry is removed with her last maker.
+        book.submit_market_order_with_user(Id::from_u64(11), 10, Side::Buy, taker)
+            .unwrap();
+        assert!(book.user_orders.get(&alice).is_none());
+        assert!(book.order_locations.is_empty());
     }
 }
