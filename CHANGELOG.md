@@ -511,6 +511,81 @@ change.
   - Journals written before this release recorded the post-trade case
     under a pre-trade risk code with `may_have_mutated: false`; replay
     still skips those, and only `snapshots_match` detects the gap.
+- **Bounded journal recovery and NATS shutdown (#295).** Two liveness bugs
+  and several hardening items from the final audit (#260):
+  - `FileJournal::open` on a latest segment whose tail is garbage probed
+    every byte offset and CRC'd each candidate over the rest of the
+    segment (on the order of 10^14 bytes hashed for 256 MB): it
+    effectively never returned. The forward scan that tells a torn tail
+    from mid-segment corruption now filters candidates with
+    allocation-free checks first (framing inside the segment, a sequence
+    strictly above the last good entry, a payload starting with
+    `{"sequence_num":<header sequence>,` and ending with `}`) and
+    CRC-checks at most 64 of them, hashing at most 256 MiB. Random garbage
+    opens in time linear in the segment size (treated as a torn tail,
+    since no valid entry can follow); a tail that exhausts the budget is
+    refused with the damaged entry's `CorruptEntry` / `InvalidEntryHeader`.
+    #252's rule is unchanged: a later valid entry still refuses the open.
+  - A zero-length latest segment (crash between `create_new` and
+    `set_len`) made every append fail with `SegmentExists`; it is now grown
+    to the segment size on open. A failed `msync` of an append re-zeroes
+    the bytes it copied (best effort) before returning the error. A reader
+    whose segment is shorter than its limit gets `InvalidEntryHeader`
+    instead of a silent end. `list_segments` accepts only canonical names
+    (`segment-` + 20 digits + `.journal`, round-tripped), so a stray
+    `segment-5.journal` or `segment-+0…0.journal` can no longer alias a real
+    segment, and it sorts and dedupes.
+  - Replay compares the iteration with `last_sequence()` read before it:
+    a journal whose newest segment vanished returned `Ok` on a truncated
+    prefix and now fails with `ReplayError::JournalTruncated`.
+  - `InMemoryJournal` stores events behind `Arc` and clones `T` outside its
+    read lock; its JSON / CRC parity limits with `FileJournal` are
+    documented.
+  - NATS: `with_max_retries` is clamped to `MAX_PUBLISH_RETRIES` (10). With
+    NATS down, `shutdown()` could take days (unbounded retries, drain with
+    no deadline); once shutdown is requested (in the drain, or in a flush
+    already running when `shutdown()` was called, via shared shutdown
+    state), the first publish that exhausts its retries while the link is
+    down stops publishing and the remaining events are counted in
+    `dropped_events`. `shutdown()` is cancel-safe (a dropped future puts the
+    join handle back instead of detaching the task), and
+    `shutdown_with_deadline(Duration)` aborts the task after the deadline
+    (`NatsPublisherError::ShutdownTimedOut`).
+  - `NatsBookChangePublisher` sends `Content-Type: application/json`
+    (batches are always JSON; the `EventSerializer` trait does not cover
+    batches) and counts `error_count` once per batch, matching the trade
+    publisher's once-per-trade rule.
+  - Wire: `decode_frame` rejects a `len` above `MAX_FRAME_BODY` (4096) with
+    `InvalidPayload` from the header alone (it used to report `Truncated`
+    for up to 4 GiB), and `encode_frame` refuses such a frame.
+    `encode_exec_report` rejects an unknown `status` or non-zero `_pad`, and
+    `encode_book_update` an unknown `side`, with `InvalidPayload` instead of
+    emitting frames their own decoders reject.
+  - `CountingAllocator` (feature `alloc-counters`) documents that its
+    diagnostic counters wrap (no allocation, panic or CAS loop inside the
+    allocator); `doc/panic-boundaries.md` lists it next to `memmap2` as the
+    second documented `unsafe` exception.
+
+  Compatibility:
+  - `ReplayError` is not `#[non_exhaustive]`: the new `JournalTruncated`
+    variant needs an arm in exhaustive matches. A replay that used to
+    succeed on a truncated journal now fails.
+  - `NatsPublisherError` is `#[non_exhaustive]`; `ShutdownTimedOut` is
+    additive. `MAX_PUBLISH_RETRIES` and `wire::MAX_FRAME_BODY` are new
+    public constants.
+  - Callers passing `with_max_retries` above 10 get 10 (and a `WARN`).
+  - `NatsBookChangePublisher::error_count()` is smaller for multi-subject
+    failures (once per batch instead of once per subject). During a
+    shutdown with NATS down, events that used to be retried are now in
+    `dropped_events`.
+  - Book-change messages carry an extra `Content-Type` header; payloads are
+    unchanged.
+  - Wire frames longer than 4096 bytes (none are defined) are refused on
+    both sides; encoder inputs the decoders already rejected now fail at
+    encode time.
+  - Non-canonical segment file names are ignored by `FileJournal` (it never
+    wrote any). No on-disk format change; `ORDERBOOK_SNAPSHOT_FORMAT_VERSION`
+    is unchanged.
 
 ### Changed
 

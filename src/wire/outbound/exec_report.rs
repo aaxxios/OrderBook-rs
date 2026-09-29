@@ -82,10 +82,21 @@ pub fn status_to_wire(status: &OrderStatus) -> u8 {
 ///
 /// # Errors
 ///
+/// Returns [`WireError::InvalidPayload`] when `status` is not one of the
+/// `STATUS_*` codes or `_pad` is non-zero: [`decode_exec_report`] rejects
+/// both, so the encoder never emits a frame its own decoder refuses (#295).
 /// Returns [`WireError::CapacityOverflow`] when `out` cannot grow by
-/// [`EXEC_REPORT_SIZE`] bytes. `out` is left unchanged in that case.
+/// [`EXEC_REPORT_SIZE`] bytes. `out` is left unchanged in either case.
 #[inline]
 pub fn encode_exec_report(report: &ExecReport, out: &mut Vec<u8>) -> Result<(), WireError> {
+    if report.status > STATUS_REJECTED {
+        return Err(WireError::InvalidPayload("ExecReport: unknown status"));
+    }
+    if report._pad != 0 {
+        return Err(WireError::InvalidPayload(
+            "ExecReport: non-zero reserved padding",
+        ));
+    }
     reserve_payload(out, EXEC_REPORT_SIZE)?;
     out.extend_from_slice(&report.engine_seq.to_le_bytes());
     out.extend_from_slice(&report.order_id.to_le_bytes());
@@ -267,6 +278,41 @@ mod tests {
         encode_exec_report(&msg, &mut exact).expect("encode into exact buffer");
         assert_eq!(exact.len(), EXEC_REPORT_SIZE);
         assert_eq!(exact.capacity(), cap);
+    }
+
+    /// #295: the encoder refuses what the decoder would reject, leaving
+    /// `out` unchanged.
+    #[test]
+    fn encoder_rejects_invalid_status_and_padding() {
+        let valid = ExecReport {
+            engine_seq: 1,
+            order_id: 2,
+            status: STATUS_REJECTED,
+            filled_qty: 0,
+            remaining_qty: 0,
+            price: 0,
+            reject_reason: 0,
+            _pad: 0,
+        };
+        let mut out = vec![0xEE];
+        for bad in [
+            ExecReport {
+                status: STATUS_REJECTED + 1,
+                ..valid
+            },
+            ExecReport {
+                status: u8::MAX,
+                ..valid
+            },
+            ExecReport { _pad: 1, ..valid },
+        ] {
+            assert!(matches!(
+                encode_exec_report(&bad, &mut out),
+                Err(WireError::InvalidPayload(_))
+            ));
+            assert_eq!(out, vec![0xEE], "out unchanged");
+        }
+        encode_exec_report(&valid, &mut out).expect("valid report encodes");
     }
 
     #[test]

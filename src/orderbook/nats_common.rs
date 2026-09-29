@@ -70,6 +70,17 @@ pub const BASE_RETRY_DELAY_MS: u64 = 10;
 /// Cap, in milliseconds, on a single retry backoff delay (five seconds).
 pub const MAX_RETRY_DELAY_MS: u64 = 5_000;
 
+/// Largest accepted `with_max_retries` value (#295).
+///
+/// Larger values are clamped down to this with a `tracing::warn!`. It bounds
+/// one publish to `MAX_PUBLISH_RETRIES + 1` attempts: at most about 10 s of
+/// backoff sleep (`10 + 20 + ... + 2_560` ms, then [`MAX_RETRY_DELAY_MS`])
+/// plus 11 JetStream ack timeouts. The shutdown drain gives up on the rest
+/// of the buffered events after the first publish that exhausts its retries
+/// while the link is down, so this also bounds `shutdown()` with NATS
+/// unreachable to roughly one or two such publishes.
+pub const MAX_PUBLISH_RETRIES: u32 = 10;
+
 /// Failure of a NATS publisher's background task, reported by `shutdown()`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -87,6 +98,16 @@ pub enum NatsPublisherError {
     /// example because its Tokio runtime shut down first.
     #[error("nats publisher task was cancelled before it finished")]
     TaskCancelled,
+
+    /// `shutdown_with_deadline` gave up waiting for the background task to
+    /// drain and aborted it (#295). Events it had not published yet were
+    /// discarded without being counted.
+    #[error("nats publisher shutdown did not finish within {timeout_ms} ms; task aborted")]
+    ShutdownTimedOut {
+        /// The deadline that expired, in milliseconds (saturated at
+        /// `u64::MAX`).
+        timeout_ms: u64,
+    },
 }
 
 impl NatsPublisherError {
@@ -172,6 +193,23 @@ pub(crate) fn clamp_max_batch_size(requested: usize) -> usize {
             "with_max_batch_size above the documented maximum; clamping"
         );
         MAX_BATCH_SIZE
+    } else {
+        requested
+    }
+}
+
+/// Clamps a retry count down to [`MAX_PUBLISH_RETRIES`] with a
+/// `tracing::warn!` (#295): an unbounded count would let one failing publish
+/// (and therefore `shutdown()`) run for days.
+#[must_use]
+pub(crate) fn clamp_max_retries(requested: u32) -> u32 {
+    if requested > MAX_PUBLISH_RETRIES {
+        warn!(
+            requested,
+            max = MAX_PUBLISH_RETRIES,
+            "with_max_retries above the documented maximum; clamping"
+        );
+        MAX_PUBLISH_RETRIES
     } else {
         requested
     }
@@ -305,6 +343,24 @@ pub(crate) fn increment_metric(counter: &AtomicU64, name: &'static str) {
     }
 }
 
+/// Adds `n` to a metric counter without wrapping. On overflow the counter is
+/// pinned at `u64::MAX` and an `ERROR` is logged naming it.
+#[inline]
+pub(crate) fn add_metric(counter: &AtomicU64, n: usize, name: &'static str) {
+    let n = u64::try_from(n).unwrap_or(u64::MAX);
+    let mut overflowed = false;
+    // The closure always returns `Some`, so `fetch_update` cannot fail.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.checked_add(n).unwrap_or_else(|| {
+            overflowed = true;
+            u64::MAX
+        }))
+    });
+    if overflowed {
+        counter_exhausted(name);
+    }
+}
+
 /// Logs a counter that reached `u64::MAX`.
 #[cold]
 #[inline(never)]
@@ -398,6 +454,13 @@ impl LinkState {
         }
     }
 
+    /// Whether the last publish attempt failed (the link is down).
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_down(&self) -> bool {
+        self.down.load(Ordering::Relaxed)
+    }
+
     /// Records a failed publish attempt.
     #[inline]
     fn mark_down(&self, jetstream: &async_nats::jetstream::Context, subject: &str) {
@@ -406,6 +469,103 @@ impl LinkState {
                 subject,
                 state = ?jetstream.client().connection_state(),
                 "NATS publisher disconnected: publishes are failing, retrying with backoff"
+            );
+        }
+    }
+}
+
+// ─── Shutdown drain ─────────────────────────────────────────────────────────
+
+/// Shutdown intent shared between `shutdown()` and the background task
+/// (#295).
+///
+/// `shutdown()` sets `requested` before it sends the shutdown signal, so a
+/// flush that is already running (the task only observes the signal between
+/// flushes) sees the intent at its next exhausted publish. `gave_up` latches
+/// once the task stopped publishing because the link is down; it stays set
+/// for the rest of the task's life, so neither the rest of that flush nor
+/// the drain that follows retries again.
+#[derive(Debug, Default)]
+pub(crate) struct ShutdownState {
+    /// Set by `shutdown()` / `shutdown_with_deadline()`.
+    requested: AtomicBool,
+    /// Set once the task gave up on an unreachable link during shutdown.
+    gave_up: AtomicBool,
+}
+
+impl ShutdownState {
+    /// Records that shutdown was requested. Called before the signal is
+    /// sent.
+    #[inline]
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Whether shutdown was requested.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+/// Fail-fast latch for publishes during shutdown (#295).
+///
+/// During normal operation every publish retries up to its limit. Once
+/// shutdown is requested (inside the drain, or inside a normal flush that
+/// was already running when `shutdown()` was called), the first publish
+/// that exhausts its retries while the link is down trips the latch: every
+/// event still buffered would only repeat that wait, so nothing more is
+/// published and the remaining events are counted in `dropped_events`. This
+/// bounds `shutdown()` with NATS unreachable to the publishes already in
+/// flight.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainGate<'a> {
+    /// The publisher's shared shutdown state.
+    state: &'a ShutdownState,
+    /// `true` inside the shutdown drain (shutdown is known to be requested).
+    draining: bool,
+}
+
+impl<'a> DrainGate<'a> {
+    /// Gate for a normal flush: trips only if shutdown is requested while
+    /// the flush runs.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn normal(state: &'a ShutdownState) -> Self {
+        Self {
+            state,
+            draining: false,
+        }
+    }
+
+    /// Gate for the shutdown drain.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn draining(state: &'a ShutdownState) -> Self {
+        Self {
+            state,
+            draining: true,
+        }
+    }
+
+    /// Whether the task gave up on the link: publish nothing more.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_tripped(&self) -> bool {
+        self.state.gave_up.load(Ordering::Acquire)
+    }
+
+    /// Records a publish that exhausted its retries. With shutdown requested
+    /// and the link down, trips the latch (logged once at `WARN`).
+    pub(crate) fn on_publish_exhausted(&mut self, link: &LinkState, publisher: &'static str) {
+        if (self.draining || self.state.is_requested())
+            && link.is_down()
+            && !self.state.gave_up.swap(true, Ordering::AcqRel)
+        {
+            warn!(
+                publisher,
+                "NATS link down during shutdown; dropping the remaining buffered events without publishing"
             );
         }
     }
@@ -604,16 +764,27 @@ pub(crate) fn take_slot<V>(slot: &Mutex<Option<V>>) -> Option<V> {
     slot.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
-/// Signals the background task to drain and exit, then joins it.
-///
-/// Returns `Ok(())` when the task finished normally or was already joined by
-/// an earlier call, and the typed [`NatsPublisherError`] when it panicked or
-/// was cancelled. No lock guard is held across the `.await`.
-pub(crate) async fn shutdown_task(
-    shutdown_tx: &Mutex<Option<oneshot::Sender<()>>>,
-    task_handle: &Mutex<Option<JoinHandle<()>>>,
-    publisher: &'static str,
-) -> Result<(), NatsPublisherError> {
+/// Holds a join handle taken out of its slot while it is awaited, and puts
+/// it back if the await is abandoned (the shutdown future was dropped
+/// before the task finished), so a later `shutdown()` still joins the task
+/// instead of finding an empty slot and detaching it (#295).
+struct JoinGuard<'a> {
+    /// The slot the handle came from.
+    slot: &'a Mutex<Option<JoinHandle<()>>>,
+    /// The handle; `None` once the task was joined.
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for JoinGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            store_slot(self.slot, handle);
+        }
+    }
+}
+
+/// Sends the shutdown signal, if it was not sent already.
+fn signal_shutdown(shutdown_tx: &Mutex<Option<oneshot::Sender<()>>>, publisher: &'static str) {
     if let Some(tx) = take_slot(shutdown_tx)
         && tx.send(()).is_err()
     {
@@ -622,11 +793,14 @@ pub(crate) async fn shutdown_task(
             "NATS publisher task exited before the shutdown signal"
         );
     }
+}
 
-    let Some(handle) = take_slot(task_handle) else {
-        return Ok(());
-    };
-    match handle.await {
+/// Maps the join outcome of the background task, logging it.
+fn report_join(
+    joined: Result<(), JoinError>,
+    publisher: &'static str,
+) -> Result<(), NatsPublisherError> {
+    match joined {
         Ok(()) => {
             info!(publisher, "NATS publisher task stopped");
             Ok(())
@@ -637,6 +811,84 @@ pub(crate) async fn shutdown_task(
             Err(err)
         }
     }
+}
+
+/// Signals the background task to drain and exit, then joins it.
+///
+/// Returns `Ok(())` when the task finished normally or was already joined by
+/// an earlier call, and the typed [`NatsPublisherError`] when it panicked or
+/// was cancelled. No lock guard is held across the `.await`.
+///
+/// Cancel-safe: dropping the returned future before the task finishes puts
+/// the join handle back (see [`JoinGuard`]), so a later call joins the task.
+pub(crate) async fn shutdown_task(
+    state: &ShutdownState,
+    shutdown_tx: &Mutex<Option<oneshot::Sender<()>>>,
+    task_handle: &Mutex<Option<JoinHandle<()>>>,
+    publisher: &'static str,
+) -> Result<(), NatsPublisherError> {
+    // Intent first, so a flush already running sees it (see `DrainGate`).
+    state.request();
+    signal_shutdown(shutdown_tx, publisher);
+    let mut guard = JoinGuard {
+        slot: task_handle,
+        handle: take_slot(task_handle),
+    };
+    let Some(handle) = guard.handle.as_mut() else {
+        return Ok(());
+    };
+    let joined = handle.await;
+    // Joined: nothing to restore. A `JoinHandle` must not be polled again
+    // after it completed.
+    guard.handle = None;
+    report_join(joined, publisher)
+}
+
+/// Like [`shutdown_task`], but gives the task at most `deadline` to drain.
+///
+/// When the deadline expires the task is aborted and joined, and
+/// [`NatsPublisherError::ShutdownTimedOut`] is returned; events it had not
+/// published yet are discarded without being counted. A task that finished,
+/// panicked or was cancelled on its own reports that outcome instead. Also
+/// cancel-safe.
+pub(crate) async fn shutdown_task_with_deadline(
+    state: &ShutdownState,
+    shutdown_tx: &Mutex<Option<oneshot::Sender<()>>>,
+    task_handle: &Mutex<Option<JoinHandle<()>>>,
+    publisher: &'static str,
+    deadline: Duration,
+) -> Result<(), NatsPublisherError> {
+    // Intent first, so a flush already running sees it (see `DrainGate`).
+    state.request();
+    signal_shutdown(shutdown_tx, publisher);
+    let mut guard = JoinGuard {
+        slot: task_handle,
+        handle: take_slot(task_handle),
+    };
+    let Some(handle) = guard.handle.as_mut() else {
+        return Ok(());
+    };
+    // `timeout` falls back to a far-future deadline instead of overflowing.
+    let outcome = match tokio::time::timeout(deadline, &mut *handle).await {
+        Ok(joined) => report_join(joined, publisher),
+        Err(_elapsed) => {
+            let timeout_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+            error!(
+                publisher,
+                timeout_ms, "NATS publisher shutdown deadline expired; aborting the task"
+            );
+            handle.abort();
+            match handle.await {
+                Err(join_error) if join_error.is_cancelled() => {
+                    Err(NatsPublisherError::ShutdownTimedOut { timeout_ms })
+                }
+                // Finished (or failed) on its own before the abort landed.
+                joined => report_join(joined, publisher),
+            }
+        }
+    };
+    guard.handle = None;
+    outcome
 }
 
 #[cfg(test)]
@@ -914,7 +1166,13 @@ mod tests {
                 panic!("task boom");
             }),
         );
-        let result = shutdown_task(&shutdown_tx, &task_handle, "test").await;
+        let result = shutdown_task(
+            &ShutdownState::default(),
+            &shutdown_tx,
+            &task_handle,
+            "test",
+        )
+        .await;
         assert_eq!(
             result,
             Err(NatsPublisherError::TaskPanicked {
@@ -923,7 +1181,13 @@ mod tests {
         );
         // The failure is reported once; a second call is a no-op.
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Ok(())
         );
     }
@@ -941,7 +1205,13 @@ mod tests {
             }),
         );
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Ok(())
         );
     }
@@ -954,9 +1224,143 @@ mod tests {
         handle.abort();
         store_slot(&task_handle, handle);
         assert_eq!(
-            shutdown_task(&shutdown_tx, &task_handle, "test").await,
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
             Err(NatsPublisherError::TaskCancelled)
         );
+    }
+
+    /// #295: dropping a `shutdown_task` future before the task finishes
+    /// restores the join handle; the next call joins the task.
+    #[tokio::test]
+    async fn test_cancelled_shutdown_task_future_does_not_detach() {
+        let shutdown_tx: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+        let task_handle: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = oneshot::channel::<()>();
+        store_slot(&shutdown_tx, tx);
+        let flag = std::sync::Arc::clone(&finished);
+        store_slot(
+            &task_handle,
+            tokio::spawn(async move {
+                let _ = rx.await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                flag.store(true, Ordering::SeqCst);
+            }),
+        );
+        let first = tokio::time::timeout(
+            Duration::from_millis(10),
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test",
+            ),
+        )
+        .await;
+        assert!(first.is_err(), "the first shutdown was cancelled");
+        assert!(!finished.load(Ordering::SeqCst));
+        assert_eq!(
+            shutdown_task(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test"
+            )
+            .await,
+            Ok(())
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the second shutdown joined the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_task_with_deadline_aborts_a_stuck_task() {
+        let shutdown_tx: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+        let task_handle: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        store_slot(&task_handle, tokio::spawn(std::future::pending::<()>()));
+        assert_eq!(
+            shutdown_task_with_deadline(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test",
+                Duration::from_millis(20)
+            )
+            .await,
+            Err(NatsPublisherError::ShutdownTimedOut { timeout_ms: 20 })
+        );
+        assert!(take_slot(&task_handle).is_none(), "the task was joined");
+        // A huge deadline does not overflow the timer.
+        store_slot(&task_handle, tokio::spawn(async {}));
+        assert_eq!(
+            shutdown_task_with_deadline(
+                &ShutdownState::default(),
+                &shutdown_tx,
+                &task_handle,
+                "test",
+                Duration::MAX
+            )
+            .await,
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_clamp_max_retries_bounds() {
+        assert_eq!(clamp_max_retries(0), 0);
+        assert_eq!(clamp_max_retries(3), 3);
+        assert_eq!(clamp_max_retries(MAX_PUBLISH_RETRIES), MAX_PUBLISH_RETRIES);
+        assert_eq!(clamp_max_retries(u32::MAX), MAX_PUBLISH_RETRIES);
+    }
+
+    #[test]
+    fn test_add_metric_pins_at_max() {
+        let counter = AtomicU64::new(5);
+        add_metric(&counter, 7, "test");
+        assert_eq!(counter.load(Ordering::Relaxed), 12);
+        add_metric(&counter, usize::MAX, "test");
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn test_drain_gate_trips_only_with_shutdown_requested_and_link_down() {
+        let link = LinkState::default();
+        link.down.store(true, Ordering::Relaxed);
+
+        let state = ShutdownState::default();
+        let mut normal = DrainGate::normal(&state);
+        normal.on_publish_exhausted(&link, "test");
+        assert!(!normal.is_tripped(), "no shutdown requested: keep retrying");
+
+        // Shutdown requested while a normal flush runs: the next exhausted
+        // publish trips it, and the latch is shared with the drain.
+        state.request();
+        normal.on_publish_exhausted(&link, "test");
+        assert!(normal.is_tripped());
+        assert!(DrainGate::draining(&state).is_tripped());
+
+        let fresh = ShutdownState::default();
+        let mut draining = DrainGate::draining(&fresh);
+        link.down.store(false, Ordering::Relaxed);
+        draining.on_publish_exhausted(&link, "test");
+        assert!(!draining.is_tripped(), "link up: keep draining");
+        link.down.store(true, Ordering::Relaxed);
+        draining.on_publish_exhausted(&link, "test");
+        assert!(draining.is_tripped());
+    }
+
+    #[test]
+    fn test_shutdown_timed_out_display() {
+        let err = NatsPublisherError::ShutdownTimedOut { timeout_ms: 250 };
+        assert!(err.to_string().contains("250 ms"));
     }
 
     #[test]

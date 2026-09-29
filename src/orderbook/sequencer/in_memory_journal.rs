@@ -8,7 +8,12 @@ use super::error::JournalError;
 use super::journal::{Journal, JournalEntry, JournalReadIter};
 use super::types::SequencerEvent;
 use serde::{Deserialize, Serialize};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Stored events. Each is behind an `Arc` so a reader can snapshot the
+/// range it needs under the read guard with refcount bumps only, and run
+/// `T::clone` (caller code) after releasing it.
+type Events<T> = Vec<Arc<SequencerEvent<T>>>;
 
 /// In-memory implementation of [`Journal`].
 ///
@@ -20,6 +25,29 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// ([`JournalError::NonMonotonicSequence`] otherwise), and a poisoned
 /// internal lock surfaces as [`JournalError::MutexPoisoned`] on every
 /// method, never as an empty journal.
+///
+/// # Locking
+///
+/// `T::clone` is caller code and never runs under the internal lock:
+/// `append` clones before taking the write guard, and `read_from`
+/// snapshots `Arc` handles to the requested range under the read guard,
+/// then clones each event lazily as the iterator yields it.
+///
+/// # Parity limits with `FileJournal`
+///
+/// `InMemoryJournal` stores clones, not bytes. It does not round-trip
+/// events through JSON and has no CRC (`JournalEntry::stored_crc` is `0`),
+/// so it cannot surface what only a byte format can:
+///
+/// - a `T` whose serde round-trip is lossy or fails reads back unchanged
+///   here, while `FileJournal` returns the decoded value or a
+///   `SerializationError` / `DeserializationError`;
+/// - corruption, torn tails and truncation (`CorruptEntry`,
+///   `InvalidEntryHeader`) cannot happen, and `verify_integrity` only
+///   checks the lock;
+/// - no entry-size limit applies (`EntryTooLarge`).
+///
+/// Use `FileJournal` (feature `journal`) where those paths matter.
 ///
 /// # Examples
 ///
@@ -52,7 +80,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// ```
 #[derive(Debug)]
 pub struct InMemoryJournal<T> {
-    events: RwLock<Vec<SequencerEvent<T>>>,
+    events: RwLock<Events<T>>,
 }
 
 impl<T> Default for InMemoryJournal<T> {
@@ -115,13 +143,13 @@ impl<T> InMemoryJournal<T> {
 
     /// Acquires the read lock, mapping poisoning to a typed error.
     #[inline]
-    fn read_events(&self) -> Result<RwLockReadGuard<'_, Vec<SequencerEvent<T>>>, JournalError> {
+    fn read_events(&self) -> Result<RwLockReadGuard<'_, Events<T>>, JournalError> {
         self.events.read().map_err(|_| JournalError::MutexPoisoned)
     }
 
     /// Acquires the write lock, mapping poisoning to a typed error.
     #[inline]
-    fn write_events(&self) -> Result<RwLockWriteGuard<'_, Vec<SequencerEvent<T>>>, JournalError> {
+    fn write_events(&self) -> Result<RwLockWriteGuard<'_, Events<T>>, JournalError> {
         self.events.write().map_err(|_| JournalError::MutexPoisoned)
     }
 }
@@ -133,7 +161,7 @@ where
     fn append(&self, event: &SequencerEvent<T>) -> Result<(), JournalError> {
         // Clone outside the lock: `T::clone` is caller code and must not run
         // while the write guard is held.
-        let owned = event.clone();
+        let owned = Arc::new(event.clone());
         let mut events = self.write_events()?;
         if let Some(last) = events.last().map(|e| e.sequence_num)
             && owned.sequence_num <= last
@@ -154,20 +182,30 @@ where
     }
 
     fn read_from(&self, sequence: u64) -> Result<JournalReadIter<T>, JournalError> {
-        let events = self.read_events()?;
+        // Under the read guard: only `Arc` refcount bumps, no caller code.
+        let snapshot: Events<T> = {
+            let events = self.read_events()?;
+            // Sequences are strictly increasing (enforced by `append`).
+            let start = events.partition_point(|e| e.sequence_num < sequence);
+            let range = events.get(start..).unwrap_or_default();
+            let mut snapshot = Vec::new();
+            snapshot.try_reserve_exact(range.len()).map_err(|_| {
+                JournalError::AllocationFailed {
+                    what: "events",
+                    requested: range.len(),
+                }
+            })?;
+            snapshot.extend(range.iter().cloned());
+            snapshot
+        };
 
-        let filtered: Vec<_> = events
-            .iter()
-            .filter(|e| e.sequence_num >= sequence)
-            .map(|event| {
-                Ok(JournalEntry {
-                    event: event.clone(),
-                    stored_crc: 0, // No CRC for in-memory journal
-                })
+        // `T::clone` runs here, per yielded entry, with no lock held.
+        Ok(Box::new(snapshot.into_iter().map(|event| {
+            Ok(JournalEntry {
+                event: SequencerEvent::clone(&event),
+                stored_crc: 0, // No CRC for in-memory journal
             })
-            .collect();
-
-        Ok(Box::new(filtered.into_iter()))
+        })))
     }
 
     fn last_sequence(&self) -> Result<Option<u64>, JournalError> {
@@ -183,6 +221,8 @@ where
 }
 
 #[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
     use crate::orderbook::sequencer::types::{SequencerCommand, SequencerResult};
@@ -261,5 +301,97 @@ mod tests {
             journal.verify_integrity(),
             Err(JournalError::MutexPoisoned)
         ));
+    }
+
+    /// Extra-fields probe whose `clone` records whether the journal's lock
+    /// was free (a write guard could be taken) while it ran.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LockProbe;
+
+    thread_local! {
+        static PROBED: std::cell::RefCell<Option<Arc<InMemoryJournal<LockProbe>>>> =
+            const { std::cell::RefCell::new(None) };
+        static CLONES_UNDER_LOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    impl Clone for LockProbe {
+        fn clone(&self) -> Self {
+            PROBED.with(|slot| {
+                if let Some(journal) = slot.borrow().as_ref() {
+                    CLONES.with(|c| c.set(c.get() + 1));
+                    if journal.events.try_write().is_err() {
+                        CLONES_UNDER_LOCK.with(|c| c.set(c.get() + 1));
+                    }
+                }
+            });
+            LockProbe
+        }
+    }
+
+    fn probe_event(seq: u64) -> SequencerEvent<LockProbe> {
+        let id = Id::from_u64(seq);
+        SequencerEvent {
+            sequence_num: seq,
+            timestamp_ns: 0,
+            command: SequencerCommand::AddOrder(pricelevel::OrderType::Standard {
+                id,
+                price: pricelevel::Price::new(100),
+                quantity: pricelevel::Quantity::new(1),
+                side: pricelevel::Side::Buy,
+                time_in_force: pricelevel::TimeInForce::Gtc,
+                user_id: pricelevel::Hash32::zero(),
+                timestamp: pricelevel::TimestampMs::new(0),
+                extra_fields: LockProbe,
+            }),
+            result: SequencerResult::OrderAdded { order_id: id },
+        }
+    }
+
+    /// #295: `T::clone` (caller code) never runs under the journal lock,
+    /// on append or on read.
+    #[test]
+    fn test_in_memory_clones_t_outside_the_lock() {
+        let journal = Arc::new(InMemoryJournal::<LockProbe>::new());
+        let events: Vec<_> = (1..=3).map(probe_event).collect();
+        PROBED.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&journal)));
+        for event in &events {
+            journal.append(event).expect("append");
+        }
+        let read: Vec<_> = journal
+            .read_from(2)
+            .expect("read_from")
+            .map(|entry| entry.expect("entry").event.sequence_num)
+            .collect();
+        PROBED.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(read, vec![2, 3]);
+        assert!(
+            CLONES.with(std::cell::Cell::get) >= 5,
+            "3 appends + 2 reads"
+        );
+        assert_eq!(
+            CLONES_UNDER_LOCK.with(std::cell::Cell::get),
+            0,
+            "no T::clone may run while the journal lock is held"
+        );
+    }
+
+    #[test]
+    fn test_in_memory_read_from_filters_by_sequence() {
+        let journal = InMemoryJournal::<()>::new();
+        for seq in [1, 4, 7] {
+            journal.append(&event(seq)).expect("append");
+        }
+        let seqs = |from| -> Vec<u64> {
+            journal
+                .read_from(from)
+                .expect("read_from")
+                .map(|e| e.expect("entry").event.sequence_num)
+                .collect()
+        };
+        assert_eq!(seqs(0), vec![1, 4, 7]);
+        assert_eq!(seqs(4), vec![4, 7]);
+        assert_eq!(seqs(5), vec![7]);
+        assert!(seqs(8).is_empty());
     }
 }

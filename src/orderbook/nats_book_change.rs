@@ -21,6 +21,29 @@
 //! Configuration limits and the task-failure error type are shared with the
 //! trade publisher and live in [`crate::orderbook::nats`].
 //!
+//! # Payload format
+//!
+//! Unlike [`NatsTradePublisher`](crate::orderbook::nats::NatsTradePublisher),
+//! this publisher does not take an
+//! [`EventSerializer`](crate::orderbook::serialization::EventSerializer): the
+//! trait serializes single events, not a [`BookChangeBatch`], so batches are
+//! always encoded as **JSON** (`serde_json`). Every message carries a
+//! `Content-Type: application/json` header (added in #295; earlier releases
+//! sent none) next to `Nats-Sequence`. Pluggable batch serialization is a
+//! possible future enhancement.
+//!
+//! # Error accounting
+//!
+//! Counters use one **per-batch** granularity: a flushed batch increments
+//! `publish_count` once when every subject it targets (`changes`, plus
+//! `bid` / `ask` when present) is acknowledged, and `error_count` once
+//! otherwise (serialization failure, a subject exhausting its retries, or
+//! an exhausted sequence counter), so `publish_count + error_count` equals
+//! the number of batches that reached the publish step. The trade publisher
+//! applies the same rule to its unit, the trade (both of its subjects
+//! count once). Before #295 this publisher counted one error per failed
+//! subject.
+//!
 //! # Runtime requirements
 //!
 //! The background task runs on the Tokio runtime handle passed to
@@ -47,9 +70,10 @@ use crate::orderbook::nats::{
     MAX_BATCH_WINDOW_MS, MAX_MIN_PUBLISH_INTERVAL_MS, NatsPublisherError,
 };
 use crate::orderbook::nats_common::{
-    DropLog, LinkState, RetryPolicy, batch_deadline, checked_reserve, clamp_channel_capacity,
-    clamp_duration_ms, clamp_max_batch_size, counter_exhausted, drain_buffered, increment_metric,
-    new_batch_buffer, new_jitter_seed, publish_with_backoff, shutdown_task, store_slot,
+    DrainGate, DropLog, LinkState, RetryPolicy, ShutdownState, add_metric, batch_deadline,
+    checked_reserve, clamp_channel_capacity, clamp_duration_ms, clamp_max_batch_size,
+    clamp_max_retries, counter_exhausted, drain_buffered, increment_metric, new_batch_buffer,
+    new_jitter_seed, publish_with_backoff, shutdown_task, shutdown_task_with_deadline, store_slot,
     throttle_or_shutdown,
 };
 use pricelevel::Side;
@@ -63,6 +87,10 @@ use tracing::{debug, error, info, trace};
 
 /// Name used in this publisher's log fields.
 const PUBLISHER_NAME: &str = "book_change";
+
+/// `Content-Type` of every published batch: batches are always JSON (see
+/// the module docs).
+const CONTENT_TYPE: &str = "application/json";
 
 /// Default batch window in milliseconds. Events are accumulated for at most
 /// this duration before being flushed to NATS.
@@ -169,12 +197,16 @@ impl From<PriceLevelChangedEvent> for BookChangeEntry {
 ///
 /// The publisher tracks the following counters via atomic operations:
 ///
-/// - **publish_count** — number of successfully published batches
-/// - **error_count** — number of permanently failed publish attempts
+/// - **publish_count** — number of batches published successfully (every
+///   subject acknowledged), counted once per batch
+/// - **error_count** — number of batches that **failed** to publish, counted
+///   once per batch whatever the number of failed subjects (see the
+///   [module docs](self#error-accounting))
 /// - **events_received** — total events received from the listener callback
 /// - **batches_published** — total batches flushed to NATS
-/// - **dropped_events** — events dropped because the channel was full or the
-///   background task was no longer running
+/// - **dropped_events** — events dropped because the channel was full, the
+///   background task was no longer running, or shutdown gave up on
+///   an unreachable NATS link
 /// - **sequence** — monotonically increasing batch sequence number
 ///
 /// # Example
@@ -231,10 +263,10 @@ pub struct NatsBookChangePublisher {
     /// Monotonically increasing batch sequence number.
     sequence: AtomicU64,
 
-    /// Count of successfully published batches.
+    /// Count of successfully published batches (once per batch).
     publish_count: AtomicU64,
 
-    /// Count of permanently failed publish attempts (after all retries).
+    /// Count of batches that failed to publish (once per batch).
     error_count: AtomicU64,
 
     /// Total events received from the listener callback.
@@ -265,6 +297,11 @@ pub struct NatsBookChangePublisher {
     /// events, flush them, and exit. Sent by
     /// [`shutdown`](NatsBookChangePublisher::shutdown).
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+
+    /// Shutdown intent and the give-up latch shared with the background
+    /// task, so a flush already running when `shutdown()` is called stops
+    /// retrying against an unreachable link (#295).
+    shutdown_state: ShutdownState,
 }
 
 /// Sequence numbers assigned to one flushed batch, one per published
@@ -357,6 +394,7 @@ impl NatsBookChangePublisher {
             drop_log: DropLog::default(),
             task_handle: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
+            shutdown_state: ShutdownState::default(),
         }
     }
 
@@ -431,21 +469,27 @@ impl NatsBookChangePublisher {
     /// Defaults to [`DEFAULT_MAX_RETRIES`] (3). Set to 0 to disable retries.
     /// Retry `n` (zero-based) waits a jittered delay in `[c / 2, c]` where
     /// `c = min(BASE_RETRY_DELAY_MS * 2^n, MAX_RETRY_DELAY_MS)`.
+    ///
+    /// Values above [`MAX_PUBLISH_RETRIES`](crate::orderbook::nats::MAX_PUBLISH_RETRIES) (10) are **clamped** to it with a
+    /// `tracing::warn!`, so one failing publish (and `shutdown()`) stays
+    /// bounded.
     #[must_use = "builders do nothing unless consumed"]
     #[inline]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
+        self.max_retries = clamp_max_retries(max_retries);
         self
     }
 
-    /// Returns the number of successfully published batches.
+    /// Returns the number of successfully published batches (once per
+    /// batch).
     #[must_use]
     #[inline]
     pub fn publish_count(&self) -> u64 {
         self.publish_count.load(Ordering::Relaxed)
     }
 
-    /// Returns the number of permanently failed publish attempts.
+    /// Returns the number of batches that failed to publish (once per
+    /// batch, however many of its subjects failed).
     #[must_use]
     #[inline]
     pub fn error_count(&self) -> u64 {
@@ -552,6 +596,20 @@ impl NatsBookChangePublisher {
     /// joins the task reports its outcome; later calls (and a call racing
     /// the one joining) return `Ok(())` immediately.
     ///
+    /// Cancel-safe: dropping the returned future (for example under
+    /// `tokio::time::timeout`) does not detach the task; a later call joins
+    /// it.
+    ///
+    /// # Bounded with NATS down
+    ///
+    /// Each publish retries at most [`MAX_PUBLISH_RETRIES`](crate::orderbook::nats::MAX_PUBLISH_RETRIES) times. Once
+    /// shutdown is requested (in the drain, or in a flush that was already
+    /// running when this was called), the first publish that exhausts its
+    /// retries while the link is down ends publishing: the remaining
+    /// buffered events are counted in `dropped_events` and the task exits. Use
+    /// [`shutdown_with_deadline`](Self::shutdown_with_deadline) for a hard
+    /// wall-clock bound.
+    ///
     /// # Errors
     ///
     /// - [`NatsPublisherError::TaskPanicked`] if the background task panicked
@@ -559,7 +617,40 @@ impl NatsBookChangePublisher {
     /// - [`NatsPublisherError::TaskCancelled`] if the task was cancelled,
     ///   for example because its runtime shut down first.
     pub async fn shutdown(&self) -> Result<(), NatsPublisherError> {
-        shutdown_task(&self.shutdown_tx, &self.task_handle, PUBLISHER_NAME).await
+        shutdown_task(
+            &self.shutdown_state,
+            &self.shutdown_tx,
+            &self.task_handle,
+            PUBLISHER_NAME,
+        )
+        .await
+    }
+
+    /// Like [`shutdown`](Self::shutdown), but waits at most `deadline` for
+    /// the drain.
+    ///
+    /// If the task has not finished when the deadline expires it is aborted
+    /// and joined, and the events it had not published yet are discarded
+    /// **without** being counted in any metric. Cancel-safe like
+    /// `shutdown`.
+    ///
+    /// # Errors
+    ///
+    /// - [`NatsPublisherError::ShutdownTimedOut`] if the deadline expired.
+    /// - [`NatsPublisherError::TaskPanicked`] /
+    ///   [`NatsPublisherError::TaskCancelled`] as for `shutdown`.
+    pub async fn shutdown_with_deadline(
+        &self,
+        deadline: Duration,
+    ) -> Result<(), NatsPublisherError> {
+        shutdown_task_with_deadline(
+            &self.shutdown_state,
+            &self.shutdown_tx,
+            &self.task_handle,
+            PUBLISHER_NAME,
+            deadline,
+        )
+        .await
     }
 
     /// Background task that drains the event channel, batches events, and
@@ -625,7 +716,8 @@ impl NatsBookChangePublisher {
                                 Ok(Some(event)) => batch.push(BookChangeEntry::from(event)),
                                 Ok(None) => {
                                     // Channel closed — flush remaining and exit
-                                    Self::flush_batch(&publisher, &mut batch).await;
+                                    let mut gate = DrainGate::normal(&publisher.shutdown_state);
+                                    Self::flush_batch(&publisher, &mut batch, &mut gate).await;
                                     return;
                                 }
                                 Err(_) => break, // Timeout — flush batch
@@ -640,7 +732,12 @@ impl NatsBookChangePublisher {
                 );
             }
 
-            Self::flush_batch(&publisher, &mut batch).await;
+            Self::flush_batch(
+                &publisher,
+                &mut batch,
+                &mut DrainGate::normal(&publisher.shutdown_state),
+            )
+            .await;
 
             // Throttle before the next flush, raced with the shutdown signal
             // so a long interval never delays teardown.
@@ -651,26 +748,34 @@ impl NatsBookChangePublisher {
         }
 
         // Flush any remaining events
-        Self::flush_batch(&publisher, &mut batch).await;
+        Self::flush_batch(
+            &publisher,
+            &mut batch,
+            &mut DrainGate::normal(&publisher.shutdown_state),
+        )
+        .await;
     }
 
     /// Shutdown path: close the channel to new events, then flush the current
     /// batch plus everything already buffered in `max_batch_size` chunks, so
     /// no accepted event is lost. Closing first bounds the loop even while
     /// the listener keeps firing. The throttle is skipped so teardown is
-    /// prompt.
+    /// prompt. Once a publish exhausts its retries with the link down, the
+    /// rest is counted in `dropped_events` instead of being published
+    /// ([`DrainGate`]).
     async fn drain_on_shutdown(
         publisher: &Arc<Self>,
         rx: &mut mpsc::Receiver<PriceLevelChangedEvent>,
         batch: &mut Vec<BookChangeEntry>,
     ) {
         rx.close();
+        let mut gate = DrainGate::draining(&publisher.shutdown_state);
         loop {
             drain_buffered(rx, batch, publisher.max_batch_size);
             if batch.is_empty() {
                 break;
             }
-            Self::flush_batch(publisher, batch).await;
+            Self::flush_batch(publisher, batch, &mut gate).await;
         }
     }
 
@@ -686,8 +791,23 @@ impl NatsBookChangePublisher {
     /// atomic step before anything is published, so a batch is either emitted
     /// on all of its subjects or refused as a whole (never partially). The
     /// throttle is applied by the caller, raced with the shutdown signal.
-    async fn flush_batch(publisher: &Arc<Self>, batch: &mut Vec<BookChangeEntry>) {
+    ///
+    /// The outcome is counted once per batch (see the
+    /// [module docs](self#error-accounting)). A tripped `gate` (shutdown
+    /// drain, link down) publishes nothing more: the batch's events are
+    /// counted in `dropped_events`, and a batch whose first subject tripped
+    /// it skips its remaining subjects.
+    async fn flush_batch(
+        publisher: &Arc<Self>,
+        batch: &mut Vec<BookChangeEntry>,
+        gate: &mut DrainGate<'_>,
+    ) {
         if batch.is_empty() {
+            return;
+        }
+        if gate.is_tripped() {
+            add_metric(&publisher.dropped_events, batch.len(), "dropped_events");
+            batch.clear();
             return;
         }
 
@@ -720,10 +840,11 @@ impl NatsBookChangePublisher {
 
         // Publish the aggregate changes subject
         let changes_subject = format!("{}.{}.changes", publisher.subject_prefix, publisher.symbol);
-        let all_ok = Self::publish_batch(publisher, &changes_subject, &all_batch, seq).await;
+        let all_ok = Self::publish_batch(publisher, &changes_subject, &all_batch, seq, gate).await;
 
         // Publish bid-side subject if there are bid changes
         let bid_ok = match bid_seq {
+            Some(_) if gate.is_tripped() => false,
             Some(bid_seq) => {
                 let bid_changes: Vec<BookChangeEntry> = changes
                     .iter()
@@ -738,13 +859,14 @@ impl NatsBookChangePublisher {
                     changes: bid_changes,
                 };
                 let bid_subject = format!("{}.{}.bid", publisher.subject_prefix, publisher.symbol);
-                Self::publish_batch(publisher, &bid_subject, &bid_batch, bid_seq).await
+                Self::publish_batch(publisher, &bid_subject, &bid_batch, bid_seq, gate).await
             }
             None => true,
         };
 
         // Publish ask-side subject if there are ask changes
         let ask_ok = match ask_seq {
+            Some(_) if gate.is_tripped() => false,
             Some(ask_seq) => {
                 let ask_changes: Vec<BookChangeEntry> = changes
                     .iter()
@@ -759,7 +881,7 @@ impl NatsBookChangePublisher {
                     changes: ask_changes,
                 };
                 let ask_subject = format!("{}.{}.ask", publisher.subject_prefix, publisher.symbol);
-                Self::publish_batch(publisher, &ask_subject, &ask_batch, ask_seq).await
+                Self::publish_batch(publisher, &ask_subject, &ask_batch, ask_seq, gate).await
             }
             None => true,
         };
@@ -768,23 +890,27 @@ impl NatsBookChangePublisher {
             increment_metric(&publisher.publish_count, "publish_count");
             increment_metric(&publisher.batches_published, "batches_published");
             trace!(seq, symbol = %publisher.symbol, "book change batch published to NATS");
+        } else {
+            // Once per batch, however many subjects failed.
+            increment_metric(&publisher.error_count, "error_count");
         }
     }
 
     /// Serialize and publish a single batch to a NATS subject with retry logic.
     ///
-    /// Returns `true` if the publish succeeded, `false` if all retries were
-    /// exhausted.
+    /// Returns `true` if the publish succeeded, `false` if serialization
+    /// failed or all retries were exhausted (which may trip `gate`). Counting
+    /// is left to [`Self::flush_batch`], once per batch.
     async fn publish_batch(
         publisher: &Arc<Self>,
         subject: &str,
         batch: &BookChangeBatch,
         seq: u64,
+        gate: &mut DrainGate<'_>,
     ) -> bool {
         let payload = match serde_json::to_vec(batch) {
             Ok(bytes) => bytes,
             Err(e) => {
-                increment_metric(&publisher.error_count, "error_count");
                 error!(error = %e, "failed to serialize book change batch for NATS");
                 return false;
             }
@@ -794,6 +920,7 @@ impl NatsBookChangePublisher {
 
         let mut headers = async_nats::HeaderMap::new();
         headers.insert("Nats-Sequence", seq.to_string().as_str());
+        headers.insert("Content-Type", CONTENT_TYPE);
 
         let policy = RetryPolicy {
             max_retries: publisher.max_retries,
@@ -810,7 +937,7 @@ impl NatsBookChangePublisher {
         )
         .await;
         if !published {
-            increment_metric(&publisher.error_count, "error_count");
+            gate.on_publish_exhausted(&publisher.link, PUBLISHER_NAME);
         }
         published
     }
@@ -894,6 +1021,10 @@ mod tests {
             .with_min_publish_interval_ms(u64::MAX)
             .with_max_retries(u32::MAX);
         assert_eq!(publisher.batch_window_ms, MAX_BATCH_WINDOW_MS);
+        assert_eq!(
+            publisher.max_retries,
+            crate::orderbook::nats::MAX_PUBLISH_RETRIES
+        );
         assert_eq!(publisher.max_batch_size, MAX_BATCH_SIZE);
         assert_eq!(publisher.channel_capacity, MAX_CHANNEL_CAPACITY);
         assert_eq!(
@@ -926,7 +1057,9 @@ mod tests {
         // (two publishes: `changes` and `bid`) instead of being dropped.
         assert_eq!(handle.sequence(), 2, "one batch minted two sequences");
         assert_eq!(handle.publish_count(), 0, "no server to acknowledge");
-        assert_eq!(handle.error_count(), 2, "both subjects failed once each");
+        // #295: counted once per batch; the drain gave up on the link after
+        // the `changes` subject, so `bid` was not attempted.
+        assert_eq!(handle.error_count(), 1, "one failed batch, counted once");
     }
 
     #[tokio::test]
@@ -945,7 +1078,7 @@ mod tests {
         let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
         assert_eq!(joined, Ok(Ok(())));
         assert_eq!(handle.sequence(), 3, "changes + bid + ask");
-        assert_eq!(handle.error_count(), 3);
+        assert_eq!(handle.error_count(), 1, "one failed batch, counted once");
         assert_eq!(handle.dropped_events(), 0);
 
         // After shutdown the listener drops (and counts) events, never panics.
@@ -1036,7 +1169,7 @@ mod tests {
         // Let the task flush the first batch (it fails fast against the
         // offline client) and enter the throttle wait.
         let flushed = tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.error_count() < 2 {
+            while handle.error_count() < 1 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -1050,7 +1183,106 @@ mod tests {
             "shutdown must not wait out the throttle"
         );
         assert_eq!(handle.sequence(), 4, "both batches were flushed");
+        assert_eq!(handle.error_count(), 2, "one per failed batch");
         assert_eq!(handle.dropped_events(), 0);
+    }
+
+    /// #295: with NATS unreachable, the shutdown drain gives up after the
+    /// first publish that exhausts its retries, counts the rest as dropped
+    /// and completes promptly.
+    #[tokio::test]
+    async fn test_shutdown_with_link_down_is_bounded_and_counts_dropped() {
+        let publisher = publisher()
+            .await
+            .with_batch_window_ms(u64::MAX)
+            .with_max_batch_size(10)
+            .with_max_retries(2);
+        let (handle, listener) = publisher.into_listener();
+        for seq in 0..50 {
+            listener(event(Side::Buy, seq));
+        }
+        let started = std::time::Instant::now();
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(handle.events_received(), 50);
+        assert_eq!(handle.error_count(), 1, "the one batch that was attempted");
+        assert_eq!(handle.dropped_events(), 40, "the other four batches");
+        assert_eq!(handle.publish_count(), 0);
+    }
+
+    /// #295 (PR #296 review): shutdown requested while a normal flush is
+    /// already publishing against an unreachable link trips the shared
+    /// latch, so the drain that follows does not retry the next batch.
+    #[tokio::test]
+    async fn test_shutdown_during_normal_flush_with_link_down_is_bounded() {
+        let publisher = publisher().await.with_max_batch_size(5).with_max_retries(2);
+        let (handle, listener) = publisher.into_listener();
+        for seq in 0..10 {
+            listener(event(Side::Buy, seq));
+        }
+        // Wait until the first (normal) flush reserved its sequences.
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.sequence() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the normal flush started publishing");
+        let begun = std::time::Instant::now();
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())));
+        assert!(begun.elapsed() < Duration::from_secs(10));
+        assert_eq!(handle.error_count(), 1, "only the in-flight batch failed");
+        assert_eq!(handle.dropped_events(), 5, "the second batch was dropped");
+        assert_eq!(handle.sequence(), 2, "the second batch reserved nothing");
+    }
+
+    /// #295: `shutdown_with_deadline` returns a typed timeout and aborts
+    /// the task when the drain outlives the deadline.
+    #[tokio::test]
+    async fn test_shutdown_with_deadline_times_out_and_aborts() {
+        let publisher = publisher()
+            .await
+            .with_batch_window_ms(u64::MAX)
+            .with_max_retries(u32::MAX);
+        let (handle, listener) = publisher.into_listener();
+        listener(event(Side::Buy, 1));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            handle
+                .shutdown_with_deadline(Duration::from_millis(100))
+                .await,
+            Err(NatsPublisherError::ShutdownTimedOut { timeout_ms: 100 })
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The task was joined: nothing is left to shut down.
+        assert_eq!(handle.shutdown().await, Ok(()));
+    }
+
+    /// #295: dropping a `shutdown()` future mid-drain does not detach the
+    /// task; a later `shutdown()` joins it.
+    #[tokio::test]
+    async fn test_cancelled_shutdown_future_then_shutdown_joins_the_task() {
+        let publisher = publisher()
+            .await
+            .with_batch_window_ms(u64::MAX)
+            .with_max_retries(3);
+        let (handle, listener) = publisher.into_listener();
+        listener(event(Side::Buy, 1));
+        let first = tokio::time::timeout(Duration::from_millis(5), handle.shutdown()).await;
+        assert!(
+            first.is_err(),
+            "the drain outlives 5 ms (four failed attempts)"
+        );
+        assert_eq!(handle.error_count(), 0, "still draining");
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle.shutdown()).await;
+        assert_eq!(joined, Ok(Ok(())));
+        assert_eq!(
+            handle.error_count(),
+            1,
+            "the second shutdown waited for the drain to finish"
+        );
     }
 
     #[tokio::test]

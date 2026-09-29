@@ -8,7 +8,8 @@
 //!
 //! Every frame is `[len:u32 LE][kind:u8][payload …]`. `len` is the byte
 //! length of `kind + payload` (it does NOT include the 4-byte `len` prefix
-//! itself). All multi-byte integers are little-endian.
+//! itself) and is at most [`MAX_FRAME_BODY`](crate::wire::framing::MAX_FRAME_BODY) (4096) bytes. All multi-byte
+//! integers are little-endian.
 //!
 //! # Direction
 //!
@@ -62,7 +63,7 @@ pub mod inbound;
 pub mod outbound;
 
 pub use error::WireError;
-pub use framing::{decode_frame, encode_frame};
+pub use framing::{MAX_FRAME_BODY, decode_frame, encode_frame};
 pub use inbound::{
     CancelOrderWire, CancelReplaceWire, MassCancelWire, NewOrderWire, decode_cancel_order,
     decode_cancel_replace, decode_mass_cancel, decode_new_order,

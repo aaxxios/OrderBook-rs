@@ -240,6 +240,25 @@ pub enum ReplayError {
         found: u64,
     },
 
+    /// The journal's entries ended before the last sequence it reports
+    /// (#295).
+    ///
+    /// Replay reads [`Journal::last_sequence`] before iterating and
+    /// requires the iteration to reach it. An iterator that stops short (for
+    /// example a `FileJournal` whose newest segment file vanished from the
+    /// directory) would otherwise return `Ok` on a truncated prefix,
+    /// indistinguishable from a complete replay.
+    #[error(
+        "journal truncated: last sequence is {expected_last}, but replay reached {}",
+        describe_reached(*.reached)
+    )]
+    JournalTruncated {
+        /// The last sequence the journal reported before replay started.
+        expected_last: u64,
+        /// The last sequence replay read, or `None` when it read no entry.
+        reached: Option<u64>,
+    },
+
     /// The protocol sequence counter overflowed `u64` while advancing.
     ///
     /// Unreachable at any realistic journal length, but advancing the counter
@@ -469,6 +488,15 @@ fn first_difference<I: PartialEq>(recorded: &[I], replayed: &[I]) -> Option<usiz
     }
 }
 
+/// Renders the `reached` field of a [`ReplayError::JournalTruncated`].
+#[cold]
+fn describe_reached(reached: Option<u64>) -> String {
+    match reached {
+        Some(seq) => format!("sequence {seq}"),
+        None => "no entry".to_string(),
+    }
+}
+
 /// Renders the replay side of an [`ReplayError::OutcomeMismatch`].
 fn describe_outcome(actual: &Option<OrderBookError>) -> String {
     match actual {
@@ -678,6 +706,7 @@ where
     /// - [`ReplayError::StpModeMismatch`] if a journaled STP rejection records a different [`STPMode`] than the replay book uses
     /// - [`ReplayError::MassCancelMismatch`] if a journaled mass cancel or eviction does not replay to the same ids
     /// - [`ReplayError::JournalError`] if reading from the journal fails, including its last sequence
+    /// - [`ReplayError::JournalTruncated`] if the journal's entries end before the last sequence it reports
     #[must_use = "replay result carries the reconstructed book and the last applied sequence"]
     pub fn replay_from(
         journal: &impl Journal<T>,
@@ -955,6 +984,9 @@ where
         let mut count = 0u64;
         let mut expected_seq = from_sequence;
 
+        // Read before iterating: every entry up to this sequence is
+        // committed, so the iteration below must reach it (#295).
+        let target = journal.last_sequence()?;
         let iter = journal.read_from(from_sequence)?;
 
         for entry_result in iter {
@@ -995,7 +1027,40 @@ where
             }
         }
 
+        Self::ensure_reached(target, from_sequence, expected_seq)?;
         Ok(last_applied_seq)
+    }
+
+    /// Fails with [`ReplayError::JournalTruncated`] when the iteration that
+    /// started at `from_sequence` and stopped before `next_seq` did not reach
+    /// `target`, the journal's last sequence read before iterating.
+    fn ensure_reached(
+        target: Option<u64>,
+        from_sequence: u64,
+        next_seq: u64,
+    ) -> Result<(), ReplayError> {
+        let Some(expected_last) = target.filter(|last| *last >= from_sequence) else {
+            return Ok(());
+        };
+        // Gap detection makes the read sequences contiguous from
+        // `from_sequence`, so the last one read is `next_seq - 1`.
+        let reached = if next_seq > from_sequence {
+            next_seq.checked_sub(1)
+        } else {
+            None
+        };
+        if reached.is_some_and(|last| last >= expected_last) {
+            return Ok(());
+        }
+        tracing::error!(
+            expected_last,
+            reached = ?reached,
+            "journal iteration ended before its last sequence; replay refused"
+        );
+        Err(ReplayError::JournalTruncated {
+            expected_last,
+            reached,
+        })
     }
 
     /// Replays the full journal and compares the result to an expected snapshot.
@@ -2153,6 +2218,91 @@ mod tests {
             ),
             Ok(_) => panic!("expected SequenceGap {{ expected: 3, found: 4 }}, got Ok(_)"),
         }
+    }
+
+    /// A journal whose iterator stops before the last sequence it reports,
+    /// as a `FileJournal` does when its newest segment file vanished.
+    struct TruncatingJournal {
+        inner: InMemoryJournal<()>,
+        reported_last: u64,
+    }
+
+    impl Journal<()> for TruncatingJournal {
+        fn append(&self, event: &SequencerEvent<()>) -> Result<(), JournalError> {
+            self.inner.append(event)
+        }
+        fn read_from(
+            &self,
+            sequence: u64,
+        ) -> Result<crate::orderbook::sequencer::JournalReadIter<()>, JournalError> {
+            self.inner.read_from(sequence)
+        }
+        fn last_sequence(&self) -> Result<Option<u64>, JournalError> {
+            Ok(Some(self.reported_last))
+        }
+        fn verify_integrity(&self) -> Result<(), JournalError> {
+            Ok(())
+        }
+    }
+
+    /// #295: an iteration that ends before `last_sequence()` is a typed
+    /// error, never `Ok` on a truncated prefix.
+    #[test]
+    fn test_replay_reports_journal_truncated_before_last_sequence() {
+        let journal = TruncatingJournal {
+            inner: InMemoryJournal::new(),
+            reported_last: 5,
+        };
+        for seq in 0..3 {
+            journal
+                .append(&make_add_event(
+                    seq,
+                    new_id(),
+                    100 + u128::from(seq),
+                    1,
+                    Side::Buy,
+                ))
+                .expect("append");
+        }
+        match ReplayEngine::<()>::replay_from(&journal, 0, "TEST") {
+            Err(ReplayError::JournalTruncated {
+                expected_last,
+                reached,
+            }) => assert_eq!((expected_last, reached), (5, Some(2))),
+            other => panic!("expected JournalTruncated, got {:?}", other.err()),
+        }
+        // A suffix replay whose start is past every readable entry reads
+        // nothing and still fails.
+        match ReplayEngine::<()>::replay_from(&journal, 4, "TEST") {
+            Err(ReplayError::JournalTruncated {
+                expected_last,
+                reached,
+            }) => assert_eq!((expected_last, reached), (5, None)),
+            other => panic!("expected JournalTruncated, got {:?}", other.err()),
+        }
+        let err = ReplayError::JournalTruncated {
+            expected_last: 5,
+            reached: None,
+        };
+        assert!(err.to_string().contains("no entry"));
+    }
+
+    #[test]
+    fn test_replay_complete_journal_is_not_truncated() {
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        for seq in 0..3 {
+            journal
+                .append(&make_add_event(
+                    seq,
+                    new_id(),
+                    100 + u128::from(seq),
+                    1,
+                    Side::Buy,
+                ))
+                .expect("append");
+        }
+        let (_, last) = ReplayEngine::<()>::replay_from(&journal, 1, "TEST").expect("replay");
+        assert_eq!(last, 2);
     }
 
     #[test]

@@ -34,6 +34,21 @@
 //! exist only at the `GlobalAlloc` trait boundary (`alloc`, `dealloc`,
 //! `alloc_zeroed`, `realloc`); every block delegates immediately to
 //! the inner allocator after updating the counters.
+//!
+//! ## Counter overflow (diagnostic counters wrap)
+//!
+//! The counters are diagnostic only (budget tests and benches) and are
+//! bumped with a plain `fetch_add`, which **wraps** at `u64::MAX` instead of
+//! failing (#295). This is deliberate: the allocator must not allocate,
+//! panic, log or spin on a compare-and-swap loop (`fetch_update` +
+//! `checked_add` would add contention to every allocation of a process
+//! whose latency the benches measure). A wrap is unreachable in practice:
+//! `bytes_allocated`, the fastest-growing counter, takes about 58 years at
+//! a sustained 10 GB/s. Should one happen anyway, it is still observable:
+//! [`AllocSnapshot::since`] returns `None` for a pair of snapshots taken
+//! across the wrap, rather than a bogus delta. The `usize` to `u64` size
+//! casts are lossless on every supported target (pointer width at most 64
+//! bits).
 
 #![allow(unsafe_code)]
 
@@ -139,6 +154,9 @@ impl<Inner: GlobalAlloc> CountingAllocator<Inner> {
     }
 }
 
+// Counter bumps below use `fetch_add`, which wraps: see the module docs
+// ("Counter overflow") for why that is the intended diagnostic behaviour.
+//
 // SAFETY: `GlobalAlloc` is an unsafe trait. Each method below is
 // implemented as: increment a counter with `Ordering::Relaxed`, then
 // delegate to the inner allocator. The inner allocator's safety
