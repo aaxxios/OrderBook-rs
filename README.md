@@ -280,6 +280,20 @@ This order book engine is built with the following design principles:
   `flush_listener_events()`); `pending_listener_events()` gauges the
   unbounded backlog a slow listener builds. A poisoned submit gate now engages the kill
   switch (`submit_gate_poisoned()`) instead of being recovered silently.
+- **Bounded journal recovery and NATS shutdown (#295).** Reopening a
+  `FileJournal` whose latest segment ends in garbage is linear in the
+  segment size (cheap pre-checks, capped CRC probes) instead of
+  effectively never returning; an empty latest segment left by a crash is
+  grown on open; only canonical segment names are read. Replay reports
+  `ReplayError::JournalTruncated` when the entries end before
+  `last_sequence()`. The NATS publishers clamp `with_max_retries` to
+  `MAX_PUBLISH_RETRIES` (10), stop publishing during the shutdown drain
+  once the link is down (the rest is counted in `dropped_events`), have a
+  cancel-safe `shutdown()` and a new `shutdown_with_deadline(Duration)`.
+  The book-change publisher sends `Content-Type: application/json` and
+  counts errors once per batch. Wire frames above `MAX_FRAME_BODY` (4096)
+  are rejected, and the outbound encoders refuse values their decoders
+  reject.
 
 #### Migration from 0.13
 
@@ -366,6 +380,14 @@ This order book engine is built with the following design principles:
 | remainder not rested after trades: no terminal state | `Cancelled { filled_quantity, reason: RestFailed }` |
 | modify after a concurrent partial fill: re-add rested the quantity read before it | `UpdatePrice` moves the remainder; `UpdatePriceAndQuantity` / `Replace`: `Err(ModifyRolledBack { source: OrderChangedDuringModify, .. })` |
 | re-priced partially filled order: state reset to `Open` | `PartiallyFilled` with cumulative quantities |
+| `ReplayError` (no truncation variant); a journal whose entries end early replays `Ok` on the prefix | adds `JournalTruncated { expected_last, reached }` (exhaustive matches need an arm) |
+| `FileJournal` lists any `segment-<u64>.journal` name | only canonical `segment-<20 digits>.journal` names |
+| `Nats{Trade,BookChange}Publisher::with_max_retries(n)`: any `u32` | clamped to `MAX_PUBLISH_RETRIES` (10) with a `WARN` |
+| shutdown drain with NATS down retries every buffered event | after the first exhausted publish the rest is counted in `dropped_events` |
+| `NatsPublisherError { TaskPanicked, TaskCancelled }` | adds `ShutdownTimedOut { timeout_ms }` (`shutdown_with_deadline`) |
+| `NatsBookChangePublisher::error_count()`: one per failed subject | one per failed batch |
+| `wire::decode_frame`: oversized `len` → `Truncated` | `len > MAX_FRAME_BODY` (4096) → `InvalidPayload`; `encode_frame` refuses it |
+| `wire::encode_exec_report` / `encode_book_update` encode any `status` / `_pad` / `side` | `Err(WireError::InvalidPayload(..))` for values the decoders reject |
 
 Re-exported pricelevel items change with pricelevel 0.10:
 `PriceLevel::snapshot()` returns `Result`, `Trade::new` is gone (use

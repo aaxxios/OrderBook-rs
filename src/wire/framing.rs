@@ -25,6 +25,18 @@ const KIND_SIZE: usize = 1;
 /// payload). Also the offset of the first payload byte.
 const MIN_FRAME_SIZE: usize = LEN_PREFIX + KIND_SIZE;
 
+/// Largest accepted frame body (`kind + payload`, the value of the `len`
+/// prefix), in bytes (#295).
+///
+/// Every message defined today has a fixed payload of at most 48 bytes, so
+/// this leaves ample room for forward-compatible additions while letting a
+/// reader reject a hostile or corrupt length prefix as soon as it has the
+/// 5-byte header, instead of waiting for (or buffering) up to 4 GiB as
+/// [`WireError::Truncated`]. [`decode_frame`] returns
+/// [`WireError::InvalidPayload`] above it; [`encode_frame`] refuses to emit
+/// such a frame.
+pub const MAX_FRAME_BODY: usize = 4096;
+
 /// Encodes a frame into `out`.
 ///
 /// Writes `len` (4 bytes, little-endian, value `1 + payload.len()`), the
@@ -33,9 +45,10 @@ const MIN_FRAME_SIZE: usize = LEN_PREFIX + KIND_SIZE;
 /// # Errors
 ///
 /// Propagates any [`io::Error`] returned by the underlying writer, and
-/// returns [`io::ErrorKind::InvalidInput`] when `kind + payload` does not
-/// fit in the wire-format `u32` length prefix — guarantees the declared
-/// frame length always matches the bytes written.
+/// returns [`io::ErrorKind::InvalidInput`] when `kind + payload` exceeds
+/// [`MAX_FRAME_BODY`] (and therefore the wire-format `u32` length prefix):
+/// the declared frame length always matches the bytes written, and every
+/// emitted frame is one [`decode_frame`] accepts.
 #[inline]
 pub fn encode_frame<W: Write>(kind: u8, payload: &[u8], out: &mut W) -> io::Result<()> {
     // `len` is the size of `kind + payload`. Reject payloads whose encoded
@@ -45,6 +58,7 @@ pub fn encode_frame<W: Write>(kind: u8, payload: &[u8], out: &mut W) -> io::Resu
     let body_len_usize = payload
         .len()
         .checked_add(KIND_SIZE)
+        .filter(|len| *len <= MAX_FRAME_BODY)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame payload too large"))?;
     let body_len = u32::try_from(body_len_usize)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame payload too large"))?;
@@ -63,7 +77,10 @@ pub fn encode_frame<W: Write>(kind: u8, payload: &[u8], out: &mut W) -> io::Resu
 /// # Errors
 ///
 /// Returns [`WireError::Truncated`] if `buf` is shorter than the framing
-/// header or shorter than the body length declared by the header.
+/// header or shorter than the body length declared by the header, and
+/// [`WireError::InvalidPayload`] if the declared body length is zero or
+/// above [`MAX_FRAME_BODY`] (checked before the truncation check, so a
+/// stream reader can reject the frame from its header alone).
 #[inline]
 #[must_use = "the decoded value (or error) must be handled"]
 pub fn decode_frame(buf: &[u8]) -> Result<(u8, &[u8], usize), WireError> {
@@ -78,6 +95,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<(u8, &[u8], usize), WireError> {
 
     if body_len < KIND_SIZE {
         return Err(WireError::InvalidPayload("frame body shorter than kind"));
+    }
+    if body_len > MAX_FRAME_BODY {
+        return Err(WireError::InvalidPayload(
+            "frame length exceeds MAX_FRAME_BODY",
+        ));
     }
 
     let total = LEN_PREFIX
@@ -159,11 +181,45 @@ mod tests {
     }
 
     #[test]
-    fn max_declared_length_is_truncated_not_panic() {
-        // `len = u32::MAX` on a 6-byte buffer: the checked arithmetic and
-        // `get` reject it as truncated.
+    fn max_declared_length_is_invalid_not_truncated() {
+        // #295: `len = u32::MAX` on a 6-byte buffer is rejected from the
+        // header alone instead of reported as truncated (which would make a
+        // stream reader wait for 4 GiB).
         let buf = [0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00];
-        assert_eq!(decode_frame(&buf), Err(WireError::Truncated));
+        assert_eq!(
+            decode_frame(&buf),
+            Err(WireError::InvalidPayload(
+                "frame length exceeds MAX_FRAME_BODY"
+            ))
+        );
+    }
+
+    #[test]
+    fn frame_body_limit_is_inclusive_on_both_sides() {
+        let max_payload = vec![0xAB; MAX_FRAME_BODY - KIND_SIZE];
+        let mut buf = Vec::new();
+        encode_frame(0x01, &max_payload, &mut buf).expect("largest frame encodes");
+        let (_, payload, consumed) = decode_frame(&buf).expect("largest frame decodes");
+        assert_eq!(payload.len(), MAX_FRAME_BODY - KIND_SIZE);
+        assert_eq!(consumed, buf.len());
+
+        let oversized = vec![0xAB; MAX_FRAME_BODY];
+        let mut out = Vec::new();
+        let err = encode_frame(0x01, &oversized, &mut out).expect_err("oversized frame");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(out.is_empty(), "nothing written for a refused frame");
+
+        // A header declaring one byte more than the limit is invalid even
+        // with the full body present.
+        let mut forged = u32::try_from(MAX_FRAME_BODY + 1)
+            .expect("fits u32")
+            .to_le_bytes()
+            .to_vec();
+        forged.extend(std::iter::repeat_n(0u8, MAX_FRAME_BODY + 1));
+        assert!(matches!(
+            decode_frame(&forged),
+            Err(WireError::InvalidPayload(_))
+        ));
     }
 
     #[test]

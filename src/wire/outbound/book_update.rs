@@ -47,10 +47,16 @@ pub struct BookUpdateWire {
 ///
 /// # Errors
 ///
-/// Returns [`WireError::CapacityOverflow`] when `out` cannot grow by
-/// [`BOOK_UPDATE_SIZE`] bytes. `out` is left unchanged in that case.
+/// Returns [`WireError::InvalidPayload`] when `side` is neither
+/// [`SIDE_BUY`] nor [`SIDE_SELL`]: [`decode_book_update`] rejects it, so the
+/// encoder never emits a frame its own decoder refuses (#295). Returns
+/// [`WireError::CapacityOverflow`] when `out` cannot grow by
+/// [`BOOK_UPDATE_SIZE`] bytes. `out` is left unchanged in either case.
 #[inline]
 pub fn encode_book_update(update: &BookUpdateWire, out: &mut Vec<u8>) -> Result<(), WireError> {
+    if update.side != SIDE_BUY && update.side != SIDE_SELL {
+        return Err(WireError::InvalidPayload("BookUpdate: unknown side"));
+    }
     reserve_payload(out, BOOK_UPDATE_SIZE)?;
     out.extend_from_slice(&update.engine_seq.to_le_bytes());
     out.push(update.side);
@@ -176,6 +182,26 @@ mod tests {
         encode_book_update(&msg, &mut exact).expect("encode into exact buffer");
         assert_eq!(exact.len(), BOOK_UPDATE_SIZE);
         assert_eq!(exact.capacity(), cap);
+    }
+
+    /// #295: the encoder refuses a side the decoder would reject, leaving
+    /// `out` unchanged.
+    #[test]
+    fn encoder_rejects_unknown_side() {
+        let mut out = vec![0xEE];
+        for side in [2u8, u8::MAX] {
+            let bad = BookUpdateWire {
+                engine_seq: 1,
+                side,
+                price: 0,
+                qty: 0,
+            };
+            assert_eq!(
+                encode_book_update(&bad, &mut out),
+                Err(WireError::InvalidPayload("BookUpdate: unknown side"))
+            );
+            assert_eq!(out, vec![0xEE], "out unchanged");
+        }
     }
 
     #[test]
