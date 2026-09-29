@@ -72,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     location is the id's ownership token (#288), and releasing it first
     would let a same-id order admitted meanwhile have its resting state
     overwritten by the old order's `Filled`. Event order is unchanged.
+  - The rest path claims an order's location and publishes its
+    user-index entry, risk reservation and resting state before the level
+    admits it (#288), running caller code in between (`Clock`, metrics,
+    `T::default()`). A panic there left all of them, and possibly a new
+    empty level, behind for an order no level holds. A drop guard now
+    withdraws them in #288's release order (user index and reservation,
+    then the location, then the recorded state, clock-free), and removes
+    the empty level.
   - A standalone `OrderStateTracker::transition` invoked its listener
     before queuing a terminal id for eviction, so a panicking listener
     left the id retained forever. The id is queued first.
@@ -89,7 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rounds); `add_limit_orders` +0.6%, `add_limit_orders_with_listeners`
   +0.6%, `match_market_against_limit` -2.3%,
   `match_market_against_limit_with_listeners` +0.6%,
-  `match_market_against_iceberg` -0.9% (5 rounds). All within noise.
+  `match_market_against_iceberg` -0.9% (5 rounds). The rest-path claim
+  guard, against main e0762f4: `add_only_hdr` p50 / p99 / p99.9
+  +1.9% / -3.4% / -3.7% (8 rounds); `add_limit_orders` +0.7%,
+  `add_limit_orders_with_listeners` +1.1%, `match_market_against_limit`
+  +0.8% (4 rounds). All within noise.
 
 - **Panic-free matching, STP and matching pool (#246).** The last
   panicking forms in `matching.rs`, `stp.rs` and `pool.rs` are gone and

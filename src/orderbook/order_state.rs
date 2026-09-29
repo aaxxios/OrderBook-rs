@@ -456,6 +456,37 @@ impl OrderStateTracker {
         Some((old, new_status))
     }
 
+    /// Undo the transition that recorded `status` for `order_id`, when it
+    /// is still the latest one (#294).
+    ///
+    /// For a book whose rest path unwound after recording the resting
+    /// state of an order its level never admitted: pops that history entry
+    /// and restores the previous status, or forgets the order when it was
+    /// its only transition. Reads no clock and invokes no listener (the
+    /// unwinding emission scope drops the deferred event). A non-matching
+    /// latest status, or no entry, is left untouched.
+    pub(crate) fn withdraw_last_transition(&self, order_id: Id, status: &OrderStatus) {
+        let dashmap::Entry::Occupied(mut occupied) = self.entries.entry(order_id) else {
+            return;
+        };
+        let tracked = occupied.get_mut();
+        if tracked.status != *status
+            || tracked
+                .history
+                .last()
+                .is_none_or(|(_, last)| last != status)
+        {
+            return;
+        }
+        tracked.history.pop();
+        match tracked.history.last() {
+            Some((_, previous)) => tracked.status = previous.clone(),
+            None => {
+                occupied.remove();
+            }
+        }
+    }
+
     /// The installed listener, if any (#249: the owning book invokes it
     /// from its deferred dispatcher).
     #[inline]

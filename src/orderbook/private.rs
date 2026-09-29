@@ -173,6 +173,21 @@ where
         }
     }
 
+    /// Undo a resting state [`Self::track_state`] recorded for an order
+    /// whose admission then unwound (#294). No clock, no listener, no
+    /// metric: safe to call from a drop guard while the thread unwinds.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn withdraw_tracked_state(
+        &self,
+        order_id: pricelevel::Id,
+        status: &super::order_state::OrderStatus,
+    ) {
+        if let Some(ref tracker) = self.order_state_tracker {
+            tracker.withdraw_last_transition(order_id, status);
+        }
+    }
+
     /// Record an `OrderStatus::Rejected` transition for a failed risk
     /// admission, mapping the typed [`OrderBookError`] to its closed
     /// [`super::reject_reason::RejectReason`] code.

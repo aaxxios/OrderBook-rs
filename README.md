@@ -298,7 +298,7 @@ This order book engine is built with the following design principles:
   the submit gate (a `Clock`, metrics recorder or `tracing` subscriber
   running mid-mutation) now engages the kill switch and latches
   `submit_gate_poisoned()` like one under the exclusive side; a sweep
-  drain that unwinds leaves no ghost order location; the public
+  drain or rest path that unwinds leaves no ghost order location; the public
   `place_order_in_book` bypass is gone; a standalone
   `OrderStateTracker` queues a terminal id for eviction before its
   listener runs; the listener dispatcher always progresses when its

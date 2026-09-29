@@ -7,7 +7,10 @@
 //!   maker's `Filled` state) leaves no ghost location or user-index entry
 //!   for the makers it consumed;
 //! - a standalone `OrderStateTracker` whose listener panics still queues
-//!   the terminal id for eviction.
+//!   the terminal id for eviction;
+//! - a rest path that unwinds between the location claim and the level's
+//!   admission withdraws everything it published (location, user index,
+//!   risk reservation, resting state, an empty level it created).
 
 #[cfg(test)]
 // tests may panic: rules/global_rules.md § Testing
@@ -16,6 +19,7 @@ mod tests {
     use crate::orderbook::book::OrderBook;
     use crate::orderbook::clock::Clock;
     use crate::orderbook::order_state::{OrderStateTracker, OrderStatus};
+    use crate::orderbook::risk::RiskConfig;
     use crate::{OrderBookError, current_time_millis};
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
     use std::sync::Arc;
@@ -238,5 +242,125 @@ mod tests {
         tracker.transition(Id::from_u64(2), OrderStatus::Filled { filled_quantity: 1 });
         assert!(tracker.get(Id::from_u64(1)).is_none(), "evicted");
         assert!(tracker.get(Id::from_u64(2)).is_some());
+    }
+
+    /// A `Clock` panic while the rest path records the resting state (the
+    /// location and user entry already claimed, the risk reservation
+    /// taken) used to leave them all behind for an order no level holds.
+    #[test]
+    fn test_rest_clock_panic_withdraws_claim() {
+        let clock = Arc::new(ArmedClock::default());
+        let mut book = book_with_clock(&clock);
+        book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(2));
+        let book = Arc::new(book);
+        book.add_order(limit(1, 90, 5, Side::Buy, 1))
+            .expect("resting bid");
+
+        clock.armed.store(true, Ordering::SeqCst);
+        let panicking = Arc::clone(&book);
+        let joined = thread::spawn(move || {
+            let _ = panicking.add_order(limit(2, 80, 1, Side::Buy, 1));
+        })
+        .join();
+        assert!(joined.is_err(), "the Clock panic propagated");
+        clock.armed.store(false, Ordering::SeqCst);
+
+        let id = Id::from_u64(2);
+        assert!(!book.order_locations.contains_key(&id), "ghost location");
+        assert!(
+            !book
+                .user_orders
+                .iter()
+                .any(|entry| entry.value().contains(&id)),
+            "ghost user-index entry"
+        );
+        let tracker = book.order_state_tracker.as_ref().expect("tracker");
+        assert!(tracker.get(id).is_none(), "no state was recorded");
+        assert!(book.bids.get(&80).is_none(), "no level");
+        assert!(book.is_kill_switch_engaged());
+
+        // The reservation was released: the account's second slot is free
+        // again, and the third is still refused.
+        book.release_kill_switch();
+        book.add_order(limit(3, 85, 1, Side::Buy, 1))
+            .expect("second open order fits");
+        let err = book
+            .add_order(limit(4, 84, 1, Side::Buy, 1))
+            .expect_err("third open order refused");
+        assert!(
+            matches!(err, OrderBookError::RiskMaxOpenOrders { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A panic inside the level admission (after the resting state was
+    /// recorded and the level created) withdraws the state and removes the
+    /// empty level too.
+    #[test]
+    fn test_rest_admission_panic_withdraws_state_and_level() {
+        let clock = Arc::new(ArmedClock::default());
+        let mut book = book_with_clock(&clock);
+        book.rest_fault_hook = Some(Arc::new(|id: Id| {
+            if id == Id::from_u64(2) {
+                panic!("injected admission panic");
+            }
+            None
+        }));
+        let book = Arc::new(book);
+        book.add_order(limit(1, 90, 5, Side::Buy, 1))
+            .expect("resting bid");
+
+        let panicking = Arc::clone(&book);
+        let joined = thread::spawn(move || {
+            let _ = panicking.add_order(limit(2, 80, 1, Side::Buy, 1));
+        })
+        .join();
+        assert!(joined.is_err(), "the admission panic propagated");
+
+        let id = Id::from_u64(2);
+        assert!(!book.order_locations.contains_key(&id), "ghost location");
+        assert!(
+            !book
+                .user_orders
+                .iter()
+                .any(|entry| entry.value().contains(&id)),
+            "ghost user-index entry"
+        );
+        let tracker = book.order_state_tracker.as_ref().expect("tracker");
+        assert!(tracker.get(id).is_none(), "resting state withdrawn");
+        assert!(book.bids.get(&80).is_none(), "empty level removed");
+        assert_eq!(book.best_bid(), Some(90));
+        // The earlier order is untouched.
+        assert!(book.order_locations.contains_key(&Id::from_u64(1)));
+        assert!(matches!(
+            tracker.get(Id::from_u64(1)),
+            Some(OrderStatus::Open)
+        ));
+        assert!(book.is_kill_switch_engaged());
+    }
+
+    /// `withdraw_last_transition` restores the previous status, forgets an
+    /// order whose only transition it removes, and ignores a mismatch.
+    #[test]
+    fn test_withdraw_last_transition() {
+        let tracker = OrderStateTracker::new();
+        let id = Id::from_u64(7);
+        let partial = OrderStatus::PartiallyFilled {
+            original_quantity: 10,
+            filled_quantity: 4,
+        };
+        tracker.transition(id, OrderStatus::Open);
+        tracker.transition(id, partial.clone());
+
+        tracker.withdraw_last_transition(id, &OrderStatus::Open);
+        assert_eq!(tracker.get(id), Some(partial.clone()), "mismatch ignored");
+
+        tracker.withdraw_last_transition(id, &partial);
+        assert_eq!(tracker.get(id), Some(OrderStatus::Open));
+        assert_eq!(tracker.get_history(id).map(|h| h.len()), Some(1));
+
+        tracker.withdraw_last_transition(id, &OrderStatus::Open);
+        assert!(tracker.get(id).is_none(), "only transition removed");
+        tracker.withdraw_last_transition(id, &OrderStatus::Open);
     }
 }
