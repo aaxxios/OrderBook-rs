@@ -437,12 +437,15 @@ change.
   rested, and overwrote the maker's `Filled` state with `Open`
   (pre-existing on main; 100/100 runs of the new 8-thread stress test
   failed). `rest_on_level` now publishes the location (claimed atomically
-  with `DashMap::entry`), special-order tracking and the resting state
+  with `DashMap::entry`), the user-index entry and the resting state
   before the level admits the order, and withdraws them if the level
-  refuses it; the user-index entry is pushed after the admission and
-  withdrawn again if a concurrent sweep or cancel removed the order's
-  location meanwhile. No new lock. The same fix reordered the raw
-  `place_order_in_book`.
+  refuses it. The location is the id's ownership token: every remover
+  (sweep drain, cancel, zero-quantity update, rollbacks) releases it
+  last, so a reused id never sees or removes a previous order's user or
+  risk entry, and emptied `user_orders` entries are dropped only if still
+  empty. Special orders are still registered after the admission, so a
+  repricing pass cannot unregister an order that is being admitted. No
+  new lock. The same fix reordered the raw `place_order_in_book`.
 - **Risk open-order count no longer double-released by two sweeps
   sharing a maker (#288).** The fill hook of the risk layer marked a fully filled
   maker's entry exhausted and removed it in two steps; the other sweep's
@@ -458,6 +461,13 @@ change.
     As before, it may have traded first. `place_order_in_book` returns
     `DuplicateOrderId` for an id already located on the book instead of
     overwriting its location.
+  - `SequencerResult::from` classifies `DuplicateOrderId` as
+    `may_have_mutated: true`: the loser of a concurrent same-id race can
+    fail with it after trading (it also counts in the reject metric then,
+    without an order state, which belongs to the winner). Replay was
+    already re-executing these rejections. Replay cannot reproduce such a
+    race (the loser's trades are missing from the replayed book); unique
+    ids per submit are an ingress / sequencing obligation.
   - A cancel that arrives while an order is being rested now finds it as
     soon as its level admits it (it used to return `Ok(None)` until the
     bookkeeping finished).

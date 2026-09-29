@@ -502,41 +502,70 @@ main.
 
 Contract: `rest_on_level` (the single resting point for a submit's
 remainder, a modify's re-add and a modify's restore) publishes, in order,
-the risk reservation (#243), the location, claimed atomically with
-`DashMap::entry` (an occupied entry is `DuplicateOrderId`, with the
-reservation released), special-order tracking and the resting state, and
-only then admits the order to its level under the price's shared stripe
-(#247). A sweep that consumes the order therefore finds its location and
-risk entry, removes them, and records `Filled` after the resting state; a
-cancel finds it as soon as the level holds it.
+the risk reservation (#243), the location, the user-index entry and the
+resting state, and only then admits the order to its level under the
+price's shared stripe (#247). Special-order tracking, the strandable-maker
+count (a strandable maker always rests under the exclusive gate, where no
+sweep overlaps it), the level event and the depth gauges follow the
+admission. A sweep that consumes the order therefore finds its location,
+user entry and risk entry, removes them, and records `Filled` after the
+resting state; a cancel finds it as soon as the level holds it.
 
-The user-index entry is pushed right after the admission and followed by a
-re-check of the location. Every remover (the sweep's drain, the
-single-order cancel) drops the location before it untracks the user
-entry: if the re-check still sees this order's location, the remover's
-untrack is ordered after the push (through the location map's lock) and
-removes it; if the location is gone, the remover may have untracked
-first, so the resting thread untracks the entry itself (idempotent).
-Pushing it before the admission needs no re-check but measured 6% to 8%
-slower on `concurrent_add_limit_orders/2` (two threads admitting for one
-account, whose single user-index entry is the hot spot). Measured against
-main with three interleaved rounds, the re-check variant costs one
-`order_locations` read per rested order: `add_limit_orders` +1.6% to
-+2.5%, `add_only_hdr` p50 one 41.7 ns clock tick (27 to 28 ticks), p99 /
-p99.9 within noise; `concurrent_add_limit_orders` +3.1% at 2 threads,
-+2.0% at 4, -1.7% at 8, -0.3% at 16; `concurrent_mixed_operations` and
-`mixed_70_20_10_hdr` within noise.
+**The location is the id's ownership token** (PR #290 review). It is
+claimed atomically with `DashMap::entry` (an occupied entry is
+`DuplicateOrderId`, with the reservation released), and every remover
+releases it **last**: the sweep's drain, the single-order cancel
+(`finish_removal`), the zero-quantity `UpdateQuantity`, a refused
+admission's rollback (`withdraw_unrested`) and `place_order_in_book`'s
+rollback untrack the user entry, release the risk entry and (a cancel)
+unregister special orders first. A user-index or risk entry for an id therefore only
+exists while one admission owns the id, so an id reused as soon as the
+previous order is gone (supported, see `strandable_maker_count.rs`) can
+neither see nor remove the previous order's entries. A first version of
+this fix pushed the user entry after the admission and re-checked the
+location by value; that let a reuse of the id at the same price and side
+keep a stale second entry (`test_id_reused_mid_rest_keeps_one_user_entry`
+fails on it). Emptied `user_orders` entries are dropped with `remove_if`
+on emptiness, so a push for the same user between the emptying and the
+removal is kept.
+
+Special-order tracking is registered after the admission, as before #288:
+the repricers unregister every tracked id `get_order` cannot find, so a
+registration made before the order reached its level could be lost for
+good. A registration that lands after a concurrent cancel leaves a stale
+id, which the next repricing pass removes. (Pre-existing and unchanged: a
+repricer that reads `get_order == None` for an order that is then
+replaced by a same-id order can unregister the new one.)
+
+Cost, measured against main with three interleaved rounds: one location
+claim instead of an insert, and the user-index push moved ahead of the
+admission. `add_limit_orders` +0.3%, `add_only_hdr` p50 / p99 / p99.9
++0.0% / -1.5% / -0.7%; `concurrent_add_limit_orders` +4.3% at 2 threads
+(two threads admitting for one account, whose single user-index entry is
+the hot spot), -0.6% at 4, -4.0% at 8, -0.4% at 16;
+`concurrent_mixed_operations` +0.2% to +1.3%; `mixed_70_20_10_hdr` p99 /
+p99.9 -2.7% / -4.1%; `add_only_risk_hdr` p50 -6.2%.
 
 If the level refuses the order (counter capacity, a poisoned level), the
-location, special-order tracking and reservation are withdrawn and the
-recorded state is followed by the caller's terminal one (`Rejected`,
-`Cancelled { RestFailed }`, or a modify's restore). Readers can briefly
-observe an order located but not yet on its level (`get_order` returns
-`None`, a cancel returns `Ok(None)`) and, right after the admission, a
-resting order whose user-index entry is not pushed yet; never an index
-left behind for an order that no longer rests. No lock was added; the
-strandable-maker count stays after the admission because a strandable
-maker always rests under the exclusive gate, where no sweep overlaps it.
+user entry and reservation are withdrawn, then the location is released,
+and the recorded state is followed by the caller's terminal one
+(`Rejected`, `Cancelled { RestFailed }`, or a modify's restore). Readers
+can briefly observe an order indexed but not yet on its level
+(`get_order` returns `None`, a cancel returns `Ok(None)`); never an index
+left behind for an order that no longer rests. No lock was added.
+
+**Duplicate ids and replay.** The atomic claim means a same-id submit
+that lost a concurrent admission race fails with `DuplicateOrderId`
+**after its sweep may have traded**, so `SequencerResult::from` now
+classifies `DuplicateOrderId` as `may_have_mutated: true` (the early,
+pre-trade duplicate check raises the same error). Such a loser records no
+order state (the id belongs to the winner; a terminal state would end the
+winner on the tracker) but is counted in the reject metric when it
+traded. Replay cannot reproduce it: replayed sequentially the loser meets
+the winner resting and is refused by the early check with no fills, the
+reject codes agree, and the missing trades surface only in
+`snapshots_match`. Unique order ids, or submits serialized per id, are an
+ingress / sequencing obligation (see the `sequencer::replay` module docs).
 
 The same stress test exposed a second window, in the risk layer: two
 sweeps can share a maker, and the one that consumes it last also calls

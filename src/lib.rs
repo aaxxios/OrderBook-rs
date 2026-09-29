@@ -239,11 +239,12 @@
 //!   locked book, and keeps `filled_quantity` cumulative; an emptied price
 //!   level is never removed while a concurrent submit is admitting into it.
 //! - **Consistent indices under concurrent crossing adds (#288).** An
-//!   order's location, special-order tracking and resting state are
-//!   published before its level admits it (its user-index entry right
-//!   after, re-checked against the location), so a concurrent sweep that
-//!   consumes it removes them instead of racing their insertion, and a
-//!   same-id submit is refused with `DuplicateOrderId`. The risk layer
+//!   order's location, user-index entry and resting state are published
+//!   before its level admits it, and every remover releases the location
+//!   (the id's ownership token) last, so a concurrent sweep that consumes
+//!   the order removes them instead of racing their insertion, a reused id
+//!   never touches a previous order's entries, and a same-id submit is
+//!   refused with `DuplicateOrderId` (now classified as possibly mutating). The risk layer
 //!   removes a fully filled maker's entry under the same lock that zeroes
 //!   it, so two sweeps sharing a maker release its open-order slot once.
 //!
