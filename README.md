@@ -49,8 +49,17 @@ This order book engine is built with the following design principles:
 ### What's New in Version 0.14.0 (unreleased)
 
 0.14.0 is the panic-policy release: crate-owned code no longer initiates
-panics, the gate enforcing it is absolute, and every failure that used to
-be clamped, ignored or silently recovered is a typed error. It is a
+panics and the gate enforcing it is absolute. The engine and state
+failures the audit found clamped, ignored or silently recovered (matching,
+fees and notionals, risk, modifies, mass cancels, snapshots and restore,
+journals and replay, wire and bincode decoding) now surface as typed
+errors. A few documented paths stay infallible by design and use an
+explicit, logged or counted fallback instead: `current_time_millis()`
+returns `0` / `u64::MAX` sentinels (use `try_current_time_millis()` for a
+`Result`), the `CountingAllocator` diagnostic counters wrap, NATS builder
+values are clamped with a `WARN`, undeliverable listener events are
+counted in `dropped_listener_events()`, and the `()`-guarded level-stripe,
+outbox and eviction-queue locks recover from poison with a log. It is a
 breaking release; see the migration table below.
 
 #### Breaking behaviour
