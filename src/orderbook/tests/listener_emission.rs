@@ -191,30 +191,32 @@ mod tests {
         push(log, format!("R all {}", m.cancelled_count()));
     }
 
-    /// Stream recorded on `main` (4a21d2b) before #249, with the same
-    /// scenario. Emission moved after commit and gate release; for a single
-    /// thread the order must not change at all.
+    /// Stream recorded on `main` (c59d74f, after #288 / #291) with the
+    /// same scenario and the listeners still running inline. Emission moved
+    /// after commit and gate release; for a single thread the order must
+    /// not change at all. (#288 moved each resting order's `Open` state
+    /// ahead of its level event on main; the branch follows it exactly.)
     const EXPECTED: &[&str] = &[
-        "L seq=0 Sell 101 q=5",
         "S 00000000-0000-0001-0000-000000000000 Open -> Open",
+        "L seq=0 Sell 101 q=5",
         "R add ok",
-        "L seq=1 Sell 102 q=5",
         "S 00000000-0000-0002-0000-000000000000 Open -> Open",
+        "L seq=1 Sell 102 q=5",
         "R add ok",
-        "L seq=2 Sell 102 q=8",
         "S 00000000-0000-0003-0000-000000000000 Open -> Open",
+        "L seq=2 Sell 102 q=8",
         "R add ok",
-        "L seq=3 Sell 103 q=10",
         "S 00000000-0000-0004-0000-000000000000 Open -> Open",
+        "L seq=3 Sell 103 q=10",
         "R add ok",
-        "L seq=4 Buy 99 q=5",
         "S 00000000-0000-0005-0000-000000000000 Open -> Open",
+        "L seq=4 Buy 99 q=5",
         "R add ok",
-        "L seq=5 Buy 98 q=4",
         "S 00000000-0000-0006-0000-000000000000 Open -> Open",
+        "L seq=5 Buy 98 q=4",
         "R add ok",
-        "L seq=6 Buy 97 q=6",
         "S 00000000-0000-0007-0000-000000000000 Open -> Open",
+        "L seq=6 Buy 97 q=6",
         "R add ok",
         "L seq=7 Sell 101 q=0",
         "L seq=8 Sell 102 q=5",
@@ -226,8 +228,8 @@ mod tests {
         "S 00000000-0000-0002-0000-000000000000 Open -> Filled(2)",
         "S 00000000-0000-0003-0000-000000000000 Open -> Filled(3)",
         "T seq=11 taker=00000000-0000-000b-0000-000000000000 makers=[00000000-0000-0002-0000-000000000000@102x2,00000000-0000-0003-0000-000000000000@102x3] maker_fees=0 taker_fees=0",
-        "L seq=12 Buy 102 q=1",
         "S 00000000-0000-000b-0000-000000000000 PartiallyFilled(5/6) -> PartiallyFilled(5/6)",
+        "L seq=12 Buy 102 q=1",
         "C T seq=11 taker=00000000-0000-000b-0000-000000000000 makers=[00000000-0000-0002-0000-000000000000@102x2,00000000-0000-0003-0000-000000000000@102x3] maker_fees=0 taker_fees=0",
         "R with_result ok",
         "L seq=13 Buy 102 q=0",
@@ -242,8 +244,8 @@ mod tests {
         "R cancel ok",
         "L seq=18 Sell 103 q=0",
         "S 00000000-0000-0004-0000-000000000000 Open -> Cancelled(user requested, filled=0)",
-        "L seq=19 Sell 104 q=10",
         "S 00000000-0000-0004-0000-000000000000 Cancelled(user requested, filled=0) -> Open",
+        "L seq=19 Sell 104 q=10",
         "R update_price ok",
         "L seq=20 Sell 104 q=4",
         "R update_qty ok",
@@ -259,17 +261,17 @@ mod tests {
         "R killed err kill switch active: new order entry and modifications are halted",
         "S 00000000-0000-0010-0000-000000000000 Rejected(kill switch active) -> Rejected(kill switch active)",
         "R killed_limit err kill switch active: new order entry and modifications are halted",
-        "L seq=23 Buy 95 q=2",
         "S 00000000-0000-0014-0000-000000000000 Open -> Open",
+        "L seq=23 Buy 95 q=2",
         "R add ok",
-        "L seq=24 Buy 94 q=2",
         "S 00000000-0000-0015-0000-000000000000 Open -> Open",
+        "L seq=24 Buy 94 q=2",
         "R add ok",
-        "L seq=25 Sell 120 q=2",
         "S 00000000-0000-0016-0000-000000000000 Open -> Open",
+        "L seq=25 Sell 120 q=2",
         "R add ok",
-        "L seq=26 Sell 121 q=2",
         "S 00000000-0000-0017-0000-000000000000 Open -> Open",
+        "L seq=26 Sell 121 q=2",
         "R add ok",
         "L seq=27 Sell 104 q=1",
         "T seq=28 taker=00000000-0000-0018-0000-000000000000 makers=[00000000-0000-0004-0000-000000000000@104x3] maker_fees=0 taker_fees=0",
@@ -652,7 +654,9 @@ mod tests {
             .position(|l| l.contains("Buy 90 q=1"))
             .expect("nested level event delivered");
         let state = got.iter().position(|l| l == nested).expect("nested state");
-        assert!(level < state, "nested batch delivered in its own order");
+        // `rest_on_level` records the resting state before the admission
+        // that emits the level event (#288); the batch keeps that order.
+        assert!(state < level, "nested batch delivered in its own order");
         assert!(!book.submit_gate.is_poisoned());
         assert_book_consistent(&book);
     }
