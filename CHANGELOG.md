@@ -541,6 +541,9 @@ change.
     concurrency a submit can return before another thread's dispatcher has
     delivered its events. A listener may observe a book state newer than
     its event.
+  - Emission scopes nest per book: caller code running inside one book's
+    mutation (a `Clock`, `T::clone`) that drives another book gets that
+    book's events delivered after its own gate is released.
   - Re-entrant calls are now allowed: a listener may submit, cancel,
     modify or mass-cancel on the same book (previously a deadlock under
     the exclusive gate). The nested call's events are delivered after the
@@ -551,6 +554,8 @@ change.
     `OrderBook::dropped_listener_events()`, `OrderBook::listener_panics()`,
     and `OrderBook::flush_listener_events()` to deliver batches left
     queued after such a panic (call it when `listener_panics()` grows).
+    A snapshot-package restore discards (and counts) batches still queued
+    from before it, since it rewinds `engine_seq` below them.
   - Backlog: the listener outbox is unbounded; a slow or stalled listener
     grows it (caller contract: listeners return quickly). New gauge
     `OrderBook::pending_listener_events()`.

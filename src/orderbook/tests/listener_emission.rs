@@ -951,6 +951,76 @@ mod tests {
         assert_eq!(a_seqs, vec![0, 1], "A's stream unaffected");
     }
 
+    /// PR #289 review: a snapshot-package restore rewinds `engine_seq`.
+    /// Batches a listener panic left queued describe the replaced book and
+    /// carry higher sequences; delivering them after the restore would make
+    /// the stream go backwards. The restore discards them (counted in
+    /// `dropped_listener_events`) and the restored book's events are
+    /// delivered in strictly increasing order.
+    #[test]
+    fn package_restore_discards_batches_left_by_a_listener_panic() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let slot: Arc<OnceLock<Weak<OrderBook<()>>>> = Arc::new(OnceLock::new());
+        let mut book = OrderBook::<()>::new("EMIT");
+        let level_log = Arc::clone(&log);
+        book.set_price_level_listener(Arc::new(move |event: PriceLevelChangedEvent| {
+            push(&level_log, format!("L {}", event.engine_seq));
+        }));
+        let inner_slot = Arc::clone(&slot);
+        book.set_trade_listener(Arc::new(move |result: &TradeResult| {
+            if result.match_result.order_id() == Id::from_u64(2)
+                && let Some(book) = inner_slot.get().and_then(Weak::upgrade)
+            {
+                // Queued behind the current batch, then the listener dies.
+                let _ = book.add_order(limit(3, 90, 1, Side::Buy, TimeInForce::Gtc));
+                panic!("listener bug after re-entering");
+            }
+        }));
+        book.add_order(limit(1, 100, 5, Side::Sell, TimeInForce::Gtc))
+            .expect("maker");
+        let package = book.create_snapshot_package(10).expect("package");
+        let restored_seq = package.engine_seq;
+        let book = Arc::new(book);
+        slot.set(Arc::downgrade(&book)).expect("slot");
+
+        let panicking = Arc::clone(&book);
+        let joined = thread::spawn(move || {
+            let _ = panicking.add_order(limit(2, 100, 1, Side::Buy, TimeInForce::Gtc));
+        })
+        .join();
+        assert!(joined.is_err());
+        let queued = book.pending_listener_events();
+        assert!(queued > 0, "the nested batch is left queued");
+        assert!(book.engine_seq() > restored_seq);
+        let dropped_before = book.dropped_listener_events();
+
+        let Ok(mut book) = Arc::try_unwrap(book) else {
+            panic!("the test holds the only strong reference");
+        };
+        book.restore_from_snapshot_package(package)
+            .expect("restore");
+        assert_eq!(book.engine_seq(), restored_seq, "the counter is rewound");
+        assert_eq!(book.pending_listener_events(), 0, "stale batches discarded");
+        assert_eq!(
+            book.dropped_listener_events(),
+            dropped_before + queued as u64,
+            "discarded events are counted"
+        );
+
+        log.lock().expect("log").clear();
+        book.add_order(limit(4, 80, 1, Side::Buy, TimeInForce::Gtc))
+            .expect("post-restore add");
+        book.add_order(limit(5, 79, 1, Side::Buy, TimeInForce::Gtc))
+            .expect("post-restore add");
+        book.flush_listener_events();
+        let got = log.lock().expect("log").clone();
+        let expect: Vec<String> = [restored_seq, restored_seq + 1]
+            .iter()
+            .map(|seq| format!("L {seq}"))
+            .collect();
+        assert_eq!(got, expect, "only the restored book's events, increasing");
+    }
+
     /// `flush_listener_events` is a no-op on a quiet book and never
     /// dispatches while another thread holds the role.
     #[test]

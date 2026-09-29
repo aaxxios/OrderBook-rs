@@ -714,6 +714,14 @@ the next dispatch on the book or by `flush_listener_events`. Operators
 should call `flush_listener_events` when `listener_panics` increases, so
 those batches do not wait for the next mutation on a quiet book.
 
+**Restore after a panic.** A snapshot-package restore rewinds `engine_seq`
+below any batch a panic left queued, so at its point of no return it
+discards those batches (counted in `dropped_listener_events`, logged at
+`WARN`): they describe the replaced book, and delivering them after the
+restore would run the stream backwards (PR #289 review). Discarding, not
+delivering, keeps caller code out of the restore; call
+`flush_listener_events` first to deliver them.
+
 **Backlog.** The outbox is unbounded by design: nothing is dropped or
 rejected because listeners are slow. A stalled or slow listener on the
 dispatching thread lets every other submitter's events accumulate, which

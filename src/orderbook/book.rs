@@ -4825,6 +4825,17 @@ where
     /// documents. All of them fire before any live state is mutated
     /// (#207) — a failed package restore leaves the book, its
     /// configuration, and its risk state untouched.
+    ///
+    /// # Listener events
+    ///
+    /// A successful restore discards listener events still queued from
+    /// before it (only possible after a listener panic, see
+    /// [`Self::flush_listener_events`]), counting them in
+    /// [`Self::dropped_listener_events`] and logging at `WARN`: they
+    /// describe the replaced book and carry sequences above the restored
+    /// `engine_seq`, so delivering them later would run the stream
+    /// backwards. Call [`Self::flush_listener_events`] before restoring to
+    /// deliver them instead.
     pub fn restore_from_snapshot_package(
         &mut self,
         package: OrderBookSnapshotPackage,
@@ -4866,6 +4877,22 @@ where
         Self::ensure_snapshot_not_crossed(&prepared)?;
 
         // ---- Point of no return: everything below is infallible. ----
+
+        // PR #289 review: the restore rewinds `engine_seq` below anything
+        // still queued for the listeners (only batches a listener panic
+        // left behind can be queued: `&mut self` excludes every submitter
+        // and dispatcher). Those events describe the book being replaced;
+        // delivering them after the restore would run the stream
+        // backwards, so they are discarded and counted in
+        // `dropped_listener_events`.
+        let discarded = self.outbox.discard_pending();
+        if discarded > 0 {
+            tracing::warn!(
+                symbol = %self.symbol,
+                discarded,
+                "snapshot restore discarded listener events queued before it (left by a listener panic)"
+            );
+        }
 
         // Preserve the persisted risk-installation state exactly:
         // install only when a config was snapshotted, otherwise

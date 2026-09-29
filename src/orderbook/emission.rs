@@ -315,6 +315,31 @@ impl EventOutbox {
         poisoned.into_inner()
     }
 
+    /// Discard every queued batch (PR #289 review), counting its events
+    /// as dropped; returns how many. Only a snapshot-package restore calls
+    /// it: `&mut self` means no submitter or dispatcher is active, so the
+    /// queue holds only batches a listener panic left behind. They describe
+    /// the book the restore replaces and carry sequences above the counter
+    /// the restore rewinds to, so delivering them afterwards would make the
+    /// stream go backwards.
+    pub(super) fn discard_pending(&mut self) -> usize {
+        // Same recovery as `lock`: the queue is intact at every unwind
+        // point. Cleared first, so the exclusive borrow below is the only one.
+        self.state.clear_poison();
+        let state = match self.state.get_mut() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let discarded = state
+            .queue
+            .drain(..)
+            .try_fold(0usize, |total, batch| total.checked_add(batch.events.len()));
+        *self.nonempty.get_mut() = false;
+        let discarded = discarded.unwrap_or(usize::MAX);
+        self.count_dropped(discarded);
+        discarded
+    }
+
     /// Publish whether the queue is empty for the lock-free checks.
     #[inline]
     fn sync_queued(&self, state: &OutboxState) {
