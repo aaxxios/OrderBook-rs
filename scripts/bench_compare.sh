@@ -19,8 +19,13 @@
 #   --baseline REF     Git ref for the baseline side (default: v0.13.1)
 #   --candidate REF    Git ref for the candidate side (default: HEAD)
 #   --rounds N         Interleaved rounds, >= 3 recommended (default: 3)
-#   --scenarios LIST   Comma-separated scenario names (default:
-#                      add_only,cancel_only,aggressive_walk)
+#   --scenarios LIST   Comma-separated scenario names (default: every
+#                      scenario `benches/compare` knows; see its
+#                      `src/main.rs` SCENARIOS table)
+#   --max-load X       Before each side of each round, wait (up to 10
+#                      min) until the 1-minute load average is below X
+#                      (default: 0 = do not wait). The load average
+#                      before and after every run is recorded either way
 #   --quick            Smoke-test mode: tiny op counts, forces
 #                      --rounds 1 unless --rounds is also given. Proves
 #                      the pipeline runs end to end; never a
@@ -37,13 +42,14 @@ BASELINE_REF="v0.13.1"
 CANDIDATE_REF="HEAD"
 ROUNDS=3
 ROUNDS_SET=0
-SCENARIOS="add_only,cancel_only,aggressive_walk"
+SCENARIOS=""
+MAX_LOAD=0
 QUICK=0
 OUT_DIR=""
 KEEP_WORKTREES=0
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -52,6 +58,7 @@ while [ $# -gt 0 ]; do
         --candidate) CANDIDATE_REF="$2"; shift 2 ;;
         --rounds) ROUNDS="$2"; ROUNDS_SET=1; shift 2 ;;
         --scenarios) SCENARIOS="$2"; shift 2 ;;
+        --max-load) MAX_LOAD="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --keep-worktrees) KEEP_WORKTREES=1; shift ;;
@@ -152,7 +159,7 @@ CANDIDATE_BIN="$(build_side candidate head)"
     echo "- baseline: $BASELINE_REF -> $BASELINE_SHA"
     echo "- candidate: $CANDIDATE_REF -> $CANDIDATE_SHA"
     echo "- rounds: $ROUNDS"
-    echo "- scenarios: $SCENARIOS"
+    echo "- scenarios: ${SCENARIOS:-all}"
     echo "- quick: $QUICK"
     echo "- os: $(uname -srm)"
     if command -v sysctl >/dev/null 2>&1 && sysctl -n machdep.cpu.brand_string >/dev/null 2>&1; then
@@ -171,23 +178,56 @@ CANDIDATE_BIN="$(build_side candidate head)"
 } > "$OUT_DIR/system_info.md"
 
 # ─── 5. Interleaved rounds: A, B, A, B, ... ──────────────────────────
-IFS=',' read -r -a SCENARIO_ARR <<< "$SCENARIOS"
-COMPARE_ARGS=("${SCENARIO_ARR[@]}")
+COMPARE_ARGS=()
 if [ "$QUICK" -eq 1 ]; then
-    COMPARE_ARGS=("--quick" "${COMPARE_ARGS[@]}")
+    COMPARE_ARGS+=("--quick")
+fi
+if [ -n "$SCENARIOS" ]; then
+    IFS=',' read -r -a SCENARIO_ARR <<< "$SCENARIOS"
+    COMPARE_ARGS+=("${SCENARIO_ARR[@]}")
 fi
 
+load1() {
+    # 1-minute load average, portable across macOS / Linux `uptime`.
+    uptime | sed 's/.*load average[s]*: *//' | tr ',' ' ' | awk '{print $1}'
+}
+
+wait_for_quiet() {
+    [ "$MAX_LOAD" = "0" ] && return 0
+    local waited=0
+    while awk -v l="$(load1)" -v m="$MAX_LOAD" 'BEGIN { exit !(l >= m) }'; do
+        if [ "$waited" -ge 600 ]; then
+            echo "load still $(load1) >= $MAX_LOAD after 600 s; running anyway" >&2
+            return 0
+        fi
+        sleep 10
+        waited=$((waited + 10))
+    done
+}
+
+echo "round,side,load_before,load_after" > "$OUT_DIR/load.csv"
+run_side() {
+    local round="$1" side="$2" bin="$3"
+    wait_for_quiet
+    local before
+    before="$(uptime | sed 's/.*load average[s]*: *//' | tr -d ',')"
+    echo "round $round/$ROUNDS: $side (load: $before)" >&2
+    # `${arr[@]+"${arr[@]}"}`: an empty array under `set -u` on bash 3.2.
+    "$bin" ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"} > "$OUT_DIR/round${round}_${side}.jsonl" \
+        2> "$OUT_DIR/round${round}_${side}.stderr.log"
+    local after
+    after="$(uptime | sed 's/.*load average[s]*: *//' | tr -d ',')"
+    echo "$round,$side,$before,$after" >> "$OUT_DIR/load.csv"
+}
+
 for round in $(seq 1 "$ROUNDS"); do
-    echo "round $round/$ROUNDS: baseline" >&2
-    "$BASELINE_BIN" "${COMPARE_ARGS[@]}" > "$OUT_DIR/round${round}_baseline.jsonl" \
-        2> "$OUT_DIR/round${round}_baseline.stderr.log"
-    echo "round $round/$ROUNDS: candidate" >&2
-    "$CANDIDATE_BIN" "${COMPARE_ARGS[@]}" > "$OUT_DIR/round${round}_candidate.jsonl" \
-        2> "$OUT_DIR/round${round}_candidate.stderr.log"
+    run_side "$round" baseline "$BASELINE_BIN"
+    run_side "$round" candidate "$CANDIDATE_BIN"
 done
 
 {
     echo "- load average (after): $(uptime | sed 's/.*load average[s]*: *//')"
+    echo "- per-run load averages (1 / 5 / 15 min, before and after): load.csv"
 } >> "$OUT_DIR/system_info.md"
 
 # ─── 6. Summarize ─────────────────────────────────────────────────────
@@ -200,10 +240,17 @@ from statistics import median
 
 out_dir = Path(sys.argv[1])
 rounds = int(sys.argv[2])
-noisy_threshold_pp = 10.0
+NOISY_PP = 10.0
+# Regression thresholds on the median-of-rounds p50 delta (#259).
+THRESHOLD_PCT = {"uncontended": 3.0, "contended": 5.0}
+# Apple silicon `Instant` tick; a single-op (`timer: single`) p50 moves
+# in steps of this size, so a delta of at most one tick is not a
+# measured regression.
+TICK_NS = 41.67
 
-# side -> scenario -> [p50 per round]
+# side -> scenario -> list of per-round rows
 data = {"baseline": {}, "candidate": {}}
+meta = {}
 for side in ("baseline", "candidate"):
     for r in range(1, rounds + 1):
         path = out_dir / f"round{r}_{side}.jsonl"
@@ -214,49 +261,86 @@ for side in ("baseline", "candidate"):
             if not line:
                 continue
             row = json.loads(line)
-            data[side].setdefault(row["scenario"], []).append(row["p50"])
+            data[side].setdefault(row["scenario"], []).append(row)
+            meta[row["scenario"]] = (row.get("class", "uncontended"), row.get("timer", "batch"))
+
+
+def stats(rows, key):
+    values = [row[key] for row in rows]
+    med = median(values)
+    spread = (max(values) - min(values)) / med * 100 if med else 0.0
+    return med, spread
+
 
 scenarios = sorted(set(data["baseline"]) | set(data["candidate"]))
-lines = []
-lines.append("| scenario | baseline p50 (median/spread) | candidate p50 (median/spread) | delta | verdict |")
-lines.append("|---|---|---|---|---|")
-
-csv_lines = ["scenario,baseline_median_ns,baseline_spread_pp,candidate_median_ns,candidate_spread_pp,delta_pct,verdict"]
+lines = [
+    "| scenario | class / timer | baseline p50 (spread) | candidate p50 (spread) | p50 delta | baseline p99 | candidate p99 | p99 delta | verdict |",
+    "|---|---|---|---|---|---|---|---|---|",
+]
+csv_lines = [
+    "scenario,class,timer,rounds_baseline,rounds_candidate,baseline_p50_median_ns,baseline_p50_spread_pp,"
+    "candidate_p50_median_ns,candidate_p50_spread_pp,p50_delta_pct,baseline_p99_median_ns,"
+    "candidate_p99_median_ns,p99_delta_pct,baseline_mean_median_ns,candidate_mean_median_ns,verdict"
+]
+counts = {}
 
 for scenario in scenarios:
     b = data["baseline"].get(scenario, [])
     c = data["candidate"].get(scenario, [])
+    cls, timer = meta.get(scenario, ("uncontended", "batch"))
     if not b or not c:
-        lines.append(f"| {scenario} | missing | missing | - | NOISY (missing data) |")
-        csv_lines.append(f"{scenario},,,,,MISSING")
+        lines.append(f"| {scenario} | {cls} / {timer} | missing | missing | - | - | - | - | MISSING |")
+        csv_lines.append(f"{scenario},{cls},{timer},{len(b)},{len(c)},,,,,,,,,,,MISSING")
+        counts["MISSING"] = counts.get("MISSING", 0) + 1
         continue
-    b_med = median(b)
-    c_med = median(c)
-    b_spread = (max(b) - min(b)) / b_med * 100 if b_med else 0.0
-    c_spread = (max(c) - min(c)) / c_med * 100 if c_med else 0.0
-    delta_pct = (c_med - b_med) / b_med * 100 if b_med else 0.0
-    noisy = b_spread > noisy_threshold_pp or c_spread > noisy_threshold_pp
-    verdict = "NOISY (inconclusive)" if noisy else ("REGRESSION" if delta_pct > 3.0 else "OK")
+    b_med, b_spread = stats(b, "p50")
+    c_med, c_spread = stats(c, "p50")
+    b99, _ = stats(b, "p99")
+    c99, _ = stats(c, "p99")
+    b_mean = median([row.get("mean", 0.0) for row in b])
+    c_mean = median([row.get("mean", 0.0) for row in c])
+    delta = (c_med - b_med) / b_med * 100 if b_med else 0.0
+    delta99 = (c99 - b99) / b99 * 100 if b99 else 0.0
+    threshold = THRESHOLD_PCT.get(cls, 3.0)
+    if b_spread > NOISY_PP or c_spread > NOISY_PP:
+        verdict = "NOISY"
+    elif delta > threshold:
+        if timer == "single" and (c_med - b_med) <= TICK_NS + 0.5:
+            verdict = "OK (<= 1 tick)"
+        else:
+            verdict = "REGRESSION"
+    elif delta > 0:
+        verdict = "OK (within threshold)"
+    else:
+        verdict = "OK"
+    key = verdict.split(" ")[0]
+    counts[key] = counts.get(key, 0) + 1
     lines.append(
-        f"| {scenario} | {b_med:.0f} ns ({b_spread:.1f} pp) | {c_med:.0f} ns ({c_spread:.1f} pp) "
-        f"| {delta_pct:+.1f}% | {verdict} |"
+        f"| {scenario} | {cls} / {timer} | {b_med:.0f} ns ({b_spread:.1f} pp) | {c_med:.0f} ns ({c_spread:.1f} pp) "
+        f"| {delta:+.1f}% | {b99:.0f} | {c99:.0f} | {delta99:+.1f}% | {verdict} |"
     )
     csv_lines.append(
-        f"{scenario},{b_med:.1f},{b_spread:.2f},{c_med:.1f},{c_spread:.2f},{delta_pct:.2f},{verdict}"
+        f"{scenario},{cls},{timer},{len(b)},{len(c)},{b_med:.1f},{b_spread:.2f},{c_med:.1f},{c_spread:.2f},"
+        f"{delta:.2f},{b99:.1f},{c99:.1f},{delta99:.2f},{b_mean:.1f},{c_mean:.1f},{verdict}"
     )
 
 summary_md = out_dir / "summary.md"
 summary_md.write_text(
     "# Bench comparison summary\n\n"
-    "p50, ns; \"spread\" is round-to-round `(max - min) / median` as a "
-    "percentage. A row with either side's spread > 10 pp is NOISY: "
-    "inconclusive, never a pass, and should be re-measured with more "
-    "rounds before drawing any conclusion (see BENCH.md \"Methodology\").\n\n"
+    f"{rounds} interleaved rounds. p50 / p99 in ns, median across rounds; \"spread\" is the "
+    "round-to-round `(max - min) / median` of p50 as a percentage. A row with either side's "
+    "spread > 10 pp is NOISY: inconclusive, never a pass; re-measure it. Otherwise a p50 "
+    "delta above +3 % (uncontended) / +5 % (contended) is a REGRESSION, except for a "
+    "single-op-timed row whose p50 moved by at most one clock tick (41.67 ns). See BENCH.md "
+    "\"Methodology\".\n\n"
     + "\n".join(lines)
+    + "\n\nCounts: "
+    + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
     + "\n"
 )
 (out_dir / "summary.csv").write_text("\n".join(csv_lines) + "\n")
 print("\n".join(lines))
+print("Counts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
 PYEOF
 
 python3 "$SUMMARIZER" "$OUT_DIR" "$ROUNDS" | tee "$OUT_DIR/summary_stdout.txt"
