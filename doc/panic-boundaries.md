@@ -5,42 +5,43 @@ Issue #242. Companion to the Production Panic Policy in
 (that crate's issue #172/#173), adapted to this crate's dependency set and
 public surface.
 
-**Status: skeleton.** This document enumerates what the Production Panic
-Policy gate (`[lints.clippy]` in `Cargo.toml`, `scripts/check_panic_policy.py`)
-cannot see — irreducible dependency panic surface, the documented
-`unsafe` exceptions, and caller-supplied code obligations — and records the
-current ratchet. Sections marked **to be completed by #260** need the
-per-call-site inventory PriceLevel's document has (guard held / partial
-mutation / unwind effect per call site); that audit is out of scope for
-issue #242, which lands the mechanical gate.
+**Status: complete (post-audit, 0.14.0).** The per-file ratchet
+introduced by #242 was burned down by #243-#259 and #265, the final
+three-way audit (#260) found the residual gaps fixed in #294 and #295, and
+the temporary ratchet ledgers were removed in #260: the gate is absolute
+(see "Enforcement" at the end). This document enumerates what that gate
+(`[lints.clippy]` in `Cargo.toml`, `scripts/check_panic_policy.py`) cannot
+see: irreducible dependency panic surface, the documented `unsafe`
+exceptions, caller-supplied code obligations, and the lock / partial
+mutation / unwind inventory for each of them.
 
 ## Contract
 
 The Production Panic Policy in `rules/global_rules.md` requires that
-crate-owned code not initiate panics. That is the required policy, not a
-completed state: `scripts/panic_policy_allowlist.txt` and each production
-file's own `// panic-policy-ratchet: see #242, removed by the fix issue`
-marker enumerate exactly what remains (`python3
-scripts/check_panic_policy.py --ratchet-report` lists the clippy-side half;
-the allowlist file is the script-side half). Removing them is issues
-#243-#257, not this one.
+crate-owned code not initiate panics. For production code (everything
+under `src/` outside `#[cfg(test)]` test modules) that is the enforced
+state: no production file carries a panic-policy exception, and any new
+panicking form, `assert!`-family macro, `saturating_*` / `wrapping_*` on
+state, or `#[allow]` / `#[expect]` of a denied clippy lint fails
+`make lint`.
 
-This document covers what is out of scope for that ratchet entirely: panic
-surface the crate does not own (dependency internals, `unsafe`) and panic
-surface the crate cannot certify (caller-supplied generic code).
+This document covers what the gate cannot certify: panic surface the
+crate does not own (dependency internals, `unsafe`) and caller-supplied
+generic code.
 
-- **What the library guarantees, once the ratchet above is empty.** It never
-  panics from crate-owned code on invalid input, a failed invariant, a
-  dependency error, or an exceptional branch, in debug or release, for every
-  feature combination. It installs no panic hook, uses no `catch_unwind`,
-  and never aborts on purpose (`std::process::exit` / `abort` are denied,
-  see `scripts/check_panic_policy.py`).
+- **What the library guarantees.** It never panics from crate-owned code
+  on invalid input, a failed invariant, a dependency error, or an
+  exceptional branch, in debug or release, for every feature combination.
+  It installs no panic hook, uses no `catch_unwind` / `panic_any` /
+  `resume_unwind`, and never aborts on purpose (`std::process::exit` /
+  `abort` are denied, see `scripts/check_panic_policy.py`).
 - **What it does not guarantee.** It does not recover from a caller panic
   (in the generic `T` on `OrderBook<T>`, or a listener/serializer/journal/
   clock implementation supplied by the caller) and does not certify
   third-party code. An allocator's OOM abort is a process-wide failure and
   is not reported as a typed error (`rules/global_rules.md`'s Production
-  Panic Policy is explicit about this).
+  Panic Policy is explicit about this). What an unwinding caller panic
+  leaves behind is bounded and listed per call site below.
 
 ## Irreducible dependency panic surface
 
@@ -51,7 +52,7 @@ exception.
 
 | Dependency | Surface used | Panic surface | Notes |
 |---|---|---|---|
-| `dashmap::DashMap` | Order index, symbol registries (`manager.rs`) | Internal `RandomState` hasher panics are not part of its public contract; growth (`RawTable` resize) aborts the process on allocator OOM, not a Rust panic | No known panic path from crate-internal usage (keys are `Id`/`String`, never attacker-controlled hash-flooding input in the trusted-input model this crate assumes) |
+| `dashmap::DashMap` / `DashSet` | Order-location and user indices (`book.rs`), risk counters and entries (`risk.rs`), order-state entries (`order_state.rs`), special-order trackers (`repricing.rs`) | Internal `RandomState` hasher panics are not part of its public contract; growth (`RawTable` resize) aborts the process on allocator OOM, not a Rust panic | No known panic path from crate-internal usage (keys are `Id`/`String`, never attacker-controlled hash-flooding input in the trusted-input model this crate assumes) |
 | `crossbeam-skiplist::SkipMap` | Price-level index (`PriceLevelCache`, book side maps) | Node allocation aborts the process on allocator OOM, not a Rust panic | Same allocator-OOM caveat as `DashMap` |
 | `crossbeam::queue::ArrayQueue` | Per-book pool of recycled listener event buffers (`EventOutbox::pool`, `src/orderbook/emission.rs`, #249) | `ArrayQueue::new` panics on a capacity of zero; `push` / `pop` never panic (a full queue returns the value) | Precondition satisfied by construction: the capacity is the non-zero constant `BUFFER_POOL`. A full pool drops the surplus buffer. No `SegQueue` is used |
 | `crossbeam::channel` (`BookManagerStd`) | Unbounded trade-event channel, `bounded(1)` stop signal, `Select` in the processor thread (#255) | `Select::select` panics if no operation is registered; a `SelectedOperation` panics if it is dropped uncompleted or completed with a receiver it was not registered with | `run_std_processor` registers exactly two receivers once and completes every selected operation exhaustively (`if index == stop { recv(&stop) } else { recv(&events) }`), so neither panic is reachable. Sends use the `Result`-returning `send` / `try_send`; the stop channel only ever carries one message, so `try_send` never sees a full buffer |
@@ -64,10 +65,24 @@ exception.
 | `zerocopy` (`wire` feature) | `FromBytes::ref_from_bytes` (inbound decode), `IntoBytes::as_bytes` (inbound encode) on `#[repr(C, packed)]` types | `ref_from_bytes` returns `Err` on a size/alignment mismatch and never panics; `as_bytes` is infallible | Wire bytes are untrusted (issue #254): the crate's own decoders read through checked offsets and `slice::get`, never indexing or `copy_from_slice`; layout sizes are guarded at compile time by a type-level `[(); N]` equality, not a runtime `assert!`; outbound encoders reserve with `Vec::try_reserve` and return `WireError::CapacityOverflow`. `decode_frame` rejects a `len` above `MAX_FRAME_BODY` (4096) with `InvalidPayload` from the header alone, and the encoders refuse (`InvalidPayload`) the `status` / `_pad` / `side` values their decoders reject (#295) |
 | Global allocator | Every collection growth | OOM aborts the process; this is not a Rust panic and is explicitly out of scope (`rules/global_rules.md`) | `try_reserve`/`try_reserve_exact` convert a growth failure into a typed error where the allocation is caller-sized (e.g. a decoded journal/wire length prefix); ordinary amortized `Vec`/`HashMap` growth is not wrapped, matching the OOM-is-not-a-panic carve-out |
 
-**To be completed by #260:** a per-call-site table (guard held / partial
-mutation / unwind effect) for the `DashMap`/`SkipMap` write paths in
-`book.rs`, `cache.rs` and `manager.rs`, matching PriceLevel's inventory
-format.
+### Concurrent-map write paths
+
+Every write to a crate-owned concurrent map, the guard it holds, and what
+an unwind in the middle leaves behind. `DashMap` shard locks are
+non-reentrant and do **not** poison: an unwind drops the guard and the
+next acquisition proceeds. `SkipMap` is lock-free and holds no guard at
+all. `BookManagerStd` / `BookManagerTokio` keep their books in a plain
+`HashMap` owned through `&mut self` (no shared-map write path), and
+`PriceLevelCache` (`cache.rs`) is atomics only.
+
+| Map | Write sites | Guard held across | Unwind effect |
+|---|---|---|---|
+| `bids` / `asks` (`SkipMap<u128, Arc<PriceLevel>>`) | `get_or_insert` in `rest_on_level` (`modifications.rs`, under the price's shared stripe); `remove_level_if_empty` (exclusive stripe, re-reads emptiness); `restore_from_snapshot_package` commit (`insert`, exclusive gate) | No map guard. The stripe is held for one level operation (see the lock inventory) | A level created by an unwound rest is removed by `UnrestedClaim`; any other emptied level left behind is removed by the next `remove_level_if_empty` on that price, and readers treat an empty level as absent |
+| `order_locations` (`DashMap<Id, (u128, Side)>`) | Claim with `entry` in `rest_on_level`; `remove` in the sweep drain (`matching.rs`), `finish_removal` and the zero-quantity `UpdateQuantity` (`modifications.rs`), `withdraw_unrested`; `insert` in the restore commit | One shard guard for the single `entry` / `insert` / `remove` call; no caller code, no log, no other lock | Single-step: the entry is present or absent. The ownership-token order (#288) and the `FilledMakerRelease` / `UnrestedClaim` guards (#294) make sure an unwound admission or sweep does not leave a location behind |
+| `user_orders` (`DashMap<Hash32, Vec<Id>>`) | `track_user_order` (`entry().or_default().push`), `untrack_user_order` (`get_mut` + `retain`, then `remove_if` on emptiness), `purge_stale_user_ids` (mass cancel, reads `order_locations` under the guard: lock order `user_orders` then `order_locations`, never the reverse) | One shard guard per call; no caller code, no log | Single-step per call (a `Vec` push or retain). A push that fails to allocate aborts (OOM, out of scope) |
+| Risk `orders` / `counters` (`risk.rs`) | `on_admission` (`orders` vacant slot, then `counters` entry: lock order orders then counters), `on_fill` (entry update and full-fill removal in one critical section, #288), `release` (read guard on counters), `release_reservation` / `on_cancel` (`remove_if` / `remove`), `evict_if_zeroed` (`remove_if`), `keep_booked_quantity`, restore (`insert`) | One or two shard guards for one reservation / release. Caller code under them: the `tracing` subscriber only, from the `WARN` of an accounting underflow (`note_release_underflow`, reachable only on a double release or an accounting bug) | The counters are atomics updated with checked read-modify-write, and the `WARN` runs after the update it reports. An unwind out of it can skip the rest of that one release (the open-count slot after a notional underflow) or leave a refused reservation's vacant `orders` slot unfilled; the unwind is under the submit gate, so the kill switch fences the book. No poison |
+| Order-state `entries` (`DashMap<Id, TrackedOrder>`, `order_state.rs`) | `record` (the `Clock` is read **before** the entry lock), `withdraw_last_transition`, `evict_if_terminal` (`remove_if`) | One shard guard; no caller code (the listener runs from the deferred dispatcher, not under the entry) | Single-step: status and history change together |
+| Special-order trackers (`DashSet<Id>`, `repricing.rs`, `special_orders`) | `register_*` / `unregister_*`, the repricer's conditional release (`remove_if` checking `order_locations` under the tracker shard: lock order tracker then location) | One shard guard; no caller code | A stale id is dropped by the next repricing pass (#291) |
 
 ## Documented `unsafe` exceptions
 
@@ -76,11 +91,13 @@ module- or site-level `#[allow(unsafe_code)]`, each behind a feature flag:
 
 - **`memmap2`, feature `journal`, `src/orderbook/sequencer/file_journal.rs`.**
   `FileJournal` memory-maps append-only segment files
-  (`memmap2::MmapMut`/`Mmap`). The `unsafe` is confined to `memmap2`'s own
-  `map`/`map_mut` constructors (memory-mapping a file is inherently unsafe:
-  the kernel can deliver `SIGBUS` on a truncated/concurrently-modified
-  backing file, which `memmap2` cannot prevent). This crate does not add its
-  own `unsafe` on top; it mitigates by pre-allocating (not truncating)
+  (`memmap2::MmapMut`/`Mmap`). The crate's `unsafe` is three site-level
+  `#[allow(unsafe_code)]` blocks (segment creation, reopen, read-only
+  mapping), each a single call to `memmap2`'s `MmapMut::map_mut` /
+  `Mmap::map` with a `SAFETY` comment (memory-mapping a file is inherently
+  unsafe: the kernel can deliver `SIGBUS` on a truncated/concurrently-modified
+  backing file, which `memmap2` cannot prevent). Every access to the mapped
+  bytes afterwards is safe slice access; it mitigates by pre-allocating (not truncating)
   segment files and by not sharing the mapped file with another writer.
   Since #252 segments are created with `create_new` (rotation onto an
   existing file is `JournalError::SegmentExists`, never a truncation of a
@@ -119,9 +136,18 @@ module- or site-level `#[allow(unsafe_code)]`, each behind a feature flag:
   `None` across a wrap) rather than use a `fetch_update` CAS loop on every
   allocation (#295).
 
-**To be completed by #260:** confirm there is no second `unsafe` introduced
-by a dependency's own `build.rs`/proc-macro that this crate re-exercises
-(informational only — not a crate-owned `unsafe` block either way).
+**Macro-generated `unsafe` (informational).** Dependency build scripts
+and proc macros run at compile time on the build host and add no runtime
+`unsafe` of their own. The one macro that emits `unsafe` into this crate's
+items is `zerocopy-derive` (feature `wire`): `#[derive(FromBytes,
+IntoBytes, Unaligned, Immutable, KnownLayout)]` on the `#[repr(C, packed)]`
+inbound wire types expands to `unsafe impl`s of those traits. rustc's
+`unsafe_code` lint does not report expansions of an external macro, and
+`zerocopy` validates the layout at derive time (a type that does not
+qualify fails to compile), so these are not crate-owned `unsafe` blocks
+and need no `#[allow(unsafe_code)]`. No other dependency macro used here
+(`serde_derive`, `thiserror`, `tracing` attributes, `bitflags`) emits
+`unsafe`.
 
 ## Caller-supplied code obligations
 
@@ -142,12 +168,29 @@ boundary's limits instead of promising to prevent every external panic."
 | `Clock` impls (`src/orderbook/clock.rs`) | Timestamp generation for the book and sequencer. On a book it runs **under the submit gate, mid-mutation**: the book's clock once per sweep (`taker_ts` in `match_order`), the order-state tracker's clock on every recorded transition (`OrderStateTracker::record`, reached from `track_state`: a resting state before the level admits the order, each filled maker's `Filled` in the sweep drain before its indices are released, a taker's terminal state) | Must not panic; must be monotonic if used with `ReplayEngine`'s determinism guarantee | `MonotonicClock` is crate-provided and compliant; a caller-supplied `Clock` breaking monotonicity is a correctness bug in the caller, not a crate panic. An unwind from it leaves the mutation partial; the submit-gate guard then engages the kill switch and latches `submit_gate_poisoned` on either side (#294). Two drop guards bound the partial state (see "Core boundary gaps" below): the sweep drain releases the indices of every filled maker not yet released, and the rest path withdraws an order's claim (location, user index, risk reservation, resting state, an empty level it created) when it unwinds before the level admits the order. Neither path leaves a ghost location |
 | Replay progress callbacks (`replay_from_with_progress`, `replay_from_with_clock_and_progress`, `src/orderbook/sequencer/replay.rs`) | Invoked per applied journal entry during replay | Must not panic; must return quickly | Runs after each entry is applied to the in-memory book, not while any lock is held |
 | `metrics` recorder (feature `metrics`, `src/orderbook/metrics.rs`) | The process-installed global `metrics` recorder, invoked synchronously from `record_reject` / `record_depth` / `record_trades` / `record_reserve_hidden_discarded` / `record_risk_accounting_anomaly` / `record_match_abort` / `record_match_fold_failure` / `record_trade_ids_exhausted` / `record_manager_trade_event_dropped` on the calling thread (the book's ones under the submit gate). Some calls fire **mid-mutation**: `record_reject` from `track_state` of a `Rejected` state, `record_reserve_hidden_discarded` per strandable maker in the sweep drain, both before the sweep's index cleanup and the taker's resting or terminal bookkeeping finish | Must not panic on a recorded metric; must return quickly; owns its own counter overflow semantics for `increment(n)` | The crate never installs its own recorder (`rules/global_rules.md`'s Logging & Observability rule against installing a global subscriber applies by the same reasoning to a metrics recorder); with none installed the `metrics` crate's no-op recorder is used. The helpers do no integer arithmetic themselves (issue #254); the `u64` to `f64` gauge casts are exact below 2^53 and cannot panic. An unwind from it is handled like a `Clock` unwind (kill switch on either gate side, drain release guard, #294) |
-| `tracing` subscriber | Every `tracing::{trace,debug,info,warn,error}!` call site, including mid-mutation ones under the submit gate (the sweep drain's strandable-maker `INFO`) and the `ERROR` the submit-gate guard logs while the thread is already unwinding | Must not panic | The crate never installs its own subscriber. A mid-mutation unwind is handled like a `Clock` unwind (#294). A subscriber that panics while the thread is already unwinding aborts the process (a Rust double panic); the guard logs once per book, at the first unwind |
+| `tracing` subscriber | Every `tracing::{trace,debug,info,warn,error}!` call site, including mid-mutation ones under the submit gate (the sweep drain's strandable-maker `INFO`) and the `ERROR` the submit-gate guard logs while the thread is already unwinding | Must not panic; must not call back into the book | The crate never installs its own subscriber. A mid-mutation unwind is handled like a `Clock` unwind (#294). A subscriber that panics while the thread is already unwinding aborts the process (a Rust double panic); the guard logs once per book, at the first unwind |
 
-**To be completed by #260:** the per-call-site guard/partial-mutation/unwind
-table PriceLevel's document has for each row above (which lock, if any, is
-held across the call; what state is already committed if the callback
-unwinds).
+### Per-call-site inventory
+
+Where each caller-supplied surface runs, which crate lock is held across
+the call, what is already committed when it runs, and what an unwind out
+of it leaves behind. "Kill switch" means the submit-gate guard's policy
+(#294): the unwind engages the kill switch and latches
+`submit_gate_poisoned` before the gate is released.
+
+| Surface | Call site | Crate locks held across the call | Committed before the call | Unwind effect |
+|---|---|---|---|---|
+| `T::default()` | Unit conversion of a resting order in `rest_on_level` (after the location claim, before the stripe); order conversion at the entry points (`book.rs`) before any mutation | Submit gate only (never a stripe, a map shard or the outbox) | Rest path: risk reservation, location, user entry, and possibly the resting state; entry points: nothing | Rest path: `UnrestedClaim` withdraws the claim; entry points: nothing to undo. Kill switch either way |
+| `T::clone()` | Modify: the copy of the original read before the cancel, and the re-add rebuilt from the cancelled remainder when the order changed meanwhile (#247); snapshot and `get_order` reads | Submit gate (modify), none for reads | Modify: nothing for the first copy; the cancel of the original for the rebuilt re-add | Modify after the cancel: the original is gone and not re-added (the rollback / `ModifyOrderLost` resolution does not run on an unwind); kill switch. Reads: nothing |
+| `TradeListener`, `OrderStateListener`, `PriceLevelChangedListener` | Book's deferred dispatcher (`emission.rs`) after the gate is released | None | The whole mutation and its `engine_seq` stamping | Dispatcher role released, undelivered remainder of the batch counted and dropped, queued batches kept; no kill switch (the book is consistent) |
+| `OrderStateListener` on a standalone tracker | `OrderStateTracker::transition`, inline | None (the entry guard and the terminal queue are released first) | The transition and its eviction enqueue (#294) | Propagates to the caller; tracker consistent |
+| Manager trade handler | `BookManagerStd` processor thread / `BookManagerTokio` task | None | The trade and its listener enqueue | Processor ends; `ManagerError::ProcessorPanicked` at stop; later events counted as dropped |
+| `EventSerializer` | `NatsTradePublisher` background task | None | The event was dequeued from the publisher channel | Task ends; `NatsPublisherError::TaskPanicked` at `shutdown()`; buffered events lost |
+| `Journal<T>` | Caller's `append`; replay's `last_sequence` / `read_from` and the entry iterator | None (replay takes the book's gate per applied event, never across a journal call) | Replay: every event already applied | Propagates out of replay; the partially replayed book is discarded by the caller |
+| `Clock` (book) | `match_order`'s `taker_ts` once per sweep; tracker `record` (before its entry lock) | Submit gate | Sweep: anything the call did before the sweep; tracker: everything up to that transition | `FilledMakerRelease` / `UnrestedClaim` release or withdraw the affected maker / claim; kill switch |
+| Replay progress callback | After each applied entry | None | That entry | Propagates out of replay |
+| `metrics` recorder | `record_*` helpers, several under the submit gate and mid-mutation (see the row above) | Submit gate for the book's calls; none for the manager's drop counter | Up to the recorded event | As `Clock`; kill switch when under the gate |
+| `tracing` subscriber | Every log call; under the submit gate, a level stripe, the outbox lock, the terminal-queue mutex, or a risk shard guard (accounting-underflow `WARN` only) at the sites named in the lock inventory and the concurrent-map table | Any of those | Up to the log call | Guards drop without poisoning a `DashMap`; `std` locks follow the lock inventory's poison policy; kill switch when under the gate. A subscriber must not call back into the book: the map shards and the exclusive gate are not reentrant |
 
 ## Default trade-id namespace (#265)
 
@@ -902,48 +945,34 @@ The sequencer / journal and NATS locks are outside the core engine and
 are documented with their subsystems (`Journal<T>` row above,
 `JournalError::MutexPoisoned`).
 
-## Ratchet
+## Enforcement
 
-Three ledgers, all mechanically enforced (`make lint`), all shrink-only:
+`make lint` (and CI's lint job) runs two layers, both absolute:
 
-1. `scripts/check_panic_policy.py --ratchet-report` lists every clippy-side
-   `#![allow(clippy::...)] // panic-policy-ratchet: see #242, removed by the
-   fix issue` currently in the tree — but a plain per-file `allow` is not
-   itself a count-based ratchet: `cargo clippy` cannot tell a violation that
-   existed when the marker was written from a brand new one added later in
-   the same file, for an already-listed lint. Ledger 3 below closes that.
-2. `scripts/panic_policy_allowlist.txt` lists every `assert!`/
-   `debug_assert!`-family, `saturating_*`/`wrapping_*`, `catch_unwind`,
-   `panic_any` and `resume_unwind` finding `scripts/check_panic_policy.py`'s
-   own syntax scan currently tolerates, one `path:rule:count` line per
-   file/rule pair (`check_panic_policy.py --write-allowlist` regenerates
-   it).
-3. `scripts/clippy_ratchet.txt` (PR #266 review) is the count-based
-   companion to ledger 1: `scripts/check_clippy_ratchet.py` copies the
-   crate to a scratch directory, strips every `panic-policy-ratchet`
-   `#![allow(...)]` block from the copy only, and re-runs `cargo clippy`
-   there with `RUSTFLAGS=--cap-lints=warn` (so the crate's own
-   `[lints.clippy]` `"deny"` entries report instead of aborting the
-   scratch build). Each ratcheted file/lint pair's finding count in the
-   ledger must match exactly; `check_clippy_ratchet.py
-   --write-clippy-ratchet` regenerates it. `make lint-clippy-ratchet` runs
-   it standalone; `make lint` runs it last (see the Makefile for the
-   measured cost).
+1. `cargo clippy --all-targets --all-features -- -D warnings` with the
+   `[lints.clippy]` restriction lints in `Cargo.toml` (`unwrap_used`,
+   `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`,
+   `indexing_slicing`, `string_slice`, `arithmetic_side_effects`, the
+   narrowing casts, `manual_assert`, `panic_in_result_fn`, `get_unwrap`,
+   `exit`) and `clippy.toml`'s "in tests" toggles.
+2. `scripts/check_panic_policy.py` (`make lint-panic`, also part of
+   `make pre-push`): first its own fixture self-test
+   (`scripts/panic_policy_fixtures/`), then a scan of `src/` for what clippy
+   cannot see: the `assert!` / `debug_assert!` families, `catch_unwind` /
+   `panic_any` / `resume_unwind`, `saturating_*` / `wrapping_*`, the
+   panicking forms inside production-adjacent `#[cfg(test)]` seams, and any
+   production `#[allow]` / `#[expect]` (inner, outer or inside `cfg_attr`)
+   of a lint `[lints.clippy]` denies.
 
-All three fail the build if a count grows past its ledger value (a new
-violation) **or** falls below it (a stale, over-generous entry) — so a fix
-PR is forced to shrink them, never to widen them. A fix PR (issues
-#243-#257) that removes a production violation:
+There is no allowlist: any finding fails. The only exception form is an
+inline `// panic-policy-allow-saturating: <reason>` marker on a reviewed,
+compile-time-only `saturating_*` / `wrapping_*` expression (none is in use
+today). Test code (`#[cfg(test)] mod tests` blocks, `src/**/tests/`) and
+the test / bench crate roots may relax the lints, as listed in the
+`Cargo.toml` comment above `[lints.clippy]`.
 
-1. Deletes or narrows the file's `#![allow(clippy::...)]` ratchet line (or
-   removes the whole marker once that file has none left).
-2. Regenerates `scripts/panic_policy_allowlist.txt` via `python3
-   scripts/check_panic_policy.py --write-allowlist` and
-   `scripts/clippy_ratchet.txt` via `python3
-   scripts/check_clippy_ratchet.py --write-clippy-ratchet`, and confirms
-   each diff only removes/lowers entries for files it touched.
-
-When all three are empty, delete the two ledger files (an absent file is an
-empty ledger, matching a from-scratch audit — `--write-allowlist` /
-`--write-clippy-ratchet` still regenerate a header-only file, which the
-final cleanup PR then removes) and delete this ratchet section.
+The temporary ratchet used during the 0.14 cycle (per-file
+`#![allow(clippy::...)] // panic-policy-ratchet` markers,
+`scripts/panic_policy_allowlist.txt`, `scripts/clippy_ratchet.txt` and
+`scripts/check_clippy_ratchet.py`) was removed in #260 once every ledger
+was empty.
