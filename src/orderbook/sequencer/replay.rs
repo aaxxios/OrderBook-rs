@@ -530,6 +530,22 @@ where
     ///   so the re-execution normally rests the residual and the verdict
     ///   disagreement surfaces as [`ReplayError::OutcomeMismatch`] — a
     ///   loud stop instead of a silently wrong book.
+    /// - An `AddOrder` journaled under
+    ///   [`RejectReason::RiskRejectedAfterTrades`] (#291: the taker traded,
+    ///   then the risk layer refused to reserve its residual) is
+    ///   re-executed with its residual **refused** instead of rested. The
+    ///   live refusal depended on the source book's `RiskConfig` and on
+    ///   concurrent state, neither of which is in the journal or in
+    ///   [`ReplayBookConfig`]; the sweep is a deterministic function of the
+    ///   book and the order, so replay reproduces the live trades and ends
+    ///   with the same book without needing the risk configuration. The
+    ///   re-execution must fail under the same code: a sweep that fills the
+    ///   whole order (nothing to refuse) or does not trade at all is
+    ///   [`ReplayError::OutcomeMismatch`]. Journals written before this
+    ///   code existed recorded such a failure under a pre-trade risk code
+    ///   with `may_have_mutated: false`; replay cannot tell it from a
+    ///   pre-trade rejection and skips it, so for those journals only
+    ///   [`snapshots_match`] detects the missing trades.
     /// - A submit journaled as [`SequencerResult::MatchAborted`] (#240) is
     ///   re-executed and must abort again with the **same committed
     ///   prefix** — the same makers, prices and quantities in order, and
@@ -1041,7 +1057,10 @@ where
     /// resurrected liquidity the live book had consumed. Replay
     /// re-executes matching deterministically, so those fills are
     /// reproduced by the re-execution itself; the recorded code is read
-    /// only to check the verdict, in [`Self::reconcile_submit`].
+    /// only to check the verdict, in [`Self::reconcile_submit`]. An
+    /// `AddOrder` recorded under [`RejectReason::RiskRejectedAfterTrades`]
+    /// is re-executed with its residual refused (#291), since the live
+    /// refusal came from a `RiskConfig` replay does not have.
     ///
     /// Every other rejected event is skipped: a string-only
     /// [`SequencerResult::Rejected`] carries no code to decide by (the
@@ -1118,6 +1137,21 @@ where
         };
 
         match &event.command {
+            // #291: the live taker traded and the risk layer then refused
+            // its residual. The refusal depended on the source book's
+            // `RiskConfig` and concurrent state, which replay does not
+            // have; the sweep did not. Replay reproduces the sweep and
+            // refuses the residual as recorded, then reconciles the code.
+            SequencerCommand::AddOrder(order)
+                if recorded == Some(RejectReason::RiskRejectedAfterTrades) =>
+            {
+                Self::reconcile_submit(
+                    event,
+                    recorded,
+                    book.replay_add_order_refusing_residual(order.clone())
+                        .map(|_| ()),
+                )?;
+            }
             SequencerCommand::AddOrder(order) => {
                 Self::reconcile_submit(event, recorded, book.add_order(order.clone()).map(|_| ()))?;
             }
@@ -1397,6 +1431,10 @@ where
     /// risk limits (`RiskMaxOpenOrders` / `RiskMaxNotional` /
     /// `RiskPriceBand`; a `RiskConfig` is not part of `ReplayBookConfig`)
     /// and application-side or internal codes ([`RejectReason::Other`]).
+    /// The risk codes are pre-trade only: a risk refusal that follows
+    /// trades is [`RejectReason::RiskRejectedAfterTrades`] (#291), which is
+    /// not in this table and is re-executed with its residual refused (see
+    /// [`Self::replay_from`]).
     /// None of them mutates the book, so skipping reproduces the live
     /// outcome exactly, while re-executing would apply a command the live
     /// book refused: under an engaged kill switch a rejected GTC would rest

@@ -386,8 +386,9 @@ book resolves every such failure instead of losing the order silently:
   could not rest after accepting it: a lost modify whose restore failed
   (`Cancelled { filled_quantity: prior fills, RestFailed }`), and any submit
   whose remainder the level or the risk reservation refused after the sweep
-  traded (`Cancelled { filled_quantity: executed, RestFailed }`; a taker
-  that did not trade is `Rejected` under the error's code). No state is
+  traded (`Cancelled { filled_quantity: executed, RestFailed }`, the risk
+  case returning `RiskRejectedAfterTrades` since #291; a taker that did
+  not trade is `Rejected` under the error's code). No state is
   recorded when the failure is a duplicate id: that id's state belongs to
   the live order that owns it.
 
@@ -529,13 +530,11 @@ fails on it). Emptied `user_orders` entries are dropped with `remove_if`
 on emptiness, so a push for the same user between the emptying and the
 removal is kept.
 
-Special-order tracking is registered after the admission, as before #288:
-the repricers unregister every tracked id `get_order` cannot find, so a
-registration made before the order reached its level could be lost for
-good. A registration that lands after a concurrent cancel leaves a stale
-id, which the next repricing pass removes. (Pre-existing and unchanged: a
-repricer that reads `get_order == None` for an order that is then
-replaced by a same-id order can unregister the new one.)
+Special-order tracking is registered after the admission, as before #288.
+A registration that lands after a concurrent cancel leaves a stale id,
+which the next repricing pass removes. A repricer releases a tracked id
+only while no admission owns it (#291, below), so a same-id order admitted
+after the pass read the id's previous order gone keeps its registration.
 
 Cost, measured against main with three interleaved rounds: one location
 claim instead of an insert, and the user-index push moved ahead of the
@@ -575,6 +574,66 @@ entry in between and release a second open-order slot (and no anomaly was
 counted, because the account's other orders kept the counter positive).
 The full-fill removal now happens under the entry lock that zeroes it:
 whichever of the two takes the entry releases the slot once.
+
+## Post-trade risk rejections and repricer id reuse (#291)
+
+**Post-trade risk rejection.** The pre-trade risk check admits a limit
+order's whole quantity before the sweep, and `rest_on_level` then reserves
+the residual's contribution (#243). That reservation can still be refused
+after the sweep traded: concurrent admissions on the same account under
+the shared submit gate, or a counter that cannot represent the residual.
+Before #291 the taker returned the plain risk error (`RiskMaxNotional`,
+`RiskMaxOpenOrders`), which `SequencerResult::from` classified as never
+mutating and whose code replay skips (a `RiskConfig` is not part of
+`ReplayBookConfig`), so replay dropped real trades and only
+`snapshots_match` noticed.
+
+Contract: a risk refusal of a residual after the taker traded is
+`OrderBookError::RiskRejectedAfterTrades { order_id, executed_quantity,
+source }` (reject code 22, `may_have_mutated: true`), wrapping the risk
+error; the trades were published like a partial fill, the residual did
+not rest, the taker ends `Cancelled { RestFailed }`, and nothing is left
+indexed (the reservation is the first thing `rest_on_level` publishes, so
+its refusal touches nothing). A refusal before any trade keeps the plain
+risk error and its pre-mutation classification. A risk-map collision on
+the id is the #288 duplicate race and stays `DuplicateOrderId`. A modify's
+re-add refused this way is `ModifyOrderLost` with this error as `source`
+(journaled as code 21, which only carries the outer reason: replay
+re-executes the modify without a `RiskConfig`, the residual rests, and
+replay stops with `ReplayError::OutcomeMismatch`, the same documented
+limit as every `ModifyOrderLost` (#247); it never diverges silently).
+
+Replay re-executes an `AddOrder` recorded under code 22 through a
+crate-internal admission that runs every check and the sweep exactly like
+`add_order` and then refuses the residual instead of resting it. The sweep
+is a deterministic function of the book and the order, so the replayed
+book ends like the live one without the source's `RiskConfig`; the
+re-execution must fail under the same code, so a replay that fills the
+whole order, or does not trade at all, stops with
+`ReplayError::OutcomeMismatch`. Only the code is reconciled, as for every
+`RejectedWithCode`; `snapshots_match` stays the oracle.
+
+**Limitation.** Journals written before code 22 recorded such a failure
+under a pre-trade risk code with `may_have_mutated: false`. Replay cannot
+tell it from a pre-trade rejection and still skips it; for those journals
+only `snapshots_match` detects the missing trades.
+
+**Repricer id reuse.** `reprice_pegged_collecting` /
+`reprice_trailing_collecting` release the tracker entry of an id whose
+order `get_order` no longer finds (a maker the sweep filled is drained
+without unregistering). A same-id order admitted between that read and
+the release used to lose its registration: its own insert found the stale
+entry and was a no-op, and the release then removed it. The release is
+now conditional on the id being unowned: under the tracker's shard lock
+(`DashSet::remove_if`) the repricer checks that no `order_locations` entry
+exists for the id. The location is the id's ownership token (#288): an
+order claims it before its level admits it and registers after the
+admission, and every remover unregisters before it releases the location.
+A registration made before the check therefore follows a claim the check
+sees, and one made after it re-inserts the id. Lock order is tracker shard
+then location shard; no path holds a location guard while touching the
+tracker. A same-id order of another kind keeps the stale entry until it is
+gone (a pass skips it: `get_order` finds a non-special order).
 
 ## Ratchet
 

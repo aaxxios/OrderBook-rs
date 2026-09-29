@@ -408,6 +408,37 @@ pub enum OrderBookError {
         cancelled_quantity: u64,
     },
 
+    /// A taker traded and then the per-account risk layer refused to
+    /// reserve its residual, so the residual did **not** rest (#291).
+    ///
+    /// The pre-trade risk check admits the whole order before the sweep,
+    /// so this only follows a reservation the check could not predict:
+    /// concurrent admissions on the same account under the shared submit
+    /// gate, or a counter that cannot represent the residual. The trades
+    /// are real (`executed_quantity > 0`, published to the listeners like
+    /// a partial fill); the taker ends
+    /// `OrderStatus::Cancelled { filled_quantity: executed_quantity,
+    /// reason: CancelReason::RestFailed }`. A risk refusal before any
+    /// trade keeps its own variant (`RiskMaxOpenOrders`,
+    /// `RiskMaxNotional`, ...), which is pre-mutation.
+    ///
+    /// Distinct from the risk rejections because it mutates the book: a
+    /// journal records it as may-have-mutated and replay re-executes the
+    /// sweep with the residual refused, which needs no `RiskConfig`.
+    /// Returned by `update_order` only as the `source` of
+    /// [`Self::ModifyOrderLost`]. Maps to the stable wire code
+    /// `RejectReason::RiskRejectedAfterTrades`.
+    RiskRejectedAfterTrades {
+        /// The taker whose residual was refused.
+        order_id: pricelevel::Id,
+        /// Quantity the taker executed before the refusal, in quantity
+        /// units.
+        executed_quantity: u64,
+        /// The risk layer's refusal. Boxed so the variant does not widen
+        /// every `Result<_, OrderBookError>`.
+        source: Box<OrderBookError>,
+    },
+
     /// A taker's fee could not be computed exactly under the configured
     /// `FeeSchedule` (#244).
     ///
@@ -698,6 +729,16 @@ impl fmt::Display for OrderBookError {
                     "order {order_id} changed during the modify: read with {read_quantity} units, cancelled with {cancelled_quantity}"
                 )
             }
+            OrderBookError::RiskRejectedAfterTrades {
+                order_id,
+                executed_quantity,
+                source,
+            } => {
+                write!(
+                    f,
+                    "risk rejected the residual of order {order_id} after it executed {executed_quantity}; remainder cancelled: {source}"
+                )
+            }
             OrderBookError::ModifyRolledBack { order_id, source } => {
                 write!(
                     f,
@@ -777,7 +818,8 @@ impl std::error::Error for OrderBookError {
             OrderBookError::MatchAborted { source, .. }
             | OrderBookError::OrderRemovedWithLevelFault { source, .. } => Some(source.as_ref()),
             OrderBookError::ModifyRolledBack { source, .. }
-            | OrderBookError::ModifyOrderLost { source, .. } => Some(source.as_ref()),
+            | OrderBookError::ModifyOrderLost { source, .. }
+            | OrderBookError::RiskRejectedAfterTrades { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
