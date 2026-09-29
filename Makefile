@@ -33,50 +33,31 @@ fmt-check:
 	cargo +stable fmt --check
 
 # Run Clippy for linting, plus the Production Panic Policy syntax gate
-# (issue #242, ported from PriceLevel's issue #173): clippy's
-# `[lints.clippy]` restriction lints (Cargo.toml) and this crate's
+# (issue #242, ported from PriceLevel's issue #173; absolute since #260):
+# clippy's `[lints.clippy]` restriction lints (Cargo.toml) and this crate's
 # `clippy.toml` cover unwrap/expect/panic/unreachable/todo/unimplemented/
 # indexing/string-slicing/narrowing-casts/raw-arithmetic in production.
 # `lint-panic` below covers what clippy has NO lint for at all (the
-# `assert!`/`debug_assert!` family) and what clippy's own `#[cfg(test)]`
+# `assert!`/`debug_assert!` family), what clippy's own `#[cfg(test)]`
 # heuristic can wrongly exempt (a standalone `#[cfg(test)]` production
-# helper that is not a `mod tests { ... }` block), plus
-# `saturating_*`/`wrapping_*` on production state. `lint-clippy-ratchet`
-# (PR #266 review) runs LAST: it re-checks every file carrying a
-# `panic-policy-ratchet` `#![allow(clippy::...)]` for a NEW violation of an
-# already-ratcheted lint, which a plain `cargo clippy` above can never see
-# (that is exactly what the file's own `allow` suppresses).
+# helper that is not a `mod tests { ... }` block), `saturating_*`/
+# `wrapping_*` on production state, and any production
+# `#[allow]`/`#[expect]` of a denied clippy lint (the escape hatch a plain
+# `cargo clippy` cannot see, since the attribute suppresses the lint).
 .PHONY: lint
 lint: lint-panic
 	cargo clippy --all-targets --all-features -- -D warnings
-	$(MAKE) lint-clippy-ratchet
 
 # Production Panic Policy syntax gate (issue #242): scripts/check_panic_policy.py.
-# Runs the scanner's own fixture self-test first — a broken scanner must
-# never silently report a clean src/ — then scans src/ for real, gated on
-# scripts/panic_policy_allowlist.txt (the ratchet: existing violations tolerate
-# their current count exactly, any new one, or any stale over-allowance, fails).
+# Runs the scanner's own fixture self-test first (a broken scanner must
+# never silently report a clean src/), then scans src/ for real. Zero
+# tolerance (issue #260): there is no allowlist ledger; any finding fails.
+# The only exception form is the inline `panic-policy-allow-saturating`
+# marker on a reviewed `saturating_*`/`wrapping_*` expression.
 .PHONY: lint-panic
 lint-panic:
 	python3 scripts/check_panic_policy.py --self-test
 	python3 scripts/check_panic_policy.py
-
-# Clippy-side ratchet gate (issue #242 follow-up, PR #266 review):
-# scripts/check_clippy_ratchet.py. A per-file `#![allow(clippy::...)]`
-# ratchet marker is not itself a count-based ratchet — normal `cargo clippy`
-# above cannot see a NEW violation of an already-allowed lint in that same
-# file. This copies the crate to a scratch dir, strips just those markers,
-# and re-runs clippy there (`--cap-lints=warn` so the crate's own
-# `[lints.clippy]` `"deny"` reports instead of aborting), gated on
-# scripts/clippy_ratchet.txt with the same exact-count ratchet discipline as
-# `lint-panic`. Measured cost: ~2-7s wall on a warm `target/` (shared with
-# the main build on purpose, for speed — dependency artifacts are content-
-# addressed and reused; only `orderbook-rs` itself recompiles against the
-# scratch copy's path, which can in turn invalidate the main tree's own
-# cached `orderbook-rs` build output for the next normal build).
-.PHONY: lint-clippy-ratchet
-lint-clippy-ratchet:
-	python3 scripts/check_clippy_ratchet.py
 
 .PHONY: lint-fix
 lint-fix:

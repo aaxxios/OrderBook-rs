@@ -30,19 +30,12 @@ What counts as "test code" here, matching the project's actual layout
    `tests/unit/`, `tests/metrics/`, `tests/alloc_budget.rs`,
    `tests/fee_tests.rs` integration-test tree, and the co-located
    `src/orderbook/tests/*.rs` / `src/utils/tests/*.rs` convention — skipped
-   entirely. NOTE: a file under such a directory that is NOT itself gated by
-   `#[cfg(test)]` (e.g. `src/orderbook/tests/test_helpers.rs`, an
-   unconditionally-compiled `pub fn` helper reachable from production) is
-   still production code under the Production Panic Policy; it does not get
-   a skip from clippy's own item-level `#[cfg(test)]` detection either, and
-   is covered instead by that file's own top-of-file `#![allow(...)]`
-   ratchet marker for whichever clippy lints it violates. This script's
-   directory-based skip is a deliberate, documented limitation: it trusts
-   that every file placed under a `tests/` directory component contains
-   only `#[cfg(test)]`-gated content, which is true for every file in this
-   crate except that one instance (verified by inspection when this script
-   was ported; re-verify if a new unconditionally-compiled helper is added
-   under a `tests/` directory).
+   entirely. This directory-based skip is exact for this crate: both
+   `src/orderbook/tests/` and `src/utils/tests/` are declared as
+   `#[cfg(test)] mod tests;` by their parent module, so every file under
+   them (including `src/orderbook/tests/test_helpers.rs`) compiles only
+   under `cfg(test)`. Re-verify if a new `tests/` directory is ever added
+   under `src/` without that gate.
 2. A `#[cfg(test)] mod <name> { ... }` block whose name is exactly `tests`,
    starts with `tests_`, or ends with `_tests` — the shape most co-located
    test modules directly inside a production file use (`mod tests`, `mod
@@ -103,36 +96,25 @@ never panics: `doc/panic-boundaries.md` and the manual review checklist in
 `rules/global_rules.md` cover what neither this script nor clippy can see
 (callback obligations, dependency preconditions, allocator OOM).
 
-RATCHET (issue #242). This crate lands the gate with hundreds of pre-existing
-clippy-caught violations (see each production file's own
-`// panic-policy-ratchet: see #242, removed by the fix issue` marker and
-`#![allow(clippy::...)]` list — `--ratchet-report` below enumerates them) and
-some pre-existing violations this script itself would otherwise catch
-(mainly the `assert!` family in a few production-adjacent test seams, and
-`saturating_*`/`wrapping_*` calls). `scripts/panic_policy_allowlist.txt`
-tracks the latter: one `path:rule:count` line per file/rule pair with a
-currently-tolerated non-zero count. In normal gate mode
-(`check_panic_policy.py` with no flags), a file's finding count for a rule
-must equal exactly its allowlist entry (absent entry means 0 allowed):
-MORE findings than allowed is a new regression (fails); FEWER findings than
-allowed is a stale entry that must shrink (also fails, so a fix PR is forced
-to edit the allowlist down rather than leaving dead slack in it). Regenerate
-the file after a legitimate change with `--write-allowlist`; NEVER hand-edit
-counts upward to paper over a new violation. `--ratchet-report` lists every
-clippy-side ratchet `#![allow(...)]` currently in the tree (file + lints),
-the companion view for what `--write-allowlist` cannot see (clippy is a
-separate tool).
+ZERO TOLERANCE (issue #260). The temporary ratchet ledgers used while the
+pre-existing violations were fixed (#243-#259) are gone: ANY finding fails
+the gate. The only exception form is the inline
+`panic-policy-allow-saturating` marker on a reviewed `saturating_*` /
+`wrapping_*` expression (see `SATURATING_PATTERNS`). There is no allowlist
+file and no per-file clippy `allow` escape hatch: this script also fails on
+a production `#[allow(clippy::<lint>)]` / `#[expect(clippy::<lint>)]` (inner
+or outer, including inside `cfg_attr`) naming any lint that Cargo.toml's
+`[lints.clippy]` table denies, or the `clippy::all` / `clippy::restriction`
+groups, outside the test spans described above. Test and bench crate roots
+(`tests/`, `benches/`) are not scanned: the policy is production-only.
 
 Usage:
     scripts/check_panic_policy.py [--path PATH ...]
     scripts/check_panic_policy.py --self-test
-    scripts/check_panic_policy.py --write-allowlist
-    scripts/check_panic_policy.py --ratchet-report
 
-Exit status is non-zero if any forbidden production form is found outside
-its allowlist tolerance (normal mode), if any fixture does not match its
-expected outcome (`--self-test`), or on a filesystem error. `--write-
-allowlist` and `--ratchet-report` always exit 0 on success.
+Exit status is non-zero if any forbidden production form is found (normal
+mode), if any fixture does not match its expected outcome (`--self-test`),
+or on a filesystem error.
 """
 
 from __future__ import annotations
@@ -144,8 +126,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ALLOWLIST_PATH = REPO_ROOT / "scripts" / "panic_policy_allowlist.txt"
-RATCHET_MARKER = "panic-policy-ratchet: see #242, removed by the fix issue"
+CARGO_TOML_PATH = REPO_ROOT / "Cargo.toml"
 
 
 def _macro_pattern(name: str) -> re.Pattern[str]:
@@ -160,7 +141,7 @@ def _macro_pattern(name: str) -> re.Pattern[str]:
     return re.compile(rf"\b{escaped}\s*!\s*[(\[{{]")
 
 
-# (pattern, human-readable label, stable rule id for the allowlist file).
+# (pattern, human-readable label, stable rule id).
 # Order does not matter: every pattern names a distinct macro/method, none is
 # a substring of another's match.
 FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
@@ -265,6 +246,87 @@ _INDEXING_EXCLUDED_KEYWORDS = frozenset(
         "as",
     }
 )
+
+# Production `allow`/`expect` escape hatch (issue #260): once the ratchet
+# ledgers were removed, the only way left to smuggle a denied clippy lint
+# back into production code is a local `#[allow(clippy::<lint>)]` /
+# `#[expect(clippy::<lint>)]` (or the inner `#![...]` form, or either one
+# inside a `cfg_attr`). The gate is absolute, so any such attribute naming a
+# lint that Cargo.toml's `[lints.clippy]` table denies (or the
+# `clippy::all` / `clippy::restriction` groups that contain them) fails,
+# unless it sits inside one of the exempt test spans. Allows of lints the
+# table does NOT deny (`clippy::too_many_arguments`, `clippy::type_complexity`,
+# ...) are style choices, not panic-policy escapes, and stay legal.
+_DENIED_CLIPPY_GROUPS = frozenset({"all", "restriction"})
+_LINTS_CLIPPY_HEADER = re.compile(r"^\s*\[lints\.clippy\]\s*$")
+_TABLE_HEADER = re.compile(r"^\s*\[")
+_LINT_LEVEL_LINE = re.compile(
+    r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"(deny|forbid)"|\{[^}]*\blevel\s*=\s*"(deny|forbid)"[^}]*\})"""
+)
+_ATTR_OPEN = re.compile(r"#\s*!?\s*\[")
+_ALLOW_OR_EXPECT = re.compile(r"\b(allow|expect)\s*\(")
+_CLIPPY_LINT_PATH = re.compile(r"\bclippy\s*::\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def load_denied_clippy_lints(cargo_toml: Path = CARGO_TOML_PATH) -> frozenset[str]:
+    """Parses the `deny`/`forbid` entries of Cargo.toml's `[lints.clippy]`
+    table with a line-oriented scan (the gate must run on the system
+    `python3`, which may predate `tomllib`). An empty result means the table
+    moved or its syntax changed, which would silently disable the
+    allow-escape check, so it is a hard error rather than an empty set.
+    """
+    denied: set[str] = set()
+    in_table = False
+    for raw_line in cargo_toml.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0]
+        if _LINTS_CLIPPY_HEADER.match(line):
+            in_table = True
+            continue
+        if in_table and _TABLE_HEADER.match(line):
+            break
+        if in_table:
+            m = _LINT_LEVEL_LINE.match(line)
+            if m:
+                denied.add(m.group(1))
+    if not denied:
+        raise SystemExit(f"check_panic_policy: no deny/forbid lints parsed from [lints.clippy] in {cargo_toml}")
+    return frozenset(denied)
+
+
+def _matching_close(masked: str, open_index: int, opener: str, closer: str) -> int:
+    """Index of the `closer` matching the `opener` at `open_index` (masked
+    text, so delimiters inside comments/strings are already blanked), or
+    `len(masked) - 1` if unbalanced."""
+    depth = 0
+    for i in range(open_index, len(masked)):
+        if masked[i] == opener:
+            depth += 1
+        elif masked[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(masked) - 1
+
+
+def find_denied_clippy_allows(masked: str, denied: frozenset[str]) -> list[tuple[int, str]]:
+    """Returns `(offset, lint)` for every denied clippy lint named inside an
+    `allow(...)` / `expect(...)` of an attribute (`#[...]` or `#![...]`,
+    including nested in `cfg_attr(...)`)."""
+    hits: list[tuple[int, str]] = []
+    forbidden = denied | _DENIED_CLIPPY_GROUPS
+    for attr in _ATTR_OPEN.finditer(masked):
+        open_bracket = attr.end() - 1
+        close_bracket = _matching_close(masked, open_bracket, "[", "]")
+        body_start = open_bracket + 1
+        body = masked[body_start:close_bracket]
+        for level in _ALLOW_OR_EXPECT.finditer(body):
+            open_paren = level.end() - 1
+            close_paren = _matching_close(body, open_paren, "(", ")")
+            for lint in _CLIPPY_LINT_PATH.finditer(body, open_paren, close_paren):
+                if lint.group(1) in forbidden:
+                    hits.append((attr.start(), lint.group(1)))
+    return hits
+
 
 # A test-module name the co-located test convention uses (`mod tests`, `mod
 # tests_bis`, `mod stop_condition_tests`, ...). Deliberately does NOT match
@@ -633,6 +695,15 @@ def _line_bounds(text: str, offset: int) -> tuple[int, int, int]:
     return line_no, line_start, line_end
 
 
+_DENIED_CLIPPY_LINTS_CACHE: list[frozenset[str]] = []
+
+
+def denied_clippy_lints() -> frozenset[str]:
+    if not _DENIED_CLIPPY_LINTS_CACHE:
+        _DENIED_CLIPPY_LINTS_CACHE.append(load_denied_clippy_lints())
+    return _DENIED_CLIPPY_LINTS_CACHE[0]
+
+
 def scan_text(path: Path, text: str, *, allowed: list[Finding] | None = None) -> list[Finding]:
     """Scans `text` and returns the un-allowed findings.
 
@@ -669,6 +740,16 @@ def scan_text(path: Path, text: str, *, allowed: list[Finding] | None = None) ->
                     allowed.append(finding)
                 continue
             findings.append(finding)
+    # Production `allow`/`expect` of a denied clippy lint (see
+    # `find_denied_clippy_allows`): outside the exempt test spans only.
+    for offset, lint in find_denied_clippy_allows(masked, denied_clippy_lints()):
+        if in_any_span(offset, span_sets.skip):
+            continue
+        line_no, line_start, line_end = _line_bounds(text, offset)
+        snippet = text[line_start:line_end].strip()
+        findings.append(
+            Finding(path, line_no, f"allow/expect(clippy::{lint}) on a denied lint", "clippy_allow", snippet)
+        )
     # Indexing/slicing: only inside a production-adjacent `#[cfg(test)]`
     # test-seam span (see `INDEXING_PATTERN`'s comment) — never over
     # ordinary production code, where clippy's own lint already applies.
@@ -717,141 +798,22 @@ def _rel(path: Path) -> str:
     return p.as_posix()
 
 
-def load_allowlist() -> dict[tuple[str, str], int]:
-    """Parses `scripts/panic_policy_allowlist.txt` (`path:rule:count` lines,
-    `#`-comments and blank lines ignored). Missing file means an empty
-    allowlist (every finding is then a fresh violation), not an error — a
-    freshly-cloned tree with a from-scratch audit is a legitimate state.
-    """
-    entries: dict[tuple[str, str], int] = {}
-    if not ALLOWLIST_PATH.exists():
-        return entries
-    for line_no, raw_line in enumerate(ALLOWLIST_PATH.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(":")
-        if len(parts) != 3:
-            print(f"scripts/panic_policy_allowlist.txt:{line_no}: malformed line (want path:rule:count): {raw_line}")
-            continue
-        path_str, rule_id, count_str = parts
-        try:
-            count = int(count_str)
-        except ValueError:
-            print(f"scripts/panic_policy_allowlist.txt:{line_no}: non-integer count: {raw_line}")
-            continue
-        entries[(path_str, rule_id)] = count
-    return entries
-
-
-def write_allowlist(paths: list[str]) -> int:
-    resolved = [(REPO_ROOT / p) for p in paths]
-    allowed: list[Finding] = []
-    findings = scan_paths(resolved, allowed=allowed)
-    counts: dict[tuple[str, str], int] = {}
-    for finding in findings:
-        key = (_rel(finding.path), finding.rule_id)
-        counts[key] = counts.get(key, 0) + 1
-    lines = [
-        "# Production Panic Policy ratchet allowlist (issue #242).",
-        "#",
-        "# One `path:rule:count` line per file/rule pair with a currently-",
-        "# tolerated non-zero finding count from scripts/check_panic_policy.py.",
-        "# Regenerated by `scripts/check_panic_policy.py --write-allowlist` — do",
-        "# not hand-edit a count upward to paper over a new violation; a fix PR",
-        "# shrinks this file by removing or lowering entries as it fixes",
-        "# production code, never by raising one.",
-        "#",
-        "# rule ids: assert, assert_eq, assert_ne, debug_assert, debug_assert_eq,",
-        "# debug_assert_ne, panic_macro, todo_macro, unimplemented_macro,",
-        "# unreachable_macro, panic_any, resume_unwind, catch_unwind, unwrap,",
-        "# unwrap_err, expect, expect_err, get_unwrap, process_exit, process_abort,",
-        "# saturating_wrapping, indexing_slicing.",
-        "",
-    ]
-    for key in sorted(counts):
-        path_str, rule_id = key
-        lines.append(f"{path_str}:{rule_id}:{counts[key]}")
-    ALLOWLIST_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"check_panic_policy --write-allowlist: wrote {len(counts)} entr{'y' if len(counts) == 1 else 'ies'} to {_rel(ALLOWLIST_PATH)}")
-    return 0
-
-
-_RATCHET_ALLOW_RE = re.compile(
-    r"//\s*" + re.escape(RATCHET_MARKER) + r"\s*\n\s*#!?\[allow\(\s*(?P<lints>[^)]*)\)\]",
-    re.MULTILINE,
-)
-
-
-def ratchet_report(paths: list[str]) -> int:
-    """Lists every clippy-side ratchet `#!/#[allow(clippy::...)]` currently
-    in the tree: the file it guards and the exact lints it lists, parsed
-    from the `// panic-policy-ratchet: see #242, removed by the fix issue`
-    marker comment immediately above the `allow(...)` attribute. This is the
-    clippy-side companion to `scripts/panic_policy_allowlist.txt` (which
-    tracks what THIS script, not clippy, finds) — together they are the
-    complete "what must shrink" picture for a fix PR.
-    """
-    resolved = [(REPO_ROOT / p) for p in paths]
-    total_files = 0
-    total_lints = 0
-    for file_path in iter_rust_files(resolved):
-        text = file_path.read_text(encoding="utf-8")
-        for match in _RATCHET_ALLOW_RE.finditer(text):
-            lints = [lint.strip() for lint in match.group("lints").split(",") if lint.strip()]
-            total_files += 1
-            total_lints += len(lints)
-            print(f"{_rel(file_path)}: {', '.join(lints)}")
-    print(f"check_panic_policy --ratchet-report: {total_files} file(s), {total_lints} clippy ratchet allow(s) total")
-    return 0
-
-
 def run_gate(paths: list[str]) -> int:
     resolved = [(REPO_ROOT / p) for p in paths]
     allowed: list[Finding] = []
     findings = scan_paths(resolved, allowed=allowed)
     for finding in allowed:
         print(f"{_rel(finding.path)}:{finding.line}: allowed ({ALLOW_SATURATING_MARKER}) {finding.label}: {finding.snippet}")
-
-    allowlist = load_allowlist()
-    counts: dict[tuple[str, str], int] = {}
-    examples: dict[tuple[str, str], list[Finding]] = {}
     for finding in findings:
-        key = (_rel(finding.path), finding.rule_id)
-        counts[key] = counts.get(key, 0) + 1
-        examples.setdefault(key, []).append(finding)
-
-    status = 0
-    all_keys = sorted(set(counts) | set(allowlist))
-    for key in all_keys:
-        path_str, rule_id = key
-        actual = counts.get(key, 0)
-        allowed_count = allowlist.get(key, 0)
-        if actual > allowed_count:
-            status = 1
-            print(
-                f"{path_str}: {actual} finding(s) of rule '{rule_id}', "
-                f"{allowed_count} allowed — new violation(s):"
-            )
-            for finding in examples.get(key, []):
-                print(f"    {path_str}:{finding.line}: {finding.label}: {finding.snippet}")
-        elif actual < allowed_count:
-            status = 1
-            print(
-                f"{path_str}: {actual} finding(s) of rule '{rule_id}', "
-                f"{allowed_count} allowed — stale allowlist entry, shrink it "
-                "(run --write-allowlist)"
-            )
-        # actual == allowed_count: within ratchet tolerance, nothing to print.
-
-    if status == 0:
-        print("check_panic_policy: no forbidden production forms outside the ratchet allowlist.")
-    else:
+        print(f"{_rel(finding.path)}:{finding.line}: {finding.rule_id}: {finding.label}: {finding.snippet}")
+    if findings:
         print(
-            "check_panic_policy: ratchet mismatch(es) found. "
+            f"check_panic_policy: {len(findings)} forbidden production form(s) found. "
             "See doc/panic-boundaries.md and rules/global_rules.md's Production Panic Policy."
         )
-    return status
+        return 1
+    print("check_panic_policy: no forbidden production forms.")
+    return 0
 
 
 def run_self_test(fixtures_dir: Path) -> int:
@@ -894,23 +856,9 @@ def main() -> int:
         action="store_true",
         help="Validate the scanner itself against scripts/panic_policy_fixtures/ instead of scanning the crate.",
     )
-    parser.add_argument(
-        "--write-allowlist",
-        action="store_true",
-        help="Regenerate scripts/panic_policy_allowlist.txt from the current scan instead of gating on it.",
-    )
-    parser.add_argument(
-        "--ratchet-report",
-        action="store_true",
-        help="List every clippy-side panic-policy-ratchet #![allow(...)] currently in the tree.",
-    )
     args = parser.parse_args()
     if args.self_test:
         return run_self_test(REPO_ROOT / "scripts" / "panic_policy_fixtures")
-    if args.write_allowlist:
-        return write_allowlist(args.paths or ["src"])
-    if args.ratchet_report:
-        return ratchet_report(args.paths or ["src", "tests", "benches"])
     return run_gate(args.paths or ["src"])
 
 
