@@ -203,7 +203,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `JournalError` is now derived with `thiserror` (Display text
     unchanged) and gains `NonMonotonicSequence`, `SegmentExists` and
     `AllocationFailed` (it is `#[non_exhaustive]`). `ReplayError` gains
-    `MassCancelMismatch`; new public `MassCancelDivergence`.
+    `MassCancelMismatch` (the enum is `#[non_exhaustive]` as of 0.14, #260,
+    so downstream matches need a wildcard arm); new public
+    `MassCancelDivergence`.
   - Behaviour: a journaled `MassCancelled` whose ids do not match the
     replay (for example a placeholder `MassCancelResult::default()` for a
     cancel that removed orders) now fails replay; journal the result the
@@ -1332,9 +1334,9 @@ change.
     second documented `unsafe` exception.
 
   Compatibility:
-  - `ReplayError` is not `#[non_exhaustive]`: the new `JournalTruncated`
-    variant needs an arm in exhaustive matches. A replay that used to
-    succeed on a truncated journal now fails.
+  - `ReplayError` gains `JournalTruncated`; the enum is `#[non_exhaustive]`
+    as of 0.14 (#260), so downstream matches need a wildcard arm. A replay
+    that used to succeed on a truncated journal now fails.
   - `NatsPublisherError` is `#[non_exhaustive]`; `ShutdownTimedOut` is
     additive. `MAX_PUBLISH_RETRIES` and `wire::MAX_FRAME_BODY` are new
     public constants.
