@@ -508,6 +508,72 @@ pub(crate) fn trade_ids_exhausted_error() -> OrderBookError {
     })
 }
 
+/// Withdraws what [`OrderBook::rest_on_level`] published before its
+/// admission if the rest path **unwinds** before the level admits the
+/// order (#294).
+///
+/// Between the location claim and the admission the rest path runs caller
+/// code: `track_state` (the tracker's `Clock`, the metrics recorder),
+/// `T::default()` in the unit conversion. A panic there used to leave the
+/// claimed location, the user-index entry, the risk reservation, the
+/// recorded resting state and possibly a freshly created empty level
+/// behind, for an order no level holds. Declared before the level stripe
+/// guard, so the stripe is released first and the drop can take the
+/// stripe's exclusive side to remove an emptied level. Disarmed by
+/// [`Self::disarm`] once the admission returned, successfully or not (the
+/// refusal path then withdraws explicitly, as before).
+///
+/// The drop withdraws the recorded state first (without reading a clock),
+/// then follows #288's release order (user index and reservation, then
+/// the location that owns the id), so every rollback happens while this
+/// admission still owns the id; it then removes a level the order left
+/// empty. It
+/// runs crate-owned code only (no allocation, no metrics; the stripe's
+/// poison `ERROR` log is the one `tracing` call), and the unwind itself
+/// engages the kill switch through the submit-gate guard.
+struct UnrestedClaim<'a, T: Clone + Send + Sync + Default + 'static> {
+    /// The book resting the order.
+    book: &'a OrderBook<T>,
+    /// The order being rested.
+    order: &'a OrderType<T>,
+    /// Its price, in price ticks.
+    price: u128,
+    /// Its side.
+    side: Side,
+    /// The #243 reservation; `None` once disarmed.
+    reservation: Option<crate::orderbook::risk::RiskReservation>,
+    /// The resting state, once `track_state` recorded it.
+    state: Option<OrderStatus>,
+}
+
+impl<T: Clone + Send + Sync + Default + 'static> UnrestedClaim<'_, T> {
+    /// The admission returned: nothing to withdraw on unwind any more.
+    /// Hands the reservation back to a refusal path that withdraws it.
+    #[inline]
+    fn disarm(&mut self) -> Option<crate::orderbook::risk::RiskReservation> {
+        self.state = None;
+        self.reservation.take()
+    }
+}
+
+impl<T: Clone + Send + Sync + Default + 'static> Drop for UnrestedClaim<'_, T> {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        // PR #297 review: the recorded state is withdrawn while this
+        // admission still owns the id (its location), so a same-id order
+        // cannot claim the id and record a transition this would pop.
+        if let Some(state) = self.state.take() {
+            self.book.withdraw_tracked_state(self.order.id(), &state);
+        }
+        self.book
+            .withdraw_unrested(self.order, self.price, self.side, reservation);
+        self.book.remove_level_if_empty(self.side, self.price);
+        self.book.cache.invalidate();
+    }
+}
+
 impl<T> OrderBook<T>
 where
     T: Clone + Send + Sync + Default + 'static,
@@ -3088,6 +3154,15 @@ where
     /// level this call left empty is removed, so no phantom level or index
     /// is exposed. `state` was already recorded; the caller records the
     /// terminal state over it.
+    ///
+    /// # Unwinding (#294)
+    ///
+    /// Caller code runs between the location claim and the admission
+    /// (`track_state`'s `Clock` and metrics recorder, `T::default()`). If
+    /// it panics, an [`UnrestedClaim`] drop guard withdraws what was
+    /// published (the recorded state, the user index and reservation, then
+    /// the location) and removes a level left empty, so no ghost index
+    /// survives the unwind.
     fn rest_on_level(
         &self,
         order: &OrderType<T>,
@@ -3137,8 +3212,20 @@ where
             self.risk_state.release_reservation(risk_reservation);
             return Err(RestFailure::Duplicate(order_id));
         }
+        // #294: from here to the admission, an unwind (caller code: the
+        // tracker's `Clock`, metrics, `T::default()`) withdraws the claim.
+        // Declared before `stripe` so the stripe is released first.
+        let mut claim = UnrestedClaim {
+            book: self,
+            order,
+            price,
+            side,
+            reservation: Some(risk_reservation),
+            state: None,
+        };
         self.track_user_order(order.user_id(), order_id);
-        self.track_state(order_id, state);
+        self.track_state(order_id, state.clone());
+        claim.state = Some(state);
 
         // #247: admission into the level runs under the shared side of the
         // price's stripe, so a concurrent removal of the level (it was
@@ -3146,20 +3233,28 @@ where
         // fresh level is created) or waits and then sees this order and
         // leaves the level in place. Concurrent admissions do not exclude
         // each other. Released before the listener runs.
+        // PR #297 review: the unit conversion (`T::default()`, caller
+        // code) runs before the stripe is taken, so no caller code of ours
+        // runs under the stripe. The claim guard covers it.
+        let unit_order = self.convert_to_unit_type(order);
         let stripe = self.lock_level(price);
         let price_level = price_levels.get_or_insert(price, Arc::new(PriceLevel::new(price)));
         let level = price_level.value();
 
-        // Convert to unit type for PriceLevel compatibility. Admission
-        // into the level is validated upstream since pricelevel 0.9
-        // (duplicate id, counter capacity). If it fails, remove the level
+        // Admission into the level is validated upstream since pricelevel
+        // 0.9 (duplicate id, counter capacity). If it fails, remove the level
         // when it is left empty — `best_bid` / `best_ask`, the cache, and
         // the depth gauges must never expose a phantom level (#211).
-        let admitted = match self.admit_to_level(level, self.convert_to_unit_type(order)) {
+        let admission = self.admit_to_level(level, unit_order);
+        let reservation = claim.disarm();
+        drop(claim);
+        let admitted = match admission {
             Ok(admitted) => admitted,
             Err(err) => {
                 drop(stripe);
-                self.withdraw_unrested(order, price, side, risk_reservation);
+                if let Some(risk_reservation) = reservation {
+                    self.withdraw_unrested(order, price, side, risk_reservation);
+                }
                 self.remove_level_if_empty(side, price);
                 self.cache.invalidate();
                 self.record_depth_metric();

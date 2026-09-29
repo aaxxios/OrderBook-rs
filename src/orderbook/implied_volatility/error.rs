@@ -9,7 +9,9 @@ use pricelevel::PriceLevelError;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum IVError {
-    /// No valid price available (empty book or no bid/ask).
+    /// No valid price available: an empty book, or
+    /// [`PriceSource::LastTrade`](super::PriceSource::LastTrade) on a
+    /// two-sided book that has not traded yet (#294).
     #[error("no valid price available from order book")]
     NoPriceAvailable,
 

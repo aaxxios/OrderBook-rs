@@ -411,22 +411,26 @@ impl OrderStateTracker {
     /// invoked, outside that lock.
     ///
     /// This standalone entry point calls the listener inline, on the
-    /// calling thread. An [`OrderBook`](crate::OrderBook) that owns the
+    /// calling thread, after the transition is recorded and a terminal id
+    /// is queued for eviction, so a panicking listener (caller code that
+    /// must not panic) leaves the tracker consistent. An [`OrderBook`](crate::OrderBook) that owns the
     /// tracker does not use it: the book records the transition and defers
     /// the listener until its mutation has committed and its submit gate is
     /// released (#249).
     pub fn transition(&self, order_id: Id, new_status: OrderStatus) {
         let old_status = self.record(order_id, &new_status);
 
+        // Track terminal states for eviction before any caller code runs
+        // (#294, as `record_transition` does): a panicking listener must
+        // not leave a terminal id outside the eviction queue.
+        if new_status.is_terminal() {
+            self.enqueue_terminal(order_id);
+        }
+
         // Notify listener
         if let Some(ref listener) = self.listener {
             let old = old_status.as_ref().unwrap_or(&new_status);
             listener(order_id, old, &new_status);
-        }
-
-        // Track terminal states for eviction
-        if new_status.is_terminal() {
-            self.enqueue_terminal(order_id);
         }
     }
 
@@ -450,6 +454,37 @@ impl OrderStateTracker {
         self.listener.as_ref()?;
         let old = old_status.unwrap_or_else(|| new_status.clone());
         Some((old, new_status))
+    }
+
+    /// Undo the transition that recorded `status` for `order_id`, when it
+    /// is still the latest one (#294).
+    ///
+    /// For a book whose rest path unwound after recording the resting
+    /// state of an order its level never admitted: pops that history entry
+    /// and restores the previous status, or forgets the order when it was
+    /// its only transition. Reads no clock and invokes no listener (the
+    /// unwinding emission scope drops the deferred event). A non-matching
+    /// latest status, or no entry, is left untouched.
+    pub(crate) fn withdraw_last_transition(&self, order_id: Id, status: &OrderStatus) {
+        let dashmap::Entry::Occupied(mut occupied) = self.entries.entry(order_id) else {
+            return;
+        };
+        let tracked = occupied.get_mut();
+        if tracked.status != *status
+            || tracked
+                .history
+                .last()
+                .is_none_or(|(_, last)| last != status)
+        {
+            return;
+        }
+        tracked.history.pop();
+        match tracked.history.last() {
+            Some((_, previous)) => tracked.status = previous.clone(),
+            None => {
+                occupied.remove();
+            }
+        }
     }
 
     /// The installed listener, if any (#249: the owning book invokes it

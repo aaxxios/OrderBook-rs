@@ -166,8 +166,9 @@ where
     ///
     /// - [`IVError::InvalidConfig`] if `config` fails [`IVConfig::validate`]
     ///   (checked before the book is read).
-    /// - [`IVError::NoPriceAvailable`] if the book has neither a usable price nor
-    ///   a last trade to derive one from.
+    /// - [`IVError::NoPriceAvailable`] if the book has no bid and no ask, or
+    ///   if `price_source` is [`PriceSource::LastTrade`], the book is
+    ///   two-sided and it has not traded yet (no fallback to the mid, #294).
     /// - [`IVError::PriceLevel`] if a best-level quantity cannot be read
     ///   ([`PriceSource::WeightedMid`] only).
     /// - [`IVError::NonFiniteResult`] if the scaled price or spread is not
@@ -234,6 +235,8 @@ where
     /// # Returns
     /// - `Ok((price, spread_bps))`: Extracted price and spread in basis points
     /// - `Err(IVError::NoPriceAvailable)`: If no valid price can be extracted
+    ///   (an empty book, or [`PriceSource::LastTrade`] on a two-sided book
+    ///   that has not traded yet)
     /// - `Err(IVError::CrossedBook)`: If the book is crossed or locked
     /// - `Err(IVError::PriceLevel)` / `Err(IVError::ArithmeticOverflow)`: from
     ///   the weighted-mid quantity read
@@ -277,10 +280,12 @@ where
                     PriceSource::WeightedMid => {
                         self.weighted_mid_price_for_iv(bid, ask, price_scale)?
                     }
+                    // #294: no silent fallback to the mid; the caller asked
+                    // for a traded price and there is none.
                     PriceSource::LastTrade => self
                         .last_trade_price()
                         .map(|p| p as f64 / price_scale)
-                        .unwrap_or(mid),
+                        .ok_or(IVError::NoPriceAvailable)?,
                 };
 
                 Ok((price, spread_bps))
@@ -590,6 +595,29 @@ mod tests {
 
         // Last trade should be at ask price (4.70)
         assert!((price - 4.70).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_extract_price_last_trade_without_trade_is_no_price_available() {
+        // #294: two-sided, never traded: typed error, not the mid.
+        let book = create_test_book();
+        assert_eq!(book.last_trade_price(), None);
+        let result = book.extract_price_for_iv(PriceSource::LastTrade, 100.0);
+        assert!(
+            matches!(result, Err(IVError::NoPriceAvailable)),
+            "{result:?}"
+        );
+        let params = IVParams::call(5.0, 5.0, 0.25, 0.05);
+        let result = book.implied_volatility(&params, PriceSource::LastTrade);
+        assert!(
+            matches!(result, Err(IVError::NoPriceAvailable)),
+            "{result:?}"
+        );
+        // The mid is still available through its own source.
+        assert!(
+            book.extract_price_for_iv(PriceSource::MidPrice, 100.0)
+                .is_ok()
+        );
     }
 
     #[test]

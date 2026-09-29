@@ -53,7 +53,7 @@ exception.
 |---|---|---|---|
 | `dashmap::DashMap` | Order index, symbol registries (`manager.rs`) | Internal `RandomState` hasher panics are not part of its public contract; growth (`RawTable` resize) aborts the process on allocator OOM, not a Rust panic | No known panic path from crate-internal usage (keys are `Id`/`String`, never attacker-controlled hash-flooding input in the trusted-input model this crate assumes) |
 | `crossbeam-skiplist::SkipMap` | Price-level index (`PriceLevelCache`, book side maps) | Node allocation aborts the process on allocator OOM, not a Rust panic | Same allocator-OOM caveat as `DashMap` |
-| `crossbeam::queue::SegQueue` | (if used on a hot path) | Allocator OOM only | — |
+| `crossbeam::queue::ArrayQueue` | Per-book pool of recycled listener event buffers (`EventOutbox::pool`, `src/orderbook/emission.rs`, #249) | `ArrayQueue::new` panics on a capacity of zero; `push` / `pop` never panic (a full queue returns the value) | Precondition satisfied by construction: the capacity is the non-zero constant `BUFFER_POOL`. A full pool drops the surplus buffer. No `SegQueue` is used |
 | `crossbeam::channel` (`BookManagerStd`) | Unbounded trade-event channel, `bounded(1)` stop signal, `Select` in the processor thread (#255) | `Select::select` panics if no operation is registered; a `SelectedOperation` panics if it is dropped uncompleted or completed with a receiver it was not registered with | `run_std_processor` registers exactly two receivers once and completes every selected operation exhaustively (`if index == stop { recv(&stop) } else { recv(&events) }`), so neither panic is reachable. Sends use the `Result`-returning `send` / `try_send`; the stop channel only ever carries one message, so `try_send` never sees a full buffer |
 | `std::collections::hash_map::RandomState` | Default hasher for the above and for every `HashMap`/`HashSet` (`DashMap::new`, `HashMap::new`) | Seeds its keys from OS entropy the first time a thread builds one; `std` panics if the platform entropy source is unavailable (no fallible constructor exists) | Irreducible dependency limit: the crate does not choose a hasher for these maps, and `std` exposes no fallible seeding. Crate-owned entropy is gone (#265: default trade-id namespaces no longer call `Uuid::new_v4()`), so this is the only remaining OS-entropy read |
 | `tokio` (`BookManagerTokio`, NATS publishers) | `tokio::sync::{RwLock, Mutex, mpsc, broadcast, watch, oneshot}`, `Handle::spawn`, `tokio::time` | `tokio::spawn` / `Handle::current()` panic when called outside a runtime; `broadcast::Receiver::recv` can return `Lagged`; a `JoinHandle` can return `Err(JoinError)` for a cancelled or panicked task; polling a completed `oneshot::Receiver` again panics | No production call site uses the ambient `tokio::spawn` / `Handle::current()` any more (the remaining ones in `nats.rs` / `nats_common.rs` are inside `#[cfg(test)]` modules). `BookManagerTokio::start_trade_processor{,_with}` resolve the runtime with `Handle::try_current()` and return `ManagerError::NoRuntime` outside one; `start_trade_processor_on` and the NATS publishers take an explicit `Handle` and spawn on it (#255, #253). Spawning onto a runtime that already shut down is not a panic: the task is cancelled and `stop_trade_processor` / `shutdown` report it (`ManagerError::ProcessorCancelled`, `NatsPublisherError::TaskCancelled`). Every processor / publisher `JoinHandle` is awaited by its stop path with `JoinError` mapped to a typed error (panicked vs cancelled). The publishers' `shutdown()` is cancel-safe: the handle is taken out of its slot only for the await and a drop guard puts it back if the shutdown future is dropped first, so a cancelled `shutdown()` never detaches the task and a completed `JoinHandle` is never polled again (#295). `shutdown_with_deadline` wraps the join in `tokio::time::timeout` (which falls back to a far-future deadline instead of overflowing on `Duration::MAX`), then aborts and joins the task (`NatsPublisherError::ShutdownTimedOut`). The manager's stop `oneshot::Receiver` is dropped from the poll loop the first time it resolves, so it is never polled after completion |
@@ -132,17 +132,17 @@ boundary's limits instead of promising to prevent every external panic."
 
 | Caller-supplied surface | Where it runs | Obligation | Notes |
 |---|---|---|---|
-| Generic `T` on `OrderBook<T>` (`Clone`, `Default`, `Debug`, and any trait bound the caller's `T` carries) | Order storage, snapshot/clone paths, `Debug` formatting | Must not panic; `Debug` must not leak caller-identifying data if `T` carries user-identifying fields (`rules/global_rules.md`'s Security/Safety section) | No engine lock is held across a `T::clone()`/`T::fmt()` call on the matching hot path (matching operates on `pricelevel`'s `OrderType<()>` internally; `T` is only touched at the book's own boundary, not inside `pricelevel`'s matcher). `T::default()` does run inside gated entry points (order conversion at the boundary); a panic there unwinds out of the entry point, and if it held the exclusive gate the next acquisition engages the kill switch (#249, see "Listener emission and submit-gate poisoning" below) |
+| Generic `T` on `OrderBook<T>` (`Clone`, `Default`, `Debug`, and any trait bound the caller's `T` carries) | Order storage, snapshot/clone paths, `Debug` formatting | Must not panic; `Debug` must not leak caller-identifying data if `T` carries user-identifying fields (`rules/global_rules.md`'s Security/Safety section) | No engine lock is held across a `T::clone()`/`T::fmt()` call on the matching hot path (matching operates on `pricelevel`'s `OrderType<()>` internally; `T` is only touched at the book's own boundary, not inside `pricelevel`'s matcher). `T::default()` does run inside gated entry points (order conversion at the boundary, and between a modify's cancel and its re-add); a panic there unwinds out of the entry point mid-mutation, and the unwinding submit-gate guard engages the kill switch on either side of the gate (#249, #294, see "Listener emission and submit-gate poisoning" below) |
 | `TradeListener` (`Arc<dyn Fn(&TradeResult) + Send + Sync>`, `src/orderbook/trade.rs`) | Runs after commit, outside the submit gate, ordered by commit (#249): buffered during the mutation, stamped with `engine_seq` under the gate, delivered by the book's single active dispatcher after the gate is released | Must not panic; must return quickly (no blocking I/O) — push into a channel, do not do work inline. May re-enter the book | No book lock is held. An unwind does not corrupt book state and does not poison the gate; it releases the dispatcher role, drops the rest of the batch being delivered (`dropped_listener_events`, `listener_panics`, `ERROR` log) and propagates out of the book call that was dispatching. Queued batches are delivered by the next dispatch (or `flush_listener_events`) |
 | Book-manager trade handler (`FnMut(TradeEvent) + Send + 'static`, `BookManagerStd` / `BookManagerTokio::start_trade_processor_with`, `BookManagerTokio::start_trade_processor_on`, `src/orderbook/manager.rs`) | Invoked once per trade event on the manager's processor: a dedicated OS thread (`BookManagerStd`) or a task on a Tokio worker (`BookManagerTokio`), never on the matching path | Must not panic. On Tokio it must also return quickly (move blocking work to `spawn_blocking`) | Runs after the book has committed the trade and its listener has queued the event; no book or manager lock is held. A panic ends the processor only: `stop_trade_processor` surfaces it as `ManagerError::ProcessorPanicked { message }`, and every later trade event is counted in `dropped_trade_events()` (and `orderbook_manager_trade_events_dropped_total` under `metrics`) instead of being processed. Book state is unaffected (#255) |
 | `OrderStateListener` (`Arc<dyn Fn(Id, &OrderStatus, &OrderStatus) + Send + Sync>`, `src/orderbook/order_state.rs`) | On a book's tracker: the transition is recorded during the mutation, the listener runs after commit, outside the submit gate, ordered by commit, in the same stream as the trade listener (#249). On a standalone tracker, `OrderStateTracker::transition` calls it inline | Same as `TradeListener` | Same as `TradeListener` |
 | `PriceLevelChangedListener` (`Arc<dyn Fn(PriceLevelChangedEvent) + Send + Sync>`, `src/orderbook/book_change_event.rs`) | Runs after commit, outside the submit gate, ordered by commit, in the same `engine_seq` stream as the trade listener (#249; feeds `NatsBookChangePublisher`) | Same as `TradeListener` | Same as `TradeListener` |
 | `EventSerializer` impls (`src/orderbook/serialization.rs`) | `NatsTradePublisher` payload encoding only (`with_serializer`). The journal encodes with `serde_json` directly, and `NatsBookChangePublisher` always encodes its batches as JSON (#295), so neither runs a caller-supplied serializer | Must return a typed error rather than panicking on an unencodable value | Crate-provided JSON/Bincode impls follow this; a caller-supplied impl is not re-certified. It runs in the trade publisher's background task with no lock held; a panic there stops the task and is reported by `shutdown()` as `NatsPublisherError::TaskPanicked` |
 | `Journal<T>` impls (`src/orderbook/sequencer/journal.rs`) | Append/read of sequencer events (`InMemoryJournal`, `FileJournal`, or a caller's own impl) | Must return `JournalError`/`ReplayError` rather than panicking; must not silently drop or reorder entries; must refuse a non-increasing `append` with `NonMonotonicSequence`, and report an unreadable `last_sequence` as `Err`, never `Ok(None)` (#252) | Crate-provided impls follow this end-to-end (poisoned locks are `MutexPoisoned`; `InMemoryJournal` clones `T` outside its lock on both append and read, #295); a caller-supplied `Journal<T>` is not re-certified |
-| `Clock` impls (`src/orderbook/clock.rs`) | Timestamp generation for the book and sequencer | Must not panic; must be monotonic if used with `ReplayEngine`'s determinism guarantee | `MonotonicClock` is crate-provided and compliant; a caller-supplied `Clock` breaking monotonicity is a correctness bug in the caller, not a crate panic |
+| `Clock` impls (`src/orderbook/clock.rs`) | Timestamp generation for the book and sequencer. On a book it runs **under the submit gate, mid-mutation**: the book's clock once per sweep (`taker_ts` in `match_order`), the order-state tracker's clock on every recorded transition (`OrderStateTracker::record`, reached from `track_state`: a resting state before the level admits the order, each filled maker's `Filled` in the sweep drain before its indices are released, a taker's terminal state) | Must not panic; must be monotonic if used with `ReplayEngine`'s determinism guarantee | `MonotonicClock` is crate-provided and compliant; a caller-supplied `Clock` breaking monotonicity is a correctness bug in the caller, not a crate panic. An unwind from it leaves the mutation partial; the submit-gate guard then engages the kill switch and latches `submit_gate_poisoned` on either side (#294). Two drop guards bound the partial state (see "Core boundary gaps" below): the sweep drain releases the indices of every filled maker not yet released, and the rest path withdraws an order's claim (location, user index, risk reservation, resting state, an empty level it created) when it unwinds before the level admits the order. Neither path leaves a ghost location |
 | Replay progress callbacks (`replay_from_with_progress`, `replay_from_with_clock_and_progress`, `src/orderbook/sequencer/replay.rs`) | Invoked per applied journal entry during replay | Must not panic; must return quickly | Runs after each entry is applied to the in-memory book, not while any lock is held |
-| `metrics` recorder (feature `metrics`, `src/orderbook/metrics.rs`) | The process-installed global `metrics` recorder, invoked synchronously from `record_reject` / `record_depth` / `record_trades` / `record_reserve_hidden_discarded` / `record_risk_accounting_anomaly` / `record_match_abort` / `record_match_fold_failure` / `record_trade_ids_exhausted` / `record_manager_trade_event_dropped` on the calling thread (including the matching path, after the book mutation that triggered the metric) | Must not panic on a recorded metric; must return quickly; owns its own counter overflow semantics for `increment(n)` | The crate never installs its own recorder (`rules/global_rules.md`'s Logging & Observability rule against installing a global subscriber applies by the same reasoning to a metrics recorder); with none installed the `metrics` crate's no-op recorder is used. The helpers do no integer arithmetic themselves (issue #254); the `u64` to `f64` gauge casts are exact below 2^53 and cannot panic |
-| `tracing` subscriber | Every `tracing::{trace,debug,info,warn,error}!` call site | Must not panic | The crate never installs its own subscriber |
+| `metrics` recorder (feature `metrics`, `src/orderbook/metrics.rs`) | The process-installed global `metrics` recorder, invoked synchronously from `record_reject` / `record_depth` / `record_trades` / `record_reserve_hidden_discarded` / `record_risk_accounting_anomaly` / `record_match_abort` / `record_match_fold_failure` / `record_trade_ids_exhausted` / `record_manager_trade_event_dropped` on the calling thread (the book's ones under the submit gate). Some calls fire **mid-mutation**: `record_reject` from `track_state` of a `Rejected` state, `record_reserve_hidden_discarded` per strandable maker in the sweep drain, both before the sweep's index cleanup and the taker's resting or terminal bookkeeping finish | Must not panic on a recorded metric; must return quickly; owns its own counter overflow semantics for `increment(n)` | The crate never installs its own recorder (`rules/global_rules.md`'s Logging & Observability rule against installing a global subscriber applies by the same reasoning to a metrics recorder); with none installed the `metrics` crate's no-op recorder is used. The helpers do no integer arithmetic themselves (issue #254); the `u64` to `f64` gauge casts are exact below 2^53 and cannot panic. An unwind from it is handled like a `Clock` unwind (kill switch on either gate side, drain release guard, #294) |
+| `tracing` subscriber | Every `tracing::{trace,debug,info,warn,error}!` call site, including mid-mutation ones under the submit gate (the sweep drain's strandable-maker `INFO`) and the `ERROR` the submit-gate guard logs while the thread is already unwinding | Must not panic | The crate never installs its own subscriber. A mid-mutation unwind is handled like a `Clock` unwind (#294). A subscriber that panics while the thread is already unwinding aborts the process (a Rust double panic); the guard logs once per book, at the first unwind |
 
 **To be completed by #260:** the per-call-site guard/partial-mutation/unwind
 table PriceLevel's document has for each row above (which lock, if any, is
@@ -538,9 +538,10 @@ claimed atomically with `DashMap::entry` (an occupied entry is
 `DuplicateOrderId`, with the reservation released), and every remover
 releases it **last**: the sweep's drain, the single-order cancel
 (`finish_removal`), the zero-quantity `UpdateQuantity`, a refused
-admission's rollback (`withdraw_unrested`) and `place_order_in_book`'s
-rollback untrack the user entry, release the risk entry and (a cancel)
-unregister special orders first. A user-index or risk entry for an id therefore only
+admission's rollback (`withdraw_unrested`) untrack the user entry,
+release the risk entry and (a cancel) unregister special orders first
+(the raw `place_order_in_book`, which followed the same order, was
+removed in #294). A user-index or risk entry for an id therefore only
 exists while one admission owns the id, so an id reused as soon as the
 previous order is gone (supported, see `strandable_maker_count.rs`) can
 neither see nor remove the previous order's entries. A first version of
@@ -756,22 +757,38 @@ and the poison cleared (every queue mutation is a single
 non-unwinding path: when the guard drops during an unwind its uncommitted
 events are dropped and counted (batches it already committed early are
 marked ready, since they describe committed trades) and nothing is
-dispatched.
+dispatched. The same drop engages the kill switch (below).
 
-**Submit-gate poison.** With listeners out of the gate, a poisoned gate
-means engine code (or `T::default()` / `T::clone()`) panicked while holding
-the exclusive side, and the book may be inconsistent. The acquisition that
-finds it poisoned engages the kill switch, latches
-`OrderBook::submit_gate_poisoned`, logs once at `ERROR`, clears the poison
-and continues. New flow and modifies then return
-`OrderBookError::KillSwitchActive` (the add / modify paths check the kill
-switch under the gate, so the detecting call itself is rejected; the
-market-order paths check it before taking the gate, so a detecting market
-order still runs and every later one is rejected); cancels and mass
-cancels keep working so the book can be drained, and the kill switch is
-persisted in the snapshot package. An operator's `release_kill_switch`
-resumes flow; the latch stays set. The price-level stripe locks keep their
-recover-and-log policy.
+**Submit-gate poison.** With listeners out of the gate, an unwind through
+a held gate means engine code, or caller code the engine runs
+mid-mutation, panicked: a `Clock`, the metrics recorder, a `tracing`
+subscriber, `T::default()` / `T::clone()`. The book may be inconsistent.
+Sources are not limited to the exclusive side: every ordinary submit,
+cancel and `UpdateQuantity` runs under the shared side, whose
+`RwLockReadGuard` never poisons.
+
+Detection (#294): `SubmitGateGuard`'s drop checks
+`std::thread::panicking()` (one call per drop, compared with the value at
+acquisition exactly as std's own poison flag does, so a gate taken by a
+destructor during an unrelated unwind is not blamed). On an unwind, on
+**either** side, it engages the kill switch and latches
+`OrderBook::submit_gate_poisoned` (logged once at `ERROR`, with the gate
+side) **before** the gate is released, so the next holder already sees
+it. The guard's own commit phase (stamping and publishing the listener
+batch, still under the gate) can run the `tracing` subscriber; a panic
+there does not run the drop again, so a sentinel armed around that phase
+and disarmed only after the gate is released applies the same policy
+(PR #297 review). The exclusive side is also poisoned by std; the acquisition that
+finds it poisoned applies the same policy (idempotent, no second log),
+clears the poison and continues.
+
+New flow and modifies then return `OrderBookError::KillSwitchActive`,
+including the market-order paths that check the kill switch before taking
+the gate; cancels and mass cancels keep working so the book can be
+drained, and the kill switch is persisted in the snapshot package. An
+operator's `release_kill_switch` resumes flow; the latch stays set. The
+price-level stripe locks keep their recover-and-log policy (see the lock
+inventory below).
 
 **Cost of the ordering guarantee.** Stamping `engine_seq` and publishing
 the batch must be one atomic step under the submit gate, so every commit
@@ -805,6 +822,85 @@ can make A's early-committed batches ready before A releases its gate;
 they describe committed mutations and keep their order. The dispatcher role is
 not bounded: under sustained load from other threads one thread can keep
 delivering for longer than its own call needed.
+
+## Core boundary gaps (#294)
+
+Findings of the final audit (#260) the mechanical gate cannot see:
+
+- **Shared-gate unwinds.** Covered by the submit-gate poison policy above.
+- **Sweep drain.** Per filled maker, `track_state` (tracker `Clock`,
+  `record_reject`), the strandable-maker `INFO` and
+  `record_reserve_hidden_discarded` run before that maker's index release
+  (strandable count, user index, location). The release cannot move ahead
+  of the caller code: the location is the id's ownership token (#288), and
+  releasing it before `Filled` is recorded would let a same-id order
+  admitted meanwhile have its resting state overwritten by the old order's
+  `Filled`. A drop guard (`FilledMakerRelease`, `src/orderbook/matching.rs`)
+  releases each maker right after its caller code, and on an unwind
+  releases every maker not released yet (crate-owned index work only; no
+  allocation, no `catch_unwind`). Event order is unchanged.
+- **Rest path.** `rest_on_level` publishes the risk reservation, the
+  location, the user-index entry and the resting state before the level
+  admits the order (#288), and between the claim and the admission runs
+  caller code (`track_state`'s `Clock` and metrics, `T::default()` in the
+  unit conversion). A drop guard (`UnrestedClaim`,
+  `src/orderbook/modifications.rs`), disarmed as soon as the admission
+  returns, withdraws on an unwind: first the resting state if it was
+  recorded (`OrderStateTracker::withdraw_last_transition`: pops that
+  transition and restores the previous status, or forgets an order whose
+  only transition it was, without reading a clock or calling a listener;
+  the deferred listener event is dropped with the unwinding emission
+  scope), then in #288's release order the user-index entry and the
+  reservation, then the location. Every rollback therefore happens while
+  the attempt still owns the id, so a same-id order cannot claim it in
+  between and have its own transition popped (PR #297 review). It then
+  removes a level the attempt left empty. The guard is declared before
+  the level-stripe guard, so the stripe is released before the drop takes
+  its exclusive side, and the unit conversion (`T::default()`) runs before
+  the stripe is taken.
+- **Raw placement.** `OrderBook::place_order_in_book` was public and
+  bypassed the gate, kill switch, risk, crossing, STP, the strandable rule
+  and state tracking. It had no production caller and was removed (0.14 is
+  a breaking release); `add_order` is the resting entry point.
+- **Standalone tracker.** `OrderStateTracker::transition` queues a
+  terminal id for eviction before invoking its listener, as the book's
+  `record_transition` does, so a panicking listener no longer leaves the
+  id unevictable.
+- **Dispatcher progress.** When the dispatcher's delivery buffer cannot
+  grow (`try_reserve` refused), it delivers the head batch in place
+  instead of leaving it ready and re-dispatching forever. A refused
+  outbox queue growth at commit keeps its drop-and-count policy
+  (`dropped_listener_events`, `ERROR`).
+- **IV `PriceSource::LastTrade`.** On a two-sided book that has not traded
+  it returns `IVError::NoPriceAvailable` instead of silently using the mid.
+
+## `std` lock inventory (#294)
+
+Every `std::sync` lock the core engine holds, and its poison policy. The
+submit gate is by design held across the mid-mutation caller code listed
+in the table of caller-supplied surfaces. Under the other three the only
+caller code that can run is the `tracing` subscriber, at the call sites
+named in each row; `T::default()` (the unit conversion of a resting
+order) runs before the level stripe is taken (PR #297 review). Every
+stripe acquisition, and every outbox acquisition of a commit, is made
+with the submit gate held (a commit from the gate guard's drop, covered
+by its commit sentinel), so a panic there engages the kill switch through
+the submit-gate policy. The dispatcher takes the outbox lock after the
+gate is released; a panic there (only the poison-recovery log can raise
+one) leaves the queue intact and releases the dispatcher role, like a
+listener panic. Each row's own poison policy only has to keep the lock
+usable.
+
+| Lock | Where | Held across | Poison policy |
+|---|---|---|---|
+| Submit gate, `RwLock<()>` | `OrderBook::submit_gate` (`book.rs`) | One gated entry point (the mutation, including mid-mutation caller code: `Clock`, metrics, `tracing`, `T::default()` / `T::clone()`); never a listener | An unwind on either side engages the kill switch and latches `submit_gate_poisoned` in the guard's drop (#294); a poisoned exclusive side is cleared by the next acquisition, which applies the same policy (#249) |
+| 64 level stripes, `[RwLock<()>; 64]` | `OrderBook::level_locks` (`book.rs`, #247) | One level admission (shared: `get_or_insert` and pricelevel's `PriceLevel::add_order`) or one emptied-level removal (exclusive: re-read and unlink); never another lock. Caller code under it: the `tracing` subscriber only, from pricelevel's failure-path events in `add_order` and from this crate's poison-recovery `ERROR` (logged while the recovered guard is held) | Data is `()`. A panic under the shared side leaves no poison; under the exclusive side it poisons the stripe, and every later acquisition recovers the guard and logs at `ERROR` (the poison is not cleared). The gate policy covers the mutation the unwind interrupted, and the rest path's claim guard removes a level it created empty |
+| Listener outbox, `Mutex<OutboxState>` | `EventOutbox::state` (`emission.rs`, #249), behind a spin flag released by a drop guard | Stamping and publishing one batch (`engine_seq` minting, a single queue `push_back`), or taking the ready prefix (`pop_front`s); flag stores. Caller code under it: the `tracing` subscriber only, from the one-time `engine_seq` exhaustion `ERROR`, the refused-allocation `ERROR`s in `enqueue` / `commit_with_trade_seq`, and the poison-recovery `ERROR` | Recovered and cleared. Every log call sits before or after a single-step queue mutation, never inside one, so the queue is intact at every unwind point; a panic while stamping loses the batch being committed (minted `engine_seq` values it held are never delivered, a gap consumers see), and the gate guard's commit sentinel engages the kill switch |
+| Terminal eviction queue, `Mutex<VecDeque<Id>>` | `OrderStateTracker::terminal_queue` (`order_state.rs`) | A push and the over-capacity pops; no map lock. Caller code under it: the `tracing` subscriber only, from the poison-recovery `WARN` | Recovered (logged at `WARN`) and cleared: the queue is an eviction hint re-checked per id (#250) |
+
+The sequencer / journal and NATS locks are outside the core engine and
+are documented with their subsystems (`Journal<T>` row above,
+`JournalError::MutexPoisoned`).
 
 ## Ratchet
 
