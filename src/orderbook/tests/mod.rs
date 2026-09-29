@@ -34,5 +34,6 @@ mod strandable_gate_concurrency;
 mod strandable_maker_count;
 mod test_helpers;
 mod time_in_force;
+mod trailing_stops;
 mod uuid;
 mod wire_compat_0_13;

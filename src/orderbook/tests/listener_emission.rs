@@ -308,6 +308,90 @@ mod tests {
         assert_eq!(got, EXPECTED);
     }
 
+    /// #286: a pending trailing stop's election runs under the gate of the
+    /// call whose trade crossed it, so its market order's events follow
+    /// that call's own events in the same batch: the crossing trade, then
+    /// the stop's terminal state after its market order's level and trade
+    /// events. The pre-#286 stream above is unchanged (it has no stop).
+    #[cfg(feature = "special_orders")]
+    const EXPECTED_WITH_STOP: &[&str] = &[
+        "S 00000000-0000-0001-0000-000000000000 Open -> Open",
+        "L seq=0 Buy 95 q=1",
+        "R add ok",
+        "S 00000000-0000-0002-0000-000000000000 Open -> Open",
+        "L seq=1 Buy 94 q=2",
+        "R add ok",
+        "S 00000000-0000-0003-0000-000000000000 Open -> Open",
+        "L seq=2 Buy 93 q=5",
+        "R add ok",
+        "S 00000000-0000-0004-0000-000000000000 Open -> Open",
+        "L seq=3 Sell 101 q=1",
+        "R add ok",
+        "L seq=4 Sell 101 q=0",
+        "S 00000000-0000-0004-0000-000000000000 Open -> Filled(1)",
+        "T seq=5 taker=00000000-0000-0005-0000-000000000000 makers=[00000000-0000-0004-0000-000000000000@101x1] maker_fees=0 taker_fees=0",
+        "R market ok",
+        "S 00000000-0000-0032-0000-000000000000 Open -> Open",
+        "R stop ok",
+        "L seq=6 Buy 95 q=0",
+        "S 00000000-0000-0001-0000-000000000000 Open -> Filled(1)",
+        "T seq=7 taker=00000000-0000-0006-0000-000000000000 makers=[00000000-0000-0001-0000-000000000000@95x1] maker_fees=0 taker_fees=0",
+        "S 00000000-0000-0006-0000-000000000000 Filled(1) -> Filled(1)",
+        "L seq=8 Buy 94 q=0",
+        "L seq=9 Buy 93 q=3",
+        "S 00000000-0000-0002-0000-000000000000 Open -> Filled(2)",
+        "T seq=10 taker=5e0c9aad-1fc6-598c-bd0d-c62ff57326d6 makers=[00000000-0000-0002-0000-000000000000@94x2,00000000-0000-0003-0000-000000000000@93x2] maker_fees=0 taker_fees=0",
+        "S 00000000-0000-0032-0000-000000000000 Open -> Filled(4)",
+        "C T seq=7 taker=00000000-0000-0006-0000-000000000000 makers=[00000000-0000-0001-0000-000000000000@95x1] maker_fees=0 taker_fees=0",
+        "R elect ok",
+    ];
+
+    #[cfg(feature = "special_orders")]
+    #[test]
+    fn single_thread_event_order_with_a_trailing_stop() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut book = recording_book(&log);
+        // Pins the stop's market-order id (UUIDv5 of the namespace).
+        book.set_trade_id_namespace(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"EMIT"));
+        for (id, price, qty) in [(1, 95, 1), (2, 94, 2), (3, 93, 5)] {
+            let r = book.add_order(limit(id, price, qty, Side::Buy, TimeInForce::Gtc));
+            push(&log, outcome("add", &r));
+        }
+        let r = book.add_order(limit(4, 101, 1, Side::Sell, TimeInForce::Gtc));
+        push(&log, outcome("add", &r));
+        let r = book.submit_market_order(Id::from_u64(5), 1, Side::Buy);
+        push(&log, outcome("market", &r));
+        // Sell stop at 96 (watermark 101, trail 5), pending off book: no
+        // level event.
+        let r = book.add_order(OrderType::TrailingStop {
+            id: Id::from_u64(50),
+            price: Price::new(96),
+            quantity: Quantity::new(4),
+            side: Side::Sell,
+            user_id: Hash32::zero(),
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            trail_amount: Quantity::new(5),
+            last_reference_price: Price::new(101),
+            extra_fields: (),
+        });
+        push(&log, outcome("stop", &r));
+        // A trade at 95 elects it; its market sell of 4 takes 2 @ 94 and
+        // 2 @ 93.
+        let r = book.add_order_with_result(limit(6, 95, 1, Side::Sell, TimeInForce::Gtc));
+        if let Ok((_, Some(tr))) = &r {
+            push(&log, format!("C {}", format_trade(tr)));
+        }
+        push(&log, outcome("elect", &r));
+        let got = log.lock().expect("log lock").clone();
+        if std::env::var_os("EMIT_PRINT").is_some() {
+            for line in &got {
+                println!("        {line:?},");
+            }
+        }
+        assert_eq!(got, EXPECTED_WITH_STOP);
+    }
+
     fn user(byte: u8) -> Hash32 {
         let mut bytes = [0u8; 32];
         bytes[0] = byte;
