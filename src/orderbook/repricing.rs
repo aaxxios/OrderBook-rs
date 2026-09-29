@@ -4,6 +4,25 @@
 //! - **PeggedOrder**: Orders that track a reference price (best bid, best ask, mid price, or last trade)
 //! - **TrailingStop**: Orders that follow the market price with a fixed trail amount
 //!
+//! # Known limitation: trailing stops rest as limit liquidity (#286)
+//!
+//! A trailing stop is placed by `add_order` as an ordinary resting limit
+//! order at its stop price, on its own side, instead of being held off-book
+//! until triggered. Consequences, all on a valid (uncrossed) book:
+//!
+//! - it provides liquidity at the stop price (a sell stop is a resting sell
+//!   and is filled by an incoming buy at that price, or trades immediately
+//!   when submitted below the best bid);
+//! - `reprice_trailing_stops` never moves it: a sell stop only moves when
+//!   `best_bid - trail > stop_price`, which a resting sell at or above the
+//!   best ask cannot satisfy (symmetric for a buy stop);
+//! - a re-price, when one happens, does not advance
+//!   `last_reference_price`, so the watermark goes stale.
+//!
+//! Do not use trailing stops as protective stops in production until #286
+//! (off-book storage, trigger rules, watermark update) lands. Pegged orders
+//! are unaffected.
+//!
 //! # Example
 //!
 //! ```ignore
