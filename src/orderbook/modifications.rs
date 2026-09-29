@@ -1,7 +1,7 @@
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::matching::MatchOutcome;
-use crate::orderbook::matching::ShapeVerdict;
+use crate::orderbook::matching::{FeasibilityScope, ShapeVerdict, SweepReservation};
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::trade::{SubmitFailure, TradeResult};
@@ -1809,15 +1809,17 @@ where
         };
 
         //
-        // Fill-or-kill preflight (#240): a later level can fail after earlier
-        // levels committed, which would turn the FOK into a partial fill.
-        // Everything the sweep can exhaust and the book can observe is
-        // checked here, before any mutation: the trade-id headroom of the
-        // book's `UuidGenerator` against the walk's upper bound on trades;
-        // the result buffers are reserved by the sweep itself from
-        // `maker_steps` before it touches the first level. A failed dry run
-        // (`matchable_quantity` / insertion-sequence view) propagates as a
-        // kill, never as zero depth.
+        // Fill-or-kill preflight (#240, #293): a later level can fail after
+        // earlier levels committed, which would turn the FOK into a partial
+        // fill. Everything the sweep can exhaust is checked here, before any
+        // mutation: per level (`fok_fillable_quantity` in `Preflight` scope)
+        // poisoning, counter headroom and a stopping maker step; then the
+        // trade-id headroom of the book's `UuidGenerator` against the exact
+        // trade ids the sweep takes. The result buffers are reserved by the
+        // sweep itself from `reservation` before it touches the first level.
+        // A failed dry run (`match_requirements` / insertion-sequence view)
+        // propagates as a kill, never as zero depth. This runs under the
+        // exclusive gate `add_order` takes for every fill-or-kill submit.
         if order.is_fill_or_kill() {
             let feasibility = self.fok_fillable_quantity(
                 order.side(),
@@ -1825,6 +1827,7 @@ where
                 Some(order.price().as_u128()),
                 order.user_id(),
                 order.id(),
+                FeasibilityScope::Preflight,
             )?;
             if feasibility.fillable < total {
                 return Err(OrderBookError::InsufficientLiquidity {
@@ -1833,11 +1836,11 @@ where
                     available: feasibility.fillable,
                 });
             }
-            if self.transaction_id_generator.remaining() < feasibility.max_trades {
+            if self.transaction_id_generator.remaining() < feasibility.trade_ids {
                 return Err(OrderBookError::PriceLevelError(
                     PriceLevelError::CapacityExceeded {
                         resource: CapacityResource::IdSequence,
-                        additional: usize::try_from(feasibility.max_trades).unwrap_or(usize::MAX),
+                        additional: usize::try_from(feasibility.trade_ids).unwrap_or(usize::MAX),
                     },
                 ));
             }
@@ -2106,6 +2109,7 @@ where
                 Some(new_order.price().as_u128()),
                 new_order.user_id(),
                 new_order.id(),
+                FeasibilityScope::DepthOnly,
             )?
             .fillable;
         // `crossable < visible`: the sweep leaves a positive visible tranche
@@ -2321,14 +2325,20 @@ where
     /// way when the book's trade-id generator is exhausted
     /// ([`Self::trade_ids_exhausted`]).
     ///
-    /// A fill-or-kill taker is preflighted before any mutation: the trade-id
-    /// headroom is checked against an upper bound on its trades and its
-    /// result buffers are reserved; a shortfall rejects it untouched with
-    /// `PriceLevelError(CapacityExceeded)`. Residual: pricelevel's per-level
-    /// counters are not observable and replenishment trades beyond the
-    /// reserved maker steps still grow the buffers, so a FOK can still abort
-    /// mid-sweep in those cases, following the rules above. See
-    /// `doc/panic-boundaries.md` for every residual.
+    /// A fill-or-kill taker is preflighted before any mutation, under the
+    /// exclusive submit gate: every level it will reach is dry-run for the
+    /// quantity the sweep will ask of it (`PriceLevel::match_requirements`),
+    /// its trade-id headroom is checked against the exact trade ids the
+    /// sweep takes and its result buffers are reserved for the exact trade
+    /// count. A poisoned level, a per-level counter without headroom, a maker
+    /// step that would stop the sweep or a buffer / trade-id shortfall
+    /// rejects it untouched with [`OrderBookError::PriceLevelError`]
+    /// (`InvalidOperation`, `CounterExhausted`, `CapacityExceeded`).
+    /// Residual: an allocator refusal inside pricelevel while a level
+    /// matches, and levels where self-trade prevention `CancelMaker` cancels
+    /// makers first (not dry-run exactly), can still stop a FOK mid-sweep,
+    /// following the rules above. See `doc/panic-boundaries.md` for every
+    /// residual.
     ///
     /// # Errors
     /// Returns [`OrderBookError::KillSwitchActive`] when the kill switch
@@ -2698,7 +2708,7 @@ where
             Some(order.price().as_u128()),
             order.user_id(),
             taker_kind,
-            fok.map_or(0, |fok| fok.maker_steps),
+            fok.map_or(SweepReservation::NONE, |fok| fok.reservation),
             arithmetic_verified_price,
         )?;
 

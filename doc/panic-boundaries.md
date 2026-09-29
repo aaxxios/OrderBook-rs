@@ -236,39 +236,86 @@ listener, risk `on_fill`, maker states, location cleanup), never rests the
 remainder, and returns `OrderBookError::MatchAborted` (taker state
 `Cancelled { MatchAborted }`).
 
-Before each level is matched, the aggregate result and the pooled
-filled-maker buffer are reserved for that level's worst case,
-`min(resting makers, quantity cap)`; a refused reservation aborts the sweep
-**before** the level is touched, with the prefix of the earlier levels.
-Fill-or-kill takers additionally reserve for their whole predicted sweep and
-check trade-id headroom before any mutation.
+Each level's result is folded into the aggregate with pricelevel's
+`MatchResult::try_absorb` (PriceLevel#219, pricelevel 0.10.1) when the level
+was asked for exactly the aggregate's remaining quantity, and trade by trade
+otherwise (quote-notional levels, self-trade prevention pre-matches). A fold
+is all or nothing: a refused one leaves the aggregate unchanged, so the
+published prefix is always a whole number of levels. Before a level is
+matched, the pooled filled-maker buffer is reserved for
+`min(resting makers, quantity asked of the level)`, and the aggregate's
+trade and filled-id vectors (split reservations, PriceLevel#219) for the same
+bound **unless** the aggregate is still empty and the fold will absorb: then
+`try_absorb` adopts the level's own buffers, which cannot fail and allocates
+nothing, so the first traded level of a base-quantity sweep needs no
+aggregate reservation. A refused reservation aborts the sweep **before** the
+level is touched, with the prefix of the earlier levels. A level that failed
+mid-match hands its error to the aggregate when it is absorbed; the abort
+path rebuilds the published prefix without it, so the committed
+`TradeResult` keeps an empty error slot (if that rebuild is refused by the
+allocator, the prefix is published with the slot set rather than dropped).
+
+Fill-or-kill takers are preflighted before any mutation, under the exclusive
+submit gate (PriceLevel#218, pricelevel 0.10.1). Each level the sweep will
+reach is dry-run with `PriceLevel::match_requirements` for exactly the
+quantity the sweep will ask of it, and must be matchable in full: not
+poisoned (`PriceLevel::is_poisoned`), its counters with headroom
+(`MatchRequirements::check` against `PriceLevel::counter_headroom`: the FIFO
+queue sequence replenishments take, the topology and mutation epochs), and
+no maker step the sweep would stop at (`MatchRequirements::stop_error`). The
+trade-id headroom is checked against the exact sum of
+`MatchRequirements::trade_ids_required`, and the result buffers are reserved
+for the exact trade count (at least the per-level reservation above), so no
+level's fold can need more room once the first level mutated. A shortfall
+rejects the taker untouched with `OrderBookError::PriceLevelError`
+(`InvalidOperation` for a poisoned level, `CounterExhausted`,
+`CapacityExceeded`). The per-level answers are only valid while nothing else
+can mutate those levels until the last match returns. The exclusive submit
+gate guarantees it: every `OrderBook` mutation path (submits, modifies,
+cancels, mass cancels, expiry eviction, and the re-pricers, which go through
+`update_order`) takes a side of that gate or `&mut self`, and the public API
+hands out no level handles (#228). A fill-or-kill re-add of a modify is
+refused before the cancel (#209, #247), so the preflight never runs under
+the shared side.
 
 Residuals, stated precisely:
 
-- **Fold beyond the reserved bound.** A replenishing iceberg / reserve maker
-  can trade again at the same level, and a maker admitted to the level by a
-  concurrent submit on the shared submit gate while it is being swept can be
-  consumed too. Those trades exceed `min(resting makers, quantity cap)`, so
-  their slots grow during the fold. Only if the allocator refuses that growth
-  are the level's committed trades left out of the aggregate `MatchResult`
-  (and so out of the `TradeResult` / journal), while the level, the makers'
-  risk counters and order states reflect them. The sweep then aborts and the
-  gap is logged at `ERROR` ("committed trades of a price level could not be
-  folded into the taker's result").
-- **Fill-or-kill preflight.** The preflight covers what the book can
-  observe: the trade-id generator's `remaining()` against a conservative
-  upper bound on the sweep's trades, and the result buffers. pricelevel's
-  internal counters (queue insertion sequence, topology / mutation epochs,
-  statistics sequence) have no public headroom query, and replenishment
-  trades beyond the reserved maker steps grow the buffers. Either can still
-  stop a FOK mid-sweep; it then follows the abort rules above (a partial
-  fill reported as `MatchAborted`, never rested). The id bound is
-  conservative, so a FOK within that many ids of the sequence's exhaustion
-  can be refused although it would fit.
-- **Poisoned levels.** A pricelevel level poisoned by an earlier panic
-  refuses to match by returning an empty result **without** an error, so the
-  book cannot tell it from an empty level and the sweep walks on to the next
-  price. This is an upstream limitation, tracked in pricelevel.
+- **Fold beyond the reserved bound.** On a level **after the first traded
+  one**, a replenishing iceberg / reserve maker can trade again, and a maker
+  admitted to the level by a concurrent submit on the shared submit gate
+  while it is being swept can be consumed too. Those trades exceed
+  `min(resting makers, quantity asked of the level)`, so their slots grow
+  during the fold (unless `try_absorb` can adopt the level's buffer). Only if
+  the allocator refuses that growth are the level's committed trades left
+  out of the aggregate `MatchResult` (and so out of the `TradeResult` /
+  journal), while the level, the makers' risk counters and order states
+  reflect them. The sweep then aborts and the gap is logged at `ERROR`
+  ("committed trades of a price level could not be folded into the taker's
+  result"). Since PriceLevel#219 the first traded level cannot hit this (an
+  absorb into an empty aggregate cannot fail), and a fill-or-kill sweep
+  cannot hit it at any level it dry-ran exactly (see the next item). On deep
+  levels after the first the bound still over-reserves; the capacity is
+  amortized and carries over to later levels.
+- **Fill-or-kill preflight.** What remains outside it:
+  - an allocator refusal inside pricelevel while a level matches (its own
+    result buffers; `match_requirements` does not cover allocation);
+  - a level where self-trade prevention `CancelMaker` cancels same-user
+    makers before the match. The dry run cannot see the post-cancel queue,
+    so that level is checked only for poisoning and a closed epoch (cancels
+    never reopen one); its trade ids count against the conservative bound
+    (`min(makers, quantity)` without hidden depth, the quantity with it),
+    its buffers against `min(makers, quantity)` (replenishment trades beyond
+    grow the fold, as above), and a failing maker cancel aborts as in #247.
+
+  A FOK stopped by either follows the abort rules above (a partial fill
+  reported as `MatchAborted`, never rested).
+- **Poisoned levels.** Closed by pricelevel 0.10.1 (PriceLevel#217): a
+  poisoned level refuses every match with `InvalidOperation` in
+  `MatchResult::error()` and no trades, so the sweep stops there with the
+  earlier levels' prefix (`MatchAborted`) instead of walking on to a worse
+  price. A post-only probe on a poisoned level is rejected untouched with
+  that error, and a fill-or-kill taker is rejected untouched by its
+  preflight. The level stays poisoned: rebuild the book from a snapshot.
 - **Replay of recorded aborts.** Replay re-executes a journaled
   `SequencerResult::MatchAborted` and requires the same committed prefix.
   An abort caused by trade-id generator exhaustion or by an allocator

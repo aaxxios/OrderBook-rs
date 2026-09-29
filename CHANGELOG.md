@@ -465,14 +465,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maker steps; a shortfall rejects it untouched with
   `OrderBookError::PriceLevelError(CapacityExceeded)` (reject code 16,
   `OrderStatus::Rejected`). A failed feasibility dry run is a kill
-  (`Rejected` with the resource code), never zero depth. The bound is
-  conservative (`min(makers, quantity taken)` per level without hidden
-  depth, the quantity taken where a replenishing maker can trade again),
-  so a FOK within that many ids of the sequence's exhaustion can be refused
-  although it would fit. Residual: pricelevel's per-level counters (queue
-  sequence, epochs) are not observable, and replenishment trades beyond the
-  reserved maker steps grow the buffers during the sweep; either can still
-  abort a FOK mid-sweep, which then follows the `MatchAborted` rules above.
+  (`Rejected` with the resource code), never zero depth. Made exact by
+  pricelevel 0.10.1 (#293, below): per-level counters are checked and the
+  trade-id check and reservation use exact counts.
   A partial `MatchAborted` from a `*_with_committed` call is the only
   failure that boxes the committed `TradeResult`; the plain APIs never box
   it.
@@ -494,9 +489,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `orderbook_trade_ids_exhausted_total`. No automatic kill switch. An
   abort during a modify's re-add for any other cause still destroys the
   original (documented on `update_order`).
-  The residuals, including poisoned pricelevel levels (empty result without
-  an error) and why a journaled abort usually stops replay with
-  `OutcomeMismatch`, are documented in `doc/panic-boundaries.md`.
+  The residuals, including why a journaled abort usually stops replay with
+  `OutcomeMismatch`, are documented in `doc/panic-boundaries.md`; poisoned
+  levels are handled since #293 (below).
+- **pricelevel 0.10.1 (#293).** The `pricelevel` floor is raised to
+  `0.10.1`, which closes three residuals of the #240 sweep-abort work.
+  Compatibility:
+  - **Poisoned levels stop the sweep (PriceLevel#217).** A poisoned level
+    used to return an empty result without an error, so the sweep walked
+    on to a worse price. It now reports `InvalidOperation` through
+    `MatchResult::error()`: the sweep stops there and returns
+    `MatchAborted` with the earlier levels' prefix (taker
+    `Cancelled { MatchAborted }`); a post-only probe on it is rejected
+    untouched with that error.
+  - **Exact fill-or-kill preflight (PriceLevel#218).** Every level a FOK
+    will reach is dry-run with `PriceLevel::match_requirements` for the
+    quantity the sweep will ask of it, under the exclusive submit gate the
+    FOK already holds. A poisoned level, a per-level counter without
+    headroom or a maker step that would stop the sweep now rejects the FOK
+    untouched with `PriceLevelError` (`InvalidOperation`, reject reason
+    `Other(0)`; `CounterExhausted`, code 17) instead of aborting it
+    mid-sweep. The trade-id check uses the exact
+    `MatchRequirements::trade_ids_required` instead of an upper bound, so
+    a FOK that fits the remaining trade ids is no longer refused (for
+    example two trades against two remaining ids, previously refused as
+    needing three), and replenishment trades are reserved up front. Levels
+    where STP `CancelMaker` cancels makers first keep the conservative
+    bound (see `doc/panic-boundaries.md`).
+  - **Level fold with `MatchResult::try_absorb` (PriceLevel#219).** The
+    first traded level of a base-quantity sweep is absorbed by adopting the
+    level's own buffers, so the aggregate result no longer allocates (or
+    over-reserves `min(makers, quantity)` on a deep level) for it; later
+    levels reserve trades and filled ids separately. Allocation counts
+    (`cargo bench --features alloc-counters --bench alloc_count`, new
+    crossing scenarios): a one-level crossing add that partially fills a
+    maker drops from 6.00 to 4.00 allocs/op (2,080 to 1,200 B/op); a 500-unit
+    taker against a 1,000-maker level from 6.00 to 4.00 allocs/op (176,320
+    to 88,320 B/op). The trades, their order and every event are unchanged.
+    A failed level absorbed into the prefix hands its error to the
+    aggregate; the abort path rebuilds the published prefix without it, so
+    the committed `TradeResult` still has an empty error slot.
+  - No public API change: the preflight types are crate-internal. No
+    snapshot or journal format change.
+
 - **Implied-volatility inputs are validated; Black-Scholes and Greeks
   return `Result` (#256).** `f64::clamp(min_iv, max_iv)` in the solver
   panicked when `min_iv > max_iv` or a bound was NaN, reachable through the
