@@ -22,13 +22,9 @@ so that byte-identical benchmark source runs against two different
 [features]
 default = []
 # Selects the adapter module in `src/adapter.rs` for the checked-out
-# `orderbook-rs` API. The three scenarios this crate drives today
-# (add_only / cancel_only / aggressive_walk) have an identical
-# `OrderBook` call surface across every version this harness currently
-# targets (verified against the `v0.13.1` tag during the #258 audit) —
-# both features select the same adapter body for now. The split exists
-# so a *future* API break is a new `#[cfg(feature = ...)]` arm in
-# `adapter.rs`, not a rewrite of `workloads.rs`.
+# `orderbook-rs` API. The two arms share every call except
+# `create_snapshot` (a plain return value on `v0.13.1`, a `Result` on
+# HEAD / 0.14.0); see the module docs of `src/adapter.rs` (#259).
 v0_13 = []
 head = []
 
