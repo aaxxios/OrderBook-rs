@@ -1407,6 +1407,86 @@ impl RiskState {
         self.on_cancel(maker_id);
     }
 
+    /// Re-book a tracked order's notional at `new_price` (#286).
+    ///
+    /// Used when a pending trailing stop trails: its risk contribution is
+    /// booked at its current stop price, so a snapshot restore (which
+    /// rebuilds the entries from the stop prices it carries) reproduces the
+    /// live counters exactly. The account's `resting_notional` moves by the
+    /// difference between the old and the new notional; the open-order
+    /// count is unchanged. Limits are **not** enforced: a trail is driven
+    /// by the market, not by the account, and cannot be refused. An
+    /// increase the counter cannot represent keeps the old booking, and a
+    /// decrease larger than the counter sets it to zero; both are logged
+    /// and counted as accounting anomalies. No-op when no `RiskConfig` is
+    /// installed or the order is not tracked.
+    ///
+    /// Lock order: the orders shard, then the counters shard, as in
+    /// [`Self::on_admission`].
+    #[cfg(feature = "special_orders")]
+    pub(super) fn rebook_price(&self, order_id: Id, new_price: u128) {
+        if self.config.is_none() {
+            return;
+        }
+        let Some(mut entry) = self.orders.get_mut(&order_id) else {
+            return;
+        };
+        if entry.price == new_price {
+            return;
+        }
+        let account = entry.account;
+        let (Some(old), Some(new)) = (
+            checked_notional(entry.remaining_qty, entry.price),
+            checked_notional(entry.remaining_qty, new_price),
+        ) else {
+            drop(entry);
+            self.note_rebook_refused(order_id, account, new_price);
+            return;
+        };
+        let applied = match self.counters.get(&account) {
+            None => false,
+            Some(counters) => match (new.checked_sub(old), old.checked_sub(new)) {
+                (Some(increase), _) => {
+                    checked_add_u128(&counters.resting_notional, increase).is_ok()
+                }
+                (None, Some(decrease)) => {
+                    if let Err(observed) = release_u128(&counters.resting_notional, decrease) {
+                        self.note_release_underflow(
+                            order_id,
+                            account,
+                            "resting_notional",
+                            observed,
+                            decrease,
+                        );
+                    }
+                    true
+                }
+                // One of the two differences always exists.
+                (None, None) => false,
+            },
+        };
+        if applied {
+            entry.price = new_price;
+        } else {
+            drop(entry);
+            self.note_rebook_refused(order_id, account, new_price);
+        }
+    }
+
+    /// Log and count a [`Self::rebook_price`] that kept the old booking.
+    #[cfg(feature = "special_orders")]
+    #[cold]
+    #[inline(never)]
+    fn note_rebook_refused(&self, order_id: Id, account: Hash32, new_price: u128) {
+        self.count_anomaly();
+        warn!(
+            order_id = %order_id,
+            account = %account,
+            new_price,
+            "risk: trailing-stop notional could not be re-booked at its new stop price; old booking kept"
+        );
+    }
+
     /// Install the per-order entries and per-account counters computed
     /// by a [`RiskRebuild`] in the prepare phase of a snapshot restore.
     ///

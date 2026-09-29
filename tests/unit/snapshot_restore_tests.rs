@@ -350,6 +350,8 @@ mod tests_restore_failure_atomicity {
                 level_b.snapshot().expect("level snapshot"),
             ],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -528,6 +530,8 @@ mod tests_restore_duplicate_price_levels {
             timestamp: 1_700_000_000_000,
             bids: vec![make_level(70), make_level(71)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
 
         let err = book

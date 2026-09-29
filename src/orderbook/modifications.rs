@@ -785,8 +785,20 @@ where
         // order that can match, so the guard spans validation through the
         // re-add and no concurrent admission, cancel or modify can land
         // between the re-add's STP scan and its fill. Repricing inherits
-        // this path, so pegged / trailing-stop re-prices are covered too.
+        // this path, so pegged re-prices are covered too.
         let _gate = self.acquire_coherent_submit_gate(self.modify_needs_exclusive_gate(&update));
+        let result = self.update_order_gated(update);
+        // #286: a re-add that traded, or a modified pending stop, is
+        // evaluated under the same gate.
+        self.settle_pending_stops();
+        result
+    }
+
+    /// The body of [`Self::update_order`], run under the gate it took.
+    fn update_order_gated(
+        &self,
+        update: OrderUpdate,
+    ) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         // Gate non-cancel variants on the kill switch. Cancel passes
         // through unchanged so operators can drain the book. The
         // existing order stays live — only the modification is
@@ -806,6 +818,16 @@ where
 
         self.cache.invalidate();
         trace!("Order book {}: Updating order {:?}", self.symbol, update);
+        // #286: a pending trailing stop rests on no level; its modify is
+        // applied to the stop store (exclusive gate: stops are pending).
+        #[cfg(feature = "special_orders")]
+        if self.has_pending_stops()
+            && self
+                .pending_stops
+                .contains(super::stop_orders::update_target(&update))
+        {
+            return self.update_pending_stop(update);
+        }
         match update {
             OrderUpdate::UpdatePrice {
                 order_id,
@@ -1208,8 +1230,9 @@ where
     /// faulty level (#248).
     pub fn cancel_order(&self, order_id: Id) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         // #209: shared gate — a concurrent FOK's exclusive window must not
-        // interleave with this cancel.
-        let _gate = self.submit_gate_read();
+        // interleave with this cancel. #286: exclusive while a trailing
+        // stop is pending (the cancel may target it).
+        let _gate = self.acquire_cancel_gate();
         self.cancel_order_with_reason(order_id, CancelReason::UserRequested)
     }
 
@@ -1244,6 +1267,11 @@ where
         let location = self.order_locations.get(&order_id).map(|val| *val);
 
         let Some(OrderLocation { price, side, .. }) = location else {
+            // #286: a pending trailing stop rests on no level.
+            #[cfg(feature = "special_orders")]
+            if self.has_pending_stops() {
+                return Ok(self.cancel_pending_stop(order_id, reason));
+            }
             return Ok(None);
         };
         let price_levels = match side {
@@ -1375,14 +1403,10 @@ where
             }
         }
 
-        // Unregister special orders from re-pricing tracking
+        // Unregister pegged orders from re-pricing tracking
         #[cfg(feature = "special_orders")]
-        {
-            self.special_order_tracker
-                .unregister_pegged_order(&order_id);
-            self.special_order_tracker
-                .unregister_trailing_stop(&order_id);
-        }
+        self.special_order_tracker
+            .unregister_pegged_order(&order_id);
 
         // Release the id last (#288): the location is its ownership token,
         // so a new same-id admission can only start once every index of
@@ -1777,6 +1801,17 @@ where
             });
         }
 
+        // #286: a trailing stop never sweeps at its stop price (it is held
+        // off book and executes as a market order when elected, with the
+        // market path's own trade-id and arithmetic preflights), so the
+        // crossing checks below do not apply to it.
+        if matches!(order, OrderType::TrailingStop { .. }) {
+            return Ok(ShapeVerdict {
+                fok: None,
+                arithmetic_verified_price: 0,
+            });
+        }
+
         if order.is_post_only() && self.will_cross_market(order.price().as_u128(), order.side()) {
             return Err(self.price_crossing(order));
         }
@@ -2162,7 +2197,7 @@ where
     /// recording any state. Errors that previously had no side-effect
     /// (e.g. the already-expired `InvalidOperation`) are intentionally
     /// no-ops here.
-    fn record_shape_rejection(&self, order: &OrderType<T>, err: &OrderBookError) {
+    pub(super) fn record_shape_rejection(&self, order: &OrderType<T>, err: &OrderBookError) {
         match err {
             OrderBookError::MissingUserId { .. } => {
                 self.track_state(
@@ -2373,17 +2408,29 @@ where
         // #225: also exclusive for an STP-relevant submit, so the per-level
         // STP scan and the fill it authorises see the same queue state. A
         // post-only submit never reaches that scan, so it stays shared.
-        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
-            order.is_fill_or_kill(),
-            order.user_id(),
-            order.is_post_only(),
-            // #230: admitting a strandable maker is exclusive in every
-            // STPMode, so no sweep can consume one it never captured.
-            Self::is_strandable_maker(&order),
-        ));
-        self.add_order_inner(order, false, false, Admission::Submit)
+        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let result = self.add_order_inner(order, false, false, Admission::Submit);
+        // #286: pending stops are evaluated under the same gate.
+        self.settle_pending_stops();
+        result
             .map(|(order, _)| order)
             .map_err(|failure| failure.into_submit().into_error())
+    }
+
+    /// The submit gate mode of an `add_order*` submit (#209 / #225 / #230 /
+    /// #286): [`Self::submit_needs_exclusive_gate`] for the order, plus
+    /// the exclusive side for the admission of a pending trailing stop.
+    #[inline]
+    fn add_order_needs_exclusive_gate(&self, order: &OrderType<T>) -> bool {
+        Self::admits_pending_stop(order)
+            || self.submit_needs_exclusive_gate(
+                order.is_fill_or_kill(),
+                order.user_id(),
+                order.is_post_only(),
+                // #230: admitting a strandable maker is exclusive in every
+                // STPMode, so no sweep can consume one it never captured.
+                Self::is_strandable_maker(order),
+            )
     }
 
     /// Add a new order to the book, automatically matching it if it's
@@ -2432,17 +2479,11 @@ where
         &self,
         order: OrderType<T>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), OrderBookError> {
-        // #209 / #225: same gating as `add_order`.
-        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
-            order.is_fill_or_kill(),
-            order.user_id(),
-            order.is_post_only(),
-            // #230: admitting a strandable maker is exclusive in every
-            // STPMode, so no sweep can consume one it never captured.
-            Self::is_strandable_maker(&order),
-        ));
-        self.add_order_inner(order, true, false, Admission::Submit)
-            .map_err(|failure| failure.into_submit().into_error())
+        // #209 / #225 / #286: same gating as `add_order`.
+        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let result = self.add_order_inner(order, true, false, Admission::Submit);
+        self.settle_pending_stops();
+        result.map_err(|failure| failure.into_submit().into_error())
     }
 
     /// [`Self::add_order_with_result`] for callers that must record what a
@@ -2468,15 +2509,11 @@ where
         &self,
         order: OrderType<T>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
-        // #209 / #225 / #230: same gating as `add_order`.
-        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
-            order.is_fill_or_kill(),
-            order.user_id(),
-            order.is_post_only(),
-            Self::is_strandable_maker(&order),
-        ));
-        self.add_order_inner(order, true, true, Admission::Submit)
-            .map_err(AdmitFailure::into_submit)
+        // #209 / #225 / #230 / #286: same gating as `add_order`.
+        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let result = self.add_order_inner(order, true, true, Admission::Submit);
+        self.settle_pending_stops();
+        result.map_err(AdmitFailure::into_submit)
     }
 
     /// Replays an `add_order` whose live execution traded and then had its
@@ -2504,13 +2541,10 @@ where
         order: OrderType<T>,
     ) -> Result<Arc<OrderType<T>>, OrderBookError> {
         // Same gating as `add_order`.
-        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
-            order.is_fill_or_kill(),
-            order.user_id(),
-            order.is_post_only(),
-            Self::is_strandable_maker(&order),
-        ));
-        self.add_order_inner(order, false, false, Admission::ReplayRefusingResidual)
+        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let result = self.add_order_inner(order, false, false, Admission::ReplayRefusingResidual);
+        self.settle_pending_stops();
+        result
             .map(|(order, _)| order)
             .map_err(|failure| failure.into_submit().into_error())
     }
@@ -2546,6 +2580,16 @@ where
         let committed = |trade_result: Option<TradeResult>| {
             if want_committed { trade_result } else { None }
         };
+        // #286: a trailing stop never sweeps or rests on a level. It is
+        // held off book as a pending stop (`special_orders`) or rejected
+        // untouched. A modify never re-adds one: `update_order` handles
+        // pending stops itself.
+        if matches!(order, OrderType::TrailingStop { .. }) {
+            return self
+                .admit_trailing_stop(order, admission.records_rejections())
+                .map(|order| (order, None))
+                .map_err(AdmitFailure::from);
+        }
         let total = match admission {
             Admission::Submit | Admission::ReplayRefusingResidual => {
                 self.check_kill_switch_or_reject(order.id())?;
@@ -2603,7 +2647,7 @@ where
         // one of them rests; the other fails there with `DuplicateOrderId`,
         // possibly after trading. Serializing order ids is still the
         // ingress / sequencing layer's job.
-        if self.order_locations.contains_key(&order.id()) {
+        if self.order_locations.contains_key(&order.id()) || self.id_is_pending_stop(order.id()) {
             if admission.records_rejections() {
                 crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
             }
@@ -2977,6 +3021,38 @@ where
         }
     }
 
+    /// Rejects a trailing stop untouched on a book built without
+    /// `special_orders` (#286): pending stops need the feature. Records
+    /// `Rejected { StopOrdersUnsupported }` (code 23) and the reject metric.
+    ///
+    /// # Errors
+    ///
+    /// Always [`OrderBookError::StopOrdersUnsupported`].
+    #[cfg(not(feature = "special_orders"))]
+    #[cold]
+    #[inline(never)]
+    fn admit_trailing_stop(
+        &self,
+        order: OrderType<T>,
+        records_rejections: bool,
+    ) -> Result<Arc<OrderType<T>>, OrderBookError> {
+        let order_id = order.id();
+        if records_rejections {
+            self.track_state(
+                order_id,
+                OrderStatus::Rejected {
+                    reason: RejectReason::StopOrdersUnsupported,
+                },
+            );
+        }
+        tracing::debug!(
+            symbol = %self.symbol,
+            %order_id,
+            "trailing stop rejected: the special_orders feature is disabled"
+        );
+        Err(OrderBookError::StopOrdersUnsupported { order_id })
+    }
+
     /// Records the `Rejected { reason }` state and reject metric of an
     /// untouched admission failure, except for a modify's re-add, whose
     /// failure the modify resolves (#247).
@@ -3314,14 +3390,8 @@ where
         // Register special orders for re-pricing tracking, now that
         // `get_order` finds the order (see the method docs).
         #[cfg(feature = "special_orders")]
-        match order {
-            OrderType::PeggedOrder { id, .. } => {
-                self.special_order_tracker.register_pegged_order(*id);
-            }
-            OrderType::TrailingStop { id, .. } => {
-                self.special_order_tracker.register_trailing_stop(*id);
-            }
-            _ => {}
+        if let OrderType::PeggedOrder { id, .. } = order {
+            self.special_order_tracker.register_pegged_order(*id);
         }
         Ok(admitted)
     }

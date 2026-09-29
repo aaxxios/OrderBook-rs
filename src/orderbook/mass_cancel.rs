@@ -535,6 +535,9 @@ where
                 cancelled_order_ids.push(order.id());
             }
         }
+        // #286: then every pending trailing stop, in admission order.
+        let resting_count = cancelled_order_ids.len();
+        cancelled_order_ids.extend(self.stops_in_scope(|_| true));
         let cancelled_count = cancelled_order_ids.len();
 
         if cancelled_count == 0 {
@@ -560,9 +563,13 @@ where
         while self.bids.pop_front().is_some() {}
         while self.asks.pop_front().is_some() {}
 
-        // 2c. Clear special order tracker
+        // 2c. Clear special order tracker and the pending trailing stops
+        // (#286; their risk contribution goes with the clear below).
         #[cfg(feature = "special_orders")]
-        self.special_order_tracker.clear();
+        {
+            self.special_order_tracker.clear();
+            self.pending_stops.clear();
+        }
 
         // 2d. Release the pre-trade risk state. cancel_all empties the whole
         // book, so the per-order on_cancel accounting collapses to a single
@@ -586,13 +593,17 @@ where
                 self.emit_price_level_changed(side, price, 0);
             }
         }
-        for &order_id in &cancelled_order_ids {
-            let prev_filled = self
-                .order_state_tracker
-                .as_ref()
-                .and_then(|t| t.get(order_id))
-                .map(|s| s.filled_quantity())
-                .unwrap_or(0);
+        for (index, &order_id) in cancelled_order_ids.iter().enumerate() {
+            // A pending stop (#286) never filled.
+            let prev_filled = if index < resting_count {
+                self.order_state_tracker
+                    .as_ref()
+                    .and_then(|t| t.get(order_id))
+                    .map(|s| s.filled_quantity())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             self.track_state(
                 order_id,
                 OrderStatus::Cancelled {
@@ -678,7 +689,9 @@ where
         );
 
         match self.collect_order_ids_by_side(side) {
-            Ok(order_ids) => {
+            Ok(mut order_ids) => {
+                // #286: then the side's pending stops, in admission order.
+                order_ids.extend(self.stops_in_scope(|stop| stop.side() == side));
                 self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelBySide)
             }
             Err(failure) => self.refuse_mass_cancel(failure),
@@ -781,13 +794,17 @@ where
         // of becoming unreachable by a later by-user cancel. The shard guard
         // is released at the end of this statement, before any cancel takes
         // the same shard's write side.
-        let Some(order_ids) = self
+        let mut order_ids = self
             .user_orders
             .get(&user_id)
             .map(|entry| entry.value().clone())
-        else {
+            .unwrap_or_default();
+        // #286: then the user's pending stops (they are not in the user
+        // index), in admission order.
+        order_ids.extend(self.stops_in_scope(|stop| stop.user_id() == user_id));
+        if order_ids.is_empty() {
             return MassCancelResult::default();
-        };
+        }
 
         let result =
             self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelByUser);
@@ -906,6 +923,12 @@ where
                 order_ids.push(order.id());
             }
         }
+        // #286: then the side's pending stops whose stop price is in range,
+        // in admission order.
+        order_ids.extend(self.stops_in_scope(|stop| {
+            let stop_price = stop.price().as_u128();
+            stop.side() == side && stop_price >= min_price && stop_price <= max_price
+        }));
 
         self.cancel_order_batch_with_reason(&order_ids, CancelReason::MassCancelByPriceRange)
     }
@@ -1070,6 +1093,9 @@ where
                 }
             }
         }
+        // #286: then the expired pending stops, in admission order.
+        expired_ids
+            .extend(self.stops_in_scope(|stop| self.tif_expired_at(stop.time_in_force(), now)));
 
         if expired_ids.is_empty() {
             return Ok(EvictionResult::default());
@@ -1251,6 +1277,20 @@ where
             }
         }
         Ok(ids)
+    }
+
+    /// The pending trailing stops matching `keep`, in admission order: the
+    /// part of a mass cancel's or an expiry eviction's scope that rests on
+    /// no level (#286), appended after the resting orders it collected.
+    /// Empty without `special_orders` or when no stop is pending.
+    fn stops_in_scope(&self, keep: impl Fn(&OrderType<()>) -> bool) -> Vec<Id> {
+        #[cfg(feature = "special_orders")]
+        if self.has_pending_stops() {
+            return self.pending_stop_ids(keep);
+        }
+        #[cfg(not(feature = "special_orders"))]
+        let _ = keep;
+        Vec::new()
     }
 
     /// Logs a refused mass cancel and builds its result: nothing cancelled,
