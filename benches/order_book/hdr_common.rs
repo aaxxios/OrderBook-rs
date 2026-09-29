@@ -202,3 +202,44 @@ pub fn submit_gtc(book: &OrderBook<()>, rng: &mut Rng, id: u64) {
         None,
     );
 }
+
+/// Seed `n` NON-crossing resting orders (bids on 900..=999, asks on
+/// 1 001..=1 100) with ids `first_id..`, spread over `owners` owners,
+/// and assert that every one rests (#259 PR review). `submit_gtc`'s
+/// tight band crosses, so a book seeded with it holds only a fraction of
+/// its ids; a scenario that means to act on resting orders seeds here.
+/// Many owners keep each owner's `user_orders` list short (a cancel
+/// removes its id with an order-preserving shift, linear in that list).
+pub fn seed_resting(book: &OrderBook<()>, rng: &mut Rng, first_id: u64, n: u64, owners: u16) {
+    let before = book.get_all_orders().len();
+    for i in 0..n {
+        let side = pick_side(rng);
+        let offset = rng.range(0, 99) as u128;
+        let price = match side {
+            Side::Buy => 900 + offset,
+            Side::Sell => 1_001 + offset,
+        };
+        let qty = rng.range(QTY_LO, QTY_HI);
+        let mut bytes = [0u8; 32];
+        bytes[..2].copy_from_slice(&((rng.next() % u64::from(owners)) as u16).to_le_bytes());
+        bytes[2] = 0x5A;
+        book.add_limit_order_with_user(
+            Id::from_u64(first_id + i),
+            price,
+            qty,
+            side,
+            TimeInForce::Gtc,
+            Hash32::new(bytes),
+            None,
+        )
+        .expect("seed order rests");
+    }
+    assert_eq!(
+        book.get_all_orders().len() - before,
+        n as usize,
+        "every seeded order rests"
+    );
+}
+
+/// Owners used by [`seed_resting`] callers.
+pub const SEED_OWNERS: u16 = 4_096;

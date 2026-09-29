@@ -1,17 +1,20 @@
 //! Thin adapter over the `orderbook-rs` API surface this harness calls.
 //!
 //! `workloads.rs` is byte-identical whichever side of the comparison it
-//! is compiled for; every version-specific detail is meant to live
-//! here, isolated behind the `v0_13` / `head` Cargo features selected by
-//! `scripts/bench_compare.sh`. As of the #258 audit the three workloads
-//! this crate drives (`add_only`, `cancel_only`, `aggressive_walk`) call
-//! nothing that differs between the `v0.13.1` tag and HEAD — both
-//! feature arms below have the same body — so this module currently
-//! documents the seam more than it uses it. Add a scenario that touches
-//! an API which *has* changed across versions this harness targets
-//! (`create_snapshot` going from a plain return value pre-`v0.14.0` to a
-//! `Result`, or a future `pricelevel::Id` constructor rename) by adding
-//! a diverging match arm here, not by branching inside `workloads.rs`.
+//! is compiled for; every version-specific detail lives here, isolated
+//! behind the `v0_13` / `head` Cargo features selected by
+//! `scripts/bench_compare.sh`. The two arms differ in exactly one call
+//! today (#259): `OrderBook::create_snapshot` returns the snapshot on
+//! `v0.13.1` and a `Result` on HEAD (0.14.0), so [`create_snapshot`]
+//! is the one diverging function. Everything else the workloads call
+//! (`add_limit_order_with_user`, `submit_market_order_with_user`,
+//! `cancel_order`, `cancel_all_orders`, `with_stp_mode`,
+//! `with_trade_and_price_level_listener`, `create_snapshot_package` /
+//! `restore_from_snapshot_package`, `get_order`, the sequencer's
+//! `InMemoryJournal` / `ReplayEngine::replay_from`) has the same
+//! signature on both tags (checked against `v0.13.1` during #259). The
+//! identical parts live in [`common`] so a future divergence is a
+//! one-function move into the two arms, not a rewrite of the workloads.
 //!
 //! Every scenario submits and cancels with a `user_id` (never the
 //! userless `add_limit_order` / `submit_market_order` paths), matching
@@ -40,15 +43,46 @@
 //! resolved type sidesteps the whole problem — this file never needs
 //! to name `Hash32` at all.
 
-#[cfg(feature = "head")]
-mod imp {
-    use orderbook_rs::{Id, OrderBook, Side, TimeInForce};
+/// Calls whose signature is identical on every targeted version.
+mod common {
+    use orderbook_rs::orderbook::OrderBookSnapshotPackage;
+    use orderbook_rs::orderbook::book_change_event::{
+        PriceLevelChangedEvent, PriceLevelChangedListener,
+    };
+    use orderbook_rs::orderbook::sequencer::{
+        InMemoryJournal, Journal, ReplayEngine, SequencerCommand, SequencerEvent, SequencerResult,
+    };
+    use orderbook_rs::orderbook::trade::{TradeListener, TradeResult};
+    use orderbook_rs::{Id, OrderBook, STPMode, Side, TimeInForce};
+    use std::hint::black_box;
+    use std::sync::Arc;
 
     pub type Book = OrderBook<()>;
+    pub type Package = OrderBookSnapshotPackage;
+    pub type EventJournal = InMemoryJournal<()>;
 
     #[inline]
     pub fn new_book(symbol: &str) -> Book {
         OrderBook::new(symbol)
+    }
+
+    /// A book with self-trade prevention in `CancelMaker` mode.
+    #[inline]
+    pub fn new_stp_book(symbol: &str) -> Book {
+        OrderBook::with_stp_mode(symbol, STPMode::CancelMaker)
+    }
+
+    /// A book with no-op trade and price-level listeners (the shape of
+    /// `benches/concurrent/register.rs::book_with_listeners`, minus the
+    /// HEAD-only `engine_seq` field read).
+    pub fn new_listener_book(symbol: &str) -> Book {
+        let trade: TradeListener = Arc::new(|result: &TradeResult| {
+            black_box(result);
+        });
+        let level: PriceLevelChangedListener = Arc::new(|event: PriceLevelChangedEvent| {
+            black_box(event);
+        });
+        OrderBook::with_trade_and_price_level_listener(symbol, trade, level)
     }
 
     #[inline]
@@ -58,6 +92,10 @@ mod imp {
         bytes
     }
 
+    /// Every operation returns the engine's own result so the caller can
+    /// drop it after the clock stops (#259 PR review): dropping it here
+    /// would free the returned order / match result / id list inside the
+    /// timed region.
     #[inline]
     pub fn add_limit_order_with_user(
         book: &Book,
@@ -66,21 +104,24 @@ mod imp {
         qty: u64,
         side: Side,
         user: [u8; 32],
-    ) {
-        let _ = book.add_limit_order_with_user(
-            id,
-            price,
-            qty,
-            side,
-            TimeInForce::Gtc,
-            user.into(),
-            None,
-        );
+    ) -> impl Sized {
+        book.add_limit_order_with_user(id, price, qty, side, TimeInForce::Gtc, user.into(), None)
     }
 
     #[inline]
-    pub fn cancel_order(book: &Book, id: Id) {
-        let _ = book.cancel_order(id);
+    pub fn cancel_order(book: &Book, id: Id) -> impl Sized {
+        book.cancel_order(id)
+    }
+
+    #[inline]
+    pub fn cancel_all(book: &Book) -> impl Sized {
+        book.cancel_all_orders()
+    }
+
+    /// Number of resting orders (setup-time assertions only: it walks
+    /// every level).
+    pub fn resting_orders(book: &Book) -> usize {
+        book.get_all_orders().len()
     }
 
     #[inline]
@@ -90,67 +131,73 @@ mod imp {
         qty: u64,
         side: Side,
         user: [u8; 32],
-    ) {
-        let _ = book.submit_market_order_with_user(id, qty, side, user.into());
+    ) -> impl Sized {
+        book.submit_market_order_with_user(id, qty, side, user.into())
+    }
+
+    /// Full-depth snapshot package of `book`.
+    pub fn snapshot_package(book: &Book) -> Package {
+        book.create_snapshot_package(usize::MAX)
+            .expect("snapshot package")
+    }
+
+    /// Restores `package` into `book`, replacing its contents.
+    #[inline]
+    pub fn restore(book: &mut Book, package: Package) {
+        book.restore_from_snapshot_package(package)
+            .expect("restore snapshot package");
+    }
+
+    /// A journal of one `AddOrder` event per order in `orders`, in order.
+    /// The orders are read back from a book (`get_order`), so this crate
+    /// never names `pricelevel`'s `Price` / `Quantity` newtypes (see the
+    /// module docs on `owner`).
+    pub fn journal_of_adds(book: &Book, ids: &[Id]) -> EventJournal {
+        let journal = InMemoryJournal::new();
+        for (seq, id) in ids.iter().enumerate() {
+            let order = book.get_order(*id).expect("seeded order");
+            let event = SequencerEvent {
+                sequence_num: seq as u64,
+                timestamp_ns: seq as u64 * 1_000,
+                command: SequencerCommand::AddOrder((*order).clone()),
+                result: SequencerResult::OrderAdded { order_id: *id },
+            };
+            journal.append(&event).expect("journal append");
+        }
+        journal
+    }
+
+    /// Replays `journal` from sequence 0 into a fresh book, returned so
+    /// the caller drops it outside the timed region.
+    #[inline]
+    pub fn replay(journal: &EventJournal) -> Book {
+        ReplayEngine::<()>::replay_from(journal, 0, "BENCH")
+            .expect("replay")
+            .0
+    }
+}
+
+#[cfg(feature = "head")]
+mod imp {
+    pub use super::common::*;
+
+    /// Full-depth snapshot; returned so the caller drops it outside the
+    /// timed region. HEAD (0.14.0): `create_snapshot` returns a `Result`.
+    #[inline]
+    pub fn create_snapshot(book: &Book) -> impl Sized {
+        book.create_snapshot(usize::MAX).expect("snapshot")
     }
 }
 
 #[cfg(feature = "v0_13")]
 mod imp {
-    // Identical to the `head` arm today (verified during the #258
-    // audit) — kept as a separate module, not a shared one, so a future
-    // divergence is a one-file edit here instead of a rewrite of every
-    // call site in `workloads.rs`.
-    use orderbook_rs::{Id, OrderBook, Side, TimeInForce};
+    pub use super::common::*;
 
-    pub type Book = OrderBook<()>;
-
+    /// Full-depth snapshot; returned so the caller drops it outside the
+    /// timed region. `v0.13.1`: `create_snapshot` returns the snapshot.
     #[inline]
-    pub fn new_book(symbol: &str) -> Book {
-        OrderBook::new(symbol)
-    }
-
-    #[inline]
-    pub fn owner(byte: u8) -> [u8; 32] {
-        let mut bytes = [0u8; 32];
-        bytes[0] = byte;
-        bytes
-    }
-
-    #[inline]
-    pub fn add_limit_order_with_user(
-        book: &Book,
-        id: Id,
-        price: u128,
-        qty: u64,
-        side: Side,
-        user: [u8; 32],
-    ) {
-        let _ = book.add_limit_order_with_user(
-            id,
-            price,
-            qty,
-            side,
-            TimeInForce::Gtc,
-            user.into(),
-            None,
-        );
-    }
-
-    #[inline]
-    pub fn cancel_order(book: &Book, id: Id) {
-        let _ = book.cancel_order(id);
-    }
-
-    #[inline]
-    pub fn submit_market_order_with_user(
-        book: &Book,
-        id: Id,
-        qty: u64,
-        side: Side,
-        user: [u8; 32],
-    ) {
-        let _ = book.submit_market_order_with_user(id, qty, side, user.into());
+    pub fn create_snapshot(book: &Book) -> impl Sized {
+        book.create_snapshot(usize::MAX)
     }
 }
 

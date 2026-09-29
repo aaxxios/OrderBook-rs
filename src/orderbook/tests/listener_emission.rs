@@ -343,7 +343,7 @@ mod tests {
                 for order in entry.value().iter_orders() {
                     resting += 1;
                     assert_eq!(
-                        book.order_locations.get(&order.id()).map(|loc| loc.0),
+                        book.order_locations.get(&order.id()).map(|loc| loc.price),
                         Some(*entry.key()),
                         "order {} rests but is not located there",
                         order.id()

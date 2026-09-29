@@ -24,6 +24,14 @@
 // Methodology (issue #258): same sub-tick concern and fix as
 // `aggressive_walk_hdr` (pre-fix `p50` of 42 ns) — see that file's note
 // and `hdr_common::record_batch`.
+//
+// Liquidity (issue #259): the ladder holds about 27 500 lots, and 100 000
+// takers of up to 20 lots empty it after about 2 200 of them; before
+// #259 the remaining ~98 % of the samples timed a market order rejected
+// by an empty book. The ladder is now re-seeded (unmeasured, between
+// batches) whenever the resting quantity could not cover a full batch
+// of the largest taker, so every measured taker trades. Numbers are
+// not comparable with pre-#259 runs of this bench.
 
 #[path = "hdr_common.rs"]
 mod common;
@@ -45,36 +53,68 @@ fn main() {
     let maker = owner(0xAA);
     let taker = owner(0xBB);
 
-    // Seed RESTING_PER_LEVEL asks at each of NUM_LEVELS prices.
+    // Seed RESTING_PER_LEVEL asks at each of NUM_LEVELS prices; re-run
+    // (unmeasured) whenever the ladder runs low, see the note above.
     let mut next_id = 1u64;
-    for level in 0..NUM_LEVELS {
-        let price = (100 + level) as u128;
-        for _ in 0..RESTING_PER_LEVEL {
-            let _ = book.add_limit_order_with_user(
-                Id::from_u64(next_id),
-                price,
-                rng.range(1, 10),
-                Side::Sell,
-                TimeInForce::Gtc,
-                maker,
-                None,
-            );
-            next_id += 1;
+    let mut resting = 0u64;
+    let seed = |rng: &mut Rng, next_id: &mut u64, resting: &mut u64| {
+        for level in 0..NUM_LEVELS {
+            let price = (100 + level) as u128;
+            for _ in 0..RESTING_PER_LEVEL {
+                let qty = rng.range(1, 10);
+                let _ = book.add_limit_order_with_user(
+                    Id::from_u64(*next_id),
+                    price,
+                    qty,
+                    Side::Sell,
+                    TimeInForce::Gtc,
+                    maker,
+                    None,
+                );
+                *next_id += 1;
+                *resting += qty;
+            }
         }
-    }
+    };
+    seed(&mut rng, &mut next_id, &mut resting);
 
     // Aggressive notional Buy sweeps. Random budgets in [500, 2_000)
     // quote ticks — usually clear a few orders at the best level or
     // walk into the next. Batched `BATCH` at a time (see the
     // methodology note above).
+    // Inputs are drawn before the clock and each `MatchResult` is kept in
+    // a buffer reserved before it, so the timed batch holds only the
+    // sweeps: result inspection (`executed_quantity`) and the drops run
+    // after the clock stops (#259 PR review).
+    let mut inputs = Vec::with_capacity(BATCH as usize);
+    let mut results = Vec::with_capacity(BATCH as usize);
     let mut done = 0u64;
     while done < MEASURED_OPS {
         let k = BATCH.min(MEASURED_OPS - done);
+        if resting < k * 20 {
+            seed(&mut rng, &mut next_id, &mut resting);
+        }
+        inputs.clear();
+        inputs.extend((0..k).map(|_| rng.range(500, 2_000) as u128));
+        results.clear();
+        let first = next_id;
         record_batch(&mut hist, k, |j| {
-            let amount = rng.range(500, 2_000) as u128;
-            let id = Id::from_u64(next_id + done + j);
-            let _ = book.submit_market_order_by_amount_with_user(id, amount, Side::Buy, taker);
+            let id = Id::from_u64(first + j);
+            results.push(book.submit_market_order_by_amount_with_user(
+                id,
+                inputs[j as usize],
+                Side::Buy,
+                taker,
+            ));
         });
+        next_id += k;
+        for result in results.drain(..) {
+            let filled = result
+                .ok()
+                .and_then(|r| r.executed_quantity().ok())
+                .map_or(0, |q| q.as_u64());
+            resting = resting.saturating_sub(filled);
+        }
         done += k;
     }
 

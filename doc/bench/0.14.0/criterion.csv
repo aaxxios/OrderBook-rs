@@ -1,0 +1,82 @@
+benchmark,median_estimate
+"Basic OrderBook Operations/create_order_book",3.2301 µs
+"Basic OrderBook Operations/add_single_order",5.4732 µs
+"OrderBook - Add Orders/add_limit_orders",99.871 µs
+"OrderBook - Add Orders/add_limit_orders_with_listeners",97.035 µs
+"OrderBook - Add Orders/add_iceberg_orders",92.059 µs
+"OrderBook - Add Orders/add_post_only_orders",91.066 µs
+"OrderBook - Add Orders/order_count_scaling/10",4.8205 µs
+"OrderBook - Add Orders/order_count_scaling/100",36.988 µs
+"OrderBook - Add Orders/order_count_scaling/1000",373.20 µs
+"OrderBook - Match Orders/match_market_against_limit",3.9096 µs
+"OrderBook - Match Orders/match_market_against_limit_with_listeners",4.0592 µs
+"OrderBook - Match Orders/match_market_against_iceberg",6.6770 µs
+"OrderBook - Match Orders/match_quantity_scaling/10",2.0622 µs
+"OrderBook - Match Orders/match_quantity_scaling/50",4.2892 µs
+"OrderBook - Match Orders/match_quantity_scaling/100",5.8138 µs
+"OrderBook - Match Orders/match_quantity_scaling/200",8.6745 µs
+"OrderBook - Match Orders/match_quantity_scaling/500",18.855 µs
+"OrderBook - Update Orders/cancel_orders",19.584 µs
+"OrderBook - Update Orders/update_quantities",41.529 µs
+"OrderBook - Update Orders/cancel_order_count_scaling/10",1.2236 µs
+"OrderBook - Update Orders/cancel_order_count_scaling/100",12.747 µs
+"OrderBook - Update Orders/cancel_order_count_scaling/1000",157.13 µs
+"OrderBook - Mixed Operations/realistic_trading_scenario",242.97 µs
+"OrderBook - Mixed Operations/high_frequency_scenario",771.38 µs
+"match_order_deep_book",1.1004 µs
+"OrderBook - Mass Cancel/cancel_all_orders/100",150.60 µs
+"OrderBook - Mass Cancel/cancel_all_orders/1000",1.9801 ms
+"OrderBook - Mass Cancel/cancel_all_orders/10000",3.5479 ms
+"OrderBook - Mass Cancel/cancel_all_orders/50000",10.583 ms
+"OrderBook - Mass Cancel/cancel_orders_by_side/100",173.33 µs
+"OrderBook - Mass Cancel/cancel_orders_by_side/1000",1.3524 ms
+"OrderBook - Mass Cancel/cancel_orders_by_side/10000",24.927 ms
+"OrderBook - Mass Cancel/cancel_orders_by_user/100",40.950 µs
+"OrderBook - Mass Cancel/cancel_orders_by_user/1000",809.29 µs
+"OrderBook - Mass Cancel/cancel_orders_by_user/10000",26.881 ms
+"OrderBook - Snapshot/create_snapshot/100",145.13 µs
+"OrderBook - Snapshot/create_snapshot/1000",159.55 µs
+"OrderBook - Snapshot/create_snapshot/10000",364.35 µs
+"OrderBook - Snapshot/restore_from_snapshot/100",249.59 µs
+"OrderBook - Snapshot/restore_from_snapshot/1000",438.47 µs
+"OrderBook - Snapshot/restore_from_snapshot/10000",2.5228 ms
+"OrderBook - Snapshot/enriched_snapshot_all/100",152.78 µs
+"OrderBook - Snapshot/enriched_snapshot_all/1000",164.20 µs
+"OrderBook - Snapshot/enriched_snapshot_all/10000",366.96 µs
+"OrderBook - Snapshot/enriched_snapshot_mid_price/100",143.02 µs
+"OrderBook - Snapshot/enriched_snapshot_mid_price/1000",154.42 µs
+"OrderBook - Snapshot/enriched_snapshot_mid_price/10000",310.38 µs
+"OrderBook - Snapshot/snapshot_json_roundtrip/100",85.438 µs
+"OrderBook - Snapshot/snapshot_json_roundtrip/1000",446.18 µs
+"OrderBook - Replay/journal_append/100",3.0352 µs
+"OrderBook - Replay/journal_append/1000",29.686 µs
+"OrderBook - Replay/journal_append/10000",253.91 µs
+"OrderBook - Replay/replay_from_journal/100",95.529 µs
+"OrderBook - Replay/replay_from_journal/1000",464.24 µs
+"OrderBook - Replay/replay_from_journal/10000",4.5371 ms
+"OrderBook - Replay/replay_verify/100",252.77 µs
+"OrderBook - Replay/replay_verify/1000",689.34 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders/2",1.8961 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders_with_listeners/2",2.1387 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations/2",3.2642 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations_with_listeners/2",3.4483 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders/4",2.4104 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders_with_listeners/4",2.6549 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations/4",7.5916 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations_with_listeners/4",7.3607 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders/8",4.8629 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders_with_listeners/8",5.3846 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations/8",19.930 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations_with_listeners/8",19.814 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders/16",10.887 µs
+"OrderBook - Concurrent Operations/concurrent_add_limit_orders_with_listeners/16",11.426 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations/16",30.576 µs
+"OrderBook - Concurrent Operations/concurrent_mixed_operations_with_listeners/16",30.527 µs
+"serialization/json_serialize_trade",210.24 ns
+"serialization/json_serialize_book_change",44.928 ns
+"serialization/json_deserialize_trade",326.96 ns
+"serialization/json_deserialize_book_change",72.544 ns
+"serialization/bincode_serialize_trade",82.063 ns
+"serialization/bincode_serialize_book_change",25.399 ns
+"serialization/bincode_deserialize_trade",112.71 ns
+"serialization/bincode_deserialize_book_change",12.693 ns

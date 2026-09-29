@@ -12,7 +12,7 @@
 // tests may panic: rules/global_rules.md § Testing
 #[allow(clippy::arithmetic_side_effects)]
 mod tests {
-    use crate::orderbook::book::OrderBook;
+    use crate::orderbook::book::{OrderBook, OrderLocation};
     use crate::orderbook::order_state::{OrderStateTracker, OrderStatus};
     use crate::orderbook::risk::RiskConfig;
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
@@ -160,18 +160,22 @@ mod tests {
 
         // order_locations <-> levels.
         for location in book.order_locations.iter() {
-            let (price, side) = *location.value();
+            let OrderLocation {
+                price,
+                side,
+                user_id,
+            } = *location.value();
             let rests = resting.get(location.key());
             assert!(
-                rests.is_some_and(|r| r.0 == price && r.1 == side),
-                "order {} is indexed at {side} {price} but does not rest there (rests: {rests:?})",
+                rests.is_some_and(|r| r.0 == price && r.1 == side && r.2 == user_id),
+                "order {} is indexed at {side} {price} for {user_id:?} but does not rest there (rests: {rests:?})",
                 location.key()
             );
         }
-        for (id, (price, side, _, _)) in &resting {
+        for (id, (price, side, owner, _)) in &resting {
             assert_eq!(
                 book.order_locations.get(id).map(|loc| *loc),
-                Some((*price, *side)),
+                Some(OrderLocation::new(*price, *side, *owner)),
                 "order {id} rests but is not indexed"
             );
         }
@@ -462,7 +466,9 @@ mod tests {
             ));
         });
         assert_eq!(
-            book.order_locations.get(&Id::from_u64(1)).map(|l| *l),
+            book.order_locations
+                .get(&Id::from_u64(1))
+                .map(|l| l.price_side()),
             Some((100, Side::Sell))
         );
         assert_book_consistent(&book);

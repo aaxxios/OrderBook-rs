@@ -28,7 +28,7 @@
 #[path = "hdr_common.rs"]
 mod common;
 
-use common::{Rng, new_histogram, persist, record_batch, report, submit_gtc};
+use common::{Rng, SEED_OWNERS, new_histogram, persist, record_batch, report, seed_resting};
 use pricelevel::Id;
 
 const SCENARIO: &str = "cancel_only";
@@ -41,23 +41,28 @@ fn main() {
     let mut rng = Rng::new(SEED);
     let mut hist = new_histogram();
 
-    // Pre-load the book with PRELOAD_OPS resting orders. The id space is
-    // 1..=PRELOAD_OPS so cancel ids are deterministic and present.
-    for i in 0..PRELOAD_OPS {
-        submit_gtc(&book, &mut rng, i + 1);
-    }
+    // Pre-load the book with PRELOAD_OPS resting orders, ids
+    // 1..=PRELOAD_OPS. #259 PR review: seeded NON-crossing and asserted;
+    // the old `submit_gtc` seed crossed, left about 11 % of the ids
+    // resting, and most timed cancels were misses.
+    seed_resting(&book, &mut rng, 1, PRELOAD_OPS, SEED_OWNERS);
 
-    // Cancel each one, in order, `BATCH` at a time. No warmup phase
-    // needed — cancel cost is dominated by `DashMap::remove` which has a
-    // stable distribution.
+    // Cancel each one, in order, `BATCH` at a time. Each cancel's result
+    // (the removed order) is kept in a buffer reserved before the clock
+    // and dropped after it.
+    let mut results = Vec::with_capacity(BATCH as usize);
     let mut next = 0u64;
     while next < PRELOAD_OPS {
         let base = next;
         let k = BATCH.min(PRELOAD_OPS - next);
+        results.clear();
         record_batch(&mut hist, k, |j| {
-            let id = Id::from_u64(base + j + 1);
-            let _ = book.cancel_order(id);
+            results.push(book.cancel_order(Id::from_u64(base + j + 1)));
         });
+        assert!(
+            results.iter().all(|r| matches!(r, Ok(Some(_)))),
+            "every cancel hits a resting order"
+        );
         next += k;
     }
 

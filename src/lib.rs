@@ -356,6 +356,16 @@
 //!   releases; `bincode` stays on 2.0.1.
 //! - **Allocation budget test (#262).** `tests/alloc_budget.rs` asserts a
 //!   seven-window median and runs in CI.
+//! - **Performance measured against 0.13.1 (#259).** A filled maker leaves
+//!   the user index by key (its location now carries the owner) instead of
+//!   a scan over every user, and a passive add to an existing level no
+//!   longer builds and drops a whole `PriceLevel`: passive-add allocations
+//!   fall from 6.3 / 18.3 KB to 3.3 / 0.95 KB per op, `add_only` p50 -46 %,
+//!   `mixed_70_20_10` -50 %, snapshot restore -64 %, replay -56 %.
+//!   `snapshot_create_10k` (+6.2 %), contended same-price adds with
+//!   listeners at 8 threads (+15 %) and the cancel-miss path (+8 ns) are
+//!   slower and accepted (maintainer decision on #259); see
+//!   `BENCHMARKS.md` and `BENCH.md`.
 //!
 //! ### Migration from 0.13
 //!

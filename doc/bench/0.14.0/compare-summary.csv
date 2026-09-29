@@ -1,0 +1,15 @@
+scenario,class,timer,rounds_baseline,rounds_candidate,baseline_p50_median_ns,baseline_p50_spread_pp,candidate_p50_median_ns,candidate_p50_spread_pp,p50_delta_pct,baseline_p99_median_ns,candidate_p99_median_ns,p99_delta_pct,baseline_mean_median_ns,candidate_mean_median_ns,verdict
+add_only,uncontended,single,7,7,1083.0,0.09,584.0,7.02,-46.08,59103.0,29807.0,-49.57,7129.0,3953.6,OK
+aggressive_walk,uncontended,batch,7,7,3365.0,35.19,2437.0,4.19,-27.58,4811.0,6115.0,27.10,3394.7,2773.4,NOISY
+cancel_only,uncontended,batch,7,7,713.0,7.29,687.0,3.35,-3.65,1066.0,1024.0,-3.94,729.5,706.5,OK
+contended_add_4t,contended,batch,7,7,2171.0,3.32,1343.0,7.07,-38.14,3145.0,2151.0,-31.61,2217.4,1391.5,OK
+contended_add_8t,contended,batch,7,7,3649.0,4.22,3321.0,7.05,-8.99,5423.0,5207.0,-3.98,3751.4,3432.3,OK
+contended_add_listeners_4t,contended,batch,7,7,2059.0,18.31,1529.0,1.24,-25.74,2783.0,2301.0,-17.32,2101.4,1579.1,FASTER (separated)
+contended_add_listeners_8t,contended,batch,7,7,3795.0,8.33,4363.0,1.93,14.97,5435.0,6675.0,22.82,3883.6,4534.0,REGRESSION
+mass_cancel_burst,uncontended,single,7,7,760831.0,2.56,754175.0,2.58,-0.87,1242111.0,1033215.0,-16.82,755100.7,754820.1,OK
+mixed_70_20_10,uncontended,single,7,7,917.0,0.00,459.0,9.15,-49.95,28543.0,14583.0,-48.91,3141.4,1799.9,OK
+replay_10k,uncontended,single,7,7,9019391.0,0.64,3942399.0,1.19,-56.29,10264575.0,4415487.0,-56.98,9131376.6,3978390.2,OK
+snapshot_create_10k,uncontended,single,7,7,372991.0,2.61,396287.0,7.36,6.25,427519.0,470783.0,10.12,375473.4,402467.3,REGRESSION
+snapshot_restore_10k,uncontended,single,7,7,10887167.0,3.01,3962879.0,0.93,-63.60,12738559.0,4538367.0,-64.37,11025014.8,4007893.0,OK
+stp_cancel_maker,uncontended,single,7,7,2709.0,53.89,2041.0,10.24,-24.66,5295.0,4335.0,-18.13,2803.8,2131.8,FASTER (separated)
+thin_book_sweep,uncontended,batch,7,7,541.0,81.70,341.0,2.64,-36.97,1291.0,1066.0,-17.43,588.1,382.3,NOISY
