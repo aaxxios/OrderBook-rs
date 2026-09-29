@@ -63,6 +63,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `ModifyRolledBack`       | 20  |
 /// | `ModifyOrderLost`        | 21  |
 /// | `RiskRejectedAfterTrades` | 22 |
+/// | `StopOrdersUnsupported`  | 23  |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -141,6 +142,11 @@ pub enum RejectReason {
     /// `OrderBookError::RiskRejectedAfterTrades`. A risk refusal before
     /// any trade keeps its own code (2, 3 or 4).
     RiskRejectedAfterTrades = 22,
+    /// A trailing stop was submitted to a book built without the
+    /// `special_orders` feature, which holds and triggers pending stops
+    /// (#286). Rejected before the book changed. Carried by
+    /// `OrderBookError::StopOrdersUnsupported`.
+    StopOrdersUnsupported = 23,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -179,6 +185,7 @@ impl RejectReason {
             Self::ModifyRolledBack => 20,
             Self::ModifyOrderLost => 21,
             Self::RiskRejectedAfterTrades => 22,
+            Self::StopOrdersUnsupported => 23,
             Self::Other(code) => code,
         }
     }
@@ -213,6 +220,7 @@ impl RejectReason {
             20 => Self::ModifyRolledBack,
             21 => Self::ModifyOrderLost,
             22 => Self::RiskRejectedAfterTrades,
+            23 => Self::StopOrdersUnsupported,
             other => Self::Other(other),
         }
     }
@@ -272,6 +280,7 @@ impl std::fmt::Display for RejectReason {
             Self::ModifyRolledBack => write!(f, "modify rolled back"),
             Self::ModifyOrderLost => write!(f, "modify lost the order"),
             Self::RiskRejectedAfterTrades => write!(f, "risk rejected after trades"),
+            Self::StopOrdersUnsupported => write!(f, "stop orders unsupported"),
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -336,6 +345,7 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::AllocationFailed { .. } => Self::Other(0),
             OrderBookError::EngineSeqExhausted { .. } => Self::Other(0),
             OrderBookError::SnapshotCrossed { .. } => Self::Other(0),
+            OrderBookError::StopOrdersUnsupported { .. } => Self::StopOrdersUnsupported,
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { .. } => Self::Other(0),
             #[cfg(feature = "nats")]
@@ -356,7 +366,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 22] {
+    fn named_variants() -> [RejectReason; 23] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -380,6 +390,7 @@ mod tests {
             RejectReason::ModifyRolledBack,
             RejectReason::ModifyOrderLost,
             RejectReason::RiskRejectedAfterTrades,
+            RejectReason::StopOrdersUnsupported,
         ]
     }
 
@@ -407,6 +418,7 @@ mod tests {
         assert_eq!(RejectReason::ModifyRolledBack.as_u16(), 20);
         assert_eq!(RejectReason::ModifyOrderLost.as_u16(), 21);
         assert_eq!(RejectReason::RiskRejectedAfterTrades.as_u16(), 22);
+        assert_eq!(RejectReason::StopOrdersUnsupported.as_u16(), 23);
     }
 
     /// #247: both modify re-add outcomes have their own codes, round trip
@@ -443,6 +455,24 @@ mod tests {
         assert!(std::error::Error::source(&lost).is_some());
         assert!(rolled_back.to_string().contains("restored"));
         assert!(lost.to_string().contains("could not be restored"));
+    }
+
+    /// #286: a trailing stop refused by a book without `special_orders` has
+    /// its own code, round trips through `from_u16` and names the order.
+    #[test]
+    fn test_from_order_book_error_maps_stop_orders_unsupported() {
+        let err = OrderBookError::StopOrdersUnsupported {
+            order_id: Id::from_u64(9),
+        };
+        assert_eq!(
+            RejectReason::from(&err),
+            RejectReason::StopOrdersUnsupported
+        );
+        let reason = RejectReason::from_u16(23);
+        assert_eq!(reason, RejectReason::StopOrdersUnsupported);
+        assert_eq!(reason.as_u16(), 23);
+        assert_eq!(reason.to_string(), "stop orders unsupported");
+        assert!(err.to_string().contains("special_orders"));
     }
 
     /// #291: a post-trade risk refusal has its own code, distinct from the

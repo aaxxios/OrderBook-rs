@@ -527,6 +527,22 @@ pub enum OrderBookError {
         best_ask: u128,
     },
 
+    /// A trailing stop reached a book that cannot hold it (#286).
+    ///
+    /// Trailing stops are held off book and triggered by the book's last
+    /// trade price, which needs the `special_orders` feature. Without it,
+    /// `add_order` rejects an `OrderType::TrailingStop` untouched with this
+    /// error (before 0.14.0 it was silently rested as a limit order at its
+    /// stop price), and a snapshot carrying pending stops cannot be
+    /// restored. Also raised, with the feature, by a snapshot restore that
+    /// finds a trailing stop resting on a price level (the pre-0.14 model,
+    /// which no longer exists). Maps to the stable wire code
+    /// `RejectReason::StopOrdersUnsupported` (23).
+    StopOrdersUnsupported {
+        /// The trailing stop that was refused.
+        order_id: pricelevel::Id,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -798,6 +814,12 @@ impl fmt::Display for OrderBookError {
                 write!(
                     f,
                     "snapshot is crossed: best bid {best_bid} is at or above best ask {best_ask}"
+                )
+            }
+            OrderBookError::StopOrdersUnsupported { order_id } => {
+                write!(
+                    f,
+                    "trailing stop {order_id} is not supported here: pending stops are held off book and need the special_orders feature"
                 )
             }
             #[cfg(feature = "nats")]

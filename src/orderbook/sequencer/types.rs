@@ -492,7 +492,10 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         // the post-commit emission instead of returning it. A crossed
         // snapshot is a restore-only error.
         | OrderBookError::EngineSeqExhausted { .. }
-        | OrderBookError::SnapshotCrossed { .. } => false,
+        | OrderBookError::SnapshotCrossed { .. }
+        // #286: a trailing stop refused by a book without `special_orders`
+        // (or a restore that met one); rejected before any check runs.
+        | OrderBookError::StopOrdersUnsupported { .. } => false,
         #[cfg(feature = "nats")]
         OrderBookError::NatsPublishError { .. } | OrderBookError::NatsSerializationError { .. } => {
             false
