@@ -745,6 +745,27 @@ persisted in the snapshot package. An operator's `release_kill_switch`
 resumes flow; the latch stays set. The price-level stripe locks keep their
 recover-and-log policy.
 
+**Cost of the ordering guarantee.** Stamping `engine_seq` and publishing
+the batch must be one atomic step under the submit gate, so every commit
+takes the outbox lock once (1.23 acquisitions per add at 8 threads,
+dispatcher drains included). On a single thread, or with no listener
+installed, that is free or absent; under many concurrent submitters with
+a trivial listener it is visible. Measured against main c59d74f (3 to 5
+interleaved Criterion rounds): `concurrent_add_limit_orders` with a
+no-op trade + price-level listener is +3.8% / +6.7% / +3.7% at 2 / 8 / 16
+threads (4 threads within noise), the one workload over the 5% budget.
+That workload is the worst case by construction: all threads add at one
+price for one account (already serialised on the level and the user
+index), and a no-op listener makes delivery free, so the lock handoff is
+the entire difference. Listener-free paths are unchanged within noise
+(`add_limit_orders` +0.1%, `concurrent_add_limit_orders` -1.0% to
++0.7%, `concurrent_mixed_operations` -1.2% to +1.1%, HDR `add_only` and
+`mixed_70_20_10` p50 0.0%, `aggressive_walk` p50 +2.4% over 10 rounds,
+one 1 ns histogram bucket); with listeners, mixed and market-order workloads stay within
++5%. The alternatives measured or analysed are listed in the
+`CHANGELOG.md` entry for #249; the maintainer accepted this cost for the
+guarantee.
+
 **Limits.** One emission scope per thread: a gated call on book B made by
 caller code running inside book A's mutation (a `Clock`, `T::clone`)
 finds the scope taken, so B's events take the immediate path and are

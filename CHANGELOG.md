@@ -569,6 +569,36 @@ change.
     installed clone the `TradeResult` once (caller copy + deferred listener
     copy; same fills, fees and `engine_seq`). Journal and replay do not go
     through listeners and are unaffected.
+  - **Measured cost of the total-order guarantee** (Criterion, 3 to 5
+    interleaved rounds against main c59d74f, Apple M-series). The one
+    workload over the 5% budget is `concurrent_add_limit_orders` **with a
+    no-op trade + price-level listener installed**: +3.8% / +6.7% / +3.7%
+    at 2 / 8 / 16 threads (4 threads within noise). Why: a strictly
+    increasing `engine_seq` in commit order needs each commit's stamp and
+    publish to be one atomic step under the submit gate, which is one
+    outbox lock acquisition per commit (measured 1.23 per add at 8
+    threads, dispatcher drains included); on main the listeners ran
+    inline, concurrently and unordered. The workload maximises that cost:
+    every thread adds at one price for one account, so all of them
+    serialise on the same level and index anyway, and a no-op listener
+    makes delivery free, leaving the lock handoff as the whole difference.
+    Everything else is within budget. Without listeners every path is
+    unchanged within noise: `add_limit_orders` +0.1%,
+    `concurrent_add_limit_orders` -1.0% to +0.7%,
+    `concurrent_mixed_operations` -1.2% to +1.1%, HDR `add_only` and
+    `mixed_70_20_10` p50 0.0%, `aggressive_walk` p50 +2.4% over 10 rounds
+    (one 1 ns histogram bucket). With listeners, `add_limit_orders` is
+    +2.4%, `concurrent_mixed_operations` -0.9% to +4.9% and
+    `match_market_against_limit` +3% to +4%. Tried and kept: a
+    spin flag in front of the outbox mutex (the contended `std` mutex
+    parked waiters in the kernel; 8 threads went from +9.3% to about +6%).
+    Tried and reverted: cache-line co-location of the outbox's hot fields,
+    appending events into a shared buffer in place (slower at every thread
+    count), backoff tuning. Evaluated and not pursued: dropping
+    readiness tracking (at most about 2 points, and it would deliver
+    before the owner's gate release), a lock-free ring keyed by
+    `engine_seq` (state-only batches and externally minted sequence
+    numbers leave gaps that can only be closed by stalling delivery).
 
 - **`OrderBook::peek_match` returns `Result` (#246).** Compatibility:
   `peek_match(side, quantity, price_limit)`: `u64` →

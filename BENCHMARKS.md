@@ -72,6 +72,23 @@ Per-op latency under N concurrent threads (`add_limit` / `mixed`):
 | 8  | ~3.69 µs | ~7.13 µs |
 | 16 | ~10.3 µs | ~16.2 µs |
 
+### Listener variants (#249)
+
+`concurrent_add_limit_orders_with_listeners/N`,
+`concurrent_mixed_operations_with_listeners/N`,
+`add_limit_orders_with_listeners` and
+`match_market_against_limit_with_listeners` repeat their base workload
+with a no-op trade + price-level listener installed. Since 0.14.0
+listener events are delivered after commit, outside the submit gate, in
+one `engine_seq` order per book; stamping that order costs one outbox
+lock acquisition per commit. Against main c59d74f (3 to 5 interleaved
+rounds) `concurrent_add_limit_orders_with_listeners` is +3.8% / +6.7% /
++3.7% at 2 / 8 / 16 threads, the only workload over the 5% budget: every
+thread adds at one price for one account and the listener does nothing,
+so the lock handoff is the whole difference. The listener-free rows are
+unchanged within noise; see `doc/panic-boundaries.md` ("Cost of the
+ordering guarantee") and the #249 `CHANGELOG.md` entry.
+
 ## Observations
 
 - **Snapshot creation scales sub-linearly**: 10,000 orders is only ~3.2x
