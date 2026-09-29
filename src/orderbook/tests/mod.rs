@@ -1,5 +1,6 @@
 mod analytics_overflow;
 mod book;
+mod concurrent_crossing_adds;
 mod depth_analysis;
 mod enriched_snapshot_tests;
 mod error;

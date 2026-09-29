@@ -4,6 +4,24 @@
 //! and re-applies each command to a fresh [`OrderBook`], producing an
 //! identical final state. This enables disaster recovery, audit compliance,
 //! and state verification.
+//!
+//! # Concurrent same-id submits are not replayable
+//!
+//! Replay is sequential, so it reproduces a journal recorded from one
+//! submitting thread (as a sequencer feeds the book), not every interleaving
+//! of a book driven concurrently on the shared submit gate. One case is
+//! called out because it involves trades: two concurrent submits carrying
+//! the same fresh order id can both pass the early duplicate check, both
+//! sweep, and only one can then rest (the id is claimed atomically, #288);
+//! the loser returns `DuplicateOrderId` **after its trades**. The journal
+//! records only the reject code (the error does not carry the fills), and
+//! replayed in journal order the loser meets the winner already resting and
+//! is refused by the early check with no fills. The codes agree, so replay
+//! does not stop there: the replayed book simply lacks the loser's trades,
+//! a divergence only [`snapshots_match`] (or a later outcome mismatch)
+//! reveals. Assigning unique order ids, or serializing submits per id, is
+//! an ingress / sequencing obligation; the engine only guarantees that the
+//! live book stays consistent (one resting order per id, no orphaned index).
 
 use super::error::JournalError;
 use super::journal::Journal;

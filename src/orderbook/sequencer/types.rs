@@ -438,7 +438,13 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::ModifyOrderLost { .. }
         // Only ever the source of one of the two above; classified with
         // them in case a caller surfaces it on its own.
-        | OrderBookError::OrderChangedDuringModify { .. } => true,
+        | OrderBookError::OrderChangedDuringModify { .. }
+        // #288: the id is claimed atomically when the remainder rests, so
+        // a same-id submit that lost a concurrent admission race fails
+        // here after its sweep may have traded. The common early duplicate
+        // check is pre-mutation, but the error does not say which one
+        // fired; replay re-executes it and reproduces the early rejection.
+        | OrderBookError::DuplicateOrderId { .. } => true,
         // Admission and shape checks (all evaluated before the sweep), the
         // operational gates, and the non-reject internal errors. The
         // post-sweep post-only rejection is here too: `pricelevel`
@@ -454,7 +460,6 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::InvalidPriceLevel(_)
         | OrderBookError::OrderSizeOutOfRange { .. }
         | OrderBookError::MissingUserId { .. }
-        | OrderBookError::DuplicateOrderId { .. }
         | OrderBookError::QuantityOverflow { .. }
         | OrderBookError::ZeroVisibleTranche { .. }
         | OrderBookError::ReserveResidualWouldBeDiscarded { .. }

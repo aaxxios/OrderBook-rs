@@ -427,6 +427,57 @@ change.
   Concurrent admissions at the same price still run in parallel; cost is
   one uncontended shared acquire per rested order and one exclusive
   acquire per removed level.
+- **Concurrent crossing adds no longer leave an order indexed but not
+  resting (#288).** Under the shared submit gate (`STPMode::None`, no
+  strandable maker) an order's location, user-index entry and
+  `Open` / `PartiallyFilled` state were published only **after** its
+  level admitted it. A concurrent sweep could consume the order in that
+  window: its drain found no index to remove, and the resting thread then
+  inserted a location and user-index entry for an order that no longer
+  rested, and overwrote the maker's `Filled` state with `Open`
+  (pre-existing on main; 100/100 runs of the new 8-thread stress test
+  failed). `rest_on_level` now publishes the location (claimed atomically
+  with `DashMap::entry`), the user-index entry and the resting state
+  before the level admits the order, and withdraws them if the level
+  refuses it. The location is the id's ownership token: every remover
+  (sweep drain, cancel, zero-quantity update, rollbacks) releases it
+  last, so a reused id never sees or removes a previous order's user or
+  risk entry, and emptied `user_orders` entries are dropped only if still
+  empty. Special orders are still registered after the admission, so a
+  repricing pass cannot unregister an order that is being admitted. No
+  new lock. The same fix reordered the raw `place_order_in_book`.
+- **Risk open-order count no longer double-released by two sweeps
+  sharing a maker (#288).** The fill hook of the risk layer marked a fully filled
+  maker's entry exhausted and removed it in two steps; the other sweep's
+  `on_maker_removed` could take the zeroed entry in between and release a
+  second open-order slot for the same order, leaving the account's
+  `open_count` below its resting orders with no anomaly counted. The
+  full-fill removal now happens under the same entry lock.
+
+  Compatibility:
+  - A same-id submit racing a live order is now refused with
+    `DuplicateOrderId` when it would rest, even without a `RiskConfig`
+    (it used to overwrite the other order's location, last writer wins).
+    As before, it may have traded first. `place_order_in_book` returns
+    `DuplicateOrderId` for an id already located on the book instead of
+    overwriting its location.
+  - `SequencerResult::from` classifies `DuplicateOrderId` as
+    `may_have_mutated: true`: the loser of a concurrent same-id race can
+    fail with it after trading (it also counts in the reject metric then,
+    without an order state, which belongs to the winner). Replay was
+    already re-executing these rejections. Replay cannot reproduce such a
+    race (the loser's trades are missing from the replayed book); unique
+    ids per submit are an ingress / sequencing obligation.
+  - A cancel that arrives while an order is being rested now finds it as
+    soon as its level admits it (it used to return `Ok(None)` until the
+    bookkeeping finished).
+  - The order-state listener sees an order's `Open` / `PartiallyFilled`
+    before the level event of its admission. If the level then refuses
+    the order (a resource failure: counter capacity, a poisoned level),
+    that state is followed by the terminal one (`Rejected` or
+    `Cancelled { RestFailed }`), and a rolled-back modify shows the
+    re-add's accepted state ahead of the restore's
+    (`Open, Cancelled, Open, Open` instead of `Open, Cancelled, Open`).
 
 ### Changed
 

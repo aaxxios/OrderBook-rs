@@ -416,7 +416,11 @@ fills, so "known fills" means what it recorded (a taker's pre-rest fills),
 the same convention every cancel follows.
 
 Order-state listener sequence on a rollback: `Cancelled { UserRequested }`
-for the cancel, then the restored status. A re-add failure the modify
+for the cancel, then the restored status. A re-add refused by its level
+(rather than before it) first records its own resting state, because
+since #288 that state is recorded before the level admits the order (see
+below), so the sequence is the cancel, the re-add's `Open` /
+`PartiallyFilled`, then the restored status. A re-add failure the modify
 resolves records no `Rejected` state or reject metric of its own; a
 failure raised inside the re-add's sweep (a self-trade-prevention cancel
 with no fill, a failed post-only probe, an abort with an empty prefix) is
@@ -482,6 +486,95 @@ with a `Mutex` per stripe serialised admissions at a hot price
 adding at one price); the shared side keeps concurrent admissions at
 main's speed. Single-threaded adds pay one uncontended shared acquire and
 release per rested order, and a removed level one exclusive acquire.
+
+## Resting-order indices under concurrent sweeps (#288)
+
+Under the shared submit gate a sweep can match an order from the moment
+its level admits it. Everything else that identifies the order as resting
+used to be published only after that admission: the `order_locations`
+entry, the `user_orders` entry and the `Open` / `PartiallyFilled` state. A
+concurrent sweep that consumed the order in between drained a maker with
+no index to remove (and recorded `Filled`), after which the resting
+thread inserted a location and a user-index entry for an order that no
+longer rested and overwrote `Filled` with `Open`. An 8-thread stress test
+(`src/orderbook/tests/concurrent_crossing_adds.rs`) failed 100/100 runs on
+main.
+
+Contract: `rest_on_level` (the single resting point for a submit's
+remainder, a modify's re-add and a modify's restore) publishes, in order,
+the risk reservation (#243), the location, the user-index entry and the
+resting state, and only then admits the order to its level under the
+price's shared stripe (#247). Special-order tracking, the strandable-maker
+count (a strandable maker always rests under the exclusive gate, where no
+sweep overlaps it), the level event and the depth gauges follow the
+admission. A sweep that consumes the order therefore finds its location,
+user entry and risk entry, removes them, and records `Filled` after the
+resting state; a cancel finds it as soon as the level holds it.
+
+**The location is the id's ownership token** (PR #290 review). It is
+claimed atomically with `DashMap::entry` (an occupied entry is
+`DuplicateOrderId`, with the reservation released), and every remover
+releases it **last**: the sweep's drain, the single-order cancel
+(`finish_removal`), the zero-quantity `UpdateQuantity`, a refused
+admission's rollback (`withdraw_unrested`) and `place_order_in_book`'s
+rollback untrack the user entry, release the risk entry and (a cancel)
+unregister special orders first. A user-index or risk entry for an id therefore only
+exists while one admission owns the id, so an id reused as soon as the
+previous order is gone (supported, see `strandable_maker_count.rs`) can
+neither see nor remove the previous order's entries. A first version of
+this fix pushed the user entry after the admission and re-checked the
+location by value; that let a reuse of the id at the same price and side
+keep a stale second entry (`test_id_reused_mid_rest_keeps_one_user_entry`
+fails on it). Emptied `user_orders` entries are dropped with `remove_if`
+on emptiness, so a push for the same user between the emptying and the
+removal is kept.
+
+Special-order tracking is registered after the admission, as before #288:
+the repricers unregister every tracked id `get_order` cannot find, so a
+registration made before the order reached its level could be lost for
+good. A registration that lands after a concurrent cancel leaves a stale
+id, which the next repricing pass removes. (Pre-existing and unchanged: a
+repricer that reads `get_order == None` for an order that is then
+replaced by a same-id order can unregister the new one.)
+
+Cost, measured against main with three interleaved rounds: one location
+claim instead of an insert, and the user-index push moved ahead of the
+admission. `add_limit_orders` +0.3%, `add_only_hdr` p50 / p99 / p99.9
++0.0% / -1.5% / -0.7%; `concurrent_add_limit_orders` +4.3% at 2 threads
+(two threads admitting for one account, whose single user-index entry is
+the hot spot), -0.6% at 4, -4.0% at 8, -0.4% at 16;
+`concurrent_mixed_operations` +0.2% to +1.3%; `mixed_70_20_10_hdr` p99 /
+p99.9 -2.7% / -4.1%; `add_only_risk_hdr` p50 -6.2%.
+
+If the level refuses the order (counter capacity, a poisoned level), the
+user entry and reservation are withdrawn, then the location is released,
+and the recorded state is followed by the caller's terminal one
+(`Rejected`, `Cancelled { RestFailed }`, or a modify's restore). Readers
+can briefly observe an order indexed but not yet on its level
+(`get_order` returns `None`, a cancel returns `Ok(None)`); never an index
+left behind for an order that no longer rests. No lock was added.
+
+**Duplicate ids and replay.** The atomic claim means a same-id submit
+that lost a concurrent admission race fails with `DuplicateOrderId`
+**after its sweep may have traded**, so `SequencerResult::from` now
+classifies `DuplicateOrderId` as `may_have_mutated: true` (the early,
+pre-trade duplicate check raises the same error). Such a loser records no
+order state (the id belongs to the winner; a terminal state would end the
+winner on the tracker) but is counted in the reject metric when it
+traded. Replay cannot reproduce it: replayed sequentially the loser meets
+the winner resting and is refused by the early check with no fills, the
+reject codes agree, and the missing trades surface only in
+`snapshots_match`. Unique order ids, or submits serialized per id, are an
+ingress / sequencing obligation (see the `sequencer::replay` module docs).
+
+The same stress test exposed a second window, in the risk layer: two
+sweeps can share a maker, and the one that consumes it last also calls
+`on_maker_removed`. `RiskState::on_fill` zeroed a fully filled entry and
+removed it in two steps, so that `on_maker_removed` could take the zeroed
+entry in between and release a second open-order slot (and no anomaly was
+counted, because the account's other orders kept the counter positive).
+The full-fill removal now happens under the entry lock that zeroes it:
+whichever of the two takes the entry releases the slot once.
 
 ## Ratchet
 

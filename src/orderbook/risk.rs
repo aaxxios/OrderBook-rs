@@ -1054,28 +1054,41 @@ impl RiskState {
         if self.config.is_none() {
             return;
         }
-        // Read-modify-write the entry. Use `get_mut` for the partial
-        // case and `remove` for the full case to keep the map small.
-        let (account, entry_price, released_qty, fully_filled, tracked_qty) = {
-            let Some(mut entry) = self.orders.get_mut(&maker_id) else {
-                return;
+        // Read-modify-write the entry under its shard lock. A partial fill
+        // updates it in place; a full fill removes it **in the same
+        // critical section** (#288). Two sweeps can share a maker under the
+        // shared submit gate: the one that consumes it last also calls
+        // `on_maker_removed` (`on_cancel`). Marking the entry exhausted and
+        // removing it in two steps let that cancel take the zeroed entry in
+        // between and release a second open-order slot for the same order.
+        // Now whichever of the two takes the entry releases its slot, and
+        // the other finds nothing.
+        let (account, entry_price, released_qty, fully_filled, tracked_qty) =
+            match self.orders.entry(maker_id) {
+                dashmap::Entry::Vacant(_) => return,
+                dashmap::Entry::Occupied(mut occupied) => {
+                    let entry = occupied.get_mut();
+                    let tracked_qty = entry.remaining_qty;
+                    let (new_remaining, released_qty) = match tracked_qty.checked_sub(filled_qty) {
+                        Some(new_remaining) => (new_remaining, filled_qty),
+                        None => (0, tracked_qty),
+                    };
+                    let account = entry.account;
+                    let entry_price = entry.price;
+                    entry.remaining_qty = new_remaining;
+                    let fully_filled = new_remaining == 0;
+                    if fully_filled {
+                        occupied.remove();
+                    }
+                    (
+                        account,
+                        entry_price,
+                        released_qty,
+                        fully_filled,
+                        tracked_qty,
+                    )
+                }
             };
-            let tracked_qty = entry.remaining_qty;
-            let (new_remaining, released_qty) = match tracked_qty.checked_sub(filled_qty) {
-                Some(new_remaining) => (new_remaining, filled_qty),
-                None => (0, tracked_qty),
-            };
-            let account = entry.account;
-            let entry_price = entry.price;
-            entry.remaining_qty = new_remaining;
-            (
-                account,
-                entry_price,
-                released_qty,
-                new_remaining == 0,
-                tracked_qty,
-            )
-        };
 
         if released_qty != filled_qty {
             self.note_fill_overshoot(maker_id, account, tracked_qty, filled_qty);
@@ -1098,7 +1111,6 @@ impl RiskState {
         // matters: do not widen a read-guard scope across the eviction call
         // or it self-deadlocks.
         if fully_filled {
-            self.orders.remove(&maker_id);
             self.evict_if_zeroed(account);
         }
     }

@@ -753,7 +753,10 @@ mod tests {
     }
 
     /// SHOULD: a rolled-back modify records no `Rejected` state for the
-    /// failed re-add: the listener sees the cancel and the restore only.
+    /// failed re-add. Since #288 an order's resting state is recorded
+    /// before its level admits it (so a concurrent sweep's `Filled` can
+    /// never precede it), so a re-add the level refuses leaves its `Open`
+    /// in the history ahead of the restore's.
     #[test]
     fn test_rollback_records_no_rejection_for_the_readd() {
         let mut book = tracked_book();
@@ -784,6 +787,9 @@ mod tests {
                     filled_quantity: 0,
                     reason: CancelReason::UserRequested,
                 },
+                // The re-add, recorded before the level refused it.
+                OrderStatus::Open,
+                // The restore.
                 OrderStatus::Open,
             ]
         );
