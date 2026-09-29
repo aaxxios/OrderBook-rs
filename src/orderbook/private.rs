@@ -1,6 +1,5 @@
 use crate::{OrderBook, OrderBookError};
-use pricelevel::{OrderType, PriceLevel, Side, TimeInForce};
-use std::sync::Arc;
+use pricelevel::{OrderType, Side, TimeInForce};
 use std::sync::atomic::Ordering;
 
 impl<T> OrderBook<T>
@@ -66,79 +65,6 @@ where
             Side::Buy => OrderBook::<T>::best_ask(self).is_some_and(|best_ask| price >= best_ask),
             Side::Sell => OrderBook::<T>::best_bid(self).is_some_and(|best_bid| price <= best_bid),
         }
-    }
-
-    /// Places a resting order in the book, updates its location.
-    ///
-    /// Raw placement: no matching, risk or order-state bookkeeping. The
-    /// location (the id's ownership token) and the user index are
-    /// published before the level admits the order, so a concurrent sweep
-    /// that consumes it finds and removes them (#288); a level refusal
-    /// untracks the user entry and then releases the location.
-    ///
-    /// # Errors
-    ///
-    /// [`OrderBookError::DuplicateOrderId`] when an order with this id is
-    /// already located on the book (nothing is touched), and
-    /// [`OrderBookError::PriceLevelError`] when the level refuses the
-    /// order.
-    #[allow(dead_code)]
-    pub fn place_order_in_book(
-        &self,
-        order: Arc<OrderType<T>>,
-    ) -> Result<Arc<OrderType<T>>, OrderBookError> {
-        let (side, price, order_id) = (order.side(), order.price().as_u128(), order.id());
-
-        let book_side = match side {
-            Side::Buy => &self.bids,
-            Side::Sell => &self.asks,
-        };
-
-        // #288: claim the location (stored as (price, side) for cancel_order)
-        // and index the owner before the order becomes matchable.
-        let claimed = match self.order_locations.entry(order_id) {
-            dashmap::Entry::Occupied(_) => false,
-            dashmap::Entry::Vacant(slot) => {
-                slot.insert((price, side));
-                true
-            }
-        };
-        if !claimed {
-            return Err(OrderBookError::DuplicateOrderId { order_id });
-        }
-        self.track_user_order(order.user_id(), order_id);
-
-        // Get or create the price level and admit under the shared side of
-        // the price's stripe, so a concurrent empty-level removal cannot
-        // unlink it (#247).
-        let stripe = self.lock_level(price);
-        let price_level = book_side
-            .get_or_insert(price, Arc::new(PriceLevel::new(price)))
-            .value()
-            .clone();
-
-        // Convert OrderType<T> to OrderType<()> for compatibility with current PriceLevel API
-        let unit_order = self.convert_to_unit_type(&*order);
-        if let Err(err) = price_level.add_order(unit_order) {
-            drop(stripe);
-            // Untrack while this placement still owns the id, then release
-            // it (#288).
-            self.untrack_user_order(order.user_id(), &order_id);
-            self.order_locations
-                .remove_if(&order_id, |_, location| *location == (price, side));
-            self.remove_level_if_empty(side, price);
-            return Err(err.into());
-        }
-        drop(stripe);
-
-        // notify price level changes
-        self.emit_level_changed(side, &price_level);
-
-        // Refresh the operational depth gauges. No-op when the
-        // `metrics` feature is disabled.
-        self.record_depth_metric();
-
-        Ok(order)
     }
 
     /// Register an order in the `user_orders` index.
@@ -433,7 +359,6 @@ mod tests {
     use crate::orderbook::book::OrderBook;
     use crate::utils::current_time_millis; // Import the time utility
     use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
-    use std::sync::Arc;
     use uuid::Uuid;
 
     // Helper function to create a unique order ID
@@ -442,10 +367,10 @@ mod tests {
     }
 
     #[test]
-    fn test_private_place_order_in_book() {
+    fn test_private_add_order_publishes_location_and_level() {
         let order_book: OrderBook<()> = OrderBook::new("TEST");
         let order_id = create_order_id();
-        let order = Arc::new(OrderType::Standard {
+        let order = OrderType::Standard {
             id: order_id,
             price: Price::new(100),
             quantity: Quantity::new(10),
@@ -454,9 +379,9 @@ mod tests {
             timestamp: TimestampMs::new(current_time_millis()),
             time_in_force: TimeInForce::Gtc,
             extra_fields: (),
-        });
+        };
 
-        assert!(order_book.place_order_in_book(order).is_ok());
+        assert!(order_book.add_order(order).is_ok());
 
         // Verify order location
         let location = order_book.order_locations.get(&order_id).unwrap();

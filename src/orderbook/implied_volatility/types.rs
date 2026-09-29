@@ -20,6 +20,11 @@ pub enum PriceSource {
     /// Volume-weighted mid price based on quantities at best bid/ask.
     WeightedMid,
     /// Last traded price from the order book.
+    ///
+    /// Does not fall back to the mid (#294): on a two-sided book that has
+    /// not traded yet, IV extraction returns
+    /// [`IVError::NoPriceAvailable`](super::IVError::NoPriceAvailable).
+    /// A one-sided book is priced from its only side, as for every source.
     LastTrade,
 }
 

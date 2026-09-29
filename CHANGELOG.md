@@ -50,6 +50,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Core boundary gaps found by the final audit (#294).** Engine
+  consistency around caller-supplied code; no panic was reachable with
+  valid input.
+  - An unwind under the **shared** side of the submit gate left no trace
+    (a `RwLockReadGuard` never poisons): a panicking `Clock`, metrics
+    recorder, `tracing` subscriber or `T::default()` running mid-mutation
+    in an ordinary submit, cancel or modify left the book possibly
+    inconsistent and still accepting flow. `SubmitGateGuard`'s drop now
+    checks `std::thread::panicking()` (once per drop, against the value
+    at acquisition, like std's own poison flag) and, on either side,
+    engages the kill switch and latches `submit_gate_poisoned()` before
+    the gate is released, logging once at `ERROR`.
+  - The sweep drain ran the per-maker caller code (`track_state`'s
+    `Clock` and `record_reject`, the strandable-maker `INFO`,
+    `record_reserve_hidden_discarded`) before each maker's index cleanup,
+    so an unwind left ghost locations and user-index entries for every
+    maker not cleaned yet. A drop guard now releases the indices of every
+    maker not released yet while the drain unwinds. The per-maker order
+    (state recorded, then location released) is kept on purpose: the
+    location is the id's ownership token (#288), and releasing it first
+    would let a same-id order admitted meanwhile have its resting state
+    overwritten by the old order's `Filled`. Event order is unchanged.
+  - A standalone `OrderStateTracker::transition` invoked its listener
+    before queuing a terminal id for eviction, so a panicking listener
+    left the id retained forever. The id is queued first.
+  - The listener dispatcher could spin forever when its delivery buffer
+    persistently refused to grow (`try_reserve`): the head batch stayed
+    ready and was never taken. It is now delivered in place.
+  - Dead code: the unused `next_order_id` counter is gone and the
+    drop-only submit-gate guard fields are `_`-prefixed instead of
+    `#[allow(dead_code)]`.
+
+  Cost, measured against main 4567530 with interleaved rounds (medians,
+  on a loaded machine): one `thread::panicking()` read per gate
+  acquisition and per drop, and no allocation in the drain.
+  `aggressive_walk_hdr` p50 / p99 / p99.9 +0.0% / -1.4% / +1.6% (10
+  rounds); `add_limit_orders` +0.6%, `add_limit_orders_with_listeners`
+  +0.6%, `match_market_against_limit` -2.3%,
+  `match_market_against_limit_with_listeners` +0.6%,
+  `match_market_against_iceberg` -0.9% (5 rounds). All within noise.
+
 - **Panic-free matching, STP and matching pool (#246).** The last
   panicking forms in `matching.rs`, `stp.rs` and `pool.rs` are gone and
   the three files leave both panic-policy ledgers:
@@ -596,6 +637,26 @@ change.
   CI now runs it (#262). Test-only change.
 
 ### Changed (breaking)
+
+- **Core boundary tightening (#294).** Compatibility:
+  - `OrderBook::place_order_in_book` is removed. It was a public raw
+    placement that bypassed the submit gate, the kill switch, risk,
+    crossing checks, self-trade prevention, the strandable-maker rule and
+    order-state tracking, contradicting the gate's documented boundary; it
+    had no production caller. Use `add_order` (or the `add_*` helpers).
+  - `PriceSource::LastTrade` IV extraction on a two-sided book that has
+    not traded yet returns `Err(IVError::NoPriceAvailable)` instead of
+    silently pricing from the mid. Use `PriceSource::MidPrice` as an
+    explicit fallback. One-sided books are priced from their only side,
+    as before.
+  - A panic under the shared submit gate now engages the kill switch and
+    latches `submit_gate_poisoned()`; after an unwind under the exclusive
+    side the kill switch is engaged at the unwind rather than at the next
+    acquisition, so a market order submitted right after the panic is
+    rejected too. `release_kill_switch` resumes flow as before.
+  - `OrderStateTracker::transition` (standalone tracker) runs the
+    terminal-id eviction before its listener, so a listener that reads
+    the tracker can find an older terminal id already evicted.
 
 - **Listeners run after commit and outside the submit gate (#249,
   decision D3).** Behaviour change, no signature change. Compatibility:

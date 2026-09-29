@@ -411,22 +411,26 @@ impl OrderStateTracker {
     /// invoked, outside that lock.
     ///
     /// This standalone entry point calls the listener inline, on the
-    /// calling thread. An [`OrderBook`](crate::OrderBook) that owns the
+    /// calling thread, after the transition is recorded and a terminal id
+    /// is queued for eviction, so a panicking listener (caller code that
+    /// must not panic) leaves the tracker consistent. An [`OrderBook`](crate::OrderBook) that owns the
     /// tracker does not use it: the book records the transition and defers
     /// the listener until its mutation has committed and its submit gate is
     /// released (#249).
     pub fn transition(&self, order_id: Id, new_status: OrderStatus) {
         let old_status = self.record(order_id, &new_status);
 
+        // Track terminal states for eviction before any caller code runs
+        // (#294, as `record_transition` does): a panicking listener must
+        // not leave a terminal id outside the eviction queue.
+        if new_status.is_terminal() {
+            self.enqueue_terminal(order_id);
+        }
+
         // Notify listener
         if let Some(ref listener) = self.listener {
             let old = old_status.as_ref().unwrap_or(&new_status);
             listener(order_id, old, &new_status);
-        }
-
-        // Track terminal states for eviction
-        if new_status.is_terminal() {
-            self.enqueue_terminal(order_id);
         }
     }
 

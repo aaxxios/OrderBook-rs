@@ -232,11 +232,12 @@ pub const UNSTAMPED_ENGINE_SEQ: u64 = u64::MAX;
 /// `T` (`Clone`, `Default`, and whatever else the caller's type carries)
 /// and every listener are caller code the crate cannot certify. They must
 /// not panic. `T::default()` / `T::clone()` run at the book's boundary
-/// (order conversion, snapshots), not inside pricelevel's matcher; a panic
-/// there unwinds out of the calling entry point, and if that entry point
-/// held the exclusive side of the submit gate the book engages its kill
-/// switch on the next acquisition (see [`Self::submit_gate_poisoned`]).
-/// See `doc/panic-boundaries.md`.
+/// (order conversion, snapshots), not inside pricelevel's matcher. A
+/// `Clock`, the metrics recorder and the `tracing` subscriber also run
+/// under the submit gate, mid-mutation. A panic in any of them unwinds out
+/// of the calling entry point, and if that entry point held either side of
+/// the submit gate the book engages its kill switch before releasing it
+/// (see [`Self::submit_gate_poisoned`]). See `doc/panic-boundaries.md`.
 pub struct OrderBook<T = ()> {
     /// The symbol or identifier for this order book
     pub(super) symbol: String,
@@ -264,10 +265,6 @@ pub struct OrderBook<T = ()> {
 
     /// Generator for unique transaction IDs
     pub(super) transaction_id_generator: UuidGenerator,
-
-    /// Counter for generating sequential order IDs
-    #[allow(dead_code)]
-    pub(super) next_order_id: AtomicU64,
 
     /// Strictly monotonic sequence counter minted by [`Self::next_engine_seq`]
     /// and stamped on every outbound event (`TradeResult`,
@@ -424,12 +421,15 @@ pub struct OrderBook<T = ()> {
     /// synchronous).
     pub(super) submit_gate: std::sync::RwLock<()>,
 
-    /// Latched the first time a submit-gate acquisition finds the gate
-    /// poisoned (#249). Since listeners run after the gate is released, a
-    /// poisoned gate can only mean engine code panicked mid-mutation while
-    /// holding the exclusive side; the book then engages the kill switch
-    /// (see [`Self::submit_gate_poisoned`]). Not part of the snapshot
-    /// format (the kill switch it engages is).
+    /// Latched the first time code panicked while holding either side of
+    /// the submit gate (#249, #294): detected by the guard's drop while
+    /// the thread unwinds, and by an acquisition that finds the exclusive
+    /// side poisoned. Since listeners run after the gate is released, that
+    /// means engine code or caller code running mid-mutation (`Clock`,
+    /// metrics recorder, `tracing` subscriber, `T::default()` /
+    /// `T::clone()`) panicked; the book then engages the kill switch (see
+    /// [`Self::submit_gate_poisoned`]). Not part of the snapshot format
+    /// (the kill switch it engages is).
     pub(super) submit_gate_poisoned: AtomicBool,
 
     /// Sequenced outbox and dispatcher state for the trade, price-level and
@@ -708,6 +708,26 @@ where
 /// Engine-sequence minting, free of `T` bounds so the listener outbox
 /// (`emission.rs`, #249) can stamp events from the submit-gate guard.
 impl<T> OrderBook<T> {
+    /// A panic unwound through a held submit gate (#249, #294): engage the
+    /// kill switch and latch [`Self::submit_gate_poisoned`], logging once
+    /// at `ERROR`. Called from [`SubmitGateGuard`]'s drop while the thread
+    /// unwinds (either side, gate still held) and from
+    /// [`Self::on_submit_gate_poisoned`]. Only atomics and one `tracing`
+    /// event: no lock, no allocation of its own.
+    #[cold]
+    #[inline(never)]
+    fn latch_submit_gate_unwind(&self, gate_side: &'static str) {
+        // `engage_kill_switch`, inlined: this block is free of `T` bounds.
+        self.kill_switch.store(true, Ordering::Relaxed);
+        if !self.submit_gate_poisoned.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                symbol = %self.symbol,
+                gate_side,
+                "submit gate poisoned: code panicked mid-mutation while holding the submit gate; kill switch engaged, new flow and modifies are rejected until an operator releases it (cancels still run)"
+            );
+        }
+    }
+
     /// Mint the next monotonic outbound sequence number.
     ///
     /// Called exactly once per outbound event (trade emission, price-level
@@ -992,7 +1012,6 @@ where
             order_locations: DashMap::new(),
             user_orders: DashMap::new(),
             transaction_id_generator: UuidGenerator::new(namespace),
-            next_order_id: AtomicU64::new(1),
             engine_seq: AtomicU64::new(0),
             kill_switch: AtomicBool::new(false),
             risk_state: RiskState::new(),
@@ -1500,22 +1519,29 @@ where
     /// and delivered after the gate is released. See
     /// [`SubmitGateGuard`].
     ///
-    /// # Poisoning (#249)
+    /// # Poisoning (#249, #294)
     ///
-    /// Listeners no longer run under the gate, so a poisoned gate can only
-    /// mean engine code panicked mid-mutation while holding the exclusive
-    /// side, and the book may be inconsistent. The acquisition that finds
-    /// it poisoned engages the kill switch (every later new-flow call and
-    /// modify returns [`OrderBookError::KillSwitchActive`]), latches
-    /// [`Self::submit_gate_poisoned`], logs once at `ERROR`, clears the
-    /// poison and continues, so cancels and mass cancels can still drain
-    /// the book, exactly as under an operator-engaged kill switch.
+    /// Listeners no longer run under the gate, so an unwind through a held
+    /// gate can only mean engine code, or caller code the engine runs
+    /// mid-mutation (a `Clock`, the metrics recorder, a `tracing`
+    /// subscriber, `T::default()` / `T::clone()`), panicked, and the book
+    /// may be inconsistent. [`SubmitGateGuard`]'s drop detects it with
+    /// `std::thread::panicking()` on **both** sides (a
+    /// `RwLockReadGuard` never poisons, so the shared side has no other
+    /// signal): it engages the kill switch before the gate is released
+    /// (every later new-flow call and modify returns
+    /// [`OrderBookError::KillSwitchActive`]), latches
+    /// [`Self::submit_gate_poisoned`] and logs once at `ERROR`. The
+    /// exclusive side is also poisoned by std; the acquisition that finds
+    /// it poisoned applies the same policy (idempotent), clears the poison
+    /// and continues. Cancels and mass cancels keep working so the book
+    /// can be drained, exactly as under an operator-engaged kill switch.
     pub(super) fn submit_gate_read(&self) -> SubmitGateGuard<'_, T> {
         let lock = self.submit_gate.read().unwrap_or_else(|poisoned| {
             self.on_submit_gate_poisoned();
             poisoned.into_inner()
         });
-        SubmitGateGuard::new(self, GateLock::Read(lock))
+        SubmitGateGuard::new(self, GateLock::Read { _guard: lock })
     }
 
     /// Acquire the exclusive (write) side of the submit gate for a
@@ -1525,7 +1551,12 @@ where
     /// [`Self::submit_gate_read`] for the emission scope and the poisoning
     /// policy.
     pub(super) fn submit_gate_write(&self) -> SubmitGateGuard<'_, T> {
-        SubmitGateGuard::new(self, GateLock::Write(self.submit_gate_write_raw()))
+        SubmitGateGuard::new(
+            self,
+            GateLock::Write {
+                _guard: self.submit_gate_write_raw(),
+            },
+        )
     }
 
     /// The bare exclusive lock, poison handled (see
@@ -1542,19 +1573,15 @@ where
     #[cold]
     #[inline(never)]
     fn on_submit_gate_poisoned(&self) {
-        self.engage_kill_switch();
         self.submit_gate.clear_poison();
-        if !self.submit_gate_poisoned.swap(true, Ordering::Relaxed) {
-            tracing::error!(
-                symbol = %self.symbol,
-                "submit gate poisoned: engine code panicked mid-mutation; kill switch engaged, new flow and modifies are rejected until an operator releases it (cancels still run)"
-            );
-        }
+        self.latch_submit_gate_unwind("exclusive");
     }
 
-    /// `true` once a submit-gate acquisition has found the gate poisoned
-    /// (#249): engine code panicked mid-mutation while holding the
-    /// exclusive side. The book engaged its kill switch at that point, so
+    /// `true` once code panicked while holding either side of the submit
+    /// gate (#249, #294): engine code, or caller code the engine runs
+    /// mid-mutation (a `Clock`, the metrics recorder, a `tracing`
+    /// subscriber, `T::default()` / `T::clone()`). The book engaged its
+    /// kill switch before releasing the gate, so
     /// new flow and modifies return [`OrderBookError::KillSwitchActive`]
     /// while cancels keep working. Latched for the life of the book (also
     /// after an operator releases the kill switch, which is the operator's
@@ -1638,7 +1665,8 @@ where
     ///
     /// Every mutation performed through the `OrderBook` API either passes
     /// this gate or takes `&mut self` (the snapshot-package and JSON restore
-    /// variants, exclusive by construction), so the exclusive holder
+    /// variants, exclusive by construction; #294 removed the public raw
+    /// `place_order_in_book`, which bypassed it), so the exclusive holder
     /// observes a frozen book: its scan and
     /// its sweep see the same queue state, and a competing admission
     /// blocks here and runs against the post-decision state instead.
@@ -1674,7 +1702,7 @@ where
             poisoned.into_inner()
         });
         if self.strandable_makers_resting.load(Ordering::Relaxed) == 0 {
-            return SubmitGateGuard::new(self, GateLock::Read(shared));
+            return SubmitGateGuard::new(self, GateLock::Read { _guard: shared });
         }
         // A strandable maker was admitted between the caller's decision and
         // this acquisition. Release and start over on the exclusive side.
@@ -1934,7 +1962,6 @@ where
             order_locations: DashMap::new(),
             user_orders: DashMap::new(),
             transaction_id_generator: UuidGenerator::new(namespace),
-            next_order_id: AtomicU64::new(1),
             engine_seq: AtomicU64::new(0),
             kill_switch: AtomicBool::new(false),
             risk_state: RiskState::new(),
@@ -2007,7 +2034,6 @@ where
             order_locations: DashMap::new(),
             user_orders: DashMap::new(),
             transaction_id_generator: UuidGenerator::new(namespace),
-            next_order_id: AtomicU64::new(1),
             engine_seq: AtomicU64::new(0),
             kill_switch: AtomicBool::new(false),
             risk_state: RiskState::new(),
@@ -6474,10 +6500,17 @@ pub(super) enum CancelFault {
 ///
 /// Listeners therefore never run under the gate or mid-mutation, and a
 /// listener may re-enter the book. On a book with no listener the guard
-/// opens no scope and dropping it only releases the gate. When the thread
-/// is unwinding (engine panic) nothing is dispatched; the gate's own
-/// poisoning then drives the kill-switch policy on the next acquisition
-/// (see [`OrderBook::submit_gate_read`]).
+/// opens no scope and dropping it only releases the gate.
+///
+/// # Unwinding (#294)
+///
+/// When the guard is dropped by a panic that started after it was taken
+/// (`std::thread::panicking()`, checked once per drop, exactly as std's
+/// own poison flag does), the book engages its kill switch and latches
+/// [`OrderBook::submit_gate_poisoned`] **before** the gate is released, on
+/// the shared side as well as the exclusive one: a `RwLockReadGuard`
+/// never poisons, so this is the only signal an unwind under the shared
+/// side leaves. Nothing is dispatched (see [`OrderBook::submit_gate_read`]).
 pub(super) struct SubmitGateGuard<'a, T> {
     /// The book whose gate is held.
     book: &'a OrderBook<T>,
@@ -6485,23 +6518,34 @@ pub(super) struct SubmitGateGuard<'a, T> {
     lock: GateLock<'a>,
     /// The call's emission scope, when a listener is installed.
     emission: Option<super::emission::GateEmission>,
+    /// `true` when the thread was already unwinding when the gate was
+    /// taken (a destructor running during an unrelated panic called the
+    /// book). A second panic inside the critical section would abort the
+    /// process, so an unwind seen at drop is then not this call's.
+    panicking_on_entry: bool,
 }
 
 /// The held side of the submit gate. Only the drop timing matters, hence
-/// the unused-field allowances.
+/// the `_`-prefixed fields.
 pub(super) enum GateLock<'a> {
     /// Shared mode: everything whose decision does not span two operations
     /// — ordinary and post-only submits, `UpdateQuantity`, `Cancel`, every
     /// modify on an `STPMode::None` book, cancels and anonymous match-only
     /// sweeps.
-    Read(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>),
+    Read {
+        /// Held for its drop only.
+        _guard: std::sync::RwLockReadGuard<'a, ()>,
+    },
     /// Exclusive mode: a fill-or-kill submit's feasibility + sweep window
     /// (#209); an STP-relevant submit's per-level scan + fill window and
     /// the matching-capable modifies (`UpdatePrice`,
     /// `UpdatePriceAndQuantity`, `Replace`) that carry the same window
     /// under STP; every mass cancel and expiry eviction (#248); and the
     /// live snapshot restore commit (#225).
-    Write(#[allow(dead_code)] std::sync::RwLockWriteGuard<'a, ()>),
+    Write {
+        /// Held for its drop only.
+        _guard: std::sync::RwLockWriteGuard<'a, ()>,
+    },
     /// The gate has been released.
     Released,
 }
@@ -6516,12 +6560,25 @@ impl<'a, T> SubmitGateGuard<'a, T> {
             book,
             lock,
             emission,
+            panicking_on_entry: std::thread::panicking(),
         }
     }
 }
 
 impl<T> Drop for SubmitGateGuard<'_, T> {
     fn drop(&mut self) {
+        // #294: an unwind through the held gate, on either side. Engaged
+        // before the gate is released below, so the next holder sees it.
+        if std::thread::panicking() && !self.panicking_on_entry {
+            let gate_side = match self.lock {
+                GateLock::Read { .. } => Some("shared"),
+                GateLock::Write { .. } => Some("exclusive"),
+                GateLock::Released => None,
+            };
+            if let Some(gate_side) = gate_side {
+                self.book.latch_submit_gate_unwind(gate_side);
+            }
+        }
         let Some(emission) = self.emission.take() else {
             // No listener: the gate is released by the field drop.
             return;

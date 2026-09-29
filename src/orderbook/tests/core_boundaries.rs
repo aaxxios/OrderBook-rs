@@ -1,0 +1,242 @@
+//! #294: core boundary gaps found by the final audit.
+//!
+//! - an unwind under the **shared** side of the submit gate (a panicking
+//!   `Clock`) engages the kill switch and latches `submit_gate_poisoned`,
+//!   like one under the exclusive side;
+//! - a sweep whose drain unwinds (a panicking `Clock` while recording a
+//!   maker's `Filled` state) leaves no ghost location or user-index entry
+//!   for the makers it consumed;
+//! - a standalone `OrderStateTracker` whose listener panics still queues
+//!   the terminal id for eviction.
+
+#[cfg(test)]
+// tests may panic: rules/global_rules.md § Testing
+#[allow(clippy::arithmetic_side_effects, clippy::manual_assert)]
+mod tests {
+    use crate::orderbook::book::OrderBook;
+    use crate::orderbook::clock::Clock;
+    use crate::orderbook::order_state::{OrderStateTracker, OrderStatus};
+    use crate::{OrderBookError, current_time_millis};
+    use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread;
+
+    /// A clock that panics while armed, otherwise counts up.
+    #[derive(Debug, Default)]
+    struct ArmedClock {
+        armed: AtomicBool,
+        ticks: AtomicU64,
+    }
+
+    impl Clock for ArmedClock {
+        fn now_millis(&self) -> TimestampMs {
+            if self.armed.load(Ordering::SeqCst) {
+                panic!("injected Clock panic");
+            }
+            TimestampMs::new(self.ticks.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+    }
+
+    fn limit(id: u64, price: u128, qty: u64, side: Side, user: u8) -> OrderType<()> {
+        OrderType::Standard {
+            id: Id::from_u64(id),
+            price: Price::new(price),
+            quantity: Quantity::new(qty),
+            side,
+            time_in_force: TimeInForce::Gtc,
+            user_id: Hash32::new([user; 32]),
+            timestamp: TimestampMs::new(current_time_millis()),
+            extra_fields: (),
+        }
+    }
+
+    /// A book whose order-state tracker reads `clock`.
+    fn book_with_clock(clock: &Arc<ArmedClock>) -> OrderBook<()> {
+        let mut book = OrderBook::<()>::new("B294");
+        book.set_order_state_tracker(OrderStateTracker::with_clock(
+            Arc::clone(clock) as Arc<dyn Clock>
+        ));
+        book
+    }
+
+    /// A `Clock` panicking under the shared gate (an ordinary GTC add on an
+    /// `STPMode::None` book) used to leave no trace: a read guard never
+    /// poisons. The unwinding guard now engages the kill switch and latches
+    /// the flag; new flow is rejected, cancels still drain the book.
+    #[test]
+    fn test_shared_gate_clock_panic_engages_kill_switch() {
+        let clock = Arc::new(ArmedClock::default());
+        let book = Arc::new(book_with_clock(&clock));
+        book.add_order(limit(1, 90, 5, Side::Buy, 1))
+            .expect("resting bid");
+        assert!(
+            !book.submit_needs_exclusive_gate(false, Hash32::new([1; 32]), false, false),
+            "the panicking submit runs under the shared side"
+        );
+
+        clock.armed.store(true, Ordering::SeqCst);
+        let panicking = Arc::clone(&book);
+        let joined = thread::spawn(move || {
+            let _ = panicking.add_order(limit(2, 80, 1, Side::Buy, 1));
+        })
+        .join();
+        assert!(joined.is_err(), "the Clock panic propagated");
+        clock.armed.store(false, Ordering::SeqCst);
+
+        assert!(book.is_kill_switch_engaged());
+        assert!(book.submit_gate_poisoned());
+        assert!(
+            !book.submit_gate.is_poisoned(),
+            "the shared side never poisons"
+        );
+
+        let err = book
+            .add_order(limit(3, 85, 1, Side::Buy, 1))
+            .expect_err("new flow rejected");
+        assert!(matches!(err, OrderBookError::KillSwitchActive), "{err:?}");
+        let err = book
+            .submit_market_order(Id::from_u64(4), 1, Side::Sell)
+            .expect_err("market flow rejected");
+        assert!(matches!(err, OrderBookError::KillSwitchActive), "{err:?}");
+        assert!(
+            book.cancel_order(Id::from_u64(1))
+                .expect("cancel runs")
+                .is_some()
+        );
+
+        // An operator release resumes flow; the latch stays.
+        book.release_kill_switch();
+        book.add_order(limit(5, 70, 1, Side::Buy, 1))
+            .expect("flow resumes");
+        assert!(book.submit_gate_poisoned());
+    }
+
+    /// A clean submit neither engages the kill switch nor latches.
+    #[test]
+    fn test_shared_gate_without_panic_does_not_latch() {
+        let clock = Arc::new(ArmedClock::default());
+        let book = book_with_clock(&clock);
+        book.add_order(limit(1, 100, 5, Side::Sell, 1))
+            .expect("maker");
+        book.add_order(limit(2, 100, 5, Side::Buy, 2))
+            .expect("taker");
+        assert!(!book.is_kill_switch_engaged());
+        assert!(!book.submit_gate_poisoned());
+    }
+
+    /// The drain records each filled maker's `Filled` state (reading the
+    /// tracker's `Clock`) before releasing its location. A `Clock` panic
+    /// on the first maker used to leave every consumed maker located and
+    /// user-indexed although no level holds it (ghost locations). The
+    /// release guard now releases them while the drain unwinds.
+    #[test]
+    fn test_drain_unwind_leaves_no_ghost_location() {
+        let clock = Arc::new(ArmedClock::default());
+        let mut book = book_with_clock(&clock);
+        // Arm the clock once the sweep reaches the level: the next clock
+        // read is the drain's first `Filled`.
+        let arm = Arc::clone(&clock);
+        book.level_interleave_hook = Some(Arc::new(move |price: u128| {
+            if price == 100 {
+                arm.armed.store(true, Ordering::SeqCst);
+            }
+        }));
+        let book = Arc::new(book);
+        for id in 1..=3 {
+            book.add_order(limit(id, 100, 5, Side::Sell, 1))
+                .expect("maker");
+        }
+        book.add_order(limit(10, 110, 5, Side::Sell, 1))
+            .expect("untouched maker");
+
+        let panicking = Arc::clone(&book);
+        let joined = thread::spawn(move || {
+            let _ = panicking.add_order(limit(4, 100, 15, Side::Buy, 2));
+        })
+        .join();
+        assert!(joined.is_err(), "the Clock panic propagated");
+        clock.armed.store(false, Ordering::SeqCst);
+
+        for id in 1..=3 {
+            let id = Id::from_u64(id);
+            assert!(
+                !book.order_locations.contains_key(&id),
+                "maker {id} left a ghost location"
+            );
+            assert!(
+                !book
+                    .user_orders
+                    .iter()
+                    .any(|entry| entry.value().contains(&id)),
+                "maker {id} left a ghost user-index entry"
+            );
+            assert!(book.get_order(id).is_none());
+        }
+        assert!(book.asks.get(&100).is_none(), "the emptied level is gone");
+        assert!(!book.order_locations.contains_key(&Id::from_u64(4)));
+        // The untouched maker keeps its indices.
+        assert!(book.order_locations.contains_key(&Id::from_u64(10)));
+        assert!(book.get_order(Id::from_u64(10)).is_some());
+        // The unwind went through the (shared) gate: kill switch engaged.
+        assert!(book.is_kill_switch_engaged());
+        assert!(book.submit_gate_poisoned());
+    }
+
+    /// The drain's normal path is unchanged: every filled maker is
+    /// released and recorded `Filled`, in order.
+    #[test]
+    fn test_drain_releases_every_filled_maker() {
+        let clock = Arc::new(ArmedClock::default());
+        let book = book_with_clock(&clock);
+        for id in 1..=3 {
+            book.add_order(limit(id, 100, 5, Side::Sell, 1))
+                .expect("maker");
+        }
+        book.add_order(limit(4, 100, 15, Side::Buy, 2))
+            .expect("taker");
+        let tracker = book.order_state_tracker.as_ref().expect("tracker");
+        for id in 1..=3 {
+            let id = Id::from_u64(id);
+            assert!(!book.order_locations.contains_key(&id));
+            assert!(matches!(
+                tracker.get(id),
+                Some(OrderStatus::Filled { filled_quantity: 5 })
+            ));
+        }
+        assert!(book.user_orders.is_empty());
+        assert!(!book.submit_gate_poisoned());
+    }
+
+    /// A standalone tracker's listener used to run before the terminal id
+    /// was queued for eviction, so a panicking listener left that id
+    /// retained forever. It is now queued first and evicted on schedule.
+    #[test]
+    fn test_standalone_tracker_listener_panic_still_evicts() {
+        let mut tracker = OrderStateTracker::with_capacity(1);
+        tracker.set_listener(Arc::new(|id: Id, _old: &OrderStatus, new: &OrderStatus| {
+            if id == Id::from_u64(1) && new.is_terminal() {
+                panic!("injected listener panic");
+            }
+        }));
+        let tracker = Arc::new(tracker);
+        tracker.transition(Id::from_u64(1), OrderStatus::Open);
+
+        let panicking = Arc::clone(&tracker);
+        let joined = thread::spawn(move || {
+            panicking.transition(Id::from_u64(1), OrderStatus::Filled { filled_quantity: 1 });
+        })
+        .join();
+        assert!(joined.is_err(), "the listener panic propagated");
+        assert!(
+            tracker.get(Id::from_u64(1)).is_some(),
+            "retained within capacity"
+        );
+
+        // A second terminal id exceeds the capacity of 1: the first one,
+        // queued before its listener panicked, is evicted.
+        tracker.transition(Id::from_u64(2), OrderStatus::Filled { filled_quantity: 1 });
+        assert!(tracker.get(Id::from_u64(1)).is_none(), "evicted");
+        assert!(tracker.get(Id::from_u64(2)).is_some());
+    }
+}

@@ -667,6 +667,38 @@ fn release_ticket(ticket: u64) {
     });
 }
 
+/// Reserve room for one more batch in the dispatcher's delivery buffer
+/// (#294). `false` when the allocator refused the growth.
+#[inline]
+fn reserve_delivery_slot(pending: &mut VecDeque<Batch>) -> bool {
+    #[cfg(test)]
+    if delivery_reserve_seam::refused() {
+        return false;
+    }
+    pending.try_reserve(1).is_ok()
+}
+
+/// Test seam (#294): make [`reserve_delivery_slot`] refuse on this thread,
+/// standing in for an allocator that refuses the delivery buffer's growth.
+#[cfg(test)]
+mod delivery_reserve_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REFUSE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// `true` while the seam refuses on this thread.
+    pub(super) fn refused() -> bool {
+        REFUSE.try_with(Cell::get).unwrap_or(false)
+    }
+
+    /// Arm or disarm the seam on this thread.
+    pub(super) fn set_refused(refuse: bool) {
+        let _ = REFUSE.try_with(|cell| cell.set(refuse));
+    }
+}
+
 /// Take this thread's recycled dispatcher buffer.
 fn take_delivering() -> VecDeque<Batch> {
     EMISSION
@@ -1058,21 +1090,35 @@ impl<T> OrderBook<T> {
         if self.outbox.nonempty.load(Ordering::SeqCst) {
             role.pending = take_delivering();
             loop {
+                // #294: a batch taken without a slot in `pending` (its
+                // growth refused) is delivered in place, so a persistent
+                // refusal still makes progress instead of leaving the head
+                // ready forever (and `dispatch_listener_events` spinning).
+                let mut in_place = None;
                 {
                     let mut state = self.outbox.lock();
-                    while state.queue.front().is_some_and(Batch::is_ready)
-                        && role.pending.try_reserve(1).is_ok()
-                    {
+                    while state.queue.front().is_some_and(Batch::is_ready) {
+                        if !reserve_delivery_slot(&mut role.pending) {
+                            if role.pending.is_empty() {
+                                in_place = state.queue.pop_front();
+                            }
+                            break;
+                        }
                         if let Some(batch) = state.queue.pop_front() {
                             role.pending.push_back(batch);
                         }
                     }
                     self.outbox.sync_queued(&state);
                 }
-                if role.pending.is_empty() {
+                if role.pending.is_empty() && in_place.is_none() {
                     break;
                 }
                 while let Some(batch) = role.pending.pop_front() {
+                    self.deliver(batch.events, &mut role);
+                }
+                if let Some(batch) = in_place {
+                    // `pending` is empty here: the panic guard has nothing
+                    // to put back, exactly as for a batch popped from it.
                     self.deliver(batch.events, &mut role);
                 }
                 if !self.outbox.nonempty.load(Ordering::SeqCst) {
@@ -1249,6 +1295,52 @@ mod tests {
         let token = open_scope(&outbox).expect("scope");
         assert!(outbox.pool.is_empty(), "taken from the pool");
         let _ = close_scope(token);
+    }
+
+    /// #294: a dispatcher whose delivery buffer cannot grow delivers the
+    /// head batch in place instead of leaving it ready forever (before the
+    /// fix `flush_listener_events` spun on `head_ready`). Two ready batches,
+    /// delivered in order, nothing dropped.
+    #[test]
+    fn refused_delivery_reserve_delivers_in_place() {
+        use crate::orderbook::OrderBook;
+        use crate::orderbook::order_state::OrderStateTracker;
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<Id>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tracker = OrderStateTracker::new();
+        let sink = Arc::clone(&seen);
+        tracker.set_listener(Arc::new(move |id, _old, _new| {
+            sink.lock().expect("sink").push(id);
+        }));
+        let mut book = OrderBook::<()>::new("SEAM");
+        book.set_order_state_tracker(tracker);
+
+        for raw in [1u64, 2] {
+            let mut events = EventBuf::default();
+            events
+                .push(PendingEvent::State {
+                    order_id: Id::from_u64(raw),
+                    old: OrderStatus::Open,
+                    new: OrderStatus::Open,
+                })
+                .expect("push");
+            let mut state = book.outbox.lock();
+            // No owner: ready at once, like a batch committed outside a gate.
+            book.enqueue(&mut state, u64::MAX, None, events);
+        }
+        assert_eq!(book.pending_listener_events(), 2);
+
+        delivery_reserve_seam::set_refused(true);
+        book.flush_listener_events();
+        delivery_reserve_seam::set_refused(false);
+
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Id::from_u64(1), Id::from_u64(2)]
+        );
+        assert_eq!(book.pending_listener_events(), 0);
+        assert_eq!(book.dropped_listener_events(), 0);
     }
 
     /// Scopes nest per book (PR #289 review): an inner book's scope buffers

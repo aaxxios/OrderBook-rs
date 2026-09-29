@@ -106,8 +106,9 @@ mod tests {
     }
 
     #[test]
-    fn test_place_order_in_book_buy_side() {
-        // Test place_order_in_book for buy side (lines 90)
+    fn test_add_order_rests_buy_side() {
+        // Resting path, buy side (#294: the raw placement helper was
+        // removed; `add_order` is the resting entry point).
         let book = OrderBook::<TestExtraFields>::new("TEST");
         let order_id = create_order_id();
 
@@ -122,7 +123,7 @@ mod tests {
             extra_fields: TestExtraFields::default(),
         });
 
-        let result = book.place_order_in_book(order.clone());
+        let result = book.add_order((*order).clone());
         assert!(result.is_ok());
 
         // Verify order was added by checking if we can retrieve it
@@ -137,8 +138,8 @@ mod tests {
     }
 
     #[test]
-    fn test_place_order_in_book_sell_side() {
-        // Test place_order_in_book for sell side
+    fn test_add_order_rests_sell_side() {
+        // Resting path, sell side.
         let book = OrderBook::<TestExtraFields>::new("TEST");
         let order_id = create_order_id();
 
@@ -153,7 +154,7 @@ mod tests {
             extra_fields: TestExtraFields::default(),
         });
 
-        let result = book.place_order_in_book(order.clone());
+        let result = book.add_order((*order).clone());
         assert!(result.is_ok());
 
         // Verify order was added by checking if we can retrieve it
@@ -609,8 +610,8 @@ mod tests {
     }
 
     #[test]
-    fn test_place_order_in_book_existing_price_level() {
-        // Test place_order_in_book when price level already exists
+    fn test_add_order_rests_at_existing_price_level() {
+        // Resting at a price level that already exists.
         let book = OrderBook::<TestExtraFields>::new("TEST");
 
         // Add first order
@@ -626,7 +627,7 @@ mod tests {
             extra_fields: TestExtraFields::default(),
         });
 
-        let _ = book.place_order_in_book(order1);
+        let _ = book.add_order((*order1).clone());
 
         // Add second order at same price
         let order_id2 = create_order_id();
@@ -641,7 +642,7 @@ mod tests {
             extra_fields: TestExtraFields::default(),
         });
 
-        let result = book.place_order_in_book(order2);
+        let result = book.add_order((*order2).clone());
         assert!(result.is_ok());
 
         // Verify both orders were added by checking if we can retrieve them

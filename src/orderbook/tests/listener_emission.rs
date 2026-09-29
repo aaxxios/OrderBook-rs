@@ -662,8 +662,9 @@ mod tests {
     }
 
     /// Engine code panicking mid-mutation under the exclusive gate poisons
-    /// it. The next acquisition engages the kill switch and the submission
-    /// gets the typed `KillSwitchActive` error; cancels still work.
+    /// it. The unwinding guard engages the kill switch (#294); the next
+    /// acquisition clears the poison and the submission gets the typed
+    /// `KillSwitchActive` error; cancels still work.
     #[test]
     fn submit_gate_poison_engages_kill_switch() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
@@ -687,9 +688,12 @@ mod tests {
         .join();
         assert!(joined.is_err());
         assert!(book.submit_gate.is_poisoned());
-        assert!(!book.is_kill_switch_engaged(), "not detected yet");
+        // #294: the guard's drop detects the unwind and engages the kill
+        // switch before the gate is released.
+        assert!(book.is_kill_switch_engaged(), "detected at unwind");
+        assert!(book.submit_gate_poisoned());
 
-        // Detection: kill switch engaged, typed error, poison cleared.
+        // Next acquisition: typed error, poison cleared, latch kept.
         let err = book
             .add_order(limit(4, 80, 1, Side::Buy, TimeInForce::Gtc))
             .expect_err("rejected after poison");

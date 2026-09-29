@@ -304,6 +304,83 @@ fn find_strandable(strandable: &[(Id, u64)], filled_id: Id) -> Option<u64> {
         .map(|(_, hidden)| *hidden)
 }
 
+/// Releases the book indices of the makers a sweep filled, in
+/// `filled_orders` order, including when the drain unwinds (#294).
+///
+/// The drain runs caller code per maker before releasing that maker's
+/// location: `track_state` reads the tracker's `Clock` and may call the
+/// metrics recorder, and the strandable-maker report calls `tracing` and
+/// the metrics recorder. The location is the id's ownership token (#288)
+/// and must be released **after** the maker's `Filled` state is recorded,
+/// otherwise a same-id order admitted in between would have its resting
+/// state overwritten by the old order's `Filled`; so the release cannot
+/// simply move ahead of the caller code. Instead, [`Self::release_next`]
+/// releases one maker after its caller code ran, and the guard's `Drop`
+/// releases every maker not released yet when that caller code unwinds.
+/// Either way no filled maker keeps a ghost location, user-index entry or
+/// strandable count. The drop does crate-owned index work only (no
+/// allocation, no caller code apart from the count's `WARN` on a refused
+/// decrement), and the unwind itself engages the kill switch through the
+/// submit gate guard.
+struct FilledMakerRelease<'a, T: Clone + Send + Sync + Default + 'static> {
+    /// The sweeping book.
+    book: &'a OrderBook<T>,
+    /// Every maker the sweep filled, `(id, filled quantity)`.
+    filled: &'a [(Id, u64)],
+    /// The sweep's captured strandable makers, sorted by id bytes.
+    strandable: Option<&'a [(Id, u64)]>,
+    /// Index of the first maker not released yet.
+    next: usize,
+}
+
+impl<T: Clone + Send + Sync + Default + 'static> FilledMakerRelease<'_, T> {
+    /// Release the indices of the maker at `self.next` and advance.
+    /// `strandable` is whether the caller already found it in the capture
+    /// list (saves a second lookup).
+    #[inline]
+    fn release_next(&mut self, strandable: bool) {
+        if let Some((filled_id, _)) = self.filled.get(self.next) {
+            release_filled_maker(self.book, *filled_id, strandable);
+        }
+        // `next < filled.len() <= isize::MAX`: the fallback is unreachable
+        // and would mean "everything released".
+        self.next = self.next.checked_add(1).unwrap_or(self.filled.len());
+    }
+}
+
+impl<T: Clone + Send + Sync + Default + 'static> Drop for FilledMakerRelease<'_, T> {
+    fn drop(&mut self) {
+        // Non-empty only when the drain unwound mid-maker.
+        for (filled_id, _) in self.filled.get(self.next..).unwrap_or_default() {
+            let strandable = self
+                .strandable
+                .is_some_and(|strandable| find_strandable(strandable, *filled_id).is_some());
+            release_filled_maker(self.book, *filled_id, strandable);
+        }
+    }
+}
+
+/// Release one filled maker's indices: the strandable-maker count (#230),
+/// the user index, then the location (#288: untrack before releasing the
+/// id, the location is its ownership token).
+#[inline]
+fn release_filled_maker<T: Clone + Send + Sync + Default + 'static>(
+    book: &OrderBook<T>,
+    filled_id: Id,
+    strandable: bool,
+) {
+    if strandable {
+        // #230: the fill drain is the third and last place a strandable
+        // maker leaves a level. Being in the capture list AND in
+        // `filled_orders` is exactly that — and, because a sweep in such a
+        // book runs exclusively, the two really are the same order rather
+        // than an id reused in between.
+        book.note_removed_strandable_maker();
+    }
+    book.untrack_order_by_id(&filled_id);
+    book.order_locations.remove(&filled_id);
+}
+
 /// Outcome of an internal match: the [`MatchResult`] plus whether self-trade
 /// prevention cancelled the taker. The flag lets the resting caller (`add_order`)
 /// know it must NOT rest the residual — a partially-filled taker that then
@@ -1380,35 +1457,39 @@ where
         if let Some(strandable) = strandable_makers.as_mut() {
             strandable.sort_unstable_by_key(|(id, _)| id.as_bytes());
         }
-        for (filled_id, filled_quantity) in &filled_orders {
-            self.track_state(
-                *filled_id,
-                OrderStatus::Filled {
-                    filled_quantity: *filled_quantity,
-                },
-            );
-            if let Some(strandable) = strandable_makers.as_ref()
-                && let Some(discarded_hidden) = find_strandable(strandable, *filled_id)
-            {
-                tracing::info!(
-                    path = "maker",
-                    order_id = %filled_id,
-                    executed_quantity = *filled_quantity,
-                    discarded_hidden_quantity = discarded_hidden,
-                    "reserve maker removed: visible tranche exhausted without auto-replenishment"
+        {
+            // #294: per maker, the caller code (Clock, metrics, tracing)
+            // runs first and the index release follows, as before; the
+            // guard releases the rest if that caller code unwinds, so an
+            // unwind leaves no ghost location. Event order is unchanged.
+            let mut release = FilledMakerRelease {
+                book: self,
+                filled: &filled_orders,
+                strandable: strandable_makers.as_deref(),
+                next: 0,
+            };
+            for (filled_id, filled_quantity) in &filled_orders {
+                self.track_state(
+                    *filled_id,
+                    OrderStatus::Filled {
+                        filled_quantity: *filled_quantity,
+                    },
                 );
-                crate::orderbook::metrics::record_reserve_hidden_discarded(discarded_hidden);
-                // #230: the fill drain is the third and last place a
-                // strandable maker leaves a level. Being in the capture list
-                // AND in `filled_orders` is exactly that — and, because a
-                // sweep in such a book runs exclusively, the two really are
-                // the same order rather than an id reused in between.
-                self.note_removed_strandable_maker();
+                let discarded = release
+                    .strandable
+                    .and_then(|strandable| find_strandable(strandable, *filled_id));
+                if let Some(discarded_hidden) = discarded {
+                    tracing::info!(
+                        path = "maker",
+                        order_id = %filled_id,
+                        executed_quantity = *filled_quantity,
+                        discarded_hidden_quantity = discarded_hidden,
+                        "reserve maker removed: visible tranche exhausted without auto-replenishment"
+                    );
+                    crate::orderbook::metrics::record_reserve_hidden_discarded(discarded_hidden);
+                }
+                release.release_next(discarded.is_some());
             }
-            // #288: untrack before releasing the id (the location is its
-            // ownership token, see `rest_on_level`).
-            self.untrack_order_by_id(filled_id);
-            self.order_locations.remove(filled_id);
         }
 
         // Return vectors to pool for reuse. `stp_orders` only entered the pool

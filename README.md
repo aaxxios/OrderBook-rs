@@ -294,6 +294,16 @@ This order book engine is built with the following design principles:
   counts errors once per batch. Wire frames above `MAX_FRAME_BODY` (4096)
   are rejected, and the outbound encoders refuse values their decoders
   reject.
+- **Core boundary gaps closed (#294).** A panic under the shared side of
+  the submit gate (a `Clock`, metrics recorder or `tracing` subscriber
+  running mid-mutation) now engages the kill switch and latches
+  `submit_gate_poisoned()` like one under the exclusive side; a sweep
+  drain that unwinds leaves no ghost order location; the public
+  `place_order_in_book` bypass is gone; a standalone
+  `OrderStateTracker` queues a terminal id for eviction before its
+  listener runs; the listener dispatcher always progresses when its
+  buffer cannot grow; `PriceSource::LastTrade` no longer falls back to
+  the mid.
 
 #### Migration from 0.13
 
@@ -314,6 +324,9 @@ This order book engine is built with the following design principles:
 | mass cancels on the shared submit gate | exclusive gate; `cancel_all_orders` emits after clearing |
 | listeners run inline, often under the submit gate; re-entering the book can deadlock | run after commit and gate release, ordered by commit; re-entry allowed; may run on another submitter's thread |
 | submit-gate poison recovered silently | kill switch engaged, `submit_gate_poisoned()` latched |
+| panic under the shared submit gate: no trace | kill switch engaged, `submit_gate_poisoned()` latched (#294) |
+| `OrderBook::place_order_in_book(order)` (raw placement, no gate / risk / STP / state) | removed; use `add_order` (#294) |
+| IV `PriceSource::LastTrade` with no trade: falls back to the mid | `Err(IVError::NoPriceAvailable)` on a two-sided book (#294) |
 | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 4`; reads `2..=4` |
 | `AllocSnapshot::since(earlier) -> AllocSnapshot` (saturating) | `-> Option<AllocSnapshot>`; `None` when `earlier` is ahead |
 | `wire::encode_{exec_report, trade_print, book_update}(msg, &mut Vec<u8>)` (returns `()`) | `-> Result<(), WireError>`; `WireError` adds `CapacityOverflow` |
