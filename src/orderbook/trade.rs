@@ -234,7 +234,10 @@ impl TradeResult {
 /// submit / cancel / update / mass cancel / market sweeps): the nested call
 /// commits its own events and returns without dispatching them; they are
 /// delivered after the current batch, by the same dispatcher. A listener
-/// that blocks, however, delays every later event of the book.
+/// that blocks, however, delays every later event of the book, and the
+/// book's outbox grows meanwhile: it is **not bounded**, so a stalled
+/// listener grows memory without limit. Monitor
+/// [`OrderBook::pending_listener_events`](crate::OrderBook::pending_listener_events).
 ///
 /// # Obligations
 ///
@@ -244,7 +247,10 @@ impl TradeResult {
 /// is unaffected (the mutation already committed) and the submit gate is
 /// not poisoned, but the rest of that batch is dropped
 /// ([`OrderBook::dropped_listener_events`](crate::OrderBook::dropped_listener_events),
-/// [`OrderBook::listener_panics`](crate::OrderBook::listener_panics)); see
+/// [`OrderBook::listener_panics`](crate::OrderBook::listener_panics)).
+/// When `listener_panics` increases, call
+/// [`OrderBook::flush_listener_events`](crate::OrderBook::flush_listener_events)
+/// to deliver the batches queued behind the panic; see
 /// `doc/panic-boundaries.md`.
 pub type TradeListener = Arc<dyn Fn(&TradeResult) + Send + Sync>;
 

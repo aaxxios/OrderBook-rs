@@ -1070,8 +1070,40 @@ impl<T> OrderBook<T> {
     /// queued only after a listener panicked while other batches were
     /// waiting; they are delivered by the next mutation, or by this call.
     /// Returns immediately when another thread is dispatching.
+    ///
+    /// Operational recommendation: when [`Self::listener_panics`]
+    /// increases, call this once the cause is addressed (or right away) so
+    /// the batches queued behind the panicking one are not left waiting
+    /// for the next mutation on a quiet book.
     pub fn flush_listener_events(&self) {
         self.dispatch_listener_events();
+    }
+
+    /// Operational backlog gauge (#249): listener events committed to this
+    /// book's outbox and not yet taken by the dispatcher.
+    ///
+    /// Near zero in steady state. It grows while the dispatching thread is
+    /// inside a slow or stalled listener, since every other submitter keeps
+    /// committing behind it, and after a listener panic until the next
+    /// dispatch ([`Self::flush_listener_events`]). **The outbox is not
+    /// bounded**: nothing drops or rejects events because the backlog is
+    /// large. Keeping listeners fast (the documented caller contract) is
+    /// what bounds it; alert on a growing value. Excludes the batch a
+    /// dispatcher is delivering at the moment. Takes the outbox lock and
+    /// walks the queue, so poll it from monitoring, not per submit.
+    #[must_use]
+    pub fn pending_listener_events(&self) -> usize {
+        let state = self.outbox.lock();
+        // Every counted event occupies memory, so the sum cannot reach
+        // `usize::MAX`; the fallback only keeps the arithmetic checked.
+        match state
+            .queue
+            .iter()
+            .try_fold(0usize, |total, batch| total.checked_add(batch.events.len()))
+        {
+            Some(total) => total,
+            None => usize::MAX,
+        }
     }
 
     /// Listener events dropped instead of delivered since the book was

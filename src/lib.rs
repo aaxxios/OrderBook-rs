@@ -263,7 +263,8 @@
 //!   order as before. A listener may re-enter the book; a panicking listener
 //!   leaves the book consistent and the gate unpoisoned
 //!   (`dropped_listener_events()`, `listener_panics()`,
-//!   `flush_listener_events()`). A poisoned submit gate now engages the kill
+//!   `flush_listener_events()`); `pending_listener_events()` gauges the
+//!   unbounded backlog a slow listener builds. A poisoned submit gate now engages the kill
 //!   switch (`submit_gate_poisoned()`) instead of being recovered silently.
 //!
 //! ### Migration from 0.13

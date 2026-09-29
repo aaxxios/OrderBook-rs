@@ -706,7 +706,16 @@ started back at the head of the queue, counts the undelivered remainder of
 the panicking batch in `dropped_listener_events` and the panic in
 `listener_panics`, and logs at `ERROR`; the panic propagates out of the
 book call that was dispatching. Queued batches are delivered, in order, by
-the next dispatch on the book or by `flush_listener_events`. The outbox mutex
+the next dispatch on the book or by `flush_listener_events`. Operators
+should call `flush_listener_events` when `listener_panics` increases, so
+those batches do not wait for the next mutation on a quiet book.
+
+**Backlog.** The outbox is unbounded by design: nothing is dropped or
+rejected because listeners are slow. A stalled or slow listener on the
+dispatching thread lets every other submitter's events accumulate, which
+is the caller's contract to avoid (listeners must return quickly).
+`OrderBook::pending_listener_events()` is the operational gauge (events
+committed and not yet taken by the dispatcher); alert on growth. The outbox mutex
 is never held across caller code; if it were ever poisoned it is recovered
 and the poison cleared (every queue mutation is a single
 `push_back` / `pop_front` / flag store).

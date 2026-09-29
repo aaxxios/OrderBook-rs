@@ -550,7 +550,10 @@ change.
     delivered is dropped and counted. New diagnostics:
     `OrderBook::dropped_listener_events()`, `OrderBook::listener_panics()`,
     and `OrderBook::flush_listener_events()` to deliver batches left
-    queued after such a panic.
+    queued after such a panic (call it when `listener_panics()` grows).
+  - Backlog: the listener outbox is unbounded; a slow or stalled listener
+    grows it (caller contract: listeners return quickly). New gauge
+    `OrderBook::pending_listener_events()`.
   - Submit-gate poisoning is no longer recovered silently. It can now only
     follow an engine (or `T::default()` / `T::clone()`) panic under the
     exclusive gate; the acquisition that detects it engages the kill switch

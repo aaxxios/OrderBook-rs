@@ -708,6 +708,63 @@ mod tests {
         );
     }
 
+    /// The backlog gauge: while the dispatching thread is stuck in a
+    /// listener, other submitters queue behind it and
+    /// `pending_listener_events` counts their events; it drains to zero
+    /// once the listener returns, with every event delivered in order.
+    #[test]
+    fn stalled_listener_grows_the_backlog_gauge() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut book = OrderBook::<()>::new("EMIT");
+        let seen = Arc::clone(&seqs);
+        let entered = Mutex::new(Some(entered_tx));
+        book.set_price_level_listener(Arc::new(move |event: PriceLevelChangedEvent| {
+            seen.lock().expect("seqs").push(event.engine_seq);
+            // Stall on the first event only.
+            if let Some(tx) = entered.lock().expect("entered").take() {
+                tx.send(()).expect("signal");
+                release_rx
+                    .lock()
+                    .expect("release")
+                    .recv()
+                    .expect("released");
+            }
+        }));
+        let book = Arc::new(book);
+        assert_eq!(book.pending_listener_events(), 0);
+
+        let stalled = Arc::clone(&book);
+        let dispatcher = thread::spawn(move || {
+            stalled
+                .add_order(limit(1, 90, 1, Side::Buy, TimeInForce::Gtc))
+                .expect("first add");
+        });
+        entered_rx.recv().expect("listener entered");
+        for id in 2..=6 {
+            book.add_order(limit(
+                id,
+                90 - u128::from(id),
+                1,
+                Side::Buy,
+                TimeInForce::Gtc,
+            ))
+            .expect("queued add");
+        }
+        assert_eq!(
+            book.pending_listener_events(),
+            5,
+            "the five later adds wait behind the stalled listener"
+        );
+        release_tx.send(()).expect("release");
+        dispatcher.join().expect("dispatcher");
+        assert_eq!(book.pending_listener_events(), 0);
+        let seqs = seqs.lock().expect("seqs");
+        assert_eq!(*seqs, (0..6).collect::<Vec<u64>>());
+    }
+
     /// `flush_listener_events` is a no-op on a quiet book and never
     /// dispatches while another thread holds the role.
     #[test]
