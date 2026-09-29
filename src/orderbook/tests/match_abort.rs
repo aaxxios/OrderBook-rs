@@ -271,6 +271,10 @@ mod tests {
         assert_aborted(&failure.error, 10, 2);
         let committed = failure.committed.as_ref().expect("committed prefix");
         assert_prefix_is_a_and_b(committed);
+        // PriceLevel#219: the failed level was absorbed with its error; the
+        // published prefix is rebuilt without it.
+        assert!(committed.match_result.error().is_none());
+        assert_eq!(committed.match_result.remaining_quantity().as_u64(), 10);
         let published = streams.trades.lock().expect("trade sink");
         assert_eq!(published.len(), 1);
         assert_eq!(
@@ -595,10 +599,8 @@ mod tests {
         assert_eq!(book.best_bid(), None);
     }
 
-    /// The preflight bound is conservative: at a level without hidden depth
-    /// it counts `min(makers, quantity taken)` trades, so 10 units over A
-    /// (level 100) and B / C (level 101) need three ids of headroom although
-    /// the sweep only mints two.
+    /// With headroom to spare the FOK fills in full and mints exactly the
+    /// ids it traded.
     #[test]
     fn test_fok_within_trade_id_headroom_fills_in_full() {
         let (book, streams) = aborting_book(3);
@@ -656,6 +658,317 @@ mod tests {
             SequencerResult::from_submit_failure(&failure),
             Err(OrderBookError::InvalidOperation { .. })
         ));
+    }
+
+    /// #293 (PriceLevel#218): the trade-id check counts the trades the
+    /// sweep will actually mint, not an upper bound. 10 units over A (level
+    /// 100) and B / C (level 101) trade twice, so two ids are enough; before
+    /// #293 the bound `min(makers, quantity)` asked for three and killed it.
+    #[test]
+    fn test_fok_trade_id_check_is_exact() {
+        let (book, streams) = aborting_book(2);
+        book.add_limit_order_with_user(
+            Id::from_u64(TAKER),
+            101,
+            10,
+            Side::Buy,
+            TimeInForce::Fok,
+            taker_user(),
+            None,
+        )
+        .expect("two trades fit the two remaining ids");
+        let published = streams.trades.lock().expect("trade sink");
+        assert_eq!(published.len(), 1);
+        assert_prefix_is_a_and_b(&published[0]);
+        drop(published);
+        assert_eq!(book.transaction_id_generator.remaining(), 0);
+        assert_eq!(book.match_aborts(), 0);
+    }
+
+    /// A FOK the preflight refuses at a later level: nothing traded,
+    /// nothing moved, every maker still rests, the taker is `Rejected`.
+    fn assert_fok_rejected_untouched(book: &OrderBook<()>, streams: &Streams, remaining: u64) {
+        assert!(streams.trades.lock().expect("trade sink").is_empty());
+        assert!(streams.levels.lock().expect("level sink").is_empty());
+        assert_eq!(book.transaction_id_generator.remaining(), remaining);
+        for maker in [MAKER_A, MAKER_B, MAKER_C, MAKER_D] {
+            assert_eq!(
+                book.order_status(Id::from_u64(maker)),
+                Some(OrderStatus::Open)
+            );
+            assert!(book.get_order(Id::from_u64(maker)).is_some());
+        }
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), Some(100));
+        assert_eq!(book.match_aborts(), 0, "nothing was aborted");
+    }
+
+    /// #293 (PriceLevel#217): a poisoned level refuses every match, so a
+    /// FOK that would have to trade there after level 100 is rejected
+    /// before level 100 is touched, instead of aborting mid-sweep.
+    ///
+    /// pricelevel only poisons a level when code panics inside it, which
+    /// this crate cannot provoke, so the preflight's test-only fault hook
+    /// stands in for `PriceLevel::is_poisoned` at level 101.
+    #[test]
+    fn test_fok_preflight_rejects_a_poisoned_later_level_untouched() {
+        let (mut book, streams) = aborting_book(100);
+        book.fok_level_fault_hook = Some(Arc::new(|price: u128| {
+            (price == 101).then(|| PriceLevelError::InvalidOperation {
+                message: "price level poisoned (test)".to_string(),
+            })
+        }));
+        let err = book
+            .add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                102,
+                15,
+                Side::Buy,
+                TimeInForce::Fok,
+                taker_user(),
+                None,
+            )
+            .expect_err("preflight must reject");
+        assert!(
+            matches!(
+                err,
+                OrderBookError::PriceLevelError(PriceLevelError::InvalidOperation { .. })
+            ),
+            "unexpected error {err:?}"
+        );
+        let reason = RejectReason::from(&err);
+        assert_eq!(
+            book.order_status(Id::from_u64(TAKER)),
+            Some(OrderStatus::Rejected { reason })
+        );
+        assert_fok_rejected_untouched(&book, &streams, 100);
+    }
+
+    /// #293 (PriceLevel#218): a level whose FIFO sequence counter has no
+    /// headroom for the sweep's replenishments refuses the match; the FOK
+    /// is rejected untouched with `CounterExhausted` instead of aborting
+    /// after level 100 committed.
+    ///
+    /// Exhausting a real level counter takes about `2^64` operations and a
+    /// restored book restarts its counters, so the preflight's test-only
+    /// fault hook stands in for `MatchRequirements::check` at level 101.
+    #[test]
+    fn test_fok_preflight_rejects_exhausted_level_counter_untouched() {
+        let (mut book, streams) = aborting_book(100);
+        book.fok_level_fault_hook = Some(Arc::new(|price: u128| {
+            (price == 101).then_some(PriceLevelError::CounterExhausted {
+                counter: pricelevel::ExhaustedCounter::QueueSequence,
+            })
+        }));
+        let err = book
+            .add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                102,
+                15,
+                Side::Buy,
+                TimeInForce::Fok,
+                taker_user(),
+                None,
+            )
+            .expect_err("preflight must reject");
+        assert!(
+            matches!(
+                err,
+                OrderBookError::PriceLevelError(PriceLevelError::CounterExhausted {
+                    counter: pricelevel::ExhaustedCounter::QueueSequence,
+                })
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(RejectReason::from(&err), RejectReason::CounterExhausted);
+        assert_eq!(
+            book.order_status(Id::from_u64(TAKER)),
+            Some(OrderStatus::Rejected {
+                reason: RejectReason::CounterExhausted,
+            })
+        );
+        assert_fok_rejected_untouched(&book, &streams, 100);
+    }
+
+    /// The fault hook only answers for the level it names: a FOK that
+    /// fills at level 100 alone never reaches level 101 and fills.
+    #[test]
+    fn test_fok_preflight_ignores_levels_it_does_not_reach() {
+        let (mut book, streams) = aborting_book(100);
+        book.fok_level_fault_hook = Some(Arc::new(|price: u128| {
+            (price == 101).then_some(PriceLevelError::CounterExhausted {
+                counter: pricelevel::ExhaustedCounter::QueueSequence,
+            })
+        }));
+        book.add_limit_order_with_user(
+            Id::from_u64(TAKER),
+            102,
+            5,
+            Side::Buy,
+            TimeInForce::Fok,
+            taker_user(),
+            None,
+        )
+        .expect("level 100 fills the FOK");
+        assert_eq!(streams.trades.lock().expect("trade sink").len(), 1);
+        assert_eq!(book.best_ask(), Some(101));
+    }
+
+    /// #293 (PriceLevel#217): a level that refuses the match with an error
+    /// and no trades — the shape a poisoned level now reports — stops the
+    /// sweep with the earlier levels' prefix instead of letting it walk on
+    /// to a worse price. With one id left, A trades at 100 and B's first
+    /// step at 101 fails before trading.
+    #[test]
+    fn test_sweep_stops_at_a_level_that_refuses_without_trading() {
+        let (book, streams) = aborting_book(1);
+        let err = book
+            .add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                102,
+                20,
+                Side::Buy,
+                TimeInForce::Gtc,
+                taker_user(),
+                None,
+            )
+            .expect_err("sweep must abort");
+        assert_aborted(&err, 5, 1);
+        let published = streams.trades.lock().expect("trade sink");
+        assert_eq!(published.len(), 1);
+        let trades = published[0].match_result.trades().as_vec();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].maker_order_id(), Id::from_u64(MAKER_A));
+        assert!(published[0].match_result.error().is_none());
+        drop(published);
+        for maker in [MAKER_B, MAKER_C, MAKER_D] {
+            assert_eq!(
+                book.order_status(Id::from_u64(maker)),
+                Some(OrderStatus::Open)
+            );
+        }
+        assert_eq!(book.get_orders_at_price(102, Side::Sell).len(), 1);
+        assert_eq!(book.best_bid(), None, "the remainder must never rest");
+    }
+
+    /// #293 (PriceLevel#219): the first level is absorbed by adopting its
+    /// own buffers, error included when it failed mid-match. The published
+    /// prefix is rebuilt without the error slot, like every other abort.
+    #[test]
+    fn test_first_level_abort_prefix_is_published_without_error_slot() {
+        let mut book = OrderBook::<()>::new("ABRT1");
+        book.set_order_state_tracker(OrderStateTracker::new());
+        let trades = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&trades);
+        book.set_trade_listener(Arc::new(move |tr: &TradeResult| {
+            sink.lock().expect("trade sink").push(tr.clone());
+        }));
+        for id in [MAKER_A, MAKER_B] {
+            book.add_limit_order_with_user(
+                Id::from_u64(id),
+                100,
+                5,
+                Side::Sell,
+                TimeInForce::Gtc,
+                maker_user(),
+                None,
+            )
+            .expect("seed maker");
+        }
+        book.transaction_id_generator = generator_with_remaining(1);
+        let failure = book
+            .submit_market_order_with_committed(Id::from_u64(TAKER), 10, Side::Buy)
+            .expect_err("sweep must abort");
+        assert_aborted(&failure.error, 5, 1);
+        let committed = failure.committed.as_ref().expect("committed prefix");
+        assert!(committed.match_result.error().is_none());
+        assert_eq!(committed.match_result.trades().len(), 1);
+        assert_eq!(committed.match_result.remaining_quantity().as_u64(), 5);
+        assert_eq!(
+            book.order_status(Id::from_u64(MAKER_B)),
+            Some(OrderStatus::Open)
+        );
+        let published = trades.lock().expect("trade sink");
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].engine_seq, committed.engine_seq);
+    }
+
+    /// #293 (PriceLevel#218): an iceberg that replenishes trades more often
+    /// than it has makers. The FOK preflight counts those trades exactly,
+    /// both for the trade-id check (one id short is rejected untouched) and
+    /// for the result reservation (enough ids fill in full).
+    #[test]
+    fn test_fok_counts_replenishment_trades_exactly() {
+        let build = |remaining: u64| {
+            let mut book = OrderBook::<()>::new("ICE");
+            book.add_iceberg_order(
+                Id::from_u64(MAKER_A),
+                100,
+                2,
+                6,
+                Side::Sell,
+                TimeInForce::Gtc,
+                None,
+            )
+            .expect("seed iceberg");
+            book.add_limit_order(
+                Id::from_u64(MAKER_B),
+                101,
+                2,
+                Side::Sell,
+                TimeInForce::Gtc,
+                None,
+            )
+            .expect("seed maker");
+            book.transaction_id_generator = generator_with_remaining(remaining);
+            book
+        };
+        // 10 units: the iceberg trades 2 + 2 + 2 + 2 (four trades), then B.
+        let short = build(4);
+        let err = short
+            .add_limit_order(
+                Id::from_u64(TAKER),
+                101,
+                10,
+                Side::Buy,
+                TimeInForce::Fok,
+                None,
+            )
+            .expect_err("one id short");
+        assert!(
+            matches!(
+                err,
+                OrderBookError::PriceLevelError(PriceLevelError::CapacityExceeded {
+                    resource: CapacityResource::IdSequence,
+                    additional: 5,
+                })
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(short.best_ask(), Some(100));
+
+        let mut exact = build(5);
+        let trades = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&trades);
+        exact.set_trade_listener(Arc::new(move |tr: &TradeResult| {
+            sink.lock().expect("trade sink").push(tr.clone());
+        }));
+        exact
+            .add_limit_order(
+                Id::from_u64(TAKER),
+                101,
+                10,
+                Side::Buy,
+                TimeInForce::Fok,
+                None,
+            )
+            .expect("five ids fill the FOK");
+        let published = trades.lock().expect("trade sink");
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].match_result.trades().len(), 5);
+        assert!(published[0].match_result.is_complete());
+        assert_eq!(exact.transaction_id_generator.remaining(), 0);
+        assert_eq!(exact.match_fold_failures(), 0);
     }
 
     #[cfg(feature = "bincode")]

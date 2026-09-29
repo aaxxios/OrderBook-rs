@@ -1220,6 +1220,122 @@ mod tests_stp_reachability {
         }
     }
 
+    /// #293 (PR #299 review): the fill-or-kill preflight must bound an STP
+    /// `CancelTaker` / `CancelBoth` pre-match by what pricelevel executes,
+    /// not by the visible depth `safe_quantity` counted ahead of the
+    /// same-user maker.
+    ///
+    /// Asks: 5 at 99 from another user, then at 100 the shape of
+    /// `precheck_refuses_when_a_maker_ahead_cannot_deliver_its_counted_depth`
+    /// (a replenishing reserve whose replenish would overflow the level's
+    /// visible counter, a huge maker, the taker's own maker). A FOK buy of 15
+    /// at 100 counts 5 at 99 plus `safe_quantity` ≥ 10 at 100, but the sweep
+    /// would fill 5 at 99, execute nothing at 100 and then cancel the taker:
+    /// a partial fill of a FOK. The preflight must kill it with the book
+    /// untouched.
+    #[test]
+    fn fok_preflight_uses_the_executable_pre_match_not_counted_depth() {
+        const CHEAP: u64 = 60;
+        const RESERVE: u64 = 61;
+        const HUGE: u64 = 62;
+        const SELF_ASK: u64 = 63;
+
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let mut book: OrderBook<()> = DefaultOrderBook::new("STPF");
+            book.set_stp_mode(mode);
+            book.set_order_state_tracker(OrderStateTracker::new());
+            let trades = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let sink = std::sync::Arc::clone(&trades);
+            book.set_trade_listener(std::sync::Arc::new(move |_: &TradeResult| {
+                *sink.lock().expect("trade sink") += 1;
+            }));
+            book.add_limit_order_with_user(
+                Id::from_u64(CHEAP),
+                PRICE - 1,
+                5,
+                Side::Sell,
+                TimeInForce::Gtc,
+                user(3),
+                None,
+            )
+            .expect("seed the cheaper level");
+            book.add_order(OrderType::ReserveOrder {
+                id: Id::from_u64(RESERVE),
+                price: Price::new(PRICE),
+                visible_quantity: Quantity::new(10),
+                hidden_quantity: Quantity::new(100),
+                side: Side::Sell,
+                user_id: user(2),
+                timestamp: TimestampMs::new(0),
+                time_in_force: TimeInForce::Gtc,
+                replenish_threshold: Quantity::new(5),
+                replenish_amount: NonZeroU64::new(90),
+                auto_replenish: true,
+                extra_fields: (),
+            })
+            .expect("seed the replenishing reserve at the front");
+            book.add_limit_order_with_user(
+                Id::from_u64(HUGE),
+                PRICE,
+                u64::MAX - 15,
+                Side::Sell,
+                TimeInForce::Gtc,
+                user(2),
+                None,
+            )
+            .expect("seed the maker that fills the level's visible headroom");
+            book.add_limit_order_with_user(
+                Id::from_u64(SELF_ASK),
+                PRICE,
+                5,
+                Side::Sell,
+                TimeInForce::Gtc,
+                user(1),
+                None,
+            )
+            .expect("seed the same-user maker behind them");
+
+            let result = book.add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                PRICE,
+                15,
+                Side::Buy,
+                TimeInForce::Fok,
+                user(1),
+                None,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(OrderBookError::InsufficientLiquidity {
+                        requested: 15,
+                        available: 5,
+                        ..
+                    })
+                ),
+                "{mode}: the preflight counts only what the pre-match executes: {result:?}"
+            );
+            assert_eq!(
+                *trades.lock().expect("trade sink"),
+                0,
+                "{mode}: nothing traded"
+            );
+            assert_eq!(
+                book.get_order(Id::from_u64(CHEAP))
+                    .map(|o| o.visible_quantity().as_u64()),
+                Some(5),
+                "{mode}: the cheaper level is untouched"
+            );
+            for id in [RESERVE, HUGE, SELF_ASK] {
+                assert!(
+                    book.get_order(Id::from_u64(id)).is_some(),
+                    "{mode}: maker {id} still rests"
+                );
+            }
+            assert_eq!(book.best_bid(), None, "{mode}: a FOK never rests");
+        }
+    }
+
     fn assert_self_maker_intact_at(book: &OrderBook<()>, visible: u64) {
         let maker = book
             .get_order(Id::from_u64(SELF_MAKER))

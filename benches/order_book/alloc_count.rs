@@ -125,7 +125,17 @@ fn report(
     let delta = after
         .since(*before)
         .expect("allocation counters are monotonic");
+    report_delta(scenario, warmup_ops, measured_ops, delta);
+}
 
+/// [`report`] for a delta accumulated over measured operations only
+/// (the crossing / sweep scenarios exclude their unmeasured setup).
+fn report_delta(
+    scenario: &str,
+    warmup_ops: u64,
+    measured_ops: u64,
+    delta: orderbook_rs::AllocSnapshot,
+) {
     let allocs_per_op = delta.allocs as f64 / measured_ops as f64;
     let bytes_per_op = delta.bytes_allocated as f64 / measured_ops as f64;
 
@@ -215,6 +225,101 @@ fn run_passive_add_scenario(scenario: &str, one_level: bool, with_user: bool) {
     report(scenario, PASSIVE_WARMUP_OPS, PASSIVE_MEASURED_OPS, &before);
 }
 
+// Crossing / sweep scenarios (#293, PriceLevel#219): the per-op
+// allocation cost of the matching sweep itself. Only the crossing call is
+// measured; any maker replenishment between calls is excluded.
+const CROSS_WARMUP_OPS: u64 = 1_000;
+const CROSS_MEASURED_OPS: u64 = 10_000;
+const CROSS_PRICE: u128 = 1_000;
+
+/// Sum of the allocation deltas of the measured calls.
+fn add_delta(total: &mut orderbook_rs::AllocSnapshot, before: orderbook_rs::AllocSnapshot) {
+    let delta = GLOBAL
+        .snapshot()
+        .since(before)
+        .expect("allocation counters are monotonic");
+    total.allocs += delta.allocs;
+    total.deallocs += delta.deallocs;
+    total.bytes_allocated += delta.bytes_allocated;
+    total.bytes_deallocated += delta.bytes_deallocated;
+}
+
+fn seed_asks(book: &OrderBook<()>, first_id: u64, count: u64, price: u128, qty: u64) {
+    for i in 0..count {
+        book.add_limit_order(
+            Id::from_u64(first_id + i),
+            price,
+            qty,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        )
+        .expect("seed ask");
+    }
+}
+
+/// A crossing limit buy that trades against one level: `makers` asks of
+/// `maker_qty` each, taker quantity `taker_qty`. With `maker_qty ==
+/// taker_qty` every call fully fills the front maker (one trade, one filled
+/// id); with large makers it partially fills one (one trade, no filled id).
+fn run_crossing_add_scenario(scenario: &str, makers: u64, maker_qty: u64, taker_qty: u64) {
+    let book: OrderBook<()> = OrderBook::new("BENCH");
+    seed_asks(&book, 1, makers, CROSS_PRICE, maker_qty);
+    let mut next_id = makers + 1;
+    let mut cross = |book: &OrderBook<()>| {
+        let id = Id::from_u64(next_id);
+        next_id += 1;
+        book.add_limit_order(
+            id,
+            CROSS_PRICE,
+            taker_qty,
+            Side::Buy,
+            TimeInForce::Gtc,
+            None,
+        )
+        .expect("crossing add");
+    };
+    for _ in 0..CROSS_WARMUP_OPS {
+        cross(&book);
+    }
+    let mut total = orderbook_rs::AllocSnapshot::default();
+    for _ in 0..CROSS_MEASURED_OPS {
+        let before = GLOBAL.snapshot();
+        cross(&book);
+        add_delta(&mut total, before);
+    }
+    report_delta(scenario, CROSS_WARMUP_OPS, CROSS_MEASURED_OPS, total);
+}
+
+/// A market buy sweeping `levels` levels of one 5-unit maker each; the
+/// levels are re-seeded (unmeasured) before every sweep.
+fn run_market_sweep_scenario(scenario: &str, levels: u64) {
+    let book: OrderBook<()> = OrderBook::new("BENCH");
+    let mut next_id = 1u64;
+    let mut sweep = |book: &OrderBook<()>, total: Option<&mut orderbook_rs::AllocSnapshot>| {
+        for level in 0..levels {
+            seed_asks(book, next_id, 1, CROSS_PRICE + u128::from(level), 5);
+            next_id += 1;
+        }
+        let id = Id::from_u64(next_id);
+        next_id += 1;
+        let before = GLOBAL.snapshot();
+        book.submit_market_order(id, 5 * levels, Side::Buy)
+            .expect("market sweep");
+        if let Some(total) = total {
+            add_delta(total, before);
+        }
+    };
+    for _ in 0..CROSS_WARMUP_OPS {
+        sweep(&book, None);
+    }
+    let mut total = orderbook_rs::AllocSnapshot::default();
+    for _ in 0..CROSS_MEASURED_OPS {
+        sweep(&book, Some(&mut total));
+    }
+    report_delta(scenario, CROSS_WARMUP_OPS, CROSS_MEASURED_OPS, total);
+}
+
 fn main() {
     let book = common::fresh_book();
     let mut rng = Rng::new(SEED);
@@ -243,4 +348,26 @@ fn main() {
         false,
         true,
     );
+
+    let full_fill_makers = CROSS_WARMUP_OPS + CROSS_MEASURED_OPS + 1;
+    run_crossing_add_scenario(
+        "alloc_count_cross_one_level_full_fill",
+        full_fill_makers,
+        5,
+        5,
+    );
+    run_crossing_add_scenario(
+        "alloc_count_cross_one_level_partial_fill",
+        100,
+        1_000_000_000,
+        5,
+    );
+    run_crossing_add_scenario(
+        "alloc_count_cross_deep_level_large_taker",
+        1_000,
+        1_000_000_000,
+        500,
+    );
+    run_market_sweep_scenario("alloc_count_market_sweep_one_level", 1);
+    run_market_sweep_scenario("alloc_count_market_sweep_three_levels", 3);
 }

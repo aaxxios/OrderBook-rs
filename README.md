@@ -75,6 +75,21 @@ breaking release; see the migration table below.
   abort. Dead-book signals: `OrderBook::match_aborts()`,
   `match_fold_failures()` and the latched `trade_ids_exhausted()` (plus
   `metrics` counters).
+- **pricelevel 0.10.1 (#293).** The dependency floor is `0.10.1`. A
+  poisoned price level stops a sweep with `MatchAborted` instead of being
+  walked past (PriceLevel#217). The fill-or-kill preflight dry-runs every
+  level with `PriceLevel::match_requirements` for the quantity the sweep
+  will ask of it, and rejects untouched a poisoned level, an exhausted
+  per-level counter (`CounterExhausted`) or a maker step that would stop
+  the sweep (PriceLevel#218); its trade-id check is exact, so a FOK that
+  fits the remaining trade ids is no longer refused. Levels are folded
+  with `MatchResult::try_absorb` and split reservations (PriceLevel#219):
+  when a level is asked for exactly the aggregate's remaining quantity and
+  the aggregate holds no trades or filled ids yet, it adopts the level's
+  buffers without reserving or allocating. In practice that is the first
+  traded level of a non-FOK base-quantity sweep; a FOK reserves its whole
+  sweep up front, and quote-notional levels and STP pre-matches asked for
+  less than the remainder are copied into a reserved aggregate.
 - **Journaling aborted submits (#240).** `add_order_with_committed`,
   `submit_market_order_with_committed` and
   `submit_market_order_by_amount_with_committed` return a `SubmitFailure`

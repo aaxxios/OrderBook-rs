@@ -410,7 +410,7 @@ mod tests {
                 None,
                 Hash32::zero(),
                 pricelevel::TakerKind::Standard,
-                0,
+                crate::orderbook::matching::SweepReservation::NONE,
                 0,
             )
             .expect("sweep outcome");

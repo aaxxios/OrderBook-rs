@@ -202,7 +202,7 @@ impl STPMode {
 ///
 /// Used internally by the matching engine to decide how to proceed
 /// after scanning orders at a price level for self-trade conflicts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum STPAction {
     /// No self-trade detected at this level; proceed normally.
     NoConflict,

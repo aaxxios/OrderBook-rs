@@ -22,26 +22,80 @@ thread_local! {
     static MATCHING_POOL: MatchingPool = MatchingPool::new();
 }
 
+/// Result-buffer reservation a sweep makes before it touches its first
+/// level (#240, split per vector since PriceLevel#219): room for `trades`
+/// more trades and `filled_ids` more filled-maker ids in the aggregate
+/// result and the pooled filled-maker buffer. [`Self::NONE`] for every
+/// sweep but a fill-or-kill one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SweepReservation {
+    /// Trades to reserve room for.
+    pub(crate) trades: u64,
+    /// Filled-maker ids to reserve room for.
+    pub(crate) filled_ids: u64,
+}
+
+impl SweepReservation {
+    /// No up-front reservation: each level reserves before it is touched.
+    pub(crate) const NONE: Self = Self {
+        trades: 0,
+        filled_ids: 0,
+    };
+
+    /// `true` when there is nothing to reserve up front.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_none(&self) -> bool {
+        self.trades == 0 && self.filled_ids == 0
+    }
+}
+
 /// Resources a fill-or-kill taker's sweep will draw on, measured by the
 /// feasibility walk [`OrderBook::fok_fillable_quantity`] before anything is
-/// mutated (#240).
+/// mutated (#240, made exact by PriceLevel#218).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FokFeasibility {
     /// Quantity the sweep would fill, in quantity units.
     pub(crate) fillable: u64,
-    /// Upper bound on the trades the sweep can emit, and therefore on the
-    /// trade ids it draws from the book's `UuidGenerator`: at a level with
-    /// no hidden depth every maker trades at most once, so the level
-    /// contributes `min(makers, quantity taken there)`; at a level with
-    /// hidden depth a replenishing maker can trade again, so only the
-    /// quantity taken there (one unit per trade at least) bounds it.
-    pub(crate) max_trades: u64,
-    /// Maker steps the sweep takes without replenishment:
-    /// `Σ min(makers, quantity taken)` over the levels it reaches. Sizes the
-    /// up-front reservation of the trade and filled-id buffers. Trades from
-    /// iceberg / reserve replenishments beyond it grow those buffers during
-    /// the sweep (see the residual documented on `OrderBook::add_order`).
-    pub(crate) maker_steps: u64,
+    /// Trade ids the sweep draws from the book's `UuidGenerator`. Exact
+    /// (`MatchRequirements::trade_ids_required`) at every level pricelevel
+    /// can dry-run as the sweep will match it; at a level where self-trade
+    /// prevention cancels same-user makers first (`CancelMaker`) the dry
+    /// run cannot see the post-cancel queue, so the level contributes an
+    /// upper bound instead: `min(makers, quantity taken there)` without
+    /// hidden depth (every maker trades at most once), the quantity taken
+    /// with hidden depth (a replenishing maker can trade again).
+    pub(crate) trade_ids: u64,
+    /// The up-front result-buffer reservation that covers every level's
+    /// fold, so no level can need more room once the first one mutated:
+    /// per level the larger of its exact trade count and the per-level
+    /// reservation the sweep makes before touching it
+    /// (`min(makers, quantity the level is asked for)`). See
+    /// `OrderBook::reserve_level_fold`.
+    pub(crate) reservation: SweepReservation,
+}
+
+/// What the feasibility walk is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeasibilityScope {
+    /// The fill-or-kill preflight (#240): every level the sweep will reach
+    /// must be matchable in full. A poisoned level (PriceLevel#217), a
+    /// per-level counter without headroom (PriceLevel#218) or a maker step
+    /// the sweep would stop at fails the walk with that level's error, so
+    /// the taker is rejected untouched. Valid only under the exclusive
+    /// submit gate.
+    Preflight,
+    /// A depth estimate only ([`OrderBook::check_modify_reserve_residual`]):
+    /// the fillable quantity is what matters, failures are left to the
+    /// sweep itself.
+    ///
+    /// Deliberately relaxes `PriceLevel::match_requirements`' precondition
+    /// (every mutator of the level excluded until the last match): only
+    /// `MatchRequirements::fillable` is read, which is the same dry run as
+    /// `PriceLevel::matchable_quantity` and just as advisory when another
+    /// submit can run under the shared gate. No counter, trade-id or
+    /// reservation decision is taken from it.
+    DepthOnly,
 }
 
 /// What admission validation (`validate_order_shape`) measured for the sweep
@@ -65,6 +119,19 @@ pub(crate) struct ShapeVerdict {
 fn fok_counter_overflow() -> OrderBookError {
     OrderBookError::InvalidOperation {
         message: "fill-or-kill feasibility accumulator overflowed u64".to_string(),
+    }
+}
+
+/// A level the fill-or-kill preflight found poisoned (PriceLevel#217): it
+/// refuses every match, so the taker is rejected before anything mutates.
+/// Same variant pricelevel reports for a poisoned level.
+#[cold]
+#[inline(never)]
+fn poisoned_level_error(price: u128) -> PriceLevelError {
+    PriceLevelError::InvalidOperation {
+        message: format!(
+            "price level {price} is poisoned and refuses every match; reconstruct the book from a snapshot"
+        ),
     }
 }
 
@@ -169,6 +236,38 @@ fn release_sweep_buffers(
             pool.return_order_snapshot_vec(stp_orders);
         }
     });
+}
+
+/// A reservation count as `usize`.
+///
+/// # Errors
+///
+/// [`PriceLevelError::CapacityExceeded`] when it does not fit.
+#[inline]
+fn steps_to_usize(steps: u64) -> Result<usize, PriceLevelError> {
+    usize::try_from(steps).map_err(|_| PriceLevelError::CapacityExceeded {
+        resource: CapacityResource::Trades,
+        additional: usize::MAX,
+    })
+}
+
+/// Reserve `additional` more slots in the sweep's pooled filled-maker
+/// buffer, fallibly.
+///
+/// # Errors
+///
+/// [`PriceLevelError::CapacityExceeded`] when it cannot grow.
+#[inline]
+fn reserve_filled_makers(
+    filled_orders: &mut Vec<(Id, u64)>,
+    additional: usize,
+) -> Result<(), PriceLevelError> {
+    filled_orders
+        .try_reserve(additional)
+        .map_err(|_| PriceLevelError::CapacityExceeded {
+            resource: CapacityResource::FilledOrderIds,
+            additional,
+        })
 }
 
 /// The per-level budget arithmetic of a sweep failed (#246): a level
@@ -729,7 +828,7 @@ where
             limit_price,
             Hash32::zero(),
             TakerKind::Standard,
-            0,
+            SweepReservation::NONE,
             verified,
         )
         .and_then(MatchOutcome::into_result)
@@ -787,7 +886,7 @@ where
             limit_price,
             taker_user_id,
             TakerKind::Standard,
-            0,
+            SweepReservation::NONE,
             verified,
         )
         .and_then(MatchOutcome::into_result)
@@ -797,8 +896,9 @@ where
     /// including the STP-cancel signal the resting caller in `add_order` needs to
     /// avoid resting a self-cross residual (#97) and the abort (#240).
     ///
-    /// `reserve_steps` is the fill-or-kill preflight reservation
-    /// ([`FokFeasibility::maker_steps`]); `0` for every other taker.
+    /// `reservation` is the fill-or-kill preflight reservation
+    /// ([`FokFeasibility::reservation`]); [`SweepReservation::NONE`] for
+    /// every other taker.
     /// `arithmetic_verified_price` is what the trade arithmetic preflight
     /// returned (#244); the sweep's backstop re-checks only levels above it.
     #[allow(clippy::too_many_arguments)]
@@ -810,7 +910,7 @@ where
         limit_price: Option<u128>,
         taker_user_id: Hash32,
         taker_kind: TakerKind,
-        reserve_steps: u64,
+        reservation: SweepReservation,
         arithmetic_verified_price: u128,
     ) -> Result<MatchOutcome, OrderBookError> {
         self.match_order_inner(
@@ -822,7 +922,7 @@ where
             },
             taker_user_id,
             taker_kind,
-            reserve_steps,
+            reservation,
             arithmetic_verified_price,
         )
     }
@@ -856,7 +956,7 @@ where
             MatchMode::QuoteAmount { amount },
             taker_user_id,
             TakerKind::Standard,
-            0,
+            SweepReservation::NONE,
             // Unused: a quote-notional sweep is bounded by its amount.
             0,
         )
@@ -889,10 +989,27 @@ where
     /// outcome comes back with [`MatchOutcome::aborted`] set and `result`
     /// holding exactly the committed prefix.
     ///
-    /// `reserve_steps > 0` (fill-or-kill only) reserves the trade and
+    /// A non-empty `reservation` (fill-or-kill only) reserves the trade and
     /// filled-id buffers before the first level is touched; a refused
     /// reservation rejects the taker untouched with
     /// [`OrderBookError::PriceLevelError`] (`CapacityExceeded`).
+    ///
+    /// # Folding levels (#240, PriceLevel#219)
+    ///
+    /// Each level's result is folded into the aggregate with
+    /// `MatchResult::try_absorb` when the level was asked for exactly the
+    /// aggregate's remaining quantity (every base-quantity level outside a
+    /// self-trade prevention pre-match whose remaining quantity is a lot
+    /// multiple, which admission guarantees for submitted orders), and trade
+    /// by trade otherwise (quote-notional levels, STP pre-matches, a
+    /// lot-rounded level cap). Nothing can fail once a
+    /// level mutated, because the room the fold needs is reserved before the
+    /// level is touched (`reserve_level_fold`), except while the aggregate
+    /// is still empty on the absorb path: absorbing into an empty aggregate
+    /// adopts the level's own buffers, which cannot fail and allocates
+    /// nothing. A refused fold leaves the aggregate unchanged (all or
+    /// nothing, as before), so the published prefix is always a whole number
+    /// of levels.
     #[allow(clippy::too_many_arguments)]
     fn match_order_inner(
         &self,
@@ -901,7 +1018,7 @@ where
         mode: MatchMode,
         taker_user_id: Hash32,
         taker_kind: TakerKind,
-        reserve_steps: u64,
+        reservation: SweepReservation,
         arithmetic_verified_price: u128,
     ) -> Result<MatchOutcome, OrderBookError> {
         self.cache.invalidate();
@@ -956,13 +1073,14 @@ where
             acquire_sweep_buffers(watch_strandable, stp_active);
 
         // Fill-or-kill preflight (#240): reserve the aggregate trade /
-        // filled-id storage and the pooled maker buffer for every maker
-        // step the feasibility walk predicted BEFORE the first level is
-        // touched, so a refused allocation kills the taker with the book
-        // untouched instead of stopping the sweep half-way.
-        if reserve_steps > 0
+        // filled-id storage and the pooled maker buffer for everything the
+        // feasibility walk predicted BEFORE the first level is touched, so
+        // a refused allocation kills the taker with the book untouched
+        // instead of stopping the sweep half-way. The reservation covers
+        // every per-level reservation below, so none of them grows.
+        if !reservation.is_none()
             && let Err(err) =
-                Self::reserve_sweep_steps(&mut match_result, &mut filled_orders, reserve_steps)
+                Self::reserve_sweep(&mut match_result, &mut filled_orders, reservation)
         {
             release_sweep_buffers(
                 filled_orders,
@@ -1100,29 +1218,10 @@ where
                 arithmetic_checked_price = price;
             }
 
-            // #240: reserve the aggregate result (and the pooled filled-maker
-            // buffer) for the most trades this level can emit BEFORE anything
-            // touches it — including the STP arms below, whose CancelMaker /
-            // CancelBoth branches cancel same-user makers — so folding its
-            // committed trades cannot fail after the level was mutated. The
-            // bound uses the pre-cancel maker count, slightly conservative
-            // when STP then removes makers. A refused reservation aborts the
-            // sweep here with the prefix of the earlier levels, this level
-            // intact.
-            if let Err(err) = Self::reserve_level_worst_case(
-                &mut match_result,
-                &mut filled_orders,
-                price_level,
-                qty_cap,
-            ) {
-                sweep_error = Some(err);
-                break;
-            }
-
             // --- STP pre-processing ---
             // When STP is active, check for self-trade conflicts before matching.
             // This is done per-price-level to handle partial fills correctly.
-            if stp_active {
+            let stp_action = if stp_active {
                 // `check_stp_at_level` must see the resting orders in the exact order
                 // the sweep consumes them — pure insertion sequence — so `safe_quantity`
                 // and the CancelBoth `maker_order_id` correspond to what `match_order`
@@ -1142,8 +1241,41 @@ where
                     sweep_error = Some(err);
                     break;
                 }
-                let action = check_stp_at_level(&stp_orders, taker_user_id, self.stp_mode);
+                Some(check_stp_at_level(
+                    &stp_orders,
+                    taker_user_id,
+                    self.stp_mode,
+                ))
+            } else {
+                None
+            };
 
+            // #240: reserve what folding this level can need BEFORE anything
+            // touches it — including the STP arms below, whose CancelMaker /
+            // CancelBoth branches cancel same-user makers — so folding its
+            // committed trades cannot fail after the level was mutated. The
+            // verdict above only read the level. The bound uses the
+            // pre-cancel maker count, slightly conservative when STP then
+            // removes makers. A refused reservation aborts the sweep here
+            // with the prefix of the earlier levels, this level intact.
+            let level_match_qty = match stp_action {
+                Some(
+                    STPAction::CancelTaker { safe_quantity }
+                    | STPAction::CancelBoth { safe_quantity, .. },
+                ) => qty_cap.min(safe_quantity),
+                Some(STPAction::NoConflict | STPAction::CancelMaker) | None => qty_cap,
+            };
+            if let Err(err) = Self::reserve_level_fold(
+                &mut match_result,
+                &mut filled_orders,
+                price_level,
+                level_match_qty,
+            ) {
+                sweep_error = Some(err);
+                break;
+            }
+
+            if let Some(action) = stp_action {
                 // #225: test-only interleaving point. The verdict above was
                 // taken on the queue state we just snapshotted; this is the
                 // exact instant a competing mutation used to be able to slip
@@ -1168,7 +1300,7 @@ where
                                 if let Some(strandable) = strandable_makers.as_mut() {
                                     self.capture_strandable_makers(price_level, strandable);
                                 }
-                                let price_level_match = price_level.match_order(
+                                let mut price_level_match = price_level.match_order(
                                     match_qty,
                                     order_id,
                                     TimeInForce::Gtc,
@@ -1190,7 +1322,8 @@ where
                                 let executed = level_executed(match_qty, &price_level_match, price);
                                 if let Err(err) = self.process_level_match(
                                     &mut match_result,
-                                    &price_level_match,
+                                    &mut price_level_match,
+                                    match_qty,
                                     &mut filled_orders,
                                     price,
                                     price_level,
@@ -1293,7 +1426,7 @@ where
                                 if let Some(strandable) = strandable_makers.as_mut() {
                                     self.capture_strandable_makers(price_level, strandable);
                                 }
-                                let price_level_match = price_level.match_order(
+                                let mut price_level_match = price_level.match_order(
                                     match_qty,
                                     order_id,
                                     TimeInForce::Gtc,
@@ -1313,7 +1446,8 @@ where
                                 let executed = level_executed(match_qty, &price_level_match, price);
                                 if let Err(err) = self.process_level_match(
                                     &mut match_result,
-                                    &price_level_match,
+                                    &mut price_level_match,
+                                    match_qty,
                                     &mut filled_orders,
                                     price,
                                     price_level,
@@ -1368,7 +1502,7 @@ where
             }
 
             // --- Normal matching (no STP conflict or after CancelMaker cleanup) ---
-            // The level's worst case was reserved above, before the STP arms.
+            // The level's fold was reserved above, before the STP arms.
             if let Some(strandable) = strandable_makers.as_mut() {
                 self.capture_strandable_makers(price_level, strandable);
             }
@@ -1381,7 +1515,7 @@ where
             if let Some(hook) = self.level_interleave_hook.as_ref() {
                 hook(price);
             }
-            let price_level_match = price_level.match_order(
+            let mut price_level_match = price_level.match_order(
                 qty_cap,
                 order_id,
                 TimeInForce::Gtc,
@@ -1402,7 +1536,8 @@ where
 
             if let Err(err) = self.process_level_match(
                 &mut match_result,
-                &price_level_match,
+                &mut price_level_match,
+                qty_cap,
                 &mut filled_orders,
                 price,
                 price_level,
@@ -1631,8 +1766,27 @@ where
             Ok(quantity) => quantity,
             Err(err) => return Err((src, err)),
         };
+        Self::rebuild_match_result(order_id, src, executed_qty)
+    }
+
+    /// Rebuild `src`'s trades and filled ids into a fresh result for an
+    /// incoming quantity of `initial` (sized up front, so the appends never
+    /// grow it). Shared by [`Self::normalize_notional_match_result`] and
+    /// [`Self::strip_level_error`].
+    ///
+    /// # Errors
+    ///
+    /// The untouched `src` with the failure: an allocator refusal
+    /// ([`PriceLevelError::CapacityExceeded`]) or a refused append
+    /// ([`PriceLevelError::InvalidOperation`], an invariant breach).
+    #[allow(clippy::result_large_err)]
+    fn rebuild_match_result(
+        order_id: Id,
+        src: MatchResult,
+        initial: Quantity,
+    ) -> Result<MatchResult, (MatchResult, PriceLevelError)> {
         let capacity = src.trades().len().max(src.filled_order_ids().len());
-        let mut rebuilt = match MatchResult::try_with_capacity(order_id, executed_qty, capacity) {
+        let mut rebuilt = match MatchResult::try_with_capacity(order_id, initial, capacity) {
             Ok(rebuilt) => rebuilt,
             Err(err) => return Err((src, err)),
         };
@@ -1774,112 +1928,100 @@ where
     /// full fill) is decremented. The hook is a no-op when no
     /// `RiskConfig` is installed, matching the rest of the risk plumbing.
     ///
-    /// The level's committed trades are folded into `match_result` **all or
-    /// nothing** (#240): the exact room they need is reserved first, so the
-    /// aggregate either carries every trade the level committed or, when the
-    /// reservation is refused, none of them. The makers the level consumed
-    /// are always recorded in `filled_orders` and the risk / price-level
-    /// listener hooks always run, because those mirror the level's real
-    /// state whatever the aggregate could hold.
+    /// The makers the level consumed are always recorded in
+    /// `filled_orders` and the risk / price-level listener hooks always
+    /// run, because those mirror the level's real state whatever the
+    /// aggregate can hold; they read `price_level_match` before it is
+    /// folded. The level's committed trades are then folded into
+    /// `match_result` **all or nothing** (#240) by [`Self::fold_level`]
+    /// (`requested` is the quantity the level was asked for).
     ///
     /// # Errors
     ///
     /// Returns the level's own failure (`MatchResult::error()`, the root
-    /// cause: pricelevel committed the prefix it reports and then stopped)
-    /// or, failing that, the refused fold. The caller stops the sweep on
-    /// `Err`; every trade the level committed has been accounted for above.
+    /// cause: pricelevel committed the prefix it reports and then stopped;
+    /// PriceLevel#217 a poisoned level reports its refusal here too, with
+    /// no trades) or, failing that, the refused fold. The caller stops the
+    /// sweep on `Err`; every trade the level committed has been accounted
+    /// for above.
     #[allow(clippy::too_many_arguments)]
     fn process_level_match(
         &self,
         match_result: &mut MatchResult,
-        price_level_match: &MatchResult,
+        price_level_match: &mut MatchResult,
+        requested: u64,
         filled_orders: &mut Vec<(Id, u64)>,
         price: u128,
         price_level: &std::sync::Arc<pricelevel::PriceLevel>,
         side: Side,
         empty_price_levels: &mut Vec<u128>,
     ) -> Result<(), PriceLevelError> {
-        let level_trades = price_level_match.trades().as_vec();
-        let level_filled = price_level_match.filled_order_ids();
-        // Fallback only. The sweep already reserved this level's worst case
-        // (`reserve_level_worst_case`) before touching it, so this is a no-op
-        // unless the level emitted more trades than that bound: a
-        // replenishing iceberg / reserve maker trading again, or a maker
-        // admitted by a concurrent submit on the shared gate. It then grows
-        // the aggregate so the fold stays all or nothing. A lone trade needs
-        // no reservation (`add_trade` reserves its slot atomically).
-        let needs_reserve = level_trades.len() > 1 || !level_filled.is_empty();
-        let mut first_error: Option<PriceLevelError> = if needs_reserve {
-            match_result.try_reserve(level_trades.len()).err()
-        } else {
-            None
-        };
-        let fold = first_error.is_none();
+        let mut first_error: Option<PriceLevelError> = None;
+        let level_trade_count = price_level_match.trades().len();
+        {
+            let level_trades = price_level_match.trades().as_vec();
 
-        // Process trades if any occurred
-        if !level_trades.is_empty() {
-            // Update last trade price atomically
-            self.last_trade_price.store(price);
-            self.has_traded.store(true, Ordering::Relaxed);
+            // Process trades if any occurred
+            if !level_trades.is_empty() {
+                // Update last trade price atomically
+                self.last_trade_price.store(price);
+                self.has_traded.store(true, Ordering::Relaxed);
 
-            // Add trades to result and update per-account risk counters
-            // for the maker side of every trade.
-            for trade in level_trades {
-                // Room is reserved and pricelevel validated the quantities,
-                // so a failure here is an invariant breach; the maker is
-                // already mutated, so keep accounting and report it.
-                if fold && let Err(err) = match_result.add_trade(*trade) {
-                    first_error.get_or_insert(err);
+                // Update per-account risk counters for the maker side of
+                // every trade.
+                for trade in level_trades {
+                    self.risk_state.on_fill(
+                        trade.maker_order_id(),
+                        trade.quantity().as_u64(),
+                        trade.price().as_u128(),
+                    );
                 }
-                self.risk_state.on_fill(
-                    trade.maker_order_id(),
-                    trade.quantity().as_u64(),
-                    trade.price().as_u128(),
-                );
+
+                // Notify price level changes
+                self.emit_level_changed(side.opposite(), price_level);
             }
 
-            // Notify price level changes
-            self.emit_level_changed(side.opposite(), price_level);
-        }
-
-        // Collect fully-consumed makers for batch removal, each with its true
-        // filled quantity. Sum the maker's trades from THIS per-level result,
-        // where `filled_order_ids()` and `trades()` are kept consistent by
-        // pricelevel (an id is recorded only after its trade is added) — so the
-        // recorded `Filled { filled_quantity }` stays correct even if the
-        // aggregate fold was refused (#104). Per-level trade counts are small;
-        // this is the cold path, not the matching hot loop.
-        for &filled_order_id in level_filled {
-            if fold && let Err(err) = match_result.add_filled_order_id(filled_order_id) {
-                first_error.get_or_insert(err);
-            }
-            // A maker's trades at one level sum to at most its own quantity,
-            // so the checked sum cannot overflow; a `None` is an invariant
-            // breach, reported rather than clamped.
-            let filled_quantity = level_trades
-                .iter()
-                .filter(|trade| trade.maker_order_id() == filled_order_id)
-                .try_fold(0u64, |acc, trade| {
-                    acc.checked_add(trade.quantity().as_u64())
-                });
-            let filled_quantity = match filled_quantity {
-                Some(quantity) => quantity,
-                None => {
-                    first_error.get_or_insert_with(|| PriceLevelError::InvalidOperation {
-                        message: format!(
-                            "filled quantity of maker {filled_order_id} overflows u64"
-                        ),
+            // Collect fully-consumed makers for batch removal, each with its
+            // true filled quantity. Sum the maker's trades from THIS
+            // per-level result, where `filled_order_ids()` and `trades()` are
+            // kept consistent by pricelevel (an id is recorded only after its
+            // trade is added) — so the recorded `Filled { filled_quantity }`
+            // stays correct even if the aggregate fold is refused (#104).
+            // Per-level trade counts are small; this is the cold path, not
+            // the matching hot loop.
+            for &filled_order_id in price_level_match.filled_order_ids() {
+                // A maker's trades at one level sum to at most its own
+                // quantity, so the checked sum cannot overflow; a `None` is an
+                // invariant breach, reported rather than clamped.
+                let filled_quantity = level_trades
+                    .iter()
+                    .filter(|trade| trade.maker_order_id() == filled_order_id)
+                    .try_fold(0u64, |acc, trade| {
+                        acc.checked_add(trade.quantity().as_u64())
                     });
-                    0
-                }
-            };
-            filled_orders.push((filled_order_id, filled_quantity));
-            // The maker left its level. `on_fill` above already released a
-            // normally exhausted maker (no-op here); a non-auto-replenishing
-            // reserve maker was removed with its hidden tranche discarded
-            // (#230), and that remainder is released now, in the same
-            // removal, instead of staying booked forever (#243 review).
-            self.risk_state.on_maker_removed(filled_order_id);
+                let filled_quantity = match filled_quantity {
+                    Some(quantity) => quantity,
+                    None => {
+                        first_error.get_or_insert_with(|| PriceLevelError::InvalidOperation {
+                            message: format!(
+                                "filled quantity of maker {filled_order_id} overflows u64"
+                            ),
+                        });
+                        0
+                    }
+                };
+                // Reserved before the level was touched
+                // (`reserve_level_fold`), so this push does not grow the
+                // pooled buffer.
+                filled_orders.push((filled_order_id, filled_quantity));
+                // The maker left its level. `on_fill` above already released
+                // a normally exhausted maker (no-op here); a
+                // non-auto-replenishing reserve maker was removed with its
+                // hidden tranche discarded (#230), and that remainder is
+                // released now, in the same removal, instead of staying
+                // booked forever (#243 review).
+                self.risk_state.on_maker_removed(filled_order_id);
+            }
         }
 
         // Check if price level is empty and mark for removal
@@ -1887,7 +2029,12 @@ where
             empty_price_levels.push(price);
         }
 
-        if !fold {
+        // The level's own failure is the root cause: pricelevel committed
+        // the prefix folded below and then stopped. Read it before the fold,
+        // which drains the level result.
+        let level_error = price_level_match.error().cloned();
+
+        if let Err(err) = Self::fold_level(match_result, price_level_match, requested) {
             // The aggregate could not take this level's committed trades.
             // The level, the makers' risk and order state already reflect
             // them, the trade stream will not. This is the ONLY path on which
@@ -1897,15 +2044,15 @@ where
             crate::orderbook::metrics::record_match_fold_failure();
             tracing::error!(
                 price,
-                level_trade_count = level_trades.len(),
+                level_trade_count,
+                error = %err,
                 "committed trades of a price level could not be folded into the taker's result"
             );
+            first_error.get_or_insert(err);
         }
 
-        // The level's own failure is the root cause: pricelevel committed
-        // the prefix folded above and then stopped.
-        match price_level_match.error() {
-            Some(level_err) => Err(level_err.clone()),
+        match level_error {
+            Some(level_err) => Err(level_err),
             None => match first_error {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -1913,65 +2060,128 @@ where
         }
     }
 
-    /// Reserve the aggregate result and the pooled filled-maker buffer for
-    /// the most trades one level can emit for a taker capped at `qty_cap`
-    /// (#240): `min(resting makers, qty_cap)`. Each maker trades at most
-    /// once unless a replenishing iceberg / reserve comes back with a fresh
-    /// tranche, and every trade takes at least one unit.
+    /// Fold one level's result into the sweep's aggregate (#240,
+    /// PriceLevel#219), all or nothing: on `Err` the aggregate is exactly
+    /// as it was (a trade-by-trade append past its reserved room is the
+    /// exception, and only an invariant breach can refuse one).
+    ///
+    /// - A level with no trades and no filled makers (nothing matchable, a
+    ///   rejected self-match, a poisoned level) changes nothing: its
+    ///   remaining quantity is what it was asked for.
+    /// - A level asked for exactly the aggregate's remaining quantity is
+    ///   absorbed with `MatchResult::try_absorb`: into an empty aggregate it
+    ///   adopts the level's buffers (no allocation, cannot fail), otherwise
+    ///   it appends into the room `reserve_level_fold` reserved. A level
+    ///   that failed mid-match hands its error to the aggregate, which the
+    ///   abort path strips again (`abort_sweep`).
+    /// - Any other level (quote-notional, STP pre-match) is appended trade
+    ///   by trade after reserving room for all of it.
+    ///
+    /// # Errors
+    ///
+    /// [`PriceLevelError::CapacityExceeded`] when the aggregate cannot grow
+    /// (only possible past the reservation: replenishment trades beyond
+    /// the per-level bound); [`PriceLevelError::InvalidOperation`] on an
+    /// invariant breach (a trade the aggregate's remaining quantity cannot
+    /// take).
+    #[inline]
+    fn fold_level(
+        match_result: &mut MatchResult,
+        level: &mut MatchResult,
+        requested: u64,
+    ) -> Result<(), PriceLevelError> {
+        if level.trades().is_empty() && level.filled_order_ids().is_empty() {
+            return Ok(());
+        }
+        if requested == match_result.remaining_quantity().as_u64() {
+            return match_result.try_absorb(level);
+        }
+        let level_trades = level.trades().as_vec();
+        let level_filled = level.filled_order_ids();
+        match_result.try_reserve_trades(level_trades.len())?;
+        match_result.try_reserve_filled_order_ids(level_filled.len())?;
+        for trade in level_trades {
+            match_result.add_trade(*trade)?;
+        }
+        for filled_order_id in level_filled {
+            match_result.add_filled_order_id(*filled_order_id)?;
+        }
+        Ok(())
+    }
+
+    /// `true` when [`Self::fold_level`] will absorb a level asked for
+    /// `match_qty` into `match_result` without needing any room: the
+    /// aggregate holds nothing yet and the level gets exactly its remaining
+    /// quantity, so `try_absorb` adopts the level's own buffers.
+    #[inline]
+    #[must_use]
+    fn fold_adopts_level(match_result: &MatchResult, match_qty: u64) -> bool {
+        match_result.trades().is_empty()
+            && match_result.filled_order_ids().is_empty()
+            && match_qty == match_result.remaining_quantity().as_u64()
+    }
+
+    /// Reserve what folding one level asked for `match_qty` can need
+    /// (#240), before the level is touched: `min(resting makers,
+    /// match_qty)` more slots in the pooled filled-maker buffer, and the
+    /// same in the aggregate's trade and filled-id vectors unless the fold
+    /// will adopt the level's own buffers ([`Self::fold_adopts_level`]:
+    /// the first traded level of every base-quantity sweep, which is where
+    /// PriceLevel#219 removed the extra allocation and the deep-level
+    /// over-reservation). Each maker trades at most once unless a
+    /// replenishing iceberg / reserve comes back with a fresh tranche, and
+    /// every trade takes at least one unit.
     ///
     /// Residual (documented in `doc/panic-boundaries.md`): replenishment
     /// trades, and makers admitted to the level by a concurrent submit on
-    /// the shared gate while it is being swept, can exceed this bound; the
-    /// extra slots then grow during the fold, and only an allocator refusal
-    /// at that point leaves the level's trades out of the aggregate.
+    /// the shared gate while it is being swept, can exceed this bound on a
+    /// level after the first; the extra slots then grow during the fold,
+    /// and only an allocator refusal at that point leaves the level's
+    /// trades out of the aggregate. On deep levels past the first the bound
+    /// still over-reserves (amortized, so capacity carries over to later
+    /// levels).
     ///
     /// # Errors
     ///
     /// [`PriceLevelError::CapacityExceeded`] when a buffer cannot grow; the
     /// level has not been touched.
     #[inline]
-    fn reserve_level_worst_case(
+    fn reserve_level_fold(
         match_result: &mut MatchResult,
         filled_orders: &mut Vec<(Id, u64)>,
         price_level: &pricelevel::PriceLevel,
-        qty_cap: u64,
+        match_qty: u64,
     ) -> Result<(), PriceLevelError> {
         let makers = u64::try_from(price_level.order_count()).unwrap_or(u64::MAX);
-        Self::reserve_sweep_steps(match_result, filled_orders, makers.min(qty_cap))
+        let steps = steps_to_usize(makers.min(match_qty))?;
+        reserve_filled_makers(filled_orders, steps)?;
+        if Self::fold_adopts_level(match_result, match_qty) {
+            return Ok(());
+        }
+        match_result.try_reserve_trades(steps)?;
+        match_result.try_reserve_filled_order_ids(steps)
     }
 
-    // PriceLevel#219: `MatchResult::try_reserve` reserves trades and filled
-    // ids with one count, so a level with no full fill still allocates the
-    // filled-id vector, and the `min(makers, qty)` bound over-reserves on
-    // deep levels. Split reservations / `try_absorb` upstream will remove
-    // both; do not skip the pre-reservation in the meantime.
-    /// Reserve room for `steps` maker steps in the aggregate result (trades
-    /// and filled ids) and the pooled filled-maker buffer: the fill-or-kill
-    /// preflight and the per-level worst case (#240). Amortized growth: a
-    /// no-op when the room is already there, and the pooled buffer is
-    /// reused across sweeps.
+    /// Reserve the fill-or-kill preflight's `reservation` (#240) in the
+    /// aggregate result and the pooled filled-maker buffer. Amortized
+    /// growth: a no-op when the room is already there, and the pooled
+    /// buffer is reused across sweeps.
     ///
     /// # Errors
     ///
     /// [`PriceLevelError::CapacityExceeded`] when a buffer cannot grow (or
-    /// `steps` does not fit `usize`); nothing observable has changed.
+    /// a count does not fit `usize`); nothing observable has changed.
     #[inline]
-    fn reserve_sweep_steps(
+    fn reserve_sweep(
         match_result: &mut MatchResult,
         filled_orders: &mut Vec<(Id, u64)>,
-        steps: u64,
+        reservation: SweepReservation,
     ) -> Result<(), PriceLevelError> {
-        let steps = usize::try_from(steps).map_err(|_| PriceLevelError::CapacityExceeded {
-            resource: CapacityResource::Trades,
-            additional: usize::MAX,
-        })?;
-        match_result.try_reserve(steps)?;
-        filled_orders
-            .try_reserve(steps)
-            .map_err(|_| PriceLevelError::CapacityExceeded {
-                resource: CapacityResource::FilledOrderIds,
-                additional: steps,
-            })
+        let trades = steps_to_usize(reservation.trades)?;
+        let filled_ids = steps_to_usize(reservation.filled_ids)?;
+        match_result.try_reserve_trades(trades)?;
+        match_result.try_reserve_filled_order_ids(filled_ids)?;
+        reserve_filled_makers(filled_orders, filled_ids)
     }
 
     /// Record a taker rejected by a pricelevel failure before any mutation
@@ -2019,6 +2229,14 @@ where
     /// unnormalized prefix is reported (#246, see
     /// [`Self::report_unnormalized_prefix`]) and the original `source`
     /// stays the abort's cause.
+    ///
+    /// A base-quantity prefix whose failed level was absorbed with
+    /// `MatchResult::try_absorb` (PriceLevel#219) carries that level's
+    /// error in its error slot. The error is the abort's `source`; the
+    /// published prefix is rebuilt without it, so the committed
+    /// `TradeResult` has the same shape as before #219. If that rebuild is
+    /// refused (only an allocator refusal can) the prefix is published with
+    /// the error slot set rather than dropped, and logged.
     #[cold]
     #[inline(never)]
     fn abort_sweep(
@@ -2036,10 +2254,55 @@ where
                     unnormalized
                 }
             }
+        } else if match_result.is_failed() {
+            match Self::strip_level_error(order_id, match_result) {
+                Ok(stripped) => stripped,
+                Err((unstripped, err)) => {
+                    tracing::error!(
+                        order_id = %order_id,
+                        error = %err,
+                        "aborted prefix could not be rebuilt without the failed level's error; published with it"
+                    );
+                    unstripped
+                }
+            }
         } else {
             match_result
         };
         self.abort_with_prefix(order_id, match_result, source)
+    }
+
+    /// Rebuild `src` without its error slot: same trades, filled ids and
+    /// remaining quantity (PriceLevel#219, see [`Self::abort_sweep`]).
+    ///
+    /// # Errors
+    ///
+    /// The untouched `src` with the failure, as for
+    /// [`Self::normalize_notional_match_result`]; additionally
+    /// [`PriceLevelError::InvalidOperation`] when executed plus remaining
+    /// quantity overflows `u64` (an invariant breach).
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::result_large_err)]
+    fn strip_level_error(
+        order_id: Id,
+        src: MatchResult,
+    ) -> Result<MatchResult, (MatchResult, PriceLevelError)> {
+        let initial = match src.executed_quantity() {
+            Ok(executed) => executed
+                .as_u64()
+                .checked_add(src.remaining_quantity().as_u64()),
+            Err(err) => return Err((src, err)),
+        };
+        match initial {
+            Some(initial) => Self::rebuild_match_result(order_id, src, Quantity::new(initial)),
+            None => Err((
+                src,
+                PriceLevelError::InvalidOperation {
+                    message: "aborted prefix quantity overflows u64".to_string(),
+                },
+            )),
+        }
     }
 
     /// Second half of [`Self::abort_sweep`]: record and return the abort for
@@ -2184,18 +2447,34 @@ where
     /// trade is emitted (#96).
     ///
     /// Alongside the fillable quantity the walk measures what the sweep will
-    /// draw on (#240): an upper bound on the trades — and so trade ids — it
-    /// can emit, and its non-replenishing maker steps, so the fill-or-kill
-    /// preflight can check the trade-id headroom and reserve the result
-    /// buffers before any mutation. See [`FokFeasibility`].
+    /// draw on (#240): the trade ids it takes and the result buffers it
+    /// needs, so the fill-or-kill preflight can check the trade-id headroom
+    /// and reserve the buffers before any mutation. See [`FokFeasibility`].
+    ///
+    /// Each level is dry-run with `PriceLevel::match_requirements` for the
+    /// quantity the sweep will ask of it (PriceLevel#218), which reports the
+    /// exact trades, trade ids and FIFO sequences the match takes. Under
+    /// [`FeasibilityScope::Preflight`] every level the sweep reaches must
+    /// also be matchable in full: not poisoned (PriceLevel#217), its
+    /// counters with headroom (`MatchRequirements::check` against
+    /// `PriceLevel::counter_headroom`), and no maker step the sweep would
+    /// stop at (`MatchRequirements::stop_error`). The per-level answers are
+    /// only valid while nothing else can mutate the levels until the sweep
+    /// ends, which the exclusive submit gate a fill-or-kill submit holds
+    /// guarantees: every `OrderBook` mutation path takes a side of that gate
+    /// or `&mut self` (see [`Self::acquire_coherent_submit_gate`]).
     ///
     /// # Errors
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a level's
-    /// insertion-sequence view or its `matchable_quantity` dry run fails
-    /// (both fallible since pricelevel 0.10). The caller must treat that as
-    /// "feasibility unknown" and refuse the order rather than guess: a
-    /// failed dry run is a kill, never zero depth.
+    /// insertion-sequence view or its dry run fails (both fallible since
+    /// pricelevel 0.10). The caller must treat that as "feasibility
+    /// unknown" and refuse the order rather than guess: a failed dry run is
+    /// a kill, never zero depth. Under [`FeasibilityScope::Preflight`] also
+    /// returns the error of the first reached level that could not be
+    /// matched in full: `InvalidOperation` for a poisoned level,
+    /// `CounterExhausted` for a counter without headroom, or the maker-step
+    /// error the sweep would stop at.
     pub(crate) fn fok_fillable_quantity(
         &self,
         side: Side,
@@ -2203,6 +2482,7 @@ where
         price_limit: Option<u128>,
         taker_user_id: Hash32,
         taker_id: Id,
+        scope: FeasibilityScope,
     ) -> Result<FokFeasibility, OrderBookError> {
         let price_levels = match side {
             Side::Buy => &self.asks,
@@ -2210,8 +2490,8 @@ where
         };
         let mut feasibility = FokFeasibility {
             fillable: 0,
-            max_trades: 0,
-            maker_steps: 0,
+            trade_ids: 0,
+            reservation: SweepReservation::NONE,
         };
         if quantity == 0 || price_levels.is_empty() {
             return Ok(feasibility);
@@ -2219,6 +2499,7 @@ where
 
         let lot = self.lot_size.unwrap_or(1);
         let stp_active = self.stp_mode.is_enabled() && taker_user_id != Hash32::zero();
+        let preflight = scope == FeasibilityScope::Preflight;
 
         let price_iter = match side {
             Side::Buy => Either::Left(price_levels.iter()),
@@ -2259,25 +2540,39 @@ where
 
             let price_level = entry.value();
 
-            // Reachable depth at this level — the quantity the real sweep could
-            // actually fill. The non-STP and STP-NoConflict cases delegate to
-            // pricelevel's authoritative dry-run `PriceLevel::matchable_quantity`
-            // (pricelevel 0.8.2), the single upstream source of truth for what
-            // `match_order` would consume — including iceberg/reserve replenishment
-            // and the removal of a non-auto-replenish reserve's undrawable hidden —
-            // instead of re-deriving it from a hand-rolled per-order estimate that
-            // could silently drift from `match_against` (#136, follow-up to #96).
-            let (reachable, stop_after) = if stp_active {
+            // PriceLevel#217: a poisoned level refuses every match. The
+            // sweep would stop there, after the earlier levels committed.
+            if preflight && price_level.is_poisoned() {
+                return Err(OrderBookError::PriceLevelError(poisoned_level_error(price)));
+            }
+            #[cfg(test)]
+            if preflight
+                && let Some(hook) = self.fok_level_fault_hook.as_ref()
+                && let Some(err) = hook(price)
+            {
+                return Err(OrderBookError::PriceLevelError(err));
+            }
+
+            // What the sweep will ask of this level, and what it takes.
+            // `Some(match_qty)`: the level is matched once, for `match_qty`,
+            // on the queue as it rests now, so pricelevel's dry run is exact
+            // (non-STP, STP `NoConflict`, and the `CancelTaker` /
+            // `CancelBoth` pre-match up to the non-self depth). `None`:
+            // `CancelMaker` cancels same-user makers before the match, so
+            // the dry run cannot see the queue the match will run on.
+            //
+            // The non-STP and STP-NoConflict depths delegate to pricelevel's
+            // authoritative dry run (#136, follow-up to #96) instead of a
+            // hand-rolled per-order estimate that could drift from
+            // `match_against`.
+            let (reachable, stop_after, exact_qty) = if stp_active {
                 // Insertion-sequence order = the sweep's consumption order, so the
                 // feasibility STP decision matches the real match even under
                 // non-monotonic timestamps (#132).
                 let orders = price_level.snapshot_by_insertion_seq()?;
                 match check_stp_at_level(&orders, taker_user_id, self.stp_mode) {
-                    // No self-trade: the whole level is reachable — delegate to the
-                    // upstream dry run.
-                    STPAction::NoConflict => {
-                        (price_level.matchable_quantity(cap, taker_id)?, false)
-                    }
+                    // No self-trade: the whole level is reachable.
+                    STPAction::NoConflict => (None, false, Some(cap)),
                     // Same-user makers are cancelled, not filled: only non-self
                     // resting depth is reachable; the walk continues. The upstream
                     // primitive cannot filter by user, so the non-self matchable
@@ -2298,40 +2593,95 @@ where
                                 break;
                             }
                         }
-                        (non_self, false)
+                        (Some(non_self), false, None)
                     }
-                    // The taker is cancelled at the first same-user order: it can
-                    // fill at most `safe_quantity` (visible-only, matching the real
-                    // sweep's cap) here, then stops.
+                    // The taker is cancelled at the first same-user order: the
+                    // sweep pre-matches `min(cap, safe_quantity)` here, then
+                    // stops. `safe_quantity` only sums the visible depth ahead
+                    // of the same-user maker; what the pre-match takes is the
+                    // dry run's fill for that request (a maker that makes no
+                    // progress, or a replenish-overflow stop, delivers less
+                    // than it shows), exactly as the modify precheck
+                    // `check_modify_stp_self_cross` bounds it.
                     STPAction::CancelTaker { safe_quantity }
-                    | STPAction::CancelBoth { safe_quantity, .. } => (safe_quantity, true),
+                    | STPAction::CancelBoth { safe_quantity, .. } => {
+                        (None, true, Some(cap.min(safe_quantity)))
+                    }
                 }
             } else {
-                (price_level.matchable_quantity(cap, taker_id)?, false)
+                (None, false, Some(cap))
             };
 
-            let taken = cap.min(reachable);
+            let makers = u64::try_from(price_level.order_count()).unwrap_or(u64::MAX);
+            // (taken, trade ids, trades to reserve, filled ids to reserve)
+            let (taken, level_trade_ids, level_trades, level_filled) = match exact_qty {
+                Some(match_qty) => {
+                    let requirements = price_level.match_requirements(match_qty, taker_id)?;
+                    if preflight && match_qty > 0 {
+                        // PriceLevel#218: no per-level counter may refuse the
+                        // match, and no maker step may stop it.
+                        requirements
+                            .check(&price_level.counter_headroom())
+                            .map_err(OrderBookError::PriceLevelError)?;
+                        if let Some(err) = requirements.stop_error() {
+                            return Err(OrderBookError::PriceLevelError(err.clone()));
+                        }
+                    }
+                    // The authoritative dry-run fill, never counted depth.
+                    let taken = match_qty.min(requirements.fillable());
+                    // The sweep reserves `min(makers, match_qty)` before it
+                    // touches the level (`reserve_level_fold`); the fold then
+                    // needs the exact trade count, which replenishments can
+                    // push past that bound. Filled makers are at most the
+                    // trades and the makers, so the level reservation covers
+                    // them.
+                    let level_reserve = makers.min(match_qty);
+                    let trades = u64::try_from(requirements.trades()).unwrap_or(u64::MAX);
+                    (
+                        taken,
+                        requirements.trade_ids_required()?,
+                        trades.max(level_reserve),
+                        level_reserve,
+                    )
+                }
+                None => {
+                    let taken = cap.min(reachable.unwrap_or(0));
+                    if preflight
+                        && let Some(counter) = price_level.counter_headroom().closed_epoch()
+                    {
+                        // Cancelling makers never reopens an epoch.
+                        return Err(OrderBookError::PriceLevelError(
+                            PriceLevelError::CounterExhausted { counter },
+                        ));
+                    }
+                    let steps = makers.min(taken);
+                    let ids_bound = if price_level.hidden_quantity() == 0 {
+                        steps
+                    } else {
+                        taken
+                    };
+                    let level_reserve = makers.min(cap);
+                    (taken, ids_bound, level_reserve, level_reserve)
+                }
+            };
+
             feasibility.fillable = feasibility
                 .fillable
                 .checked_add(taken)
                 .ok_or_else(fok_counter_overflow)?;
-            // Trades at this level: one per maker without hidden depth
-            // (each trades at most once), at most one per unit taken when a
-            // replenishing maker can come back for more.
-            let makers = u64::try_from(price_level.order_count()).unwrap_or(u64::MAX);
-            let steps = makers.min(taken);
-            let level_max_trades = if price_level.hidden_quantity() == 0 {
-                steps
-            } else {
-                taken
-            };
-            feasibility.max_trades = feasibility
-                .max_trades
-                .checked_add(level_max_trades)
+            feasibility.trade_ids = feasibility
+                .trade_ids
+                .checked_add(level_trade_ids)
                 .ok_or_else(fok_counter_overflow)?;
-            feasibility.maker_steps = feasibility
-                .maker_steps
-                .checked_add(steps)
+            feasibility.reservation.trades = feasibility
+                .reservation
+                .trades
+                .checked_add(level_trades)
+                .ok_or_else(fok_counter_overflow)?;
+            feasibility.reservation.filled_ids = feasibility
+                .reservation
+                .filled_ids
+                .checked_add(level_filled)
                 .ok_or_else(fok_counter_overflow)?;
             if stop_after {
                 break;
@@ -2674,7 +3024,14 @@ mod panic_forms_tests {
 
         let taker = Id::from_u64(10);
         let feasibility = book
-            .fok_fillable_quantity(Side::Buy, u64::MAX, Some(100), taker_user, taker)
+            .fok_fillable_quantity(
+                Side::Buy,
+                u64::MAX,
+                Some(100),
+                taker_user,
+                taker,
+                FeasibilityScope::Preflight,
+            )
             .expect("feasibility walk");
         assert_eq!(
             feasibility.fillable,

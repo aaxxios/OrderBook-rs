@@ -13,7 +13,7 @@ use super::risk::{ReferencePriceSource, RiskConfig, RiskRebuild, RiskState};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
 use crate::orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChangedListener};
-use crate::orderbook::matching::MatchOutcome;
+use crate::orderbook::matching::{MatchOutcome, SweepReservation};
 #[cfg(feature = "special_orders")]
 use crate::orderbook::repricing::SpecialOrderTracker;
 use crate::orderbook::stp::STPMode;
@@ -493,6 +493,20 @@ pub struct OrderBook<T = ()> {
     /// nor its `Option` check reaches a release binary.
     #[cfg(test)]
     pub(super) level_interleave_hook: Option<std::sync::Arc<dyn Fn(u128) + Send + Sync>>,
+
+    /// Test-only fault injection for the fill-or-kill preflight (#293).
+    ///
+    /// Consulted by `fok_fillable_quantity` under
+    /// `FeasibilityScope::Preflight` for every level the walk reaches,
+    /// after the real poisoned-level check: returning `Some(err)` makes the
+    /// preflight treat that level as unmatchable with `err`. It stands in
+    /// for states pricelevel does not let this crate construct: a poisoned
+    /// level (PriceLevel#217 needs a panic inside the level) and a per-level
+    /// counter without headroom (PriceLevel#218 needs about `2^64`
+    /// operations on one level). Exists only in `cfg(test)` builds.
+    #[cfg(test)]
+    pub(super) fok_level_fault_hook:
+        Option<std::sync::Arc<dyn Fn(u128) -> Option<pricelevel::PriceLevelError> + Send + Sync>>,
 
     /// Test-only fault injection for the single-order cancel path (#248).
     ///
@@ -1030,6 +1044,8 @@ where
             stp_interleave_hook: None,
             #[cfg(test)]
             level_interleave_hook: None,
+            #[cfg(test)]
+            fok_level_fault_hook: None,
             #[cfg(test)]
             cancel_fault_hook: None,
             #[cfg(test)]
@@ -1981,6 +1997,8 @@ where
             #[cfg(test)]
             level_interleave_hook: None,
             #[cfg(test)]
+            fok_level_fault_hook: None,
+            #[cfg(test)]
             cancel_fault_hook: None,
             #[cfg(test)]
             rest_fault_hook: None,
@@ -2052,6 +2070,8 @@ where
             stp_interleave_hook: None,
             #[cfg(test)]
             level_interleave_hook: None,
+            #[cfg(test)]
+            fok_level_fault_hook: None,
             #[cfg(test)]
             cancel_fault_hook: None,
             #[cfg(test)]
@@ -4133,7 +4153,7 @@ where
             None,
             user_id,
             TakerKind::Standard,
-            0,
+            SweepReservation::NONE,
             verified,
         )?;
         self.publish_match_outcome(outcome, want_committed)
@@ -4728,7 +4748,7 @@ where
             Some(limit_price),
             user_id,
             TakerKind::Standard,
-            0,
+            SweepReservation::NONE,
             verified,
         )?;
         self.publish_match_outcome(outcome, false)
