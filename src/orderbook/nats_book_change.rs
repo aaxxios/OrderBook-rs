@@ -1,7 +1,7 @@
 //! NATS JetStream order book change publisher.
 //!
 //! This module provides [`NatsBookChangePublisher`], which converts
-//! [`PriceLevelChangedEvent`]s from the order book into batched NATS JetStream
+//! [`PriceLevelChangedEvent`](crate::orderbook::book_change_event::PriceLevelChangedEvent)s from the order book into batched NATS JetStream
 //! messages. Events are collected via a bounded channel and flushed either when
 //! the batch window elapses or the batch reaches its maximum size.
 //!
@@ -62,7 +62,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! orderbook-rs = { version = "0.6", features = ["nats"] }
+//! orderbook-rs = { version = "0.14", features = ["nats"] }
 //! ```
 
 use crate::orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChangedListener};
@@ -177,7 +177,7 @@ impl From<PriceLevelChangedEvent> for BookChangeEntry {
 /// The publisher wraps a JetStream context and provides a non-blocking
 /// [`into_listener`](NatsBookChangePublisher::into_listener) method that returns
 /// a [`PriceLevelChangedListener`] suitable for use with
-/// [`OrderBook::price_level_changed_listener`].
+/// [`OrderBook::set_price_level_listener`](crate::orderbook::OrderBook::set_price_level_listener).
 ///
 /// # Batching
 ///
@@ -401,7 +401,7 @@ impl NatsBookChangePublisher {
     /// Set the batch window duration in milliseconds.
     ///
     /// Events are accumulated for at most this duration before being flushed.
-    /// Defaults to [`DEFAULT_BATCH_WINDOW_MS`] (1 ms).
+    /// Defaults to `DEFAULT_BATCH_WINDOW_MS` (1 ms).
     ///
     /// Values above [`MAX_BATCH_WINDOW_MS`] (60,000 ms) are **clamped** to it
     /// with a `tracing::warn!`; the builder never panics.
@@ -416,7 +416,7 @@ impl NatsBookChangePublisher {
     /// Set the maximum number of events per batch.
     ///
     /// When the batch reaches this size it is flushed immediately, regardless
-    /// of the time window. Defaults to [`DEFAULT_MAX_BATCH_SIZE`] (100).
+    /// of the time window. Defaults to `DEFAULT_MAX_BATCH_SIZE` (100).
     ///
     /// The value is **clamped** into `1..=`[`MAX_BATCH_SIZE`](crate::orderbook::nats::MAX_BATCH_SIZE) with a
     /// `tracing::warn!`: `0` becomes `1` (a zero batch size could not drain
@@ -431,7 +431,7 @@ impl NatsBookChangePublisher {
     /// Set the bounded channel capacity.
     ///
     /// When the channel is full, new events are dropped and `dropped_events`
-    /// is incremented. Defaults to [`DEFAULT_CHANNEL_CAPACITY`] (10,000).
+    /// is incremented. Defaults to `DEFAULT_CHANNEL_CAPACITY` (10,000).
     ///
     /// A `channel_capacity` of `0`, or one above [`MAX_CHANNEL_CAPACITY`](crate::orderbook::nats::MAX_CHANNEL_CAPACITY)
     /// (Tokio's semaphore limit), is invalid for a Tokio mpsc channel. Rather
@@ -449,7 +449,7 @@ impl NatsBookChangePublisher {
     ///
     /// When set to a value greater than 0, the publisher will wait at least
     /// this long between consecutive NATS publish operations. Defaults to
-    /// [`DEFAULT_MIN_PUBLISH_INTERVAL_MS`] (0, disabled).
+    /// `DEFAULT_MIN_PUBLISH_INTERVAL_MS` (0, disabled).
     ///
     /// Values above [`MAX_MIN_PUBLISH_INTERVAL_MS`] (60,000 ms) are
     /// **clamped** to it with a `tracing::warn!`.
@@ -466,7 +466,7 @@ impl NatsBookChangePublisher {
 
     /// Set the maximum number of retry attempts for transient NATS failures.
     ///
-    /// Defaults to [`DEFAULT_MAX_RETRIES`] (3). Set to 0 to disable retries.
+    /// Defaults to `DEFAULT_MAX_RETRIES` (3). Set to 0 to disable retries.
     /// Retry `n` (zero-based) waits a jittered delay in `[c / 2, c]` where
     /// `c = min(BASE_RETRY_DELAY_MS * 2^n, MAX_RETRY_DELAY_MS)`.
     ///

@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed (breaking)
 
+- **`ReplayError` is `#[non_exhaustive]` (#260).** 0.14 already adds
+  `JournalTruncated` and `MassCancelMismatch`; marking the enum now, in the
+  breaking window, lets later failure modes land without another break.
+  Compatibility: a `match` on `ReplayError` outside this crate needs a
+  wildcard arm. No behaviour change.
 - **Core boundary tightening (#294).** Compatibility:
   - `OrderBook::place_order_in_book` is removed. It was a public raw
     placement that bypassed the submit gate, the kill switch, risk,
@@ -1392,6 +1397,19 @@ change.
 
 ### Documentation
 
+- **Final panic-policy documentation (#260).** `doc/panic-boundaries.md` is
+  complete: enforced contract, concurrent-map write paths, macro-generated
+  `unsafe`, and a per-call-site inventory of caller-supplied code (locks
+  held, committed state, unwind effect). The 0.14.0 notes in `src/lib.rs`
+  / `README.md` are regrouped (breaking behaviour, breaking signatures,
+  hardening, known limitations, tooling) with a completed migration table.
+  `doc/USER_GUIDE.md` samples are updated to the 0.14 API (compile-checked)
+  and recommend `create_snapshot_package` / `restore_from_snapshot_package`;
+  `doc/wire-protocol.md` documents `MAX_FRAME_BODY` (4096) and encoder
+  validation. The trailing-stop limitation (#286: trailing stops rest as
+  limit liquidity and do not trail on an uncrossed book) is stated in the
+  crate docs, the `repricing` module docs and the user guide. Broken
+  rustdoc links in the NATS modules are fixed.
 - **Level statistics are advisory under concurrent takers (#241).**
   pricelevel 0.10 supports exactly one concurrent writer of a level's
   execution statistics (`orders_executed`, `quantity_executed`,
