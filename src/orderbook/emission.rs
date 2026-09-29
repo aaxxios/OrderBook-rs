@@ -100,12 +100,11 @@ use pricelevel::Id;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-/// `try_lock` attempts before a contended outbox lock blocks. The critical
-/// sections are a few atomic operations and a queue push or a prefix pop,
-/// so a short spin almost always wins and avoids parking the thread.
-const LOCK_SPINS: u32 = 64;
+/// Backoff rounds on the outbox's spin flag before a waiter starts
+/// yielding its time slice. Round `r` spins `2^min(r, 6)` times.
+const FLAG_SPIN_ROUNDS: u32 = 12;
 
 /// Drained event buffers a book keeps for reuse (#249). Under concurrent
 /// submitters a committer's buffer is delivered, and drained, by another
@@ -223,7 +222,15 @@ struct OutboxState {
 /// diagnostic counters.
 #[derive(Debug)]
 pub(super) struct EventOutbox {
+    /// Taken only by the holder of `busy`, so it is never contended: a
+    /// contended pthread mutex (the std implementation on macOS) parks
+    /// waiters in the kernel, which dominated the contended commit path.
     state: Mutex<OutboxState>,
+    /// Test-and-test-and-set spin flag in front of `state` (#249 perf):
+    /// waiters spin with exponential backoff, then yield, instead of
+    /// parking. The critical sections are a few atomics and one queue
+    /// push or prefix pop.
+    busy: AtomicBool,
     /// `true` while a thread holds the dispatcher role.
     dispatching: AtomicBool,
     /// `!state.queue.is_empty()`, written under the mutex only when it
@@ -243,6 +250,7 @@ impl Default for EventOutbox {
     fn default() -> Self {
         Self {
             state: Mutex::default(),
+            busy: AtomicBool::new(false),
             dispatching: AtomicBool::new(false),
             nonempty: AtomicBool::new(false),
             dropped_events: AtomicU64::new(0),
@@ -256,18 +264,35 @@ impl Default for EventOutbox {
 impl EventOutbox {
     /// Lock the queue state, recovering from poisoning (see the module
     /// docs: the state is structurally intact at every unwind point).
-    fn lock(&self) -> MutexGuard<'_, OutboxState> {
-        for _ in 0..LOCK_SPINS {
-            match self.state.try_lock() {
-                Ok(state) => return state,
-                Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
-                Err(TryLockError::Poisoned(poisoned)) => return self.recover(poisoned),
+    fn lock(&self) -> OutboxGuard<'_> {
+        let mut round = 0u32;
+        loop {
+            if !self.busy.load(Ordering::Relaxed)
+                && self
+                    .busy
+                    .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+            if round < FLAG_SPIN_ROUNDS {
+                let spins = 1u32.checked_shl(round.min(6)).unwrap_or(1);
+                for _ in 0..spins {
+                    std::hint::spin_loop();
+                }
+                round = round.checked_add(1).unwrap_or(round);
+            } else {
+                std::thread::yield_now();
             }
         }
-        match self.state.lock() {
+        // Built before the mutex is taken, so the flag is released even if
+        // the (unreachable) poison path below unwinds.
+        let flag = FlagRelease(&self.busy);
+        let state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => self.recover(poisoned),
-        }
+        };
+        OutboxGuard { state, _flag: flag }
     }
 
     /// Recover a poisoned outbox lock (see [`Self::lock`]).
@@ -320,6 +345,39 @@ impl EventOutbox {
             u64::try_from(n).unwrap_or(u64::MAX),
             "dropped_listener_events",
         );
+    }
+}
+
+/// Guard over the outbox state: the mutex guard plus the spin flag. Fields
+/// drop in declaration order, so the mutex is unlocked before the flag is
+/// released and the next flag holder never finds the mutex taken.
+struct OutboxGuard<'a> {
+    state: MutexGuard<'a, OutboxState>,
+    _flag: FlagRelease<'a>,
+}
+
+impl std::ops::Deref for OutboxGuard<'_> {
+    type Target = OutboxState;
+    #[inline]
+    fn deref(&self) -> &OutboxState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for OutboxGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut OutboxState {
+        &mut self.state
+    }
+}
+
+/// Releases the outbox spin flag on drop (also during an unwind).
+struct FlagRelease<'a>(&'a AtomicBool);
+
+impl Drop for FlagRelease<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
