@@ -216,7 +216,12 @@ impl ReplayBookConfig {
 }
 
 /// Errors that can occur during journal replay.
+///
+/// `#[non_exhaustive]` since 0.14.0 (#260): new failure modes are added over
+/// time (0.14 added `JournalTruncated` and `MassCancelMismatch`), so a match
+/// outside this crate needs a wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ReplayError {
     /// The journal contains no events to replay.
     #[error("journal is empty — nothing to replay")]
