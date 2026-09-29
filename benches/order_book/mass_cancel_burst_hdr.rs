@@ -22,7 +22,7 @@
 #[path = "hdr_common.rs"]
 mod common;
 
-use common::{Rng, new_histogram, persist, record, report, submit_gtc};
+use common::{Rng, SEED_OWNERS, new_histogram, persist, record, report, seed_resting};
 
 const SCENARIO: &str = "mass_cancel_burst";
 const ORDERS_PER_BURST: u64 = 10_000;
@@ -36,20 +36,25 @@ fn main() {
     let mut next_id: u64 = 1;
 
     for _ in 0..MEASURED_BURSTS {
-        // Re-load the book up to ORDERS_PER_BURST resting orders. Not
-        // measured.
-        for _ in 0..ORDERS_PER_BURST {
-            submit_gtc(&book, &mut rng, next_id);
-            next_id += 1;
-        }
+        // Re-load the book with ORDERS_PER_BURST resting orders. Not
+        // measured. #259 PR review: seeded NON-crossing and asserted; the
+        // old `submit_gtc` seed crossed, so much of the book had traded
+        // away before the cancel.
+        seed_resting(&book, &mut rng, next_id, ORDERS_PER_BURST, SEED_OWNERS);
+        next_id += ORDERS_PER_BURST;
 
         // The single-burst measurement: time `cancel_all_orders` end to
         // end. The histogram entry is "ns to drain N orders", not per
         // order — useful as an operator-side wall-clock guard rather
         // than a per-op tail.
-        record(&mut hist, || {
-            let _ = book.cancel_all_orders();
-        });
+        // Its result (with the cancelled-id list) is dropped after the
+        // clock stops.
+        let result = record(&mut hist, || book.cancel_all_orders());
+        drop(result);
+        assert!(
+            book.get_all_orders().is_empty(),
+            "the burst empties the book"
+        );
     }
 
     report(SCENARIO, &hist);
