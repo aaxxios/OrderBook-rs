@@ -218,10 +218,13 @@ pub enum SequencerResult {
         /// `true` for the errors a command can return *after* mutating:
         /// the unfillable IOC / market remainder
         /// (`InsufficientLiquidity`, `InsufficientLiquidityNotional`), the
-        /// STP-cancelled taker (`SelfTradePrevented`) and the
+        /// STP-cancelled taker (`SelfTradePrevented`), the
         /// residual-admission failure that follows irreversible trades
-        /// (`PriceLevelError`). `false` for every error the engine raises
-        /// before it touches the book.
+        /// (`PriceLevelError`), the residual the risk layer refused after
+        /// trades (`RiskRejectedAfterTrades`, #291) and the other
+        /// post-mutation failures listed on the classifier. `false` for
+        /// every error the engine raises before it touches the book,
+        /// including the pre-trade risk rejections.
         ///
         /// Replay needs this because the reject code alone does not carry
         /// it. [`RejectReason::Other`]`(0)` is the library's bucket for
@@ -408,7 +411,10 @@ impl SequencerResult {
 /// once the sweep's trades are already irreversible (which logs at `ERROR`
 /// and removes the level it created empty). The first two are identifiable
 /// from their reject code; the third is not, because it maps to
-/// [`RejectReason::Other`]`(0)` together with pre-mutation errors.
+/// [`RejectReason::Other`]`(0)` together with pre-mutation errors. A
+/// residual the risk layer refuses after trades is reported as its own
+/// variant, [`OrderBookError::RiskRejectedAfterTrades`] (#291), so the
+/// pre-trade risk rejections stay classified as never mutating.
 ///
 /// Deliberately conservative: an error is flagged whenever the engine
 /// *can* return it after a mutation, even when a particular call did not
@@ -444,7 +450,11 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         // here after its sweep may have traded. The common early duplicate
         // check is pre-mutation, but the error does not say which one
         // fired; replay re-executes it and reproduces the early rejection.
-        | OrderBookError::DuplicateOrderId { .. } => true,
+        | OrderBookError::DuplicateOrderId { .. }
+        // #291: raised only after the taker traded, when the risk layer
+        // refused to reserve the residual. The pre-trade risk codes below
+        // stay pre-mutation.
+        | OrderBookError::RiskRejectedAfterTrades { .. } => true,
         // Admission and shape checks (all evaluated before the sweep), the
         // operational gates, and the non-reject internal errors. The
         // post-sweep post-only rejection is here too: `pricelevel`

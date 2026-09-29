@@ -417,6 +417,22 @@ fn fill_or_kill_readd(order_id: Id) -> OrderBookError {
     }
 }
 
+/// The refusal a replay applies to the residual of a submit the journal
+/// recorded as [`OrderBookError::RiskRejectedAfterTrades`] (#291). The live
+/// refusal came from the risk layer, whose configuration a replay book does
+/// not carry, so replay states the recorded outcome instead of re-deriving
+/// it. Only the code is reconciled, never this message.
+#[cold]
+#[inline(never)]
+#[must_use]
+fn replay_refused_residual(order_id: Id) -> OrderBookError {
+    OrderBookError::InvalidOperation {
+        message: format!(
+            "replay refused the residual of order {order_id}: the journal recorded a post-trade risk rejection"
+        ),
+    }
+}
+
 /// `PriceLevel::matchable_quantity` answered more than it was asked for.
 /// Its contract bounds the answer by the request, so this is an upstream
 /// invariant breach, reported before any mutation (#247).
@@ -2253,6 +2269,11 @@ where
     /// is engaged. The check runs before any cache invalidation, STP
     /// validation, tick/lot validation, or matching work. Returns
     /// [`OrderBookError::MatchAborted`] for an aborted sweep (see above).
+    /// Returns [`OrderBookError::RiskRejectedAfterTrades`] when the taker
+    /// traded and the risk layer then refused to reserve its residual
+    /// (#291): the trades are real, the residual did not rest and the taker
+    /// ends `Cancelled { RestFailed }`. A risk refusal before any trade is
+    /// the plain risk error (`RiskMaxOpenOrders`, `RiskMaxNotional`, ...).
     #[inline]
     pub fn add_order(&self, order: OrderType<T>) -> Result<Arc<OrderType<T>>, OrderBookError> {
         // #209: shared gate for ordinary submits, exclusive for FOK so its
@@ -2366,6 +2387,42 @@ where
             .map_err(AdmitFailure::into_submit)
     }
 
+    /// Replays an `add_order` whose live execution traded and then had its
+    /// residual refused by the risk layer
+    /// ([`OrderBookError::RiskRejectedAfterTrades`], #291).
+    ///
+    /// Identical to [`Self::add_order`] (gating, admission checks, sweep,
+    /// publication) except that a residual that would rest is refused
+    /// instead: the live refusal depended on the source book's `RiskConfig`
+    /// and concurrent state, neither of which replay has, while the sweep is
+    /// a deterministic function of the book and the order. The replayed
+    /// book therefore ends exactly like the live one (the same trades, no
+    /// residual resting).
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::RiskRejectedAfterTrades`] when the sweep traded
+    /// and the residual was refused, which is the outcome the journal
+    /// recorded. Anything else means the replay diverged: `Ok` when the
+    /// order filled completely (nothing left to refuse), the refusal's
+    /// `InvalidOperation` when the sweep did not trade, or whatever error
+    /// [`Self::add_order`] would return before the residual step.
+    pub(crate) fn replay_add_order_refusing_residual(
+        &self,
+        order: OrderType<T>,
+    ) -> Result<Arc<OrderType<T>>, OrderBookError> {
+        // Same gating as `add_order`.
+        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
+            order.is_fill_or_kill(),
+            order.user_id(),
+            order.is_post_only(),
+            Self::is_strandable_maker(&order),
+        ));
+        self.add_order_inner(order, false, false, Admission::ReplayRefusingResidual)
+            .map(|(order, _)| order)
+            .map_err(|failure| failure.into_submit().into_error())
+    }
+
     /// Shared implementation behind [`Self::add_order`] and
     /// [`Self::add_order_with_result`]. `want_result` gates `TradeResult`
     /// construction so the plain `add_order` path only pays for it when an
@@ -2398,7 +2455,7 @@ where
             if want_committed { trade_result } else { None }
         };
         let total = match admission {
-            Admission::Submit => {
+            Admission::Submit | Admission::ReplayRefusingResidual => {
                 self.check_kill_switch_or_reject(order.id())?;
                 // Representability gate (#210): an unrepresentable
                 // two-tranche total must be rejected before the risk gate
@@ -2484,13 +2541,15 @@ where
             fok,
             arithmetic_verified_price,
         } = match admission {
-            Admission::Submit => match self.validate_order_shape(&order) {
-                Ok(verdict) => verdict,
-                Err(err) => {
-                    self.record_shape_rejection(&order, &err);
-                    return Err(err.into());
+            Admission::Submit | Admission::ReplayRefusingResidual => {
+                match self.validate_order_shape(&order) {
+                    Ok(verdict) => verdict,
+                    Err(err) => {
+                        self.record_shape_rejection(&order, &err);
+                        return Err(err.into());
+                    }
                 }
-            },
+            }
             Admission::ReAdd { verdict, .. } => verdict,
         };
 
@@ -2785,6 +2844,19 @@ where
             } else {
                 OrderStatus::Open
             };
+            // #291: a replay of a submit whose residual the live risk layer
+            // refused after trading. The sweep above reproduced the live
+            // trades; the residual must not rest, whatever the replay
+            // book's (absent) risk configuration would say.
+            if matches!(admission, Admission::ReplayRefusingResidual) {
+                return Err(self.rest_failed(
+                    &order,
+                    RestFailure::Risk(replay_refused_residual(order.id())),
+                    filled_qty,
+                    committed(trade_result),
+                    admission,
+                ));
+            }
             let unit_order_arc = match self.rest_on_level(&order, remaining, resting_state) {
                 Ok(admitted) => admitted,
                 Err(failure) => {
@@ -2901,6 +2973,10 @@ where
     ///   earlier fills plus the re-add's); one that did not is `Rejected`
     ///   under the error's reject code, except a modify's re-add, whose
     ///   untraded failure the modify resolves (restore or `RestFailed`).
+    /// - A risk refusal after the taker traded is surfaced as
+    ///   [`OrderBookError::RiskRejectedAfterTrades`] wrapping the risk
+    ///   error (#291), so the pre-trade risk codes keep meaning that the
+    ///   book was not touched. An untraded one keeps the risk error.
     #[cold]
     #[inline(never)]
     fn rest_failed(
@@ -2911,7 +2987,22 @@ where
         committed: Option<TradeResult>,
         admission: Admission,
     ) -> AdmitFailure {
-        let err = failure.into_error();
+        let err = match failure {
+            // #291: the risk layer refused the residual after the sweep
+            // traded. Surfaced as its own variant, so the pre-trade risk
+            // rejections keep meaning "the book was not touched". A risk
+            // map collision is the #288 duplicate race, reported as such.
+            RestFailure::Risk(source)
+                if filled_qty > 0 && !matches!(source, OrderBookError::DuplicateOrderId { .. }) =>
+            {
+                OrderBookError::RiskRejectedAfterTrades {
+                    order_id: order.id(),
+                    executed_quantity: filled_qty,
+                    source: Box::new(source),
+                }
+            }
+            failure => failure.into_error(),
+        };
         if matches!(err, OrderBookError::DuplicateOrderId { .. }) {
             // #288: the id is owned by the admission that won the race, so
             // its state is not touched; a loser that traded is still a
@@ -2937,13 +3028,23 @@ where
                 self.reject_with_risk(order.id(), &err);
             }
         }
-        tracing::error!(
-            order_id = %order.id(),
-            price = order.price().as_u128(),
-            executed_quantity = filled_qty,
-            error = %err,
-            "remainder could not be rested; taker ended, level cleaned up"
-        );
+        if matches!(admission, Admission::ReplayRefusingResidual) {
+            // Replay reproducing a journaled failure, not a new one.
+            tracing::debug!(
+                order_id = %order.id(),
+                executed_quantity = filled_qty,
+                error = %err,
+                "replay refused the residual the journal recorded as refused"
+            );
+        } else {
+            tracing::error!(
+                order_id = %order.id(),
+                price = order.price().as_u128(),
+                executed_quantity = filled_qty,
+                error = %err,
+                "remainder could not be rested; taker ended, level cleaned up"
+            );
+        }
         AdmitFailure::after(err, committed, filled_qty)
     }
 
@@ -2968,11 +3069,11 @@ where
     ///   see, or have removed, a previous admission's entry. A sweep that
     ///   consumes the order finds all of them and records its `Filled`
     ///   after `state`;
-    /// - published **after** it: special-order tracking (as before #288:
-    ///   the repricers unregister any tracked id `get_order` cannot find,
-    ///   so registering an order that is not on its level yet could lose
-    ///   it for good; a registration that lands after a concurrent cancel
-    ///   is instead cleaned up by the next repricing pass), the
+    /// - published **after** it: special-order tracking (as before #288; a
+    ///   repricer releases a tracked id `get_order` cannot find only while
+    ///   no admission owns the id (#291), so this registration is never
+    ///   lost to a pass that saw the id's previous order gone, and one that
+    ///   lands after a concurrent cancel is cleaned up by the next pass), the
     ///   strandable-maker count (a strandable maker always rests under the
     ///   exclusive gate, so no sweep overlaps it), the level event and the
     ///   depth gauges.
@@ -3009,6 +3110,14 @@ where
         // remainder instead of resting it untracked. Checked and
         // all-or-nothing; released below if the placement fails. No-op
         // when no `RiskConfig` is installed.
+        #[cfg(test)]
+        if let Some(error) = self
+            .rest_risk_fault_hook
+            .as_ref()
+            .and_then(|hook| hook(order_id))
+        {
+            return Err(RestFailure::Risk(error));
+        }
         let risk_reservation = self
             .risk_state
             .on_admission(order_id, order.user_id(), price, quantity)
@@ -3427,6 +3536,12 @@ where
 pub(super) enum Admission {
     /// A new submit: every admission check runs.
     Submit,
+    /// A replayed submit whose live execution traded and then had its
+    /// residual refused by the risk layer (#291): every admission check
+    /// runs as for [`Self::Submit`], and a residual that would rest is
+    /// refused instead, as the journal recorded. Only
+    /// [`OrderBook::replay_add_order_refusing_residual`] uses it.
+    ReplayRefusingResidual,
     /// The re-add of a validate-first modify: the kill-switch, risk and
     /// shape checks ran before the original was cancelled, and their
     /// verdict is taken as is. Rejections are not recorded as order state
@@ -3445,14 +3560,14 @@ impl Admission {
     /// Whether rejections are recorded as order state and reject metrics.
     #[inline]
     fn records_rejections(self) -> bool {
-        matches!(self, Self::Submit)
+        matches!(self, Self::Submit | Self::ReplayRefusingResidual)
     }
 
     /// Fills the order executed before this admission.
     #[inline]
     fn prior_filled(self) -> u64 {
         match self {
-            Self::Submit => 0,
+            Self::Submit | Self::ReplayRefusingResidual => 0,
             Self::ReAdd { prior_filled, .. } => prior_filled,
         }
     }

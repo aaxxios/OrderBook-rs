@@ -62,6 +62,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `NotionalOverflow`       | 19  |
 /// | `ModifyRolledBack`       | 20  |
 /// | `ModifyOrderLost`        | 21  |
+/// | `RiskRejectedAfterTrades` | 22 |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -134,6 +135,12 @@ pub enum RejectReason {
     /// could not be restored (#247). Carried by
     /// `OrderBookError::ModifyOrderLost`.
     ModifyOrderLost = 21,
+    /// A taker traded and then the per-account risk layer refused to
+    /// reserve its residual, which did not rest (#291). The trades are
+    /// real; the taker ended `Cancelled { RestFailed }`. Carried by
+    /// `OrderBookError::RiskRejectedAfterTrades`. A risk refusal before
+    /// any trade keeps its own code (2, 3 or 4).
+    RiskRejectedAfterTrades = 22,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -171,6 +178,7 @@ impl RejectReason {
             Self::NotionalOverflow => 19,
             Self::ModifyRolledBack => 20,
             Self::ModifyOrderLost => 21,
+            Self::RiskRejectedAfterTrades => 22,
             Self::Other(code) => code,
         }
     }
@@ -204,6 +212,7 @@ impl RejectReason {
             19 => Self::NotionalOverflow,
             20 => Self::ModifyRolledBack,
             21 => Self::ModifyOrderLost,
+            22 => Self::RiskRejectedAfterTrades,
             other => Self::Other(other),
         }
     }
@@ -262,6 +271,7 @@ impl std::fmt::Display for RejectReason {
             Self::NotionalOverflow => write!(f, "notional overflow"),
             Self::ModifyRolledBack => write!(f, "modify rolled back"),
             Self::ModifyOrderLost => write!(f, "modify lost the order"),
+            Self::RiskRejectedAfterTrades => write!(f, "risk rejected after trades"),
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -314,6 +324,7 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::NotionalOverflow { .. } => Self::NotionalOverflow,
             OrderBookError::ModifyRolledBack { .. } => Self::ModifyRolledBack,
             OrderBookError::ModifyOrderLost { .. } => Self::ModifyOrderLost,
+            OrderBookError::RiskRejectedAfterTrades { .. } => Self::RiskRejectedAfterTrades,
             OrderBookError::OrderChangedDuringModify { .. } => Self::Other(0),
             OrderBookError::PriceLevelError(_) => Self::Other(0),
             OrderBookError::OrderNotFound(_) => Self::Other(0),
@@ -345,7 +356,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 21] {
+    fn named_variants() -> [RejectReason; 22] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -368,6 +379,7 @@ mod tests {
             RejectReason::NotionalOverflow,
             RejectReason::ModifyRolledBack,
             RejectReason::ModifyOrderLost,
+            RejectReason::RiskRejectedAfterTrades,
         ]
     }
 
@@ -394,6 +406,7 @@ mod tests {
         assert_eq!(RejectReason::NotionalOverflow.as_u16(), 19);
         assert_eq!(RejectReason::ModifyRolledBack.as_u16(), 20);
         assert_eq!(RejectReason::ModifyOrderLost.as_u16(), 21);
+        assert_eq!(RejectReason::RiskRejectedAfterTrades.as_u16(), 22);
     }
 
     /// #247: both modify re-add outcomes have their own codes, round trip
@@ -430,6 +443,32 @@ mod tests {
         assert!(std::error::Error::source(&lost).is_some());
         assert!(rolled_back.to_string().contains("restored"));
         assert!(lost.to_string().contains("could not be restored"));
+    }
+
+    /// #291: a post-trade risk refusal has its own code, distinct from the
+    /// pre-trade risk codes it wraps, and exposes the refusal as source.
+    #[test]
+    fn test_from_order_book_error_maps_risk_rejected_after_trades() {
+        let err = OrderBookError::RiskRejectedAfterTrades {
+            order_id: Id::from_u64(7),
+            executed_quantity: 3,
+            source: Box::new(OrderBookError::RiskMaxNotional {
+                account: Hash32::zero(),
+                current: 1,
+                attempted: 20,
+                limit: 10,
+            }),
+        };
+        assert_eq!(
+            RejectReason::from(&err),
+            RejectReason::RiskRejectedAfterTrades
+        );
+        let reason = RejectReason::from_u16(22);
+        assert_eq!(reason, RejectReason::RiskRejectedAfterTrades);
+        assert_eq!(reason.to_string(), "risk rejected after trades");
+        assert!(std::error::Error::source(&err).is_some());
+        let text = err.to_string();
+        assert!(text.contains("executed 3"), "{text}");
     }
 
     /// #244: the untouched fee / notional rejections have their own codes.

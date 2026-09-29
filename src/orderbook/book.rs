@@ -495,6 +495,23 @@ pub struct OrderBook<T = ()> {
     #[cfg(test)]
     pub(super) rest_interleave_hook: Option<std::sync::Arc<dyn Fn(Id) + Send + Sync>>,
 
+    /// Test-only fault injection for the risk reservation of an order about
+    /// to rest (#291), receiving its id. Returning an error makes the
+    /// reservation fail with nothing reserved, as a concurrent admission on
+    /// the same account can make it fail after the pre-trade check passed.
+    /// Like its siblings it exists only in `cfg(test)` builds.
+    #[cfg(test)]
+    pub(super) rest_risk_fault_hook:
+        Option<std::sync::Arc<dyn Fn(Id) -> Option<OrderBookError> + Send + Sync>>,
+
+    /// Test-only interleaving point in the repricers (#291), fired with the
+    /// book and a tracked id right after `get_order` found no order for it
+    /// and before the tracker entry is released, so a test can rest a
+    /// same-id order in that window. Like its siblings it exists only in
+    /// `cfg(test)` builds.
+    #[cfg(all(test, feature = "special_orders"))]
+    pub(super) reprice_interleave_hook: Option<RepriceInterleaveHook<T>>,
+
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
 
@@ -868,6 +885,10 @@ where
             rest_fault_hook: None,
             #[cfg(test)]
             rest_interleave_hook: None,
+            #[cfg(test)]
+            rest_risk_fault_hook: None,
+            #[cfg(all(test, feature = "special_orders"))]
+            reprice_interleave_hook: None,
             #[cfg(test)]
             modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
@@ -1829,6 +1850,10 @@ where
             #[cfg(test)]
             rest_interleave_hook: None,
             #[cfg(test)]
+            rest_risk_fault_hook: None,
+            #[cfg(all(test, feature = "special_orders"))]
+            reprice_interleave_hook: None,
+            #[cfg(test)]
             modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
@@ -1895,6 +1920,10 @@ where
             rest_fault_hook: None,
             #[cfg(test)]
             rest_interleave_hook: None,
+            #[cfg(test)]
+            rest_risk_fault_hook: None,
+            #[cfg(all(test, feature = "special_orders"))]
+            reprice_interleave_hook: None,
             #[cfg(test)]
             modify_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
@@ -5914,6 +5943,22 @@ impl<T> OrderBook<T>
 where
     T: Clone + Default + Send + Sync + 'static,
 {
+    /// Whether no admission owns `order_id` (#291).
+    ///
+    /// The location entry is the id's ownership token (#288): an order
+    /// claims it before its level admits it, registers its special-order
+    /// tracking after the admission, and every remover unregisters the
+    /// tracking before it releases the location. A repricer that found no
+    /// order for a tracked id therefore releases the entry only while the id
+    /// is unowned; a same-id order admitted after `get_order` returned
+    /// `None` owns the id (and possibly already the entry, whose insert was
+    /// a no-op), so its registration is kept. Checked under the tracker's
+    /// shard lock (see `SpecialOrderTracker::unregister_pegged_order_if`).
+    #[inline]
+    fn id_unowned(&self, order_id: Id) -> bool {
+        !self.order_locations.contains_key(&order_id)
+    }
+
     /// Re-price every pegged order, returning the count repriced and pushing a
     /// `(order_id, reason)` pair onto `failures` for each one whose
     /// `update_order` is **rejected** (e.g. a risk-admission rejection). The
@@ -6001,9 +6046,15 @@ where
                     }
                 }
             } else {
-                // Order no longer exists, unregister it
+                #[cfg(test)]
+                if let Some(hook) = self.reprice_interleave_hook.as_ref() {
+                    hook(self, order_id);
+                }
+                // No order rests under this id: release the stale
+                // registration, unless an order claimed the id meanwhile
+                // (#291, see `id_unowned`).
                 self.special_order_tracker
-                    .unregister_pegged_order(&order_id);
+                    .unregister_pegged_order_if(&order_id, || self.id_unowned(order_id));
             }
         }
 
@@ -6093,9 +6144,13 @@ where
                     }
                 }
             } else {
-                // Order no longer exists, unregister it
+                #[cfg(test)]
+                if let Some(hook) = self.reprice_interleave_hook.as_ref() {
+                    hook(self, order_id);
+                }
+                // As for pegged orders (#291).
                 self.special_order_tracker
-                    .unregister_trailing_stop(&order_id);
+                    .unregister_trailing_stop_if(&order_id, || self.id_unowned(order_id));
             }
         }
 
@@ -6240,6 +6295,11 @@ pub(super) const LEVEL_LOCK_STRIPES: usize = 64;
 #[cfg(test)]
 pub(super) type ModifyInterleaveHook<T> =
     std::sync::Arc<dyn Fn(&OrderBook<T>, Id, super::modifications::ModifyPhase) + Send + Sync>;
+
+/// Test-only hook fired inside a repricer (#291); see
+/// `OrderBook::reprice_interleave_hook`.
+#[cfg(all(test, feature = "special_orders"))]
+pub(super) type RepriceInterleaveHook<T> = std::sync::Arc<dyn Fn(&OrderBook<T>, Id) + Send + Sync>;
 
 /// Test-only failure injected into a single-order cancel (#248); see
 /// `OrderBook::cancel_fault_hook`.

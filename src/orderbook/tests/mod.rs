@@ -19,6 +19,7 @@ mod modifications;
 mod operations;
 mod order;
 mod order_placement_tests;
+mod post_trade_risk;
 #[cfg(feature = "special_orders")]
 mod repricing;
 mod restore_validation;

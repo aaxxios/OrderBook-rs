@@ -71,6 +71,49 @@ impl SpecialOrderTracker {
         );
     }
 
+    /// Unregisters a pegged order only if `unowned()` still holds (#291).
+    ///
+    /// `unowned` runs under the tracker's shard lock for `order_id`, so a
+    /// registration of the same id cannot land between the check and the
+    /// removal: one made before it was preceded by its order claiming the
+    /// id (which `unowned` then sees), one made after re-inserts the id.
+    /// `unowned` must not touch this tracker. Returns whether the id was
+    /// removed.
+    pub(crate) fn unregister_pegged_order_if(
+        &self,
+        order_id: &Id,
+        unowned: impl FnOnce() -> bool,
+    ) -> bool {
+        let removed = self
+            .pegged_orders
+            .remove_if(order_id, |_| unowned())
+            .is_some();
+        if removed {
+            trace!("Unregistered pegged order {} from re-pricing", order_id);
+        }
+        removed
+    }
+
+    /// Unregisters a trailing stop order only if `unowned()` still holds
+    /// (#291); see [`Self::unregister_pegged_order_if`].
+    pub(crate) fn unregister_trailing_stop_if(
+        &self,
+        order_id: &Id,
+        unowned: impl FnOnce() -> bool,
+    ) -> bool {
+        let removed = self
+            .trailing_stop_orders
+            .remove_if(order_id, |_| unowned())
+            .is_some();
+        if removed {
+            trace!(
+                "Unregistered trailing stop order {} from re-pricing",
+                order_id
+            );
+        }
+        removed
+    }
+
     /// Returns the number of tracked pegged orders
     pub fn pegged_order_count(&self) -> usize {
         self.pegged_orders.len()

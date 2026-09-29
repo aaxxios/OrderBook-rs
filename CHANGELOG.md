@@ -478,6 +478,39 @@ change.
     `Cancelled { RestFailed }`), and a rolled-back modify shows the
     re-add's accepted state ahead of the restore's
     (`Open, Cancelled, Open, Open` instead of `Open, Cancelled, Open`).
+- **Post-trade risk rejections replay faithfully (#291).** A taker that
+  traded and then had its residual's risk reservation refused (concurrent
+  admissions on the same account, an unrepresentable counter) returned the
+  plain `RiskMaxNotional` / `RiskMaxOpenOrders` error, which
+  `SequencerResult::from` classified as never mutating and replay skipped
+  (a `RiskConfig` is not part of `ReplayBookConfig`): the replayed book
+  silently kept liquidity the live book had consumed. The failure is now
+  `OrderBookError::RiskRejectedAfterTrades { order_id, executed_quantity,
+  source }` (new reject code `RiskRejectedAfterTrades` = 22,
+  `may_have_mutated: true`), and replay re-executes such an `AddOrder`
+  with its residual refused instead of rested, which reproduces the live
+  trades without the risk configuration. A replay that cannot reproduce
+  it (the sweep fills everything or trades nothing) stops with
+  `ReplayError::OutcomeMismatch`.
+- **Repricers no longer drop a reused id's special-order tracking
+  (#291).** `reprice_pegged_orders` / `reprice_trailing_stops` released
+  the registration of any id `get_order` could not find; a same-id order
+  admitted in between lost its registration and was never repriced. The
+  release is now conditional, under the tracker's shard lock, on no order
+  owning the id (the #288 location claim).
+
+  Compatibility:
+  - A risk refusal after trades is `Err(RiskRejectedAfterTrades { .. })`
+    wrapping the former error (`source`); the reject metric and
+    `RejectReason::from` report code 22 for it. A risk refusal before any
+    trade is unchanged. Both new variants are additive: `OrderBookError`
+    and `RejectReason` are `#[non_exhaustive]`, so downstream matches
+    already carry a wildcard arm.
+  - A modify re-add refused this way still returns `ModifyOrderLost`, now
+    with `RiskRejectedAfterTrades` as its `source`.
+  - Journals written before this release recorded the post-trade case
+    under a pre-trade risk code with `may_have_mutated: false`; replay
+    still skips those, and only `snapshots_match` detects the gap.
 
 ### Changed
 

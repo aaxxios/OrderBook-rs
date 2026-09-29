@@ -261,6 +261,13 @@ This order book engine is built with the following design principles:
   refused with `DuplicateOrderId` (now classified as possibly mutating). The risk layer
   removes a fully filled maker's entry under the same lock that zeroes
   it, so two sweeps sharing a maker release its open-order slot once.
+- **Replay-safe post-trade risk rejections (#291).** A taker whose
+  residual the risk layer refuses after it traded now returns
+  `OrderBookError::RiskRejectedAfterTrades` (code 22, journaled as
+  possibly mutating) instead of a pre-trade risk error replay skipped;
+  replay re-runs the sweep and refuses the residual, reproducing the
+  live trades without a `RiskConfig`. The repricers keep a reused id's
+  special-order registration.
 
 #### Migration from 0.13
 
@@ -339,7 +346,8 @@ This order book engine is built with the following design principles:
 | `OrderBookError::PriceCrossing { opposite_price: u128 }` (`0` when empty) | `opposite_price: Option<u128>` |
 | `update_order(Cancel)`: level error ignored, indices removed anyway | same removal as `cancel_order`; errors propagated |
 | modify re-add failing after the cancel: `Err(..)`, original lost | `Err(ModifyRolledBack { .. })` (original restored, back of queue) or `Err(ModifyOrderLost { .. })` |
-| `RejectReason` codes 1 to 19 | adds `ModifyRolledBack` (20), `ModifyOrderLost` (21) |
+| `RejectReason` codes 1 to 19 | adds `ModifyRolledBack` (20), `ModifyOrderLost` (21), `RiskRejectedAfterTrades` (22) |
+| risk refusal of a residual after trades: `Err(RiskMaxNotional { .. })` / `Err(RiskMaxOpenOrders { .. })`, journaled as never mutating | `Err(RiskRejectedAfterTrades { source, .. })`, journaled as may-have-mutated and replayed |
 | `CancelReason` (9 variants) | adds `RestFailed` (exhaustive matches need an arm) |
 | remainder not rested after trades: no terminal state | `Cancelled { filled_quantity, reason: RestFailed }` |
 | modify after a concurrent partial fill: re-add rested the quantity read before it | `UpdatePrice` moves the remainder; `UpdatePriceAndQuantity` / `Replace`: `Err(ModifyRolledBack { source: OrderChangedDuringModify, .. })` |
