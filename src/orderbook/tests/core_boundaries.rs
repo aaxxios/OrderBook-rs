@@ -363,4 +363,46 @@ mod tests {
         assert!(tracker.get(id).is_none(), "only transition removed");
         tracker.withdraw_last_transition(id, &OrderStatus::Open);
     }
+
+    fn panicking_commit_hook() {
+        panic!("injected panic in the gate guard's commit phase");
+    }
+
+    /// PR #297 review: the gate guard's commit phase runs under the held
+    /// gate inside the guard's drop and can run caller code (`tracing`). A
+    /// panic there does not run the drop again and a shared guard does not
+    /// poison; the commit sentinel engages the kill switch and latches.
+    #[test]
+    fn test_commit_phase_panic_under_shared_gate_latches() {
+        let mut book = OrderBook::<()>::new("B294C");
+        // A price-level listener: every resting add commits a level event.
+        book.set_price_level_listener(Arc::new(
+            |_: crate::orderbook::book_change_event::PriceLevelChangedEvent| {},
+        ));
+        let book = Arc::new(book);
+        book.add_order(limit(1, 90, 5, Side::Buy, 1))
+            .expect("resting bid");
+        assert!(!book.is_kill_switch_engaged());
+
+        let panicking = Arc::clone(&book);
+        let joined = thread::spawn(move || {
+            crate::orderbook::emission::commit_seam::set(Some(panicking_commit_hook));
+            let _ = panicking.add_order(limit(2, 100, 5, Side::Sell, 2));
+        })
+        .join();
+        assert!(joined.is_err(), "the commit-phase panic propagated");
+
+        assert!(book.is_kill_switch_engaged());
+        assert!(book.submit_gate_poisoned());
+        assert!(!book.submit_gate.is_poisoned(), "shared side");
+        let err = book
+            .add_order(limit(3, 85, 1, Side::Buy, 1))
+            .expect_err("new flow rejected");
+        assert!(matches!(err, OrderBookError::KillSwitchActive), "{err:?}");
+        assert!(
+            book.cancel_order(Id::from_u64(1))
+                .expect("cancel runs")
+                .is_some()
+        );
+    }
 }

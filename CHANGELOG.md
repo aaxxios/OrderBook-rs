@@ -77,9 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     admits it (#288), running caller code in between (`Clock`, metrics,
     `T::default()`). A panic there left all of them, and possibly a new
     empty level, behind for an order no level holds. A drop guard now
-    withdraws them in #288's release order (user index and reservation,
-    then the location, then the recorded state, clock-free), and removes
-    the empty level.
+    withdraws them: the recorded state first (clock-free), then in #288's
+    release order the user index and reservation, then the location, so
+    every rollback happens while the attempt still owns the id and a
+    same-id order admitted concurrently cannot have its own transition
+    popped; it then removes the empty level. Review follow-up (PR #297):
+    `T::default()` (the unit conversion) now runs before the level stripe
+    is taken; and a panic raised by the gate guard's own commit phase
+    (caller `tracing` code under the held gate, inside the guard's drop)
+    is caught by a commit sentinel that engages the kill switch and
+    latches `submit_gate_poisoned()`.
   - A standalone `OrderStateTracker::transition` invoked its listener
     before queuing a terminal id for eviction, so a panicking listener
     left the id retained forever. The id is queued first.

@@ -678,6 +678,30 @@ fn reserve_delivery_slot(pending: &mut VecDeque<Batch>) -> bool {
     pending.try_reserve(1).is_ok()
 }
 
+/// Test seam (PR #297 review): a test-supplied function the commit phase
+/// calls on this thread just before publishing a non-empty batch, standing
+/// in for caller code (a `tracing` subscriber) that runs there.
+#[cfg(test)]
+pub(super) mod commit_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    /// Call the installed hook, if any.
+    pub(in crate::orderbook) fn fire() {
+        if let Some(hook) = HOOK.try_with(Cell::get).ok().flatten() {
+            hook();
+        }
+    }
+
+    /// Install or clear the hook on this thread.
+    pub(in crate::orderbook) fn set(hook: Option<fn()>) {
+        let _ = HOOK.try_with(|cell| cell.set(hook));
+    }
+}
+
 /// Test seam (#294): make [`reserve_delivery_slot`] refuse on this thread,
 /// standing in for an allocator that refuses the delivery buffer's growth.
 #[cfg(test)]
@@ -780,6 +804,8 @@ impl GateEmission {
         if events.is_empty() {
             return ticket.map_or(Committed::Nothing, Committed::Queued);
         }
+        #[cfg(test)]
+        commit_seam::fire();
         book.commit_scope(events, ticket)
     }
 }

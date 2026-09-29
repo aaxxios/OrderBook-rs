@@ -774,7 +774,11 @@ destructor during an unrelated unwind is not blamed). On an unwind, on
 **either** side, it engages the kill switch and latches
 `OrderBook::submit_gate_poisoned` (logged once at `ERROR`, with the gate
 side) **before** the gate is released, so the next holder already sees
-it. The exclusive side is also poisoned by std; the acquisition that
+it. The guard's own commit phase (stamping and publishing the listener
+batch, still under the gate) can run the `tracing` subscriber; a panic
+there does not run the drop again, so a sentinel armed around that phase
+and disarmed only after the gate is released applies the same policy
+(PR #297 review). The exclusive side is also poisoned by std; the acquisition that
 finds it poisoned applies the same policy (idempotent, no second log),
 clears the poison and continues.
 
@@ -841,15 +845,19 @@ Findings of the final audit (#260) the mechanical gate cannot see:
   caller code (`track_state`'s `Clock` and metrics, `T::default()` in the
   unit conversion). A drop guard (`UnrestedClaim`,
   `src/orderbook/modifications.rs`), disarmed as soon as the admission
-  returns, withdraws on an unwind in #288's release order: the user-index
-  entry and the reservation, then the location; then the resting state
-  if it was recorded (`OrderStateTracker::withdraw_last_transition`: pops
-  that transition and restores the previous status, or forgets an order
-  whose only transition it was, without reading a clock or calling a
-  listener; the deferred listener event is dropped with the unwinding
-  emission scope), and removes a level the attempt left empty. The guard
-  is declared before the level-stripe guard, so the stripe is released
-  before the drop takes its exclusive side.
+  returns, withdraws on an unwind: first the resting state if it was
+  recorded (`OrderStateTracker::withdraw_last_transition`: pops that
+  transition and restores the previous status, or forgets an order whose
+  only transition it was, without reading a clock or calling a listener;
+  the deferred listener event is dropped with the unwinding emission
+  scope), then in #288's release order the user-index entry and the
+  reservation, then the location. Every rollback therefore happens while
+  the attempt still owns the id, so a same-id order cannot claim it in
+  between and have its own transition popped (PR #297 review). It then
+  removes a level the attempt left empty. The guard is declared before
+  the level-stripe guard, so the stripe is released before the drop takes
+  its exclusive side, and the unit conversion (`T::default()`) runs before
+  the stripe is taken.
 - **Raw placement.** `OrderBook::place_order_in_book` was public and
   bypassed the gate, kill switch, risk, crossing, STP, the strandable rule
   and state tracking. It had no production caller and was removed (0.14 is
@@ -868,17 +876,27 @@ Findings of the final audit (#260) the mechanical gate cannot see:
 
 ## `std` lock inventory (#294)
 
-Every `std::sync` lock the core engine holds, and its poison policy. None
-is held across caller code except the submit gate, which by design is
-held across the mid-mutation caller code listed in the table of
-caller-supplied surfaces.
+Every `std::sync` lock the core engine holds, and its poison policy. The
+submit gate is by design held across the mid-mutation caller code listed
+in the table of caller-supplied surfaces. Under the other three the only
+caller code that can run is the `tracing` subscriber, at the call sites
+named in each row; `T::default()` (the unit conversion of a resting
+order) runs before the level stripe is taken (PR #297 review). Every
+stripe acquisition, and every outbox acquisition of a commit, is made
+with the submit gate held (a commit from the gate guard's drop, covered
+by its commit sentinel), so a panic there engages the kill switch through
+the submit-gate policy. The dispatcher takes the outbox lock after the
+gate is released; a panic there (only the poison-recovery log can raise
+one) leaves the queue intact and releases the dispatcher role, like a
+listener panic. Each row's own poison policy only has to keep the lock
+usable.
 
 | Lock | Where | Held across | Poison policy |
 |---|---|---|---|
 | Submit gate, `RwLock<()>` | `OrderBook::submit_gate` (`book.rs`) | One gated entry point (the mutation, including mid-mutation caller code: `Clock`, metrics, `tracing`, `T::default()` / `T::clone()`); never a listener | An unwind on either side engages the kill switch and latches `submit_gate_poisoned` in the guard's drop (#294); a poisoned exclusive side is cleared by the next acquisition, which applies the same policy (#249) |
-| 64 level stripes, `[RwLock<()>; 64]` | `OrderBook::level_locks` (`book.rs`, #247) | One level admission (shared) or one emptied-level removal (exclusive); never caller code, never another lock | Data is `()`: recovered, poison logged at `ERROR`; the gate policy covers the mutation the unwind interrupted |
-| Listener outbox, `Mutex<OutboxState>` | `EventOutbox::state` (`emission.rs`, #249), behind a spin flag | A single queue `push_back` / `pop_front` / flag store; never caller code | Recovered and cleared: every mutation under it is a single step, so the queue is intact at every unwind point |
-| Terminal eviction queue, `Mutex<VecDeque<Id>>` | `OrderStateTracker::terminal_queue` (`order_state.rs`) | A push and the over-capacity pops; no caller code, no map lock | Recovered (logged at `WARN`) and cleared: the queue is an eviction hint re-checked per id (#250) |
+| 64 level stripes, `[RwLock<()>; 64]` | `OrderBook::level_locks` (`book.rs`, #247) | One level admission (shared: `get_or_insert` and pricelevel's `PriceLevel::add_order`) or one emptied-level removal (exclusive: re-read and unlink); never another lock. Caller code under it: the `tracing` subscriber only, from pricelevel's failure-path events in `add_order` and from this crate's poison-recovery `ERROR` (logged while the recovered guard is held) | Data is `()`. A panic under the shared side leaves no poison; under the exclusive side it poisons the stripe, and every later acquisition recovers the guard and logs at `ERROR` (the poison is not cleared). The gate policy covers the mutation the unwind interrupted, and the rest path's claim guard removes a level it created empty |
+| Listener outbox, `Mutex<OutboxState>` | `EventOutbox::state` (`emission.rs`, #249), behind a spin flag released by a drop guard | Stamping and publishing one batch (`engine_seq` minting, a single queue `push_back`), or taking the ready prefix (`pop_front`s); flag stores. Caller code under it: the `tracing` subscriber only, from the one-time `engine_seq` exhaustion `ERROR`, the refused-allocation `ERROR`s in `enqueue` / `commit_with_trade_seq`, and the poison-recovery `ERROR` | Recovered and cleared. Every log call sits before or after a single-step queue mutation, never inside one, so the queue is intact at every unwind point; a panic while stamping loses the batch being committed (minted `engine_seq` values it held are never delivered, a gap consumers see), and the gate guard's commit sentinel engages the kill switch |
+| Terminal eviction queue, `Mutex<VecDeque<Id>>` | `OrderStateTracker::terminal_queue` (`order_state.rs`) | A push and the over-capacity pops; no map lock. Caller code under it: the `tracing` subscriber only, from the poison-recovery `WARN` | Recovered (logged at `WARN`) and cleared: the queue is an eviction hint re-checked per id (#250) |
 
 The sequencer / journal and NATS locks are outside the core engine and
 are documented with their subsystems (`Journal<T>` row above,

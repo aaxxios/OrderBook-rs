@@ -6565,29 +6565,74 @@ impl<'a, T> SubmitGateGuard<'a, T> {
     }
 }
 
+impl<T> SubmitGateGuard<'_, T> {
+    /// The held side's name for the poison log, `None` once released.
+    #[inline]
+    fn held_side(&self) -> Option<&'static str> {
+        match self.lock {
+            GateLock::Read { .. } => Some("shared"),
+            GateLock::Write { .. } => Some("exclusive"),
+            GateLock::Released => None,
+        }
+    }
+}
+
+/// Unwind sentinel for the commit phase of [`SubmitGateGuard`]'s drop
+/// (#294, PR #297 review).
+///
+/// The commit runs with the gate still held but **inside** the guard's
+/// drop, and can run caller code (the `tracing` subscriber, e.g. the
+/// engine-sequence exhaustion or refused-allocation logs). A panic there
+/// does not run the guard's drop again, and a shared read guard leaves no
+/// poison, so without this sentinel the kill switch and latch would stay
+/// unset. Armed only when the drop started on a non-unwinding thread, and
+/// disarmed after the gate is released; dropped while the thread panics,
+/// it latches before the gate's own field drop releases it.
+struct CommitSentinel<'a, T> {
+    /// The book whose gate is held.
+    book: &'a OrderBook<T>,
+    /// The held side, `None` when disarmed.
+    side: Option<&'static str>,
+}
+
+impl<T> Drop for CommitSentinel<'_, T> {
+    fn drop(&mut self) {
+        if let Some(side) = self.side
+            && std::thread::panicking()
+        {
+            self.book.latch_submit_gate_unwind(side);
+        }
+    }
+}
+
 impl<T> Drop for SubmitGateGuard<'_, T> {
     fn drop(&mut self) {
         // #294: an unwind through the held gate, on either side. Engaged
         // before the gate is released below, so the next holder sees it.
-        if std::thread::panicking() && !self.panicking_on_entry {
-            let gate_side = match self.lock {
-                GateLock::Read { .. } => Some("shared"),
-                GateLock::Write { .. } => Some("exclusive"),
-                GateLock::Released => None,
-            };
-            if let Some(gate_side) = gate_side {
-                self.book.latch_submit_gate_unwind(gate_side);
-            }
+        let unwinding = std::thread::panicking();
+        if unwinding
+            && !self.panicking_on_entry
+            && let Some(gate_side) = self.held_side()
+        {
+            self.book.latch_submit_gate_unwind(gate_side);
         }
         let Some(emission) = self.emission.take() else {
             // No listener: the gate is released by the field drop.
             return;
+        };
+        // PR #297 review: a panic raised by the commit itself (caller
+        // `tracing` code under the held gate) is caught by this sentinel.
+        let mut sentinel = CommitSentinel {
+            book: self.book,
+            side: if unwinding { None } else { self.held_side() },
         };
         // 1. Commit under the gate (no-op while unwinding, see
         //    `GateEmission::commit`).
         let committed = emission.commit(self.book);
         // 2. Release the gate before any listener runs.
         self.lock = GateLock::Released;
+        sentinel.side = None;
+        drop(sentinel);
         // 3. Deliver.
         match committed {
             super::emission::Committed::Nothing => {}
