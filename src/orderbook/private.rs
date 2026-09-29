@@ -222,8 +222,10 @@ where
     /// rejection.
     ///
     /// Tracker recording is a no-op when `order_state_tracker` is
-    /// `None`. Metrics emission is unconditional but compiles to a
-    /// no-op when the `metrics` feature is disabled — see
+    /// `None`. The tracker's listener, when installed, is not called here:
+    /// the transition is buffered and delivered after commit (#249).
+    /// Metrics emission is unconditional but compiles to a no-op when
+    /// the `metrics` feature is disabled — see
     /// [`crate::orderbook::metrics`]. Hooking the metric here keeps
     /// every reject path in the engine on the same single emission
     /// point.
@@ -236,8 +238,12 @@ where
         if let super::order_state::OrderStatus::Rejected { reason } = &status {
             super::metrics::record_reject(*reason);
         }
-        if let Some(ref tracker) = self.order_state_tracker {
-            tracker.transition(order_id, status);
+        if let Some(ref tracker) = self.order_state_tracker
+            && let Some((old, new)) = tracker.record_transition(order_id, status)
+        {
+            // #249: the tracker records now; its listener runs after the
+            // mutation commits and the submit gate is released.
+            self.defer_event(super::emission::PendingEvent::State { order_id, old, new });
         }
     }
 

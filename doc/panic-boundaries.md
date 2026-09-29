@@ -112,11 +112,11 @@ boundary's limits instead of promising to prevent every external panic."
 
 | Caller-supplied surface | Where it runs | Obligation | Notes |
 |---|---|---|---|
-| Generic `T` on `OrderBook<T>` (`Clone`, `Default`, `Debug`, and any trait bound the caller's `T` carries) | Order storage, snapshot/clone paths, `Debug` formatting | Must not panic; `Debug` must not leak caller-identifying data if `T` carries user-identifying fields (`rules/global_rules.md`'s Security/Safety section) | No engine lock is held across a `T::clone()`/`T::fmt()` call on the matching hot path (matching operates on `pricelevel`'s `OrderType<()>` internally; `T` is only touched at the book's own boundary, not inside `pricelevel`'s matcher) |
-| `TradeListener` (`Arc<dyn Fn(&TradeResult) + Send + Sync>`, `src/orderbook/trade.rs`) | Invoked synchronously from the matching path after a trade is committed | Must not panic; must return quickly (no blocking I/O) — push into a channel, do not do work inline | Invoked after book/queue mutation for that trade is committed, never mid-mutation; an unwind here does not corrupt book state but does abort the remainder of that `submit`/`match` call's listener fan-out |
+| Generic `T` on `OrderBook<T>` (`Clone`, `Default`, `Debug`, and any trait bound the caller's `T` carries) | Order storage, snapshot/clone paths, `Debug` formatting | Must not panic; `Debug` must not leak caller-identifying data if `T` carries user-identifying fields (`rules/global_rules.md`'s Security/Safety section) | No engine lock is held across a `T::clone()`/`T::fmt()` call on the matching hot path (matching operates on `pricelevel`'s `OrderType<()>` internally; `T` is only touched at the book's own boundary, not inside `pricelevel`'s matcher). `T::default()` does run inside gated entry points (order conversion at the boundary); a panic there unwinds out of the entry point, and if it held the exclusive gate the next acquisition engages the kill switch (#249, see "Listener emission and submit-gate poisoning" below) |
+| `TradeListener` (`Arc<dyn Fn(&TradeResult) + Send + Sync>`, `src/orderbook/trade.rs`) | Runs after commit, outside the submit gate, ordered by commit (#249): buffered during the mutation, stamped with `engine_seq` under the gate, delivered by the book's single active dispatcher after the gate is released | Must not panic; must return quickly (no blocking I/O) — push into a channel, do not do work inline. May re-enter the book | No book lock is held. An unwind does not corrupt book state and does not poison the gate; it releases the dispatcher role, drops the rest of the batch being delivered (`dropped_listener_events`, `listener_panics`, `ERROR` log) and propagates out of the book call that was dispatching. Queued batches are delivered by the next dispatch (or `flush_listener_events`) |
 | Book-manager trade handler (`FnMut(TradeEvent) + Send + 'static`, `BookManagerStd` / `BookManagerTokio::start_trade_processor_with`, `BookManagerTokio::start_trade_processor_on`, `src/orderbook/manager.rs`) | Invoked once per trade event on the manager's processor: a dedicated OS thread (`BookManagerStd`) or a task on a Tokio worker (`BookManagerTokio`), never on the matching path | Must not panic. On Tokio it must also return quickly (move blocking work to `spawn_blocking`) | Runs after the book has committed the trade and its listener has queued the event; no book or manager lock is held. A panic ends the processor only: `stop_trade_processor` surfaces it as `ManagerError::ProcessorPanicked { message }`, and every later trade event is counted in `dropped_trade_events()` (and `orderbook_manager_trade_events_dropped_total` under `metrics`) instead of being processed. Book state is unaffected (#255) |
-| `OrderStateListener` (`Arc<dyn Fn(Id, &OrderStatus, &OrderStatus) + Send + Sync>`, `src/orderbook/order_state.rs`) | Invoked on order lifecycle transitions | Same as `TradeListener` | Same commit-then-notify discipline |
-| `PriceLevelChangedListener` (`Arc<dyn Fn(PriceLevelChangedEvent) + Send + Sync>`, `src/orderbook/book_change_event.rs`) | Invoked on book-level change events (feeds `NatsBookChangePublisher`) | Same as `TradeListener` | Same commit-then-notify discipline |
+| `OrderStateListener` (`Arc<dyn Fn(Id, &OrderStatus, &OrderStatus) + Send + Sync>`, `src/orderbook/order_state.rs`) | On a book's tracker: the transition is recorded during the mutation, the listener runs after commit, outside the submit gate, ordered by commit, in the same stream as the trade listener (#249). On a standalone tracker, `OrderStateTracker::transition` calls it inline | Same as `TradeListener` | Same as `TradeListener` |
+| `PriceLevelChangedListener` (`Arc<dyn Fn(PriceLevelChangedEvent) + Send + Sync>`, `src/orderbook/book_change_event.rs`) | Runs after commit, outside the submit gate, ordered by commit, in the same `engine_seq` stream as the trade listener (#249; feeds `NatsBookChangePublisher`) | Same as `TradeListener` | Same as `TradeListener` |
 | `EventSerializer` impls (`src/orderbook/serialization.rs`) | Journal entry encoding, NATS payload encoding | Must return a typed error rather than panicking on an unencodable value | Crate-provided JSON/Bincode impls follow this; a caller-supplied impl is not re-certified. On the NATS path it runs in the publisher's background task with no lock held; a panic there stops the task and is reported by `shutdown()` as `NatsPublisherError::TaskPanicked` |
 | `Journal<T>` impls (`src/orderbook/sequencer/journal.rs`) | Append/read of sequencer events (`InMemoryJournal`, `FileJournal`, or a caller's own impl) | Must return `JournalError`/`ReplayError` rather than panicking; must not silently drop or reorder entries; must refuse a non-increasing `append` with `NonMonotonicSequence`, and report an unreadable `last_sequence` as `Err`, never `Ok(None)` (#252) | Crate-provided impls follow this end-to-end (poisoned locks are `MutexPoisoned`, `InMemoryJournal` clones `T` outside its write lock); a caller-supplied `Journal<T>` is not re-certified |
 | `Clock` impls (`src/orderbook/clock.rs`) | Timestamp generation for the book and sequencer | Must not panic; must be monotonic if used with `ReplayEngine`'s determinism guarantee | `MonotonicClock` is crate-provided and compliant; a caller-supplied `Clock` breaking monotonicity is a correctness bug in the caller, not a crate panic |
@@ -477,7 +477,8 @@ a sweep, a listener call or another lock, and never upgraded (a failed
 rest drops its shared guard before its cleanup takes the exclusive one), so
 the stripes cannot deadlock. Poisoning can only follow a panic that
 unwound while a guard was held; the data is `()`, so the guard is
-recovered and the poison logged at `ERROR`, as for the submit gate. Mass
+recovered and the poison logged at `ERROR` (the submit gate itself now
+engages the kill switch on poison, #249). Mass
 cancels and eviction run under the exclusive submit gate and were already
 safe.
 
@@ -634,6 +635,156 @@ sees, and one made after it re-inserts the id. Lock order is tracker shard
 then location shard; no path holds a location guard while touching the
 tracker. A same-id order of another kind keeps the stale entry until it is
 gone (a pass skips it: `get_order` finds a non-special order).
+
+## Listener emission and submit-gate poisoning (#249)
+
+Before 0.14.0 the three listeners ran inline, often under the submit gate
+and in several places before the mutation finished. A listener that
+re-entered the book deadlocked (or hit the std `RwLock`'s unspecified
+nested-read behaviour), and a listener panic under the exclusive side
+poisoned the gate, which the book then recovered silently.
+
+**Design** (`src/orderbook/emission.rs`, `SubmitGateGuard` in
+`src/orderbook/book.rs`):
+
+1. On a book with a listener installed, acquiring the submit gate opens a
+   thread-local *emission scope* bound to that book. Every event the call
+   produces (`TradeResult`, `PriceLevelChangedEvent`, order-state
+   transition) is pushed into the scope's buffer instead of being
+   delivered. Buffers are recycled per thread and through a small per-book
+   lock-free pool (`crossbeam::queue::ArrayQueue`) when another thread
+   drained them; nothing is buffered, and no scope is opened, on a book
+   without listeners.
+2. When the gate guard drops it commits the scope **while the gate is
+   still held**: under the book's outbox mutex it stamps `engine_seq`
+   (same checked mint and exhaustion suppression as before) and publishes
+   the batch in the same critical section, so delivery order is
+   `engine_seq` order; doing it under the gate makes it consistent with
+   commit order. Uncontended (empty queue, no dispatcher) the committer
+   claims the dispatcher role there and keeps its batch (*direct* path);
+   otherwise the batch is queued, not ready, under a ticket from the
+   committing thread's own counter.
+3. The guard then releases the gate. A direct committer delivers its batch
+   and drains what queued meanwhile. A queued batch is made ready with one
+   atomic `fetch_max` on the thread's released-ticket counter (no lock;
+   the thread's tickets come from its own counter shared by every book, so
+   they grow across books and one book's release never readies another
+   book's batch early), and the thread tries to become the book's single
+   dispatcher (an atomic flag). The dispatcher takes the ready prefix of the queue under
+   one lock and calls the listeners with no lock held; a thread that finds
+   a dispatcher active returns and leaves its batch to it; a not-ready
+   head stops the dispatcher and its owner dispatches it after releasing
+   the gate. The flag, the released counters and the queue's non-empty flag
+   are `SeqCst`, and a dispatcher that steps down re-checks the head, so no
+   ready batch is stranded. A committing call takes the outbox lock once
+   (plus a share of the dispatcher's drain locks: measured 1.23
+   acquisitions per add at 8 threads). The lock is a test-and-test-and-set
+   spin flag (exponential backoff, then yield) in front of a `std` mutex
+   only the flag holder takes: a contended `std` mutex parks waiters in
+   the kernel on macOS, which dominated the contended commit path.
+
+A result-returning submit (`add_order_with_result`, `*_with_committed`)
+needs its `TradeResult`'s `engine_seq` before it returns: at that point the
+scope's pending events are committed early, followed by the trade, so the
+caller's copy and the listener's copy carry the same sequence, minted in the
+same position as before. That path clones the `TradeResult` once when a
+trade listener is installed (the caller and the deferred listener each own
+a copy); every other path moves it.
+
+**Guarantee.** Per book, one total order consistent with commit order;
+`engine_seq` strictly increases across the delivered trade + price-level
+stream, also with concurrent submitters; a single thread observes exactly
+the pre-#249 order (pinned by
+`src/orderbook/tests/listener_emission.rs`, `single_thread_event_order_is_unchanged`).
+Delivery happens on whichever thread is dispatching, so under concurrency
+a submit can return before its events are delivered, and a listener can
+observe a book newer than its event. Re-entrant calls from a listener
+commit their own batch and return without dispatching; the active
+dispatcher delivers it after the current batch.
+
+**Panicking listener.** Not caught (`catch_unwind` is forbidden). The
+unwind leaves the book consistent (the mutation committed before any
+listener ran) and the gate unpoisoned (released before dispatch). A drop
+guard releases the dispatcher role, puts the batches it had taken but not
+started back at the head of the queue, counts the undelivered remainder of
+the panicking batch in `dropped_listener_events` and the panic in
+`listener_panics`, and logs at `ERROR`; the panic propagates out of the
+book call that was dispatching. Queued batches are delivered, in order, by
+the next dispatch on the book or by `flush_listener_events`. Operators
+should call `flush_listener_events` when `listener_panics` increases, so
+those batches do not wait for the next mutation on a quiet book.
+
+**Restore after a panic.** A snapshot-package restore rewinds `engine_seq`
+below any batch a panic left queued, so at its point of no return it
+discards those batches (counted in `dropped_listener_events`, logged at
+`WARN`): they describe the replaced book, and delivering them after the
+restore would run the stream backwards (PR #289 review). Discarding, not
+delivering, keeps caller code out of the restore; call
+`flush_listener_events` first to deliver them.
+
+**Backlog.** The outbox is unbounded by design: nothing is dropped or
+rejected because listeners are slow. A stalled or slow listener on the
+dispatching thread lets every other submitter's events accumulate, which
+is the caller's contract to avoid (listeners must return quickly).
+`OrderBook::pending_listener_events()` is the operational gauge (events
+committed and not yet taken by the dispatcher); alert on growth. The outbox mutex
+is never held across caller code; if it were ever poisoned it is recovered
+and the poison cleared (every queue mutation is a single
+`push_back` / `pop_front` / flag store).
+
+**Engine unwind mid-mutation.** The scope is committed only on the
+non-unwinding path: when the guard drops during an unwind its uncommitted
+events are dropped and counted (batches it already committed early are
+marked ready, since they describe committed trades) and nothing is
+dispatched.
+
+**Submit-gate poison.** With listeners out of the gate, a poisoned gate
+means engine code (or `T::default()` / `T::clone()`) panicked while holding
+the exclusive side, and the book may be inconsistent. The acquisition that
+finds it poisoned engages the kill switch, latches
+`OrderBook::submit_gate_poisoned`, logs once at `ERROR`, clears the poison
+and continues. New flow and modifies then return
+`OrderBookError::KillSwitchActive` (the add / modify paths check the kill
+switch under the gate, so the detecting call itself is rejected; the
+market-order paths check it before taking the gate, so a detecting market
+order still runs and every later one is rejected); cancels and mass
+cancels keep working so the book can be drained, and the kill switch is
+persisted in the snapshot package. An operator's `release_kill_switch`
+resumes flow; the latch stays set. The price-level stripe locks keep their
+recover-and-log policy.
+
+**Cost of the ordering guarantee.** Stamping `engine_seq` and publishing
+the batch must be one atomic step under the submit gate, so every commit
+takes the outbox lock once (1.23 acquisitions per add at 8 threads,
+dispatcher drains included). On a single thread, or with no listener
+installed, that is free or absent; under many concurrent submitters with
+a trivial listener it is visible. Measured against main c59d74f (3 to 5
+interleaved Criterion rounds): `concurrent_add_limit_orders` with a
+no-op trade + price-level listener is +3.8% / +6.7% / +3.7% at 2 / 8 / 16
+threads (4 threads within noise), the one workload over the 5% budget.
+That workload is the worst case by construction: all threads add at one
+price for one account (already serialised on the level and the user
+index), and a no-op listener makes delivery free, so the lock handoff is
+the entire difference. Listener-free paths are unchanged within noise
+(`add_limit_orders` +0.1%, `concurrent_add_limit_orders` -1.0% to
++0.7%, `concurrent_mixed_operations` -1.2% to +1.1%, HDR `add_only` and
+`mixed_70_20_10` p50 0.0%, `aggressive_walk` p50 +2.4% over 10 rounds,
+one 1 ns histogram bucket); with listeners, mixed and market-order workloads stay within
++5%. The alternatives measured or analysed are listed in the
+`CHANGELOG.md` entry for #249; the maintainer accepted this cost for the
+guarantee.
+
+**Limits.** Emission scopes nest per book (PR #289 review): a gated call
+on book B made by caller code running inside book A's mutation (a
+`Clock`, `T::clone`) opens B's scope on top of A's, so B buffers its own
+events and delivers them after B's gate is released, and A's scope is
+restored intact. B's listeners then still run inside A's mutation on
+that thread, so they must not drive A (A's gate may be held
+exclusively). The released-ticket counter is per thread, so B's release
+can make A's early-committed batches ready before A releases its gate;
+they describe committed mutations and keep their order. The dispatcher role is
+not bounded: under sustained load from other threads one thread can keep
+delivering for longer than its own call needed.
 
 ## Ratchet
 

@@ -522,6 +522,89 @@ change.
 
 ### Changed (breaking)
 
+- **Listeners run after commit and outside the submit gate (#249,
+  decision D3).** Behaviour change, no signature change. Compatibility:
+  - `TradeListener`, `PriceLevelChangedListener` and the book's
+    `OrderStateListener` used to run inline, often while the submit gate
+    was held and in several places before the mutation finished. Events
+    are now buffered during the mutation, stamped with `engine_seq` under
+    the gate at commit, and delivered after the gate is released by one
+    active dispatcher per book.
+  - Ordering guarantee: per book, one total order consistent with commit
+    order; `engine_seq` strictly increases across the delivered trade and
+    price-level stream, now also with concurrent submitters (previously
+    two shared-gate submitters could interleave their mints and deliver out
+    of sequence). A single submitting thread sees exactly the same events
+    in exactly the same order as before (pinned by a recorded-stream test).
+  - Timing: delivery happens on whichever thread is dispatching. Single
+    threaded, a call's events are still delivered before it returns; under
+    concurrency a submit can return before another thread's dispatcher has
+    delivered its events. A listener may observe a book state newer than
+    its event.
+  - Emission scopes nest per book: caller code running inside one book's
+    mutation (a `Clock`, `T::clone`) that drives another book gets that
+    book's events delivered after its own gate is released.
+  - Re-entrant calls are now allowed: a listener may submit, cancel,
+    modify or mass-cancel on the same book (previously a deadlock under
+    the exclusive gate). The nested call's events are delivered after the
+    current batch.
+  - Panicking listener: book state is consistent (the mutation committed
+    first) and the gate is not poisoned; the rest of the batch being
+    delivered is dropped and counted. New diagnostics:
+    `OrderBook::dropped_listener_events()`, `OrderBook::listener_panics()`,
+    and `OrderBook::flush_listener_events()` to deliver batches left
+    queued after such a panic (call it when `listener_panics()` grows).
+    A snapshot-package restore discards (and counts) batches still queued
+    from before it, since it rewinds `engine_seq` below them.
+  - Backlog: the listener outbox is unbounded; a slow or stalled listener
+    grows it (caller contract: listeners return quickly). New gauge
+    `OrderBook::pending_listener_events()`.
+  - Submit-gate poisoning is no longer recovered silently. It can now only
+    follow an engine (or `T::default()` / `T::clone()`) panic under the
+    exclusive gate; the acquisition that detects it engages the kill switch
+    (new flow and modifies return `KillSwitchActive`, cancels still run),
+    logs once at `ERROR` and latches `OrderBook::submit_gate_poisoned()`.
+  - `OrderStateTracker::transition` on a standalone tracker still calls its
+    listener inline; only a tracker owned by a book defers it.
+  - `match_market_order*` / `match_limit_order*` now publish their trades
+    before releasing the gate (they used to publish after it), so the
+    trade's `engine_seq` is stamped at commit with the sweep's level events;
+    the listener itself still runs after the gate is released.
+  - `add_order_with_result` / `*_with_committed` with a trade listener
+    installed clone the `TradeResult` once (caller copy + deferred listener
+    copy; same fills, fees and `engine_seq`). Journal and replay do not go
+    through listeners and are unaffected.
+  - **Measured cost of the total-order guarantee** (Criterion, 3 to 5
+    interleaved rounds against main c59d74f, Apple M-series). The one
+    workload over the 5% budget is `concurrent_add_limit_orders` **with a
+    no-op trade + price-level listener installed**: +3.8% / +6.7% / +3.7%
+    at 2 / 8 / 16 threads (4 threads within noise). Why: a strictly
+    increasing `engine_seq` in commit order needs each commit's stamp and
+    publish to be one atomic step under the submit gate, which is one
+    outbox lock acquisition per commit (measured 1.23 per add at 8
+    threads, dispatcher drains included); on main the listeners ran
+    inline, concurrently and unordered. The workload maximises that cost:
+    every thread adds at one price for one account, so all of them
+    serialise on the same level and index anyway, and a no-op listener
+    makes delivery free, leaving the lock handoff as the whole difference.
+    Everything else is within budget. Without listeners every path is
+    unchanged within noise: `add_limit_orders` +0.1%,
+    `concurrent_add_limit_orders` -1.0% to +0.7%,
+    `concurrent_mixed_operations` -1.2% to +1.1%, HDR `add_only` and
+    `mixed_70_20_10` p50 0.0%, `aggressive_walk` p50 +2.4% over 10 rounds
+    (one 1 ns histogram bucket). With listeners, `add_limit_orders` is
+    +2.4%, `concurrent_mixed_operations` -0.9% to +4.9% and
+    `match_market_against_limit` +3% to +4%. Tried and kept: a
+    spin flag in front of the outbox mutex (the contended `std` mutex
+    parked waiters in the kernel; 8 threads went from +9.3% to about +6%).
+    Tried and reverted: cache-line co-location of the outbox's hot fields,
+    appending events into a shared buffer in place (slower at every thread
+    count), backoff tuning. Evaluated and not pursued: dropping
+    readiness tracking (at most about 2 points, and it would deliver
+    before the owner's gate release), a lock-free ring keyed by
+    `engine_seq` (state-only batches and externally minted sequence
+    numbers leave gaps that can only be closed by stalling delivery).
+
 - **`OrderBook::peek_match` returns `Result` (#246).** Compatibility:
   `peek_match(side, quantity, price_limit)`: `u64` →
   `Result<u64, OrderBookError>`. A level whose `visible + hidden` overflows

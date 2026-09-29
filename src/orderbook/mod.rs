@@ -22,6 +22,7 @@ pub mod stp;
 /// Price level change events for real-time order book updates.
 pub mod book_change_event;
 mod cache;
+mod emission;
 /// Contains the core logic for modifying the order book state, such as adding, canceling, or updating orders.
 pub mod modifications;
 pub mod operations;
