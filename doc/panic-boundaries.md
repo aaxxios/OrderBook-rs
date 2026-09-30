@@ -788,8 +788,9 @@ what it leaves on failure:
   last trade price come from one state between two exclusive calls. It is
   a gated call: caller code running under the book's gate must not call
   it (the gate is not reentrant).
-- **No reentrancy.** The elected stop's market order runs through the
-  ungated market path (the body of `match_market_order_committed`:
+- **No reentrancy.** The elected stop's child order (an IOC market
+  order, or an IOC limit at the collar price with a `StopProtection`,
+  #302) runs through the ungated matching path (the body of `match_market_order_committed`:
   trade-id headroom, arithmetic preflight, `match_order_with_user_outcome`,
   `publish_match_outcome_from`) under the gate the entry point already
   holds; nothing re-acquires the gate. Its events land in the same
@@ -798,8 +799,12 @@ what it leaves on failure:
   elected, so it is elected at most once; every market order adds at
   most one segment to evaluate, so a cascade evaluates at most
   `pending + 1` segments. Trailing only ever tightens a stop and is
-  idempotent at a given price. The bound is the only limit: one print can
-  run every pending stop's market order within the call that printed it.
+  idempotent at a given price. The bound is the only limit on the
+  cascade's length: one print can run every pending stop's child within
+  the call that printed it. A protection collar (#302) bounds each child's
+  price, not how many run; the collar is a `Copy` value read once per
+  elected stop, with `checked_sub` / `checked_add` clamped to `0` /
+  `u128::MAX`, so it adds no failure mode.
 - **Arithmetic.** Trailing uses `checked_sub` / `checked_add` (a stop the
   trail cannot represent keeps its price), the admission sequence and the
   pending count are checked. The risk re-booking of a trailed stop

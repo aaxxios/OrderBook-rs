@@ -859,10 +859,12 @@ of the book, so pushing onto a channel is still the recommended shape.
 ### 3. State Management
 
 Use a snapshot **package** for persistence: it carries the format version
-(currently 4; versions 2 to 4 restore), a checksum, and the book's
+(currently 6; versions 2 to 6 restore), a checksum, and the book's
 configuration (fees, STP mode, tick / lot size, order-size limits, risk
-config, kill switch, `engine_seq`), and restore validates all of it before
-touching the live book.
+config, kill switch, `engine_seq`, stop protection collar), and restore
+validates all of it before touching the live book. From version 5 the
+checksummed payload also carries the pending trailing stops and the last
+trade price; version 6 adds the collar (a 0.14 reader refuses it).
 
 ```rust
 use orderbook_rs::orderbook::OrderBookSnapshotPackage;
