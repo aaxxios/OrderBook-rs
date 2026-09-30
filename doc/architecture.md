@@ -122,8 +122,10 @@ stops exist, and only the election path reads it.
   Book configuration is not journaled: `ReplayBookConfig` must carry the
   source book's fees, STP mode, shape rules, trade-id namespace and stop
   protection collar (constant over the replayed range) for the replay to
-  reproduce its trades; a collar mismatch is only detected by
-  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.
+  reproduce its trades. A collar mismatch is not an `OutcomeMismatch`,
+  and `snapshots_match` catches it only when it changed an outcome (the
+  snapshot does not carry the collar); verify the configuration by
+  comparing `stop_protection()` of the replayed and source books.
   `snapshots_match` is the equality oracle.
 
 ## Feature matrix

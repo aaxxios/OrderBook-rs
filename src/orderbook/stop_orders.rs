@@ -84,11 +84,11 @@
 //! including an empty band over a non-empty side (a gap through the
 //! collar: `filled_quantity: 0`); `Cancelled { InsufficientLiquidity }`
 //! when the side ran out within the band. `Triggered` carries the child's
-//! `limit_price` (`None` for a market child). A band that runs past the
-//! representable prices (a sell collar above the stop price, a buy stop
-//! within the collar of `u128::MAX`) is clamped to the bound (`0` /
-//! `u128::MAX`): the collar does not restrict that side. With a tick size the collar must be a
-//! multiple of it, so the limit of a tick-aligned stop is tick-aligned; the
+//! `limit_price` (`None` for a market child). A band that reaches or
+//! passes the representable bound (a sell collar `>=` the stop price, a buy
+//! `stop + collar >= u128::MAX`) has the bound as its limit (`0` /
+//! `u128::MAX`): the collar does not restrict that side. With a tick size
+//! the collar must be a multiple of it, so the limit of a tick-aligned stop is tick-aligned; the
 //! limit is a bound on matching, never a resting price, so it is not
 //! rounded. An empty band is not counted in the `InsufficientLiquidity`
 //! reject metric (a limit that does not cross is not a rejection).

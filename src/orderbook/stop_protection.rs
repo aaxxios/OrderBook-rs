@@ -56,10 +56,12 @@ const HIGHEST_PRICE: u128 = u128::MAX;
 ///
 /// # A collar wider than the price: no protection on that side
 ///
-/// A **sell** stop whose collar is larger than its stop price gets a limit
-/// of `0`: every bid is within its band, so the collar does **not** protect
-/// it at all (the same for a buy stop whose `stop + collar` exceeds
-/// `u128::MAX`, limit `u128::MAX`). This is silent by design (no log per
+/// A **sell** stop whose collar reaches or exceeds its stop price
+/// (`collar >= stop`) gets a limit of `0` (exactly `0` at equality,
+/// clamped beyond): every bid is within its band, so the collar does
+/// **not** protect it at all. The same holds for a **buy** stop whose
+/// `stop + collar` reaches or exceeds `u128::MAX` (limit `u128::MAX`). This
+/// is silent by design (no log per
 /// election, which is a hot path): size the collar well below the stop
 /// prices it protects. A stop trailing down towards the collar is covered
 /// by the same rule, since the limit is computed from the trailed stop
@@ -104,11 +106,11 @@ impl StopProtection {
     /// `stop_price` executes as when it is elected: `stop - collar` for a
     /// sell stop, `stop + collar` for a buy stop.
     ///
-    /// When the band runs past the representable prices (a sell collar
-    /// larger than the stop price, a buy stop within the collar of
-    /// `u128::MAX`), the limit is the bound itself (`0`, `u128::MAX`): every
-    /// price on that side of the stop is within the band, so the collar
-    /// does not restrict the order there.
+    /// When the band reaches or passes the representable bound (a sell
+    /// collar `>=` the stop price, a buy `stop + collar >= u128::MAX`), the
+    /// limit is the bound itself (`0`, `u128::MAX`): every price on that
+    /// side of the stop is within the band, so the collar does not restrict
+    /// the order there.
     #[inline]
     #[must_use]
     pub fn limit_price(self, side: Side, stop_price: Price) -> Price {
@@ -119,8 +121,9 @@ impl StopProtection {
     #[inline]
     #[must_use]
     pub(crate) fn limit_for(self, side: Side, stop: u128) -> u128 {
-        // A band past the representable prices is unbounded on that side:
-        // its limit is the bound itself, which every price satisfies.
+        // A band reaching or passing the representable bound is unbounded
+        // on that side: its limit is the bound itself (reached exactly at
+        // equality, clamped beyond), which every price satisfies.
         let (limit, unbounded) = match side {
             Side::Sell => (stop.checked_sub(self.collar()), LOWEST_PRICE),
             Side::Buy => (stop.checked_add(self.collar()), HIGHEST_PRICE),

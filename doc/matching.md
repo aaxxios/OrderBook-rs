@@ -113,9 +113,9 @@ Collar rules:
   `None`). With a tick size it must be a multiple of it, so the limit of a
   tick-aligned stop is tick-aligned; the limit is only a matching bound and
   is not rounded.
-- A band past the representable prices (a sell collar above the stop
-  price, a buy stop within the collar of `u128::MAX`) is clamped to `0` /
-  `u128::MAX`: unbounded on that side, so that stop is not protected at
+- A band that reaches or passes the representable bound (a sell collar
+  `>=` the stop price, a buy `stop + collar >= u128::MAX`) has the bound
+  as its limit, `0` / `u128::MAX`: unbounded on that side, so that stop is not protected at
   all (silently; no per-election log on this hot path).
 - An empty band is not counted in the `InsufficientLiquidity` reject
   metric: a limit that does not cross is not a rejection.
@@ -131,5 +131,10 @@ Collar rules:
   never read it. It travels in the snapshot package (format 6) and in
   `ReplayBookConfig::stop_protection`; replay must use the source book's
   collar, constant over the replayed range (it is not journaled), to
-  reproduce its elections. A mismatch is only detected by
-  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.
+  reproduce its elections. A mismatch is not an
+  `ReplayError::OutcomeMismatch`, and `snapshots_match` catches it only
+  when it changed an outcome (a stop elected and filled differently):
+  `OrderBookSnapshot` does not carry the collar, so with no election in
+  the range, or coinciding fills, the snapshots match while future
+  elections differ. Compare `stop_protection()` of the replayed and source
+  books (or the snapshot package's field) explicitly.

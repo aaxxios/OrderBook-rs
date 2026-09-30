@@ -246,16 +246,22 @@ driven by the book's **prints**:
   child's limit (`None` for a market child). The collar must be a multiple
   of the tick size (`InvalidTickSize`) and cannot be zero
   (`InvalidStopProtection`; unset is `None`); a later `set_tick_size` does
-  not re-validate it. A band past the representable prices (a sell collar
-  above the stop price, a buy stop within the collar of `u128::MAX`) is
-  clamped to `0` / `u128::MAX`: that stop is **not protected** on that
-  side, silently, so size the collar well below the stop prices. Without a
+  not re-validate it. A band that reaches or passes the representable
+  bound (a sell collar `>=` the stop price, a buy `stop + collar >=
+  u128::MAX`) has the bound as its limit, `0` / `u128::MAX`: that stop is
+  **not protected** on that side, silently, so size the collar well below the stop prices. Without a
   collar (the default) the child is the unpriced market order of 0.14.
   The collar travels in the snapshot package (format 6). For replay, pass
   it with `ReplayBookConfig::with_stop_protection`: it must match the
   source book **and** have been constant over the replayed range
-  (`set_stop_protection` is not journaled); a mismatch is only detected by
-  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.
+  (`set_stop_protection` is not journaled). A mismatch is not reported as
+  `ReplayError::OutcomeMismatch`, and `snapshots_match` catches it only
+  when it changed an outcome (a stop elected and filled differently): the
+  snapshot does not carry the collar, so with no election in the range, or
+  coinciding fills, the snapshots match while future elections differ.
+  Verify the configuration explicitly:
+  `replayed.stop_protection() == source.stop_protection()` (or compare
+  with the snapshot package's `stop_protection`).
 - **Price path.** Each sweep is evaluated at its first print and then at
   its last one (a sweep's prints move one way, so these are its
   extremes): at each, stops trail first and are elected second. A falling

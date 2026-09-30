@@ -804,7 +804,8 @@ what it leaves on failure:
   the call that printed it. A protection collar (#302) bounds each child's
   price, not how many run; the collar is a `Copy` value read once per
   elected stop, with `checked_sub` / `checked_add` clamped to `0` /
-  `u128::MAX`, so it adds no failure mode. Classifying a collared
+  `u128::MAX` (a band reaching or passing the bound is unbounded on that
+  side), so it adds no failure mode. Classifying a collared
   remainder (`StopProtectionBand` vs `InsufficientLiquidity`) reads the
   best-price cache once; it cannot fail.
 - **Arithmetic.** Trailing uses `checked_sub` / `checked_add` (a stop the

@@ -68,8 +68,9 @@ This order book engine is built with the following design principles:
   must be a multiple of the tick size (`InvalidTickSize`) and cannot be
   zero
   (`OrderBookError::InvalidStopProtection`; "unset" is `None`); a band
-  past the representable prices is clamped to `0` / `u128::MAX`
-  (unbounded on that side). Unset (the default) keeps the 0.14 unpriced
+  that reaches or passes the representable bound (sell `collar >= stop`,
+  buy `stop + collar >= u128::MAX`) has the bound as its limit, `0` /
+  `u128::MAX` (unbounded on that side). Unset (the default) keeps the 0.14 unpriced
   IOC market child. The config type exists in every build; it only
   acts where trailing stops exist. Paths without a pending stop never
   read it.
@@ -87,8 +88,12 @@ This order book engine is built with the following design principles:
   (add `..Default::default()` for `ReplayBookConfig`, or set the field).
   Replay must be given the source book's collar
   (`ReplayBookConfig::with_stop_protection`), constant over the replayed
-  range, to reproduce its elections; a mismatch is only detected by
-  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.
+  range, to reproduce its elections. A mismatch is not reported as
+  `ReplayError::OutcomeMismatch`, and `snapshots_match` catches it only
+  when it changed an outcome (a stop elected and filled differently):
+  `OrderBookSnapshot` does not carry the collar. Verify it explicitly by
+  comparing the replayed book's `stop_protection()` with the source
+  book's (or the snapshot package's `stop_protection`).
 - **`CancelReason::StopProtectionBand`** is appended (bincode index 10):
   exhaustive matches need the arm.
 - **`OrderStatus::Triggered { child_id, trigger_price, limit_price }`**:
@@ -106,9 +111,10 @@ This order book engine is built with the following design principles:
 - The collar bounds each child's price, not the cascade: a ladder of
   stops spaced one collar apart still walks the book `k × collar` in one
   call (no cascade depth limit or velocity pause).
-- A sell collar larger than the stop price (or a buy `stop + collar`
-  above `u128::MAX`) is clamped: that stop has no protection at all,
-  silently.
+- A sell collar that reaches or exceeds the stop price (`collar >=
+  stop`: limit `0`), or a buy stop whose `stop + collar` reaches or
+  exceeds `u128::MAX` (limit `u128::MAX`): that stop has no protection
+  at all, silently.
 
 #### Migration from 0.14
 

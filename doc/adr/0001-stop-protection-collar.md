@@ -26,8 +26,8 @@ plus or minus N ticks, and CME rests any unfilled remainder at that limit).
   "unset" is `None`.
 - Reference price: the stop's trailed stop price at election, not the
   electing print. Sell stop child: IOC limit at `stop - collar`; buy stop
-  child: IOC limit at `stop + collar`. A band past `0` / `u128::MAX` is
-  clamped (unbounded on that side).
+  child: IOC limit at `stop + collar`. A band that reaches or passes `0` /
+  `u128::MAX` has that bound as its limit (unbounded on that side).
 - Remainder: cancelled, **unlike CME**, which rests it at the limit. An
   elected stop never rests liquidity. A remainder the collar cut
   (liquidity left beyond the limit, including an empty band over a
@@ -59,11 +59,17 @@ plus or minus N ticks, and CME rests any unfilled remainder at that limit).
   rested, a stop whose band is exhausted is consumed and its position is
   left unprotected; a gap of more than one collar through the stop always
   consumes it with zero fill. Callers must watch for `StopProtectionBand`.
-- A sell collar larger than the stop price clamps the limit to `0`: that
-  stop is not protected at all. This is silent (no per-election log) and
+- A sell collar that reaches or exceeds the stop price (`collar >= stop`)
+  gives a limit of `0`, and a buy `stop + collar >= u128::MAX` a limit of
+  `u128::MAX`: that stop is not protected at all. This is silent (no per-election log) and
   documented on `StopProtection`.
 - Replay must use the source book's collar, constant over the replayed
-  range; a mismatch is only detected by `snapshots_match`.
+  range. A mismatch is not an `OutcomeMismatch`, and `snapshots_match`
+  catches it only when it changed an outcome, since `OrderBookSnapshot`
+  does not carry the collar (no election in the range, or coinciding
+  fills, and the snapshots match while future elections differ). Callers
+  verify the configuration explicitly by comparing `stop_protection()`
+  with the source book's or the snapshot package's field.
 - Paths without a pending stop never read the collar; the election path
   reads it once per elected stop.
 - Breaking for 0.15: two new public struct fields, a new `CancelReason`
