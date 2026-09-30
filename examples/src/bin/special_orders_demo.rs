@@ -16,8 +16,9 @@
 //! - a print at or through the stop price (along each sweep's price path,
 //!   not only its last print) elects the stop: it records
 //!   `OrderStatus::Triggered` and executes as an unpriced
-//!   immediate-or-cancel market order, automatically, inside the call whose
-//!   trade crossed it; its trades carry `origin_stop_id`; stops can cascade;
+//!   immediate-or-cancel market child order (or a collared limit child,
+//!   below), automatically, inside the call whose trade crossed it; its
+//!   trades carry `origin_stop_id`; stops can cascade;
 //! - a stop the last trade already crosses is rejected at admission
 //!   (`StopWouldTrigger`).
 //!
@@ -25,7 +26,9 @@
 //! `OrderBook::set_stop_protection` bounds an elected stop: its child
 //! becomes an immediate-or-cancel limit at `stop - collar` (sell) or
 //! `stop + collar` (buy) and whatever does not fill within the band is
-//! cancelled, so a thin book is not swept to its last level.
+//! cancelled (not rested, unlike CME protection points), so a thin book is
+//! not swept to its last level; a remainder the collar cut ends
+//! `Cancelled { StopProtectionBand }`.
 //!
 //! # Usage:
 //! ```bash
@@ -329,9 +332,18 @@ fn demo_stop_protection_collar() {
                 protection.limit_price(Side::Sell, Price::new(3000))
             ),
         }
+        // `Triggered` carries the child's limit (none for a market child);
+        // a remainder the collar cut ends `StopProtectionBand`.
+        if let Some(history) = book
+            .order_state_tracker()
+            .and_then(|tracker| tracker.get_history(stop_id))
+        {
+            for (_, status) in history {
+                info!("  Stop history: {status}");
+            }
+        }
         info!(
-            "  Stop status: {:?} | last trade {} | best bid left {}",
-            book.order_status(stop_id),
+            "  Last trade {} | best bid left {}",
             book.last_trade_price().unwrap_or(0),
             book.best_bid().unwrap_or(0)
         );
