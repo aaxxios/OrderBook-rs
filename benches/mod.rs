@@ -36,4 +36,14 @@ criterion_group!(
     register_serialization_benchmarks,
 );
 
+// #286: pending-stop workloads run last, after every shared row.
+#[cfg(feature = "special_orders")]
+criterion_group!(
+    pending_stop_benches,
+    order_book::pending_stops::register_benchmarks
+);
+
+#[cfg(not(feature = "special_orders"))]
 criterion_main!(benches);
+#[cfg(feature = "special_orders")]
+criterion_main!(benches, pending_stop_benches);
