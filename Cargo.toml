@@ -188,6 +188,12 @@ path = "benches/order_book/reserve_sweep_hdr.rs"
 harness = false
 
 [[bench]]
+name = "pending_stops_hdr"
+path = "benches/order_book/pending_stops_hdr.rs"
+harness = false
+required-features = ["special_orders"]
+
+[[bench]]
 name = "alloc_count"
 path = "benches/order_book/alloc_count.rs"
 harness = false
