@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-orderbook-rs = "0.14"
+orderbook-rs = "0.15"
 pricelevel = "0.10"
 ```
 
@@ -1293,6 +1293,6 @@ For issues, questions, or contributions:
 
 ---
 
-**Version:** 0.14.0  
+**Version:** 0.15.0  
 **Last Updated:** September 2026  
 **License:** MIT

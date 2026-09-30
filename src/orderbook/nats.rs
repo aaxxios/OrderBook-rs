@@ -38,7 +38,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! orderbook-rs = { version = "0.14", features = ["nats"] }
+//! orderbook-rs = { version = "0.15", features = ["nats"] }
 //! ```
 
 use crate::orderbook::nats_common::{
