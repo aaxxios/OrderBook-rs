@@ -1338,11 +1338,11 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_v5_round_trips_pending_stops_and_last_trade() {
+    fn test_snapshot_round_trips_pending_stops_and_last_trade() {
         let live = stateful_book();
         let json = live.snapshot_to_json(usize::MAX).expect("json");
         let package = OrderBookSnapshotPackage::from_json(&json).expect("parse");
-        assert_eq!(package.version, 5);
+        assert_eq!(package.version, 6, "current format (#302)");
         assert_eq!(package.snapshot.pending_stops.len(), 2);
         assert_eq!(package.snapshot.last_trade_price, Some(100));
 
@@ -1464,13 +1464,13 @@ mod tests {
         assert_eq!(restored.visible_quantity_at_price(100, Side::Sell), Some(6));
         assert_eq!(restored.last_trade_price(), None);
         assert_eq!(restored.trailing_stop_count(), 0);
-        // Re-packaged as v5.
+        // Re-packaged in the current format (v6 since #302).
         let json = restored.snapshot_to_json(usize::MAX).expect("json");
         assert_eq!(
             OrderBookSnapshotPackage::from_json(&json)
                 .expect("parse")
                 .version,
-            5
+            6
         );
     }
 

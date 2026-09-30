@@ -769,7 +769,7 @@ mod test_snapshot_engine_seq {
                     "error message must mention version 1, got: {message}"
                 );
                 assert!(
-                    message.contains("2..=5"),
+                    message.contains("2..=6"),
                     "error message must state the supported range, got: {message}"
                 );
             }
@@ -881,12 +881,12 @@ mod test_snapshot_format_v3 {
     };
     use pricelevel::{Hash32, Id, Side, TimeInForce};
 
-    /// New packages are stamped with the current (v5) format version, and a
+    /// New packages are stamped with the current (v6) format version, and a
     /// non-degraded book's payload carries no `stats_degraded` key at all
     /// (pricelevel serializes it only when `true`), which is exactly the
     /// shape a legacy v2 payload has.
     #[test]
-    fn test_new_package_is_v5_and_omits_stats_degraded_when_clean() {
+    fn test_new_package_is_v6_and_omits_stats_degraded_when_clean() {
         let book = DefaultOrderBook::new("V3");
         let added = book.add_limit_order_with_user(
             Id::from_u64(1),
@@ -904,7 +904,7 @@ mod test_snapshot_format_v3 {
             package.version, ORDERBOOK_SNAPSHOT_FORMAT_VERSION,
             "new packages carry the current format version"
         );
-        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 5, "current version is 5");
+        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 6, "current version is 6");
 
         let json = package.to_json().expect("serialize package");
         assert!(
@@ -1134,13 +1134,13 @@ mod test_snapshot_format_v3 {
         assert_eq!(round_tripped.best_ask(), Some(100));
     }
 
-    /// The version range read by `validate` is exactly 2..=5.
+    /// The version range read by `validate` is exactly 2..=6.
     #[test]
-    fn test_read_version_range_is_2_to_5() {
+    fn test_read_version_range_is_2_to_6() {
         assert_eq!(ORDERBOOK_SNAPSHOT_MIN_READ_VERSION, 2);
-        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 5);
+        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 6);
         let book = DefaultOrderBook::new("RANGE");
-        for version in 2..=5 {
+        for version in 2..=6 {
             let package = book
                 .create_snapshot_package(10)
                 .expect("build package")

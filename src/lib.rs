@@ -1689,6 +1689,7 @@ pub use orderbook::sequencer::{
 pub use orderbook::serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use orderbook::snapshot::{EnrichedSnapshot, MetricFlags};
 pub use orderbook::statistics::{DepthStats, DistributionBin};
+pub use orderbook::stop_protection::StopProtection;
 pub use orderbook::stp::STPMode;
 pub use orderbook::trade::{
     SubmitFailure, TradeArithmeticError, TradeEvent, TradeInfo, TradeListener, TradeResult,

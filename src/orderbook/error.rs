@@ -571,6 +571,19 @@ pub enum OrderBookError {
         reason: &'static str,
     },
 
+    /// A stop protection collar was refused (#302): a zero collar
+    /// (`StopProtection::try_new(0)`; an unset protection is `None`, not a
+    /// zero collar). A configuration error, not an order rejection: it maps
+    /// to `RejectReason::Other(0)`. A collar that is not a multiple of the
+    /// book's tick size is refused with [`OrderBookError::InvalidTickSize`]
+    /// instead, like a misaligned trail amount.
+    InvalidStopProtection {
+        /// The refused collar, in price units.
+        collar: u128,
+        /// Static description of the problem.
+        reason: &'static str,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -856,6 +869,9 @@ impl fmt::Display for OrderBookError {
             }
             OrderBookError::InvalidStopTerms { order_id, reason } => {
                 write!(f, "invalid trailing stop {order_id}: {reason}")
+            }
+            OrderBookError::InvalidStopProtection { collar, reason } => {
+                write!(f, "invalid stop protection collar {collar}: {reason}")
             }
             OrderBookError::StopOrdersUnsupported { order_id } => {
                 write!(

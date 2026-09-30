@@ -16,6 +16,7 @@ use crate::orderbook::book_change_event::{PriceLevelChangedEvent, PriceLevelChan
 use crate::orderbook::matching::{MatchOutcome, SweepReservation};
 #[cfg(feature = "special_orders")]
 use crate::orderbook::repricing::SpecialOrderTracker;
+use crate::orderbook::stop_protection::StopProtection;
 use crate::orderbook::stp::STPMode;
 use crate::orderbook::trade::{SubmitFailure, TradeListener, TradeResult};
 use crossbeam::atomic::AtomicCell;
@@ -657,6 +658,12 @@ pub struct OrderBook<T = ()> {
     /// Fees are calculated during trade execution and can be configured per orderbook.
     pub(super) fee_schedule: Option<FeeSchedule>,
 
+    /// Protection collar for elected stop orders (#302). `None` (the
+    /// default) keeps the unpriced IOC market child; `Some` turns it into
+    /// an IOC limit at the stop price moved by the collar. Read only when a
+    /// stop is elected; part of the snapshot package (format version 6).
+    pub(super) stop_protection: Option<StopProtection>,
+
     /// Optional order state tracker for explicit lifecycle tracking.
     /// When `Some`, every order transition (Open, PartiallyFilled, Filled,
     /// Cancelled, Rejected) is recorded. When `None`, zero overhead.
@@ -677,9 +684,9 @@ pub struct OrderBook<T = ()> {
 /// persistence or round-trip path. It intentionally omits matching
 /// configuration that [`OrderBook::create_snapshot_package`] preserves —
 /// `stp_mode`, tick/lot/min/max order size, the engine sequence, the kill
-/// switch, and the risk config — and there is no corresponding `Deserialize`,
-/// so it cannot reconstruct a book. The bids, asks, and order-location maps use
-/// `BTreeMap` so the JSON key ordering is deterministic across process runs, and
+/// switch, the risk config and the stop protection collar — and there is no
+/// corresponding `Deserialize`, so it cannot reconstruct a book. The bids,
+/// asks, and order-location maps use `BTreeMap` so the JSON key ordering is deterministic across process runs, and
 /// the volatile best-bid/ask cache is not serialized.
 ///
 /// For durable, reproducible persistence or replay, use
@@ -1174,6 +1181,7 @@ where
             max_order_size: None,
             stp_mode: STPMode::None,
             fee_schedule: None,
+            stop_protection: None,
             order_state_tracker: None,
             clock,
         }
@@ -2213,6 +2221,7 @@ where
             max_order_size: None,
             stp_mode: STPMode::None,
             fee_schedule: None,
+            stop_protection: None,
             order_state_tracker: None,
             clock: Arc::new(MonotonicClock) as Arc<dyn Clock>,
         }
@@ -2289,6 +2298,7 @@ where
             max_order_size: None,
             stp_mode: STPMode::None,
             fee_schedule: None,
+            stop_protection: None,
             order_state_tracker: None,
             clock: Arc::new(MonotonicClock) as Arc<dyn Clock>,
         }
@@ -2350,6 +2360,83 @@ where
     #[must_use]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule
+    }
+
+    /// Install, replace or clear (`None`) the protection collar for elected
+    /// stop orders (#302).
+    ///
+    /// With a collar, an elected trailing stop executes as an
+    /// immediate-or-cancel **limit** order at its stop price (the trailed
+    /// stop price at election) moved by the collar against it: a sell stop
+    /// at `stop - collar`, a buy stop at `stop + collar` (see
+    /// [`StopProtection::limit_price`]). It trades only within that band and
+    /// whatever does not fill is cancelled (the stop ends `Cancelled {
+    /// InsufficientLiquidity }` with what it filled); an elected stop never
+    /// rests. Without one (the default) it executes as an unpriced
+    /// immediate-or-cancel market order, the 0.14 behaviour.
+    ///
+    /// Applies to stops elected after the call, including stops already
+    /// pending. Trailing stops need the `special_orders` feature; without
+    /// it the collar is kept (and snapshotted) but has nothing to act on.
+    ///
+    /// With a tick size configured the collar must be a multiple of it, so
+    /// the collar limit of a tick-aligned stop price is tick-aligned. Like
+    /// the book's other shape rules, a later [`Self::set_tick_size`] does
+    /// not re-validate it: the collar keeps bounding execution exactly
+    /// (only levels at or inside the band trade), it is simply no longer a
+    /// whole number of ticks.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::InvalidTickSize`] (carrying the collar as `price`)
+    /// when the collar is not a multiple of the book's tick size; the
+    /// previous protection is kept.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use orderbook_rs::{OrderBook, OrderBookError, StopProtection};
+    ///
+    /// let mut book = OrderBook::<()>::with_tick_size("BTC/USD", 5);
+    /// book.set_stop_protection(Some(StopProtection::try_new(25)?))?;
+    /// assert_eq!(book.stop_protection().map(StopProtection::collar), Some(25));
+    ///
+    /// // 12 is not a multiple of the tick size.
+    /// assert!(book.set_stop_protection(Some(StopProtection::try_new(12)?)).is_err());
+    /// assert_eq!(book.stop_protection().map(StopProtection::collar), Some(25));
+    ///
+    /// // Back to the unprotected market child.
+    /// book.set_stop_protection(None)?;
+    /// # Ok::<(), OrderBookError>(())
+    /// ```
+    pub fn set_stop_protection(
+        &mut self,
+        protection: Option<StopProtection>,
+    ) -> Result<(), OrderBookError> {
+        if let Some(protection) = protection {
+            protection.check_tick_size(self.tick_size)?;
+        }
+        self.stop_protection = protection;
+        Ok(())
+    }
+
+    /// Install or clear the protection collar without the tick-size check
+    /// (#302): the restore and replay paths reproduce a source book as it
+    /// was, and a source book may hold a collar admitted under a previous
+    /// tick size (see [`Self::set_stop_protection`]).
+    #[inline]
+    pub(crate) fn set_stop_protection_unchecked(&mut self, protection: Option<StopProtection>) {
+        self.stop_protection = protection;
+    }
+
+    /// The protection collar for elected stop orders, if any (#302).
+    ///
+    /// `None` (the default) means an elected stop executes as an unpriced
+    /// immediate-or-cancel market order.
+    #[inline]
+    #[must_use]
+    pub fn stop_protection(&self) -> Option<StopProtection> {
+        self.stop_protection
     }
 
     /// Set the minimum price increment for orders.
@@ -5104,7 +5191,7 @@ where
     ///
     /// The returned package includes the book's configuration fields
     /// (`fee_schedule`, `stp_mode`, `tick_size`, `lot_size`,
-    /// `min_order_size`, `max_order_size`) so that
+    /// `min_order_size`, `max_order_size`, `stop_protection`, ...) so that
     /// [`restore_from_snapshot_package`](Self::restore_from_snapshot_package)
     /// can fully reconstruct the book's state.
     ///
@@ -5130,6 +5217,7 @@ where
         package.risk_config = self.risk_state.config().cloned();
         package.market_close_timestamp = self.market_close_timestamp.load(Ordering::Relaxed);
         package.has_market_close = self.has_market_close.load(Ordering::Relaxed);
+        package.stop_protection = self.stop_protection;
         Ok(package)
     }
 
@@ -5147,7 +5235,11 @@ where
     /// [`create_snapshot_package`](Self::create_snapshot_package), plus the
     /// last trade price and the pending trailing stops (format version 5,
     /// #286; older packages carry neither), whose risk is rebuilt with the
-    /// resting orders'.
+    /// resting orders', and the stop protection collar (format version 6,
+    /// #302; older packages restore with none). The collar is installed as
+    /// captured, without re-checking it against the tick size (the source
+    /// book may hold one admitted under a previous tick size, see
+    /// [`Self::set_stop_protection`]).
     ///
     /// The kill-switch flag is operator-driven and not journaled by
     /// the sequencer; it travels with snapshot packages only. Replay
@@ -5193,6 +5285,7 @@ where
         let risk_config = package.risk_config.clone();
         let market_close_timestamp = package.market_close_timestamp;
         let has_market_close = package.has_market_close;
+        let stop_protection = package.stop_protection;
 
         // Take ownership of the validated snapshot.
         let snapshot = package.into_snapshot()?;
@@ -5258,6 +5351,7 @@ where
         self.lot_size = lot_size;
         self.min_order_size = min_order_size;
         self.max_order_size = max_order_size;
+        self.set_stop_protection_unchecked(stop_protection);
 
         // Restore the engine's outbound monotonic counter so that the
         // first `next_engine_seq()` call on this restored book returns

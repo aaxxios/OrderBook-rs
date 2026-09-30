@@ -19,9 +19,12 @@
 //!   immediate-or-cancel **market order** for its quantity, on its side,
 //!   for its user (self-trade prevention, fees and the trade-id / notional
 //!   preflights apply as for any market taker); an unexecuted remainder is
-//!   cancelled. A stop the last trade already crosses is refused at
-//!   admission and on modify (`StopWouldTrigger`): a stop only triggers on
-//!   a new print.
+//!   cancelled. With a [`StopProtection`](crate::StopProtection) collar on
+//!   the book (#302) the child is an immediate-or-cancel **limit** order
+//!   instead, at the stop price moved by the collar against it (see
+//!   "Protection collar" below). A stop the last trade already crosses is
+//!   refused at admission and on modify (`StopWouldTrigger`): a stop only
+//!   triggers on a new print.
 //! - **Path.** Each sweep is evaluated as a `PrintSegment`: the price it
 //!   arrived from and its first and last prints (a sweep's prints are
 //!   monotonic, so these are its extremes). At the first print, then at the
@@ -62,6 +65,39 @@
 //! pays a few relaxed loads of that count (gate decision, re-check,
 //! evaluation) and one per matched level (the print recorder).
 //!
+//! # Protection collar (#302)
+//!
+//! [`OrderBook::set_stop_protection`] installs a per-book collar, an
+//! absolute offset in price units (like CME protection points). The child
+//! of an elected stop is then an immediate-or-cancel limit order at
+//!
+//! - `stop - collar` for a sell stop,
+//! - `stop + collar` for a buy stop,
+//!
+//! where `stop` is the stop's current (trailed) stop price at election, not
+//! the print that elected it. The child trades only at levels at or inside
+//! that limit; whatever does not fill is cancelled and nothing rests. If no
+//! level is within the band (a gap through the collar) the child trades
+//! nothing and the stop ends `Cancelled { filled_quantity: 0, reason:
+//! InsufficientLiquidity }`, the reason every immediate-or-cancel
+//! remainder takes. A band that runs past the representable prices (a
+//! sell collar above the stop price, a buy stop within the collar of
+//! `u128::MAX`) is clamped to the bound (`0` / `u128::MAX`): the collar
+//! does not restrict that side. With a tick size the collar must be a
+//! multiple of it, so the limit of a tick-aligned stop is tick-aligned; the
+//! limit is a bound on matching, never a resting price, so it is not
+//! rounded. An empty band is not counted in the `InsufficientLiquidity`
+//! reject metric (a limit that does not cross is not a rejection); the
+//! stop's terminal state is the same as a market child finding no
+//! liquidity.
+//!
+//! Every stop of a cascade is bounded by its own collar, so a cascade can
+//! no longer trade beyond the collar of the stop that reaches furthest;
+//! how far that is still depends on the pending stops' prices. Without a
+//! collar (the default) the child is the unpriced market order of 0.14.
+//! The collar is read once per elected stop: paths without a pending stop
+//! never touch it.
+//!
 //! # Lifecycle and the link to the market order
 //!
 //! The order state of a pending stop is `Open`. At election it records
@@ -86,18 +122,21 @@
 //!
 //! # What a stop does not protect against
 //!
-//! - The market order is **unpriced**: it walks the opposite side as far as
-//!   its quantity needs, with no protection collar, and the book applies no
+//! - Without a collar the market order is **unpriced**: it walks the
+//!   opposite side as far as its quantity needs, and the book applies no
 //!   price band to market orders. A thin or gapped book fills it far from
-//!   the stop price.
+//!   the stop price. Configure a [`StopProtection`](crate::StopProtection)
+//!   to bound it; the price of that bound is that a stop whose band is
+//!   empty is cancelled unexecuted, leaving the position open.
 //! - The risk layer books a pending stop at its stop price (re-booked as it
 //!   trails, without enforcing limits: a trailing sell stop can lift its
 //!   account above `max_notional_per_account`, and the account's later
 //!   admissions are rejected until it shrinks). That booking understates a
 //!   market order that fills through a gap.
-//! - A cascade is bounded only by the number of pending stops: one print
-//!   can run every pending stop's market order within the call that
-//!   printed it.
+//! - A cascade's **length** is bounded only by the number of pending stops:
+//!   one print can run every pending stop's child within the call that
+//!   printed it. A collar bounds each child's price range, not how many
+//!   children run (no cascade depth limit or velocity pause).
 //! - `cancel_orders_by_price_range` matches a stop by its **current**
 //!   (trailed) stop price, not the price it was admitted at.
 
@@ -1288,9 +1327,15 @@ where
     /// Executes one elected stop (#286), already out of the store: its
     /// risk reservation is released, `Triggered { child_id, trigger_price }`
     /// is recorded for the stop (the listener's election event), its
-    /// market order runs with `origin_stop_id` on its trades, and the stop
-    /// records that order's terminal state. Returns the market order's
-    /// sweep, if it traded.
+    /// child order runs with `origin_stop_id` on its trades, and the stop
+    /// records that order's terminal state. Returns the child's sweep, if
+    /// it traded.
+    ///
+    /// The child is an immediate-or-cancel market order, or, with a
+    /// [`StopProtection`](crate::StopProtection) on the book (#302), an
+    /// immediate-or-cancel limit order at the stop's (trailed) stop price
+    /// moved by the collar against it. The collar is read once per elected
+    /// stop, never on a path without one.
     ///
     /// A market-order id that is already in use (a resting order or a
     /// pending stop carrying the derived id: only possible when the
@@ -1303,6 +1348,10 @@ where
         let side = stop.side();
         let user_id = stop.user_id();
         let quantity = stop.visible_quantity().as_u64();
+        let stop_price = stop.price().as_u128();
+        let limit = self
+            .stop_protection
+            .map(|protection| protection.limit_for(side, stop_price));
         self.risk_state.on_cancel(stop_id);
         let child_id = self.stop_trigger_order_id(stop_id);
         if self.order_locations.contains_key(&child_id) || self.pending_stops.contains(child_id) {
@@ -1321,13 +1370,14 @@ where
             order_id = %stop_id,
             %child_id,
             %side,
-            stop = stop.price().as_u128(),
+            stop = stop_price,
             trigger_price,
             quantity,
-            "trailing stop elected; executing as a market order"
+            collar_limit = ?limit,
+            "trailing stop elected; executing as an immediate-or-cancel child"
         );
         self.pending_stops.reset_path();
-        let status = self.execute_stop_market_order(stop_id, child_id, side, quantity, user_id);
+        let status = self.execute_stop_child(stop_id, child_id, side, quantity, limit, user_id);
         self.track_state(stop_id, status);
         self.pending_stops.take_path(self.last_trade_price())
     }
@@ -1351,15 +1401,22 @@ where
         );
     }
 
-    /// Runs an elected stop's market order through the ungated market path
+    /// Runs an elected stop's child order through the ungated matching path
     /// (the body of `match_market_order_committed`; the caller holds the
     /// gate) and returns the terminal state its stop takes.
-    fn execute_stop_market_order(
+    ///
+    /// `limit` is `None` for the unpriced market child and the collar limit
+    /// with a [`StopProtection`](crate::StopProtection) (#302). Either way
+    /// the child only matches, it is never rested: the remainder is
+    /// cancelled (`InsufficientLiquidity`), including a collar child that
+    /// finds nothing within its band (`filled_quantity: 0`).
+    fn execute_stop_child(
         &self,
         stop_id: Id,
         child_id: Id,
         side: Side,
         quantity: u64,
+        limit: Option<u128>,
         user_id: Hash32,
     ) -> OrderStatus {
         if self.check_kill_switch_or_reject(child_id).is_err() {
@@ -1367,12 +1424,13 @@ where
                 reason: RejectReason::KillSwitchActive,
             };
         }
-        if let Err(err) = self.check_trade_id_headroom(child_id, side, None) {
+        if let Err(err) = self.check_trade_id_headroom(child_id, side, limit) {
             return OrderStatus::Rejected {
                 reason: RejectReason::from(&err),
             };
         }
-        let verified = match self.check_trade_arithmetic_or_reject(child_id, side, quantity, None) {
+        let verified = match self.check_trade_arithmetic_or_reject(child_id, side, quantity, limit)
+        {
             Ok(verified) => verified,
             Err(err) => {
                 return OrderStatus::Rejected {
@@ -1384,7 +1442,7 @@ where
             child_id,
             side,
             quantity,
-            None,
+            limit,
             user_id,
             TakerKind::Standard,
             SweepReservation::NONE,
