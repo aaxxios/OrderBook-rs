@@ -62,13 +62,20 @@ use dashmap::DashMap;
 use pricelevel::{
     Hash32, Id, OrderType, OrderUpdate, Price, Quantity, Side, TakerKind, TimeInForce,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, trace};
 use uuid::Uuid;
 
 /// Label hashed into the name of every stop-trigger market order id (#286).
 const STOP_TRIGGER_ID_LABEL: &[u8] = b"orderbook-rs/stop-trigger";
+
+/// Shards of the pending-stop id index (#286). Every mutation of the index
+/// runs under the exclusive submit gate and a book rarely holds many
+/// stops, so a few shards suffice (the default is four cache-padded shards
+/// per core). A power of two above one, as `DashMap::with_shard_amount`
+/// requires.
+const PENDING_STOP_SHARDS: usize = 4;
 
 /// Skip-list key of a pending stop: `(price, admission sequence)`, in price
 /// ticks. The sequence is unique per stop, so keys never collide.
@@ -224,60 +231,49 @@ impl SideIndex {
 
 /// The book's store of pending trailing stops (#286).
 ///
-/// `entries` is the id index and the ownership token of a stop's id; the
-/// two [`SideIndex`]es order the stops for trailing and election. Every
-/// mutation runs under the exclusive submit gate (see the module docs), so
-/// the three structures change together; lock-free readers (`get_order`,
-/// snapshots) read `entries` only.
+/// A book that never holds a stop pays for this field with one relaxed
+/// load per mutating call and allocates nothing: the maps are built on the
+/// first admission (or restore) of a stop. Measured against main, building
+/// them with every book (a `DashMap` with the default shard count plus the
+/// skip-list heads, several KB) shifted the allocation pattern of books
+/// that never hold a stop enough to slow contended adds by 3 to 5 % at 2 /
+/// 4 threads.
+///
+/// Every mutation runs under the exclusive submit gate (see the module
+/// docs), so the count and the maps change together; lock-free readers
+/// (`get_order`, snapshots) read the id index only.
 #[derive(Debug, Default)]
 pub(super) struct PendingStops {
+    /// The maps, built on the first stop.
+    store: OnceLock<Box<StopStore>>,
+    /// Number of pending stops: the one relaxed load the fast path reads.
+    count: AtomicUsize,
+}
+
+/// The maps behind [`PendingStops`]: `entries` is the id index and the
+/// ownership token of a stop's id; the two [`SideIndex`]es order the stops
+/// for trailing and election.
+#[derive(Debug)]
+struct StopStore {
     /// Stop id to its entry.
     entries: DashMap<Id, StopEntry>,
     /// Sell stops.
     sell: SideIndex,
     /// Buy stops.
     buy: SideIndex,
-    /// Number of pending stops: the one relaxed load the fast path reads.
-    count: AtomicUsize,
     /// Next admission sequence.
     next_seq: AtomicU64,
 }
 
-impl PendingStops {
-    /// An empty store.
-    #[must_use]
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
-    /// `true` when no stop is pending: one relaxed load.
-    #[inline]
-    #[must_use]
-    pub(super) fn is_empty(&self) -> bool {
-        self.count.load(Ordering::Relaxed) == 0
-    }
-
-    /// Number of pending stops.
-    #[inline]
-    #[must_use]
-    pub(super) fn len(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    /// Whether `id` is a pending stop.
-    #[inline]
-    #[must_use]
-    pub(super) fn contains(&self, id: Id) -> bool {
-        !self.is_empty() && self.entries.contains_key(&id)
-    }
-
-    /// A copy of the pending stop `id`.
-    #[must_use]
-    pub(super) fn get(&self, id: Id) -> Option<StopEntry> {
-        if self.is_empty() {
-            return None;
+impl StopStore {
+    /// Empty maps.
+    fn new() -> Self {
+        Self {
+            entries: DashMap::with_shard_amount(PENDING_STOP_SHARDS),
+            sell: SideIndex::default(),
+            buy: SideIndex::default(),
+            next_seq: AtomicU64::new(0),
         }
-        self.entries.get(&id).map(|entry| entry.value().clone())
     }
 
     /// The side index of `side`.
@@ -299,6 +295,61 @@ impl PendingStops {
                 operation: "pending stop admission sequence",
             })
     }
+}
+
+impl PendingStops {
+    /// An empty store; allocates nothing.
+    #[must_use]
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The maps, when a stop was ever admitted.
+    #[inline]
+    fn store(&self) -> Option<&StopStore> {
+        self.store.get().map(|store| &**store)
+    }
+
+    /// The maps, built on first use (under the exclusive gate).
+    fn store_or_init(&self) -> &StopStore {
+        self.store.get_or_init(|| Box::new(StopStore::new()))
+    }
+
+    /// `true` when no stop is pending: one relaxed load.
+    #[inline]
+    #[must_use]
+    pub(super) fn is_empty(&self) -> bool {
+        self.count.load(Ordering::Relaxed) == 0
+    }
+
+    /// Number of pending stops.
+    #[inline]
+    #[must_use]
+    pub(super) fn len(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Whether `id` is a pending stop.
+    #[inline]
+    #[must_use]
+    pub(super) fn contains(&self, id: Id) -> bool {
+        !self.is_empty()
+            && self
+                .store()
+                .is_some_and(|store| store.entries.contains_key(&id))
+    }
+
+    /// A copy of the pending stop `id`.
+    #[must_use]
+    pub(super) fn get(&self, id: Id) -> Option<StopEntry> {
+        if self.is_empty() {
+            return None;
+        }
+        self.store()?
+            .entries
+            .get(&id)
+            .map(|entry| entry.value().clone())
+    }
 
     /// Adds `order` as a new pending stop, behind every stop already
     /// pending. Returns its admission sequence.
@@ -310,7 +361,7 @@ impl PendingStops {
     /// stop, [`OrderBookError::ArithmeticOverflow`] when the sequence or the
     /// count cannot advance. Nothing is changed on error.
     pub(super) fn insert(&self, order: OrderType<()>) -> Result<u64, OrderBookError> {
-        let seq = self.take_seq()?;
+        let seq = self.store_or_init().take_seq()?;
         self.insert_at(order, seq)?;
         Ok(seq)
     }
@@ -328,7 +379,8 @@ impl PendingStops {
                 operation: "pending stop count",
             },
         )?;
-        match self.entries.entry(id) {
+        let store = self.store_or_init();
+        match store.entries.entry(id) {
             dashmap::Entry::Occupied(_) => {
                 return Err(OrderBookError::DuplicateOrderId { order_id: id });
             }
@@ -336,7 +388,7 @@ impl PendingStops {
                 slot.insert(StopEntry { order, seq });
             }
         }
-        self.index(terms.side).insert(terms, seq, id);
+        store.index(terms.side).insert(terms, seq, id);
         // Exclusive gate: no concurrent count update.
         self.count.store(next_count, Ordering::Relaxed);
         Ok(())
@@ -344,9 +396,10 @@ impl PendingStops {
 
     /// Removes the pending stop `id` and returns it.
     pub(super) fn remove(&self, id: Id) -> Option<StopEntry> {
-        let (_, entry) = self.entries.remove(&id)?;
+        let store = self.store()?;
+        let (_, entry) = store.entries.remove(&id)?;
         if let Some(terms) = StopTerms::of(&entry.order) {
-            self.index(terms.side).remove(terms, entry.seq);
+            store.index(terms.side).remove(terms, entry.seq);
         }
         let remaining = self.count.load(Ordering::Relaxed).checked_sub(1);
         match remaining {
@@ -376,21 +429,27 @@ impl PendingStops {
             Some(terms) if order.id() == id => terms,
             _ => return Err(not_a_stop(id)),
         };
+        let Some(store) = self.store() else {
+            return Err(OrderBookError::OrderNotFound(id.to_string()));
+        };
+        if !store.entries.contains_key(&id) {
+            return Err(OrderBookError::OrderNotFound(id.to_string()));
+        }
         let seq = if requeue {
-            Some(self.take_seq()?)
+            Some(store.take_seq()?)
         } else {
             None
         };
-        let Some(mut entry) = self.entries.get_mut(&id) else {
+        let Some(mut entry) = store.entries.get_mut(&id) else {
             return Err(OrderBookError::OrderNotFound(id.to_string()));
         };
         if let Some(old_terms) = StopTerms::of(&entry.order) {
-            self.index(old_terms.side).remove(old_terms, entry.seq);
+            store.index(old_terms.side).remove(old_terms, entry.seq);
         }
         if let Some(seq) = seq {
             entry.seq = seq;
         }
-        self.index(new_terms.side).insert(new_terms, entry.seq, id);
+        store.index(new_terms.side).insert(new_terms, entry.seq, id);
         entry.order = order;
         Ok(())
     }
@@ -400,8 +459,11 @@ impl PendingStops {
     /// price changed. Visits only those stops (skip-list prefix), in no
     /// order that matters: each update is independent.
     pub(super) fn trail(&self, price: u128, moved: &mut Vec<(Id, u128)>) {
+        let Some(store) = self.store() else {
+            return;
+        };
         for side in [Side::Sell, Side::Buy] {
-            let index = self.index(side);
+            let index = store.index(side);
             let stale: Vec<Id> = match side {
                 Side::Sell => index
                     .by_watermark
@@ -418,7 +480,7 @@ impl PendingStops {
                     .collect(),
             };
             for id in stale {
-                let Some(mut entry) = self.entries.get_mut(&id) else {
+                let Some(mut entry) = store.entries.get_mut(&id) else {
                     continue;
                 };
                 let Some(old) = StopTerms::of(&entry.order) else {
@@ -443,13 +505,16 @@ impl PendingStops {
     /// `(admission sequence, id)`, sorted by sequence (time priority).
     /// Visits only the elected stops (skip-list prefix per side).
     pub(super) fn elected(&self, price: u128, out: &mut Vec<(u64, Id)>) {
-        for entry in self.sell.by_stop.iter().rev() {
+        let Some(store) = self.store() else {
+            return;
+        };
+        for entry in store.sell.by_stop.iter().rev() {
             if entry.key().0 < price {
                 break;
             }
             out.push((entry.key().1, *entry.value()));
         }
-        for entry in self.buy.by_stop.iter() {
+        for entry in store.buy.by_stop.iter() {
             if entry.key().0 > price {
                 break;
             }
@@ -465,7 +530,10 @@ impl PendingStops {
         if self.is_empty() {
             return Vec::new();
         }
-        let mut stops: Vec<StopEntry> = self
+        let Some(store) = self.store() else {
+            return Vec::new();
+        };
+        let mut stops: Vec<StopEntry> = store
             .entries
             .iter()
             .filter(|entry| keep(&entry.value().order))
@@ -476,21 +544,28 @@ impl PendingStops {
         stops
     }
 
-    /// Drops every pending stop and restarts the admission sequence.
+    /// Drops every pending stop and restarts the admission sequence. The
+    /// maps, once built, are kept (empty).
     pub(super) fn clear(&self) {
-        self.entries.clear();
-        for index in [&self.sell, &self.buy] {
-            while index.by_stop.pop_front().is_some() {}
-            while index.by_watermark.pop_front().is_some() {}
+        if let Some(store) = self.store() {
+            store.entries.clear();
+            for index in [&store.sell, &store.buy] {
+                while index.by_stop.pop_front().is_some() {}
+                while index.by_watermark.pop_front().is_some() {}
+            }
+            store.next_seq.store(0, Ordering::Relaxed);
         }
         self.count.store(0, Ordering::Relaxed);
-        self.next_seq.store(0, Ordering::Relaxed);
     }
 
     /// Sets the next admission sequence (restore path, after installing
-    /// `next` stops with sequences `0..next`).
+    /// `next` stops with sequences `0..next`). Builds nothing for `0`.
     pub(super) fn set_next_seq(&self, next: u64) {
-        self.next_seq.store(next, Ordering::Relaxed);
+        match self.store() {
+            Some(store) => store.next_seq.store(next, Ordering::Relaxed),
+            None if next == 0 => {}
+            None => self.store_or_init().next_seq.store(next, Ordering::Relaxed),
+        }
     }
 }
 
@@ -562,6 +637,8 @@ where
     /// # Errors
     ///
     /// The first failing check's typed error; nothing was changed.
+    #[cold]
+    #[inline(never)]
     pub(super) fn admit_trailing_stop(
         &self,
         order: OrderType<T>,
@@ -646,6 +723,7 @@ where
 
     /// The pending stop `order_id`, converted, when there is one.
     #[must_use]
+    #[inline(never)]
     pub(super) fn pending_stop_order(&self, order_id: Id) -> Option<Arc<OrderType<T>>> {
         self.pending_stops
             .get(order_id)
@@ -655,6 +733,7 @@ where
     /// Cancels the pending stop `order_id` with `reason` (#286): releases
     /// its risk reservation, records `Cancelled { filled_quantity: 0,
     /// reason }` and releases the id last. `None` when it is not pending.
+    #[inline(never)]
     pub(super) fn cancel_pending_stop(
         &self,
         order_id: Id,
@@ -693,6 +772,7 @@ where
     /// # Errors
     ///
     /// The first failing check's typed error, with the stop unchanged.
+    #[inline(never)]
     pub(super) fn update_pending_stop(
         &self,
         update: OrderUpdate,

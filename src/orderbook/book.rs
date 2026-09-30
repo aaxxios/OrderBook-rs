@@ -1863,7 +1863,10 @@ where
     /// - the order is a **strandable maker** — a
     ///   `ReserveOrder { auto_replenish: false, .. }` with hidden quantity —
     ///   in **every** [`STPMode`], including
-    ///   [`None`](super::stp::STPMode::None) (#230, see below).
+    ///   [`None`](super::stp::STPMode::None) (#230, see below); or
+    /// - a trailing stop is pending (#286), so the stops are evaluated after
+    ///   the submit with no concurrent mutation (a post-only submit is
+    ///   taken exclusive by the acquisition's re-check instead).
     ///
     /// # Why a strandable maker is admitted exclusively
     ///
@@ -1935,10 +1938,7 @@ where
         is_post_only: bool,
         rests_strandable_maker: bool,
     ) -> bool {
-        // #286: while a trailing stop is pending, every mutator runs
-        // exclusively, so the stops are evaluated (and their market orders
-        // executed) with no concurrent mutation.
-        if is_fill_or_kill || rests_strandable_maker || self.has_pending_stops() {
+        if is_fill_or_kill || rests_strandable_maker {
             return true;
         }
         // A post-only submit never takes liquidity, so it can neither run
@@ -1952,6 +1952,12 @@ where
             // strandable-maker capture of a concurrent sweep, nor have its
             // own capture invalidated by a concurrent cancel + id reuse.
             || self.strandable_makers_resting.load(Ordering::Relaxed) > 0
+            // #286: while a trailing stop is pending, every mutator runs
+            // exclusively, so the stops are evaluated (and their market
+            // orders executed) with no concurrent mutation. A post-only
+            // submit skips this pre-check; the acquisition's re-check
+            // (`acquire_coherent_submit_gate`) still takes it exclusive.
+            || self.has_pending_stops()
     }
 
     /// Decide the submit gate mode for an [`OrderUpdate`] (#225 / #230).
