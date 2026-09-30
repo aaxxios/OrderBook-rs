@@ -116,10 +116,10 @@ use serde::{Deserialize, Serialize};
 /// any identified submit in progress, and which waiter proceeds first when
 /// the gate is released is platform-dependent.
 ///
-/// The unit of exclusion is one call, not one batch. The repricing sweeps
-/// (`RepricingOperations::reprice_pegged_orders`,
-/// `reprice_trailing_stops`, `reprice_special_orders`, `special_orders`
-/// feature) drive the public `OrderBook::update_order` once per order, so
+/// The unit of exclusion is one call, not one batch. The pegged repricing
+/// sweeps (`RepricingOperations::reprice_pegged_orders`,
+/// `reprice_special_orders`, `special_orders` feature) drive the public
+/// `OrderBook::update_order` once per order, so
 /// under STP they take and release the exclusive gate N times. That is
 /// correct and deadlock-free — each re-price is individually atomic
 /// against concurrent flow — but the sweep as a whole is not: other

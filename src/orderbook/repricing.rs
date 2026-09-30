@@ -8,8 +8,11 @@
 //!   the stop's favour, the stop price trails it by `trail_amount`, and a
 //!   last trade at or through the stop price executes it as a market order.
 //!   Evaluation is automatic after every trade, under the submit gate; see
-//!   the `stop_orders` module. [`calculate_trailing_stop_price`] and
-//!   [`RepricingOperations::should_trigger_trailing_stop`] expose the same
+//!   the `stop_orders` module.
+//!   [`calculate_trailing_stop_price`](crate::orderbook::repricing::calculate_trailing_stop_price)
+//!   and
+//!   [`RepricingOperations::should_trigger_trailing_stop`](crate::orderbook::repricing::RepricingOperations::should_trigger_trailing_stop)
+//!   expose the same
 //!   rules as pure helpers.
 //!
 //! # Example

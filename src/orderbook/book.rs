@@ -434,8 +434,10 @@ pub struct OrderBook<T = ()> {
     /// between the two steps. Every mass cancel and expiry eviction takes
     /// the **write** side too (#248): each collects its scope before it
     /// removes it, and `cancel_all_orders` clears the tracking maps
-    /// wholesale. Everything else takes the **read** side and
-    /// stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
+    /// wholesale. While a trailing stop is pending (#286) every mutator,
+    /// cancels included, takes the **write** side, so the pending stops are
+    /// only ever touched by one call at a time. Everything else takes the
+    /// **read** side and stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
     /// single place that picks the mode, and it documents the scope
     /// limitation.
     ///
@@ -4945,6 +4947,12 @@ where
     /// not affected. See [`OrderBook`]'s "Level statistics are advisory under
     /// concurrent takers" section for the exact contract.
     ///
+    /// # Pending stops and last trade (#286)
+    ///
+    /// The snapshot also carries every pending trailing stop (not limited
+    /// by `depth`, in admission order; never part of the level lists) and
+    /// the last trade price, which a restore installs.
+    ///
     /// # Errors
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
@@ -5043,7 +5051,10 @@ where
     /// (`fee_schedule`, `stp_mode`, `tick_size`, `lot_size`,
     /// `min_order_size`, `max_order_size`, `engine_seq`,
     /// `kill_switch_engaged`, and the scheduled market close) that were captured by
-    /// [`create_snapshot_package`](Self::create_snapshot_package).
+    /// [`create_snapshot_package`](Self::create_snapshot_package), plus the
+    /// last trade price and the pending trailing stops (format version 5,
+    /// #286; older packages carry neither), whose risk is rebuilt with the
+    /// resting orders'.
     ///
     /// The kill-switch flag is operator-driven and not journaled by
     /// the sequencer; it travels with snapshot packages only. Replay
@@ -5201,13 +5212,13 @@ where
     ///
     /// Rebuilds the resting bids / asks, the `order_locations` and
     /// `user_orders` indices, and — under the `special_orders` feature — the
-    /// special-order tracker, so restored pegged / trailing-stop orders resume
-    /// re-pricing (#194). The tracker holds only order ids; the trailing-stop
-    /// watermark (`last_reference_price`) and the pegged / stop price are part
-    /// of the order data and survive the snapshot round-trip, so no watermark
-    /// state is lost or re-initialized. The rebuild uses the deterministic
-    /// price-then-insertion-sequence traversal so the restore stays
-    /// replay-stable (#190 / #192).
+    /// special-order tracker, so restored pegged orders resume re-pricing
+    /// (#194). The snapshot's last trade price is installed and, under
+    /// `special_orders`, its pending trailing stops are reinstalled in
+    /// admission order with their stop price and watermark (#286); they are
+    /// validated first and must be settled against that last trade price.
+    /// The rebuild uses the deterministic price-then-insertion-sequence
+    /// traversal so the restore stays replay-stable (#190 / #192).
     ///
     /// # Failure atomicity
     ///
@@ -5820,19 +5831,17 @@ where
     }
 
     /// Re-register a restored resting order with the special-order tracker
-    /// when it is a pegged or trailing-stop order.
+    /// when it is a pegged order.
     ///
     /// Mirrors the admission-time registration in
-    /// [`add_order`](Self::add_order) so restored pegged / trailing-stop
-    /// orders resume re-pricing after a snapshot restore (#194). Called once
-    /// per restored resting order from the deterministic price-then-sequence
-    /// rebuild pass in [`restore_from_snapshot`](Self::restore_from_snapshot),
-    /// so any tracker mutation stays replay-stable.
-    ///
-    /// The tracker holds only order ids — the trailing-stop watermark
-    /// (`last_reference_price`) and the pegged / stop price live in the
-    /// order data itself and survive the snapshot round-trip, so nothing is
-    /// re-initialized here; re-registering the id fully restores re-pricing.
+    /// [`add_order`](Self::add_order) so restored pegged orders resume
+    /// re-pricing after a snapshot restore (#194). Called once per restored
+    /// resting order from the deterministic price-then-sequence rebuild pass
+    /// in [`restore_from_snapshot`](Self::restore_from_snapshot), so any
+    /// tracker mutation stays replay-stable. The tracker holds only order
+    /// ids; the pegged price lives in the order data and survives the
+    /// snapshot round-trip. Trailing stops are not tracked here: they are
+    /// pending off-book stops the snapshot carries itself (#286).
     #[cfg(feature = "special_orders")]
     #[inline]
     fn reregister_special_order(&self, order: &OrderType<()>) {
@@ -6617,17 +6626,17 @@ where
         self.reprice_pegged_collecting(&mut Vec::new())
     }
 
-    /// Re-prices all trailing stop orders based on current market conditions.
-    ///
-    /// Returns the number repriced. See
-    /// [`reprice_special_orders`](Self::reprice_special_orders) for the
-    /// failure-reporting variant.
+    /// Evaluates the pending trailing stops against the last trade price
+    /// under the exclusive submit gate (#286) and returns how many stop
+    /// prices trailed; elected stops execute. Stops are evaluated after
+    /// every trade anyway, so this normally returns `0`.
     fn reprice_trailing_stops(&self) -> Result<usize, OrderBookError> {
         self.reprice_trailing_collecting()
     }
 
-    /// Re-prices all special orders (both pegged and trailing stops) and reports
-    /// per-order failures.
+    /// Re-prices the pegged orders, evaluates the pending trailing stops
+    /// (see [`reprice_trailing_stops`](Self::reprice_trailing_stops)) and
+    /// reports per-order failures.
     ///
     /// [`RepricingResult::failed_orders`] is populated with a `(order_id,
     /// reason)` pair for every re-price whose `update_order` was rejected (e.g.

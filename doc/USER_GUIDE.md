@@ -22,7 +22,7 @@ Complete guide for using the OrderBook-rs library in your trading systems.
 OrderBook-rs is a high-performance, lock-free order book implementation for financial trading systems. It provides:
 
 - **Lock-free architecture** using crossbeam-skiplist for concurrent access
-- **Multiple order types**: Limit, Market, Iceberg, Reserve, Post-only, FOK, IOC, GTD, Pegged and Trailing stop (`special_orders`; see the trailing-stop limitation under [Order Types](#order-types))
+- **Multiple order types**: Limit, Market, Iceberg, Reserve, Post-only, FOK, IOC, GTD, Pegged and Trailing stop (`special_orders`; trailing stops are held off book, see [Trailing stops](#trailing-stops-special_orders))
 - **Real-time metrics**: VWAP, spread, imbalance, depth statistics
 - **Market impact simulation** for pre-trade analysis
 - **Intelligent order placement** strategies
@@ -54,7 +54,7 @@ orderbook-rs = "0.14"
 pricelevel = "0.10"
 ```
 
-Optional features: `special_orders` (pegged / trailing-stop repricing),
+Optional features: `special_orders` (pegged repricing, off-book trailing stops),
 `journal` (memory-mapped `FileJournal`), `nats` (JetStream publishers),
 `bincode` (binary event serializer), `wire` (binary wire codec), `metrics`
 (Prometheus-style counters through the `metrics` facade) and
@@ -206,17 +206,75 @@ sweeps by quote notional instead of base quantity.
   with `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) = 20` and rests 20 visible
   / 0 hidden — more than it first displayed
 
-**Pegged and Trailing-stop orders (`special_orders`):**
+**Pegged orders (`special_orders`):**
 - Pegged orders track a reference price (best bid, best ask, mid, last
   trade) and are re-priced by `reprice_pegged_orders` /
   `reprice_special_orders`
-- **Known limitation (#286): trailing stops rest as limit liquidity.** A
-  `TrailingStop` is placed as an ordinary resting limit order at its stop
-  price instead of being held off-book until triggered. It provides
-  liquidity at that price (a sell stop is a resting sell and trades
-  immediately when submitted below the best bid), and
-  `reprice_trailing_stops` cannot move it on an uncrossed book. Do not use
-  trailing stops as protective stops in production until #286 lands
+
+#### Trailing stops (`special_orders`)
+
+A `TrailingStop` is a **pending off-book stop** (#286). It never rests on a
+price level: it is not liquidity, does not appear in depth, analytics or the
+level lists of a snapshot, and a crossing order never trades with it. It is
+driven by the book's **last trade price**:
+
+- **Trail.** `last_reference_price` is the watermark: a sell stop keeps the
+  highest last trade seen since admission, a buy stop the lowest. The stop
+  price (`price`) follows it at `trail_amount` (sell: `watermark - trail`,
+  buy: `watermark + trail`) and only ever tightens.
+- **Trigger.** A sell stop is elected when a trade prints at or below its
+  stop price, a buy stop at or above. The stop then leaves the book and
+  executes as an immediate-or-cancel **market order** for its quantity, on
+  its side, for its user: self-trade prevention, fees and the notional /
+  trade-id checks apply as for any market taker, and an unexecuted
+  remainder is cancelled. Its trades carry the taker id
+  `book.stop_trigger_order_id(stop_id)` (a UUIDv5 of the book's trade-id
+  namespace), so replay with the same namespace reproduces them.
+- **When.** Automatically, under the submit gate, after every call that
+  can trade and when a stop is admitted or modified: a stop the current
+  last trade already crossed triggers at admission. Elections cascade (a
+  stop's trades can elect more stops) until none is elected; stops elected
+  by the same price run in admission order, each at most once.
+- **Lifecycle.** A pending stop is `Open`; once elected it takes its market
+  order's terminal state (`Filled`, `Cancelled { InsufficientLiquidity }`
+  for a remainder, `Cancelled { SelfTradePrevention }`,
+  `Rejected { KillSwitchActive }`, ...). `cancel_order`, `update_order`
+  (quantity, stop price, replace), every mass cancel, `evict_expired_orders`
+  and `get_order` cover pending stops; `trailing_stop_ids()` lists them in
+  admission order.
+- **Admission.** Time-in-force `Gtc`, `Gtd` or `Day` (not `Ioc` / `Fok`);
+  tick / lot / size / STP-user validation as for any order, and a
+  `trail_amount` that is a multiple of the tick size. The risk layer counts
+  a pending stop as an open order and books its notional at the stop price
+  (the price band does not apply to a trigger price); the booking follows
+  the stop as it trails and is released on trigger or cancel.
+- **Cost.** While a stop is pending every mutating call on the book takes
+  the exclusive submit gate (like a book with STP enabled). A book with no
+  pending stop pays one relaxed atomic load per call.
+
+```rust
+use orderbook_rs::OrderBook;
+use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
+
+let book: OrderBook<()> = OrderBook::new("BTC/USD");
+// A protective sell stop 5 below a watermark of 100: stop price 95.
+book.add_order(OrderType::TrailingStop {
+    id: Id::from_u64(50),
+    price: Price::new(95),
+    quantity: Quantity::new(3),
+    side: Side::Sell,
+    user_id: Hash32::zero(),
+    timestamp: TimestampMs::new(0),
+    time_in_force: TimeInForce::Gtc,
+    trail_amount: Quantity::new(5),
+    last_reference_price: Price::new(100),
+    extra_fields: (),
+})?;
+// Trades at 104 move it to 99; a trade at or below 99 sells 3 at market.
+```
+
+Without the `special_orders` feature a `TrailingStop` is rejected untouched
+with `OrderBookError::StopOrdersUnsupported` (reject code 23).
 
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled

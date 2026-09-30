@@ -1,7 +1,8 @@
 //! Off-book trailing stops (#286, `special_orders`).
 //!
-//! A [`OrderType::TrailingStop`] is **never** placed on a price level. It is
-//! held in the book's [`PendingStops`] store, where it is invisible to
+//! A [`OrderType::TrailingStop`](pricelevel::OrderType::TrailingStop) is
+//! **never** placed on a price level. It is held in the book's
+//! `PendingStops` store, where it is invisible to
 //! matching, depth, analytics and the level lists of every snapshot, and it
 //! is driven by the book's **last trade price**:
 //!
@@ -32,7 +33,7 @@
 //!   by `(price, admission sequence)` in lock-free skip lists, so the scan
 //!   for the next elected stop and the watermark update are ordered and
 //!   independent of hashing. The market order of stop `S` carries the id
-//!   [`stop_trigger_order_id`] (UUIDv5 of the book's trade-id namespace and
+//!   [`stop_trigger_order_id`](crate::orderbook::stop_orders::stop_trigger_order_id) (UUIDv5 of the book's trade-id namespace and
 //!   `S`), so a replay with the same namespace reproduces it.
 //!
 //! Every mutation of the store happens under the **exclusive** submit gate:

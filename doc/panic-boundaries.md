@@ -739,8 +739,9 @@ under a pre-trade risk code with `may_have_mutated: false`. Replay cannot
 tell it from a pre-trade rejection and still skips it; for those journals
 only `snapshots_match` detects the missing trades.
 
-**Repricer id reuse.** `reprice_pegged_collecting` /
-`reprice_trailing_collecting` release the tracker entry of an id whose
+**Repricer id reuse.** `reprice_pegged_collecting` (and, before #286
+moved trailing stops off book, `reprice_trailing_collecting`) releases the
+tracker entry of an id whose
 order `get_order` no longer finds (a maker the sweep filled is drained
 without unregistering). A same-id order admitted between that read and
 the release used to lose its registration: its own insert found the stale
@@ -755,6 +756,68 @@ sees, and one made after it re-inserts the id. Lock order is tracker shard
 then location shard; no path holds a location guard while touching the
 tracker. A same-id order of another kind keeps the stale entry until it is
 gone (a pass skips it: `get_order` finds a non-special order).
+
+## Off-book trailing stops (#286)
+
+Pending trailing stops (`special_orders`, `src/orderbook/stop_orders.rs`)
+are held in the book's `PendingStops` store, never on a level, and are
+evaluated against the last trade price before every mutating entry point
+that can trade returns. What the evaluation relies on and what it leaves
+on failure:
+
+- **Gate mode.** Every mutation of the store (admission, modify, cancel,
+  mass cancel, expiry, trail, election, restore) runs under the
+  **exclusive** submit gate: while a stop is pending,
+  `acquire_coherent_submit_gate`, `submit_needs_exclusive_gate`,
+  `modify_needs_exclusive_gate` and `acquire_cancel_gate` all pick the
+  exclusive side, and they re-check the pending count once the shared side
+  is held (a stop admitted in between restarts the acquisition). The count
+  only grows under the exclusive side (admission, restore), so a caller
+  holding the shared side that read zero keeps reading zero: the
+  evaluation it runs is one relaxed load, and no stop can be touched
+  concurrently. A modify's re-add, which may hold the shared side, refuses
+  a trailing stop instead of admitting one. The cost: a book holding a
+  pending stop serializes its mutators, cancels included, like a book with
+  STP enabled.
+- **No reentrancy.** The elected stop's market order runs through the
+  ungated market path (the body of `match_market_order_committed`:
+  trade-id headroom, arithmetic preflight, `match_order_with_user_outcome`,
+  `publish_match_outcome`) under the gate the entry point already holds;
+  nothing re-acquires the gate. Its events land in the same emission scope,
+  after the call's own events (#249).
+- **Bounded cascade.** An elected stop leaves the store before its market
+  order runs, so it is elected at most once; each evaluation round elects
+  at least one stop or ends, so a cascade runs at most `pending + 1`
+  rounds. Trailing only ever tightens a stop and is idempotent at a given
+  price.
+- **Arithmetic.** Trailing uses `checked_sub` / `checked_add` (a stop the
+  trail cannot represent keeps its price), the admission sequence and the
+  pending count are checked, and the risk re-booking of a trailed stop
+  (`RiskState::rebook_price`) keeps the old booking and counts an
+  accounting anomaly when the new notional is not representable.
+- **Ownership.** A stop's id is owned by its store entry, like a resting
+  order's location (#288): admission checks both, the store entry is
+  claimed before the `Open` state is recorded, and a cancel releases the
+  risk entry and records the state before it removes the entry (under the
+  exclusive gate, so no same-id admission can interleave).
+- **Unwind.** Caller code under the gate during an evaluation is the same
+  as for any sweep (`Clock` through the tracker, metrics, `tracing`,
+  `T::default()` in conversions) and follows the submit-gate policy: the
+  kill switch is engaged. An unwind between an elected stop's removal and
+  its market order loses that stop (it is out of the store, its risk
+  released, no terminal state recorded); the rest of the book is
+  consistent.
+- **Kill switch.** An elected stop is new flow: with the kill switch
+  engaged its market order is rejected untouched and the stop ends
+  `Rejected { KillSwitchActive }`. The sequencer's commands are refused by
+  the kill switch before they trade, so this only arises through the raw
+  `match_*` entry points.
+- **Restore.** A snapshot's pending stops are validated in the prepare
+  phase (kind, time-in-force, quantity, id uniqueness against the levels
+  and each other, settled against the snapshot's last trade price) and
+  their risk accumulated with checked arithmetic, so the commit installs
+  them infallibly. A trailing stop found on a level is refused with
+  `StopOrdersUnsupported`.
 
 ## Listener emission and submit-gate poisoning (#249)
 
