@@ -46,7 +46,7 @@ This order book engine is built with the following design principles:
 - **Research**: Platform for studying market microstructure and order flow
 - **Educational**: Reference implementation for understanding modern exchange architecture
 
-### What's New in Version 0.14.0 (unreleased)
+### What's New in Version 0.14.0
 
 0.14.0 is the panic-policy release: crate-owned code no longer initiates
 panics and the gate enforcing it is absolute. The engine and state
@@ -75,7 +75,7 @@ breaking release; see the migration table below.
   abort. Dead-book signals: `OrderBook::match_aborts()`,
   `match_fold_failures()` and the latched `trade_ids_exhausted()` (plus
   `metrics` counters).
-- **pricelevel 0.10.1 (#293).** The dependency floor is `0.10.1`. A
+- **pricelevel 0.10.2 (#293, #259).** The dependency floor is `0.10.2`. A
   poisoned price level stops a sweep with `MatchAborted` instead of being
   walked past (PriceLevel#217). The fill-or-kill preflight dry-runs every
   level with `PriceLevel::match_requirements` for the quantity the sweep
@@ -417,12 +417,12 @@ See `doc/panic-boundaries.md` for the full statement of each.
   the user index by key (its location now carries the owner) instead of
   a scan over every user, and a passive add to an existing level no
   longer builds and drops a whole `PriceLevel`: passive-add allocations
-  fall from 6.3 / 18.3 KB to 3.3 / 0.95 KB per op, `add_only` p50 -46 %,
-  `mixed_70_20_10` -50 %, snapshot restore -64 %, replay -56 %.
-  `snapshot_create_10k` (+6.2 %), contended same-price adds with
-  listeners at 8 threads (+15 %) and the cancel-miss path (+8 ns) are
-  slower and accepted (maintainer decision on #259); see
-  `BENCHMARKS.md` and `BENCH.md`.
+  fall from 6.3 / 18.3 KB to 3.3 / 0.95 KB per op. On the release head
+  against 0.13.1: `add_only` p50 -43 %, `mixed_70_20_10` -48 %,
+  snapshot create -51 %, snapshot restore -67 %, replay -59 %.
+  Contended same-price adds with listeners at 8 threads (+16.5 %) and
+  the cancel-miss path (+8 ns) are slower and accepted (maintainer
+  decision on #259); see `BENCHMARKS.md` and `BENCH.md`.
 
 #### Migration from 0.13
 
