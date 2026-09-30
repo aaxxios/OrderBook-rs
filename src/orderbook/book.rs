@@ -1901,9 +1901,11 @@ where
     ///   `ReserveOrder { auto_replenish: false, .. }` with hidden quantity —
     ///   in **every** [`STPMode`], including
     ///   [`None`](super::stp::STPMode::None) (#230, see below); or
-    /// - a trailing stop is pending (#286), so the stops are evaluated after
-    ///   the submit with no concurrent mutation (a post-only submit is
-    ///   taken exclusive by the acquisition's re-check instead).
+    /// - a trailing stop is pending (#286) and the submit can trade, so the
+    ///   stops are evaluated after it with no concurrent mutation. A
+    ///   post-only submit never trades and stays on the **shared** side even
+    ///   while stops are pending (it cannot move the last trade price, and
+    ///   the stop store only changes under the exclusive side).
     ///
     /// # Why a strandable maker is admitted exclusively
     ///
@@ -1992,8 +1994,8 @@ where
             // #286: while a trailing stop is pending, every mutator runs
             // exclusively, so the stops are evaluated (and their market
             // orders executed) with no concurrent mutation. A post-only
-            // submit skips this pre-check; the acquisition's re-check
-            // (`acquire_coherent_submit_gate`) still takes it exclusive.
+            // submit returns early above and stays shared: it cannot trade,
+            // so it cannot move the last trade price.
             || self.has_pending_stops()
     }
 

@@ -845,8 +845,11 @@ queueing delay a saturated real load generator would see.
 
 ### `pending_stops` — books holding pending trailing stops (added for #286)
 
-`pending_stops_hdr` (needs `--features special_orders`; not part of
-`make bench-hdr`) measures what pending off-book trailing stops cost
+Low-sample rows (the 1,000-stop election and cascade rows take 200
+samples) print `n/a` for the tail quantiles they cannot resolve.
+
+`pending_stops_hdr` (needs `--features special_orders`; `make bench-hdr`
+runs it with that feature) measures what pending off-book trailing stops cost
 the call that trades. `N` is the number of pending sell stops. With a
 stop pending, every call that can trade runs under the exclusive
 submit gate and, if it traded, evaluates the stops along its price
