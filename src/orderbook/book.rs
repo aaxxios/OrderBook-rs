@@ -434,10 +434,12 @@ pub struct OrderBook<T = ()> {
     /// between the two steps. Every mass cancel and expiry eviction takes
     /// the **write** side too (#248): each collects its scope before it
     /// removes it, and `cancel_all_orders` clears the tracking maps
-    /// wholesale. While a trailing stop is pending (#286) every mutator,
-    /// cancels included, takes the **write** side, so the pending stops are
-    /// only ever touched by one call at a time. Everything else takes the
-    /// **read** side and stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
+    /// wholesale. While a trailing stop is pending (#286) every call that
+    /// can trade, and every call that targets a pending stop, takes the
+    /// **write** side, so the stops are only ever touched (and evaluated
+    /// after a trade) by one call at a time; post-only adds and the
+    /// quantity updates and cancels of other orders keep the read side.
+    /// Everything else takes the **read** side and stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
     /// single place that picks the mode, and it documents the scope
     /// limitation.
     ///
@@ -1810,6 +1812,25 @@ where
         &self,
         wants_exclusive: bool,
     ) -> SubmitGateGuard<'_, T> {
+        self.acquire_submit_gate_for(wants_exclusive, true)
+    }
+
+    /// [`Self::acquire_coherent_submit_gate`] for a call that may or may
+    /// not trade (#286).
+    ///
+    /// A call that can trade (`can_trade`) must run exclusively while a
+    /// trailing stop is pending: its trades are evaluated against the
+    /// pending stops before it returns, and every mutation of the stop
+    /// store runs under the exclusive side. A call that cannot trade (a
+    /// post-only add, a quantity update or cancel of a resting order) keeps
+    /// the shared side. Like the strandable-maker count, the pending count
+    /// only grows under the exclusive side, so the re-check after the
+    /// shared acquisition is final.
+    pub(super) fn acquire_submit_gate_for(
+        &self,
+        wants_exclusive: bool,
+        can_trade: bool,
+    ) -> SubmitGateGuard<'_, T> {
         if wants_exclusive {
             return self.submit_gate_write();
         }
@@ -1817,38 +1838,52 @@ where
             self.on_submit_gate_poisoned();
             poisoned.into_inner()
         });
-        if self.strandable_makers_resting.load(Ordering::Relaxed) == 0 && !self.has_pending_stops()
+        if self.strandable_makers_resting.load(Ordering::Relaxed) == 0
+            && !(can_trade && self.has_pending_stops())
         {
             return SubmitGateGuard::new(self, GateLock::Read { _guard: shared });
         }
-        // A strandable maker or a pending stop (#286) was admitted between
-        // the caller's decision and this acquisition. Release and start
-        // over on the exclusive side.
+        // A strandable maker or, for a call that can trade, a pending stop
+        // (#286) was admitted between the caller's decision and this
+        // acquisition. Release and start over on the exclusive side.
         drop(shared);
         self.submit_gate_write()
     }
 
-    /// Acquire the submit gate for a single-order cancel (#286).
+    /// Acquire the submit gate for a call that cannot trade but may target
+    /// `order_id` (#286): a single-order cancel (`coherent == false`: the
+    /// plain shared side, cancels ignore the strandable-maker count), or a
+    /// quantity update / cancel through `update_order` (`coherent == true`:
+    /// [`Self::acquire_submit_gate_for`] with `wants_exclusive`, that
+    /// call's own decision).
     ///
-    /// Shared, as before, unless a trailing stop is pending: every mutation
-    /// of the pending-stop store runs under the exclusive side, and a cancel
-    /// can target a pending stop. The shared side is re-checked after it is
-    /// taken (the pending count only grows under the exclusive side), so a
-    /// cancel that runs shared never meets a pending stop. The
-    /// strandable-maker count is deliberately not consulted: cancels keep
-    /// the shared side in a book holding strandable makers (#230).
-    pub(super) fn acquire_cancel_gate(&self) -> SubmitGateGuard<'_, T> {
-        if self.has_pending_stops() {
+    /// Shared, unless `order_id` is a pending trailing stop: every mutation
+    /// of the stop store runs under the exclusive side. The target is
+    /// re-checked once the shared side is held (the stop set only changes
+    /// under the exclusive side, so the answer is final); a stop target
+    /// releases the shared side and takes the exclusive one. A call on any
+    /// other id runs concurrently, as it does on a book without stops.
+    pub(super) fn acquire_gate_for_target(
+        &self,
+        wants_exclusive: bool,
+        order_id: Id,
+        coherent: bool,
+    ) -> SubmitGateGuard<'_, T> {
+        if wants_exclusive || self.id_is_pending_stop(order_id) {
             return self.submit_gate_write();
         }
-        let shared = self.submit_gate_read();
-        if !self.has_pending_stops() {
-            return shared;
+        let gate = if coherent {
+            self.acquire_submit_gate_for(false, false)
+        } else {
+            self.submit_gate_read()
+        };
+        if !gate.is_shared() || !self.id_is_pending_stop(order_id) {
+            return gate;
         }
-        // A stop was admitted between the check and the acquisition. The
-        // shared guard's emission scope is still empty: dropping it
-        // commits nothing.
-        drop(shared);
+        // A stop with this id was admitted between the check and the
+        // acquisition. The shared guard's emission scope is still empty:
+        // dropping it commits nothing.
+        drop(gate);
         self.submit_gate_write()
     }
 
@@ -2002,11 +2037,20 @@ where
     #[inline]
     #[must_use]
     pub(super) fn modify_needs_exclusive_gate(&self, update: &OrderUpdate) -> bool {
-        // #286: every variant runs exclusively while a trailing stop is
-        // pending: the modify may target the stop, and a re-add that trades
-        // evaluates the stops before it returns.
+        // #286: while a trailing stop is pending, the variants that can
+        // trade (a re-add evaluates the stops before it returns) run
+        // exclusively; `UpdateQuantity` / `Cancel` only when they target a
+        // pending stop (re-checked under the gate, see
+        // `acquire_gate_for_target`).
         if self.has_pending_stops() {
-            return true;
+            return match update {
+                OrderUpdate::UpdatePrice { .. }
+                | OrderUpdate::UpdatePriceAndQuantity { .. }
+                | OrderUpdate::Replace { .. } => true,
+                OrderUpdate::UpdateQuantity { order_id, .. } | OrderUpdate::Cancel { order_id } => {
+                    self.id_is_pending_stop(*order_id)
+                }
+            };
         }
         // Exhaustive on purpose: a new `OrderUpdate` variant must force an
         // explicit decision here rather than silently inherit the shared
@@ -6869,6 +6913,12 @@ impl<'a, T> SubmitGateGuard<'a, T> {
 }
 
 impl<T> SubmitGateGuard<'_, T> {
+    /// `true` while the shared side is held.
+    #[inline]
+    fn is_shared(&self) -> bool {
+        matches!(self.lock, GateLock::Read { .. })
+    }
+
     /// The held side's name for the poison log, `None` once released.
     #[inline]
     fn held_side(&self) -> Option<&'static str> {

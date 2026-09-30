@@ -1554,6 +1554,216 @@ mod tests {
         );
     }
 
+    // ---- gate modes with pending stops (review M2) ----------------------
+
+    /// Runs `op` on another thread and reports whether it completed while
+    /// this thread holds the shared side of the submit gate.
+    fn completes_under_shared_gate(
+        book: &Arc<OrderBook<()>>,
+        op: impl FnOnce(&OrderBook<()>) + Send + 'static,
+    ) -> bool {
+        let shared = book.submit_gate.read().expect("shared side");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let book = Arc::clone(book);
+            std::thread::spawn(move || {
+                op(&book);
+                let _ = tx.send(());
+            })
+        };
+        let done = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        drop(shared);
+        worker.join().expect("worker");
+        done
+    }
+
+    /// While a stop is pending, calls that cannot trade keep the shared
+    /// gate (they complete while another thread holds it); a call that
+    /// targets the stop, or can trade, waits for the exclusive side.
+    #[test]
+    fn test_non_trading_calls_stay_concurrent_with_pending_stops() {
+        let book = Arc::new(new_book());
+        book.add_order(limit(1, 90, 10, Side::Buy, user(1)))
+            .expect("bid");
+        book.add_order(limit(2, 110, 10, Side::Sell, user(1)))
+            .expect("ask");
+        book.add_order(stop(50, Side::Sell, 95, 100, 5, 1))
+            .expect("pending stop");
+
+        assert!(completes_under_shared_gate(&book, |book| {
+            book.cancel_order(id(1))
+                .expect("cancel resting")
+                .expect("found");
+        }));
+        assert!(completes_under_shared_gate(&book, |book| {
+            book.add_order(OrderType::PostOnly {
+                id: id(3),
+                price: Price::new(91),
+                quantity: Quantity::new(1),
+                side: Side::Buy,
+                user_id: user(1),
+                timestamp: TimestampMs::new(3),
+                time_in_force: TimeInForce::Gtc,
+                extra_fields: (),
+            })
+            .expect("post-only");
+        }));
+        assert!(completes_under_shared_gate(&book, |book| {
+            book.update_order(OrderUpdate::UpdateQuantity {
+                order_id: id(2),
+                new_quantity: Quantity::new(4),
+            })
+            .expect("resize resting")
+            .expect("found");
+        }));
+        assert!(completes_under_shared_gate(&book, |book| {
+            book.cancel_order(id(99)).expect("unknown id");
+        }));
+
+        // Targets the stop: exclusive, so it cannot finish while the
+        // shared side is held (this is deterministic: it needs the write
+        // side), then finishes once released.
+        assert!(!completes_under_shared_gate_briefly(&book, |book| {
+            book.cancel_order(id(50))
+                .expect("cancel stop")
+                .expect("found");
+        }));
+        assert_eq!(book.trailing_stop_count(), 0);
+        // A limit add can trade: exclusive while a stop is pending.
+        book.add_order(stop(51, Side::Sell, 95, 100, 5, 1))
+            .expect("pending stop");
+        assert!(!completes_under_shared_gate_briefly(&book, |book| {
+            book.add_order(limit(4, 89, 1, Side::Buy, user(1)))
+                .expect("limit add");
+        }));
+    }
+
+    /// Like [`completes_under_shared_gate`], but gives up after a short
+    /// wait: `false` means the call was still blocked when the shared side
+    /// was released (it then completes before the join).
+    fn completes_under_shared_gate_briefly(
+        book: &Arc<OrderBook<()>>,
+        op: impl FnOnce(&OrderBook<()>) + Send + 'static,
+    ) -> bool {
+        let shared = book.submit_gate.read().expect("shared side");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let book = Arc::clone(book);
+            std::thread::spawn(move || {
+                op(&book);
+                let _ = tx.send(());
+            })
+        };
+        let done = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        drop(shared);
+        worker.join().expect("worker");
+        done
+    }
+
+    /// Mixed concurrent flow while stops are pending: shared-gate calls
+    /// (post-only adds, resizes and cancels of resting orders) interleave
+    /// with exclusive ones (takers electing stops, cancels of stops); every
+    /// stop ends in exactly one terminal state and the risk counters stay
+    /// consistent.
+    #[test]
+    fn test_mixed_concurrent_flow_with_pending_stops() {
+        let mut book = new_book();
+        book.set_risk_config(RiskConfig::new().with_max_open_orders_per_account(100_000));
+        let book = Arc::new(book);
+        book.add_order(limit(1, 50, 100_000, Side::Buy, user(1)))
+            .expect("deep bid");
+        book.add_order(limit(2, 100, 1, Side::Buy, user(1)))
+            .expect("bid 100");
+        book.submit_market_order(id(3), 1, Side::Sell)
+            .expect("trade at 100");
+        for raw in 100..160u64 {
+            book.add_order(stop_tif(
+                raw,
+                Side::Sell,
+                60,
+                100,
+                40,
+                1,
+                user(2),
+                TimeInForce::Gtc,
+            ))
+            .expect("stop");
+        }
+        let barrier = Arc::new(Barrier::new(4));
+        type Job = Box<dyn FnOnce(&OrderBook<()>) + Send>;
+        let spawn = |f: Job| {
+            let book = Arc::clone(&book);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                f(&book);
+            })
+        };
+        let handles = vec![
+            spawn(Box::new(|book| {
+                for n in 0..20u64 {
+                    let _ = book.submit_market_order(id(10_000 + n), 1, Side::Sell);
+                }
+            })),
+            spawn(Box::new(|book| {
+                for n in 0..50u64 {
+                    let raw = 20_000 + n;
+                    let _ = book.add_order(OrderType::PostOnly {
+                        id: id(raw),
+                        price: Price::new(40),
+                        quantity: Quantity::new(2),
+                        side: Side::Buy,
+                        user_id: user(3),
+                        timestamp: TimestampMs::new(raw),
+                        time_in_force: TimeInForce::Gtc,
+                        extra_fields: (),
+                    });
+                    let _ = book.update_order(OrderUpdate::UpdateQuantity {
+                        order_id: id(raw),
+                        new_quantity: Quantity::new(1),
+                    });
+                    let _ = book.cancel_order(id(raw));
+                }
+            })),
+            spawn(Box::new(|book| {
+                for raw in (100..160u64).step_by(2) {
+                    let _ = book.cancel_order(id(raw));
+                }
+            })),
+            spawn(Box::new(|book| {
+                for _ in 0..50 {
+                    let _ = book.create_snapshot(usize::MAX);
+                }
+            })),
+        ];
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert_eq!(
+            book.trailing_stop_count(),
+            0,
+            "every stop elected or cancelled"
+        );
+        for raw in 100..160u64 {
+            let status = book.order_status(id(raw)).expect("tracked");
+            assert!(
+                matches!(
+                    status,
+                    OrderStatus::Filled { filled_quantity: 1 }
+                        | OrderStatus::Cancelled {
+                            reason: CancelReason::UserRequested,
+                            ..
+                        }
+                ),
+                "stop {raw}: {status:?}"
+            );
+        }
+        assert_eq!(open_orders(&book, user(2)), 0);
+        assert_eq!(book.risk_accounting_anomalies(), 0);
+    }
+
     // ---- determinism and concurrency ------------------------------------
 
     fn scripted_trades() -> Vec<String> {

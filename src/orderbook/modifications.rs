@@ -1,4 +1,4 @@
-use crate::orderbook::book::{OrderBook, OrderLocation};
+use crate::orderbook::book::{OrderBook, OrderLocation, SubmitGateGuard};
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::matching::MatchOutcome;
 use crate::orderbook::matching::{FeasibilityScope, ShapeVerdict, SweepReservation};
@@ -786,7 +786,18 @@ where
         // re-add and no concurrent admission, cancel or modify can land
         // between the re-add's STP scan and its fill. Repricing inherits
         // this path, so pegged re-prices are covered too.
-        let _gate = self.acquire_coherent_submit_gate(self.modify_needs_exclusive_gate(&update));
+        // #286: a modify that can trade (a cancel-then-add) evaluates the
+        // pending stops and runs exclusively while one is pending; a
+        // quantity update or cancel only when it targets a pending stop.
+        let _gate = match update {
+            OrderUpdate::UpdatePrice { .. }
+            | OrderUpdate::UpdatePriceAndQuantity { .. }
+            | OrderUpdate::Replace { .. } => {
+                self.acquire_coherent_submit_gate(self.modify_needs_exclusive_gate(&update))
+            }
+            OrderUpdate::UpdateQuantity { order_id, .. } | OrderUpdate::Cancel { order_id } => self
+                .acquire_gate_for_target(self.modify_needs_exclusive_gate(&update), order_id, true),
+        };
         let result = self.update_order_gated(update);
         // #286: a re-add that traded, or a modified pending stop, is
         // evaluated under the same gate.
@@ -1230,9 +1241,9 @@ where
     /// faulty level (#248).
     pub fn cancel_order(&self, order_id: Id) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
         // #209: shared gate — a concurrent FOK's exclusive window must not
-        // interleave with this cancel. #286: exclusive while a trailing
-        // stop is pending (the cancel may target it).
-        let _gate = self.acquire_cancel_gate();
+        // interleave with this cancel. #286: exclusive only when the target
+        // is a pending trailing stop.
+        let _gate = self.acquire_gate_for_target(false, order_id, false);
         self.cancel_order_with_reason(order_id, CancelReason::UserRequested)
     }
 
@@ -2408,13 +2419,25 @@ where
         // #225: also exclusive for an STP-relevant submit, so the per-level
         // STP scan and the fill it authorises see the same queue state. A
         // post-only submit never reaches that scan, so it stays shared.
-        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let _gate = self.acquire_add_gate(&order);
         let result = self.add_order_inner(order, false, false, Admission::Submit);
         // #286: pending stops are evaluated under the same gate.
         self.settle_pending_stops();
         result
             .map(|(order, _)| order)
             .map_err(|failure| failure.into_submit().into_error())
+    }
+
+    /// Acquires the submit gate for an `add_order*` submit: the mode of
+    /// [`Self::add_order_needs_exclusive_gate`], and a post-only submit,
+    /// which cannot trade, keeps the shared side while trailing stops are
+    /// pending (#286).
+    #[inline]
+    fn acquire_add_gate(&self, order: &OrderType<T>) -> SubmitGateGuard<'_, T> {
+        self.acquire_submit_gate_for(
+            self.add_order_needs_exclusive_gate(order),
+            !order.is_post_only(),
+        )
     }
 
     /// The submit gate mode of an `add_order*` submit (#209 / #225 / #230 /
@@ -2480,7 +2503,7 @@ where
         order: OrderType<T>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), OrderBookError> {
         // #209 / #225 / #286: same gating as `add_order`.
-        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let _gate = self.acquire_add_gate(&order);
         let result = self.add_order_inner(order, true, false, Admission::Submit);
         self.settle_pending_stops();
         result.map_err(|failure| failure.into_submit().into_error())
@@ -2510,7 +2533,7 @@ where
         order: OrderType<T>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), SubmitFailure> {
         // #209 / #225 / #230 / #286: same gating as `add_order`.
-        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let _gate = self.acquire_add_gate(&order);
         let result = self.add_order_inner(order, true, true, Admission::Submit);
         self.settle_pending_stops();
         result.map_err(AdmitFailure::into_submit)
@@ -2541,7 +2564,7 @@ where
         order: OrderType<T>,
     ) -> Result<Arc<OrderType<T>>, OrderBookError> {
         // Same gating as `add_order`.
-        let _gate = self.acquire_coherent_submit_gate(self.add_order_needs_exclusive_gate(&order));
+        let _gate = self.acquire_add_gate(&order);
         let result = self.add_order_inner(order, false, false, Admission::ReplayRefusingResidual);
         self.settle_pending_stops();
         result

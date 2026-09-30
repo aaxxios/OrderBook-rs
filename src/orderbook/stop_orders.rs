@@ -52,11 +52,15 @@
 //!   price after the release elects it.
 //!
 //! Every mutation of the store happens under the **exclusive** submit gate:
-//! while a stop is pending, every gated mutator of the book takes the
-//! exclusive side (see `OrderBook::acquire_coherent_submit_gate`), and the
-//! count only grows under it, so a caller that read zero pending stops
-//! under the shared side keeps reading zero. With no pending stop the cost
-//! on every path is one relaxed atomic load.
+//! while a stop is pending, every call that can trade and every call that
+//! targets a pending stop takes the exclusive side (see
+//! `OrderBook::acquire_submit_gate_for` / `acquire_gate_for_target`);
+//! post-only adds and the quantity updates and cancels of other orders
+//! keep the shared side and never touch the store. The count only grows
+//! under the exclusive side, so a caller that read zero pending stops under
+//! the shared side keeps reading zero. With no pending stop every path
+//! pays a few relaxed loads of that count (gate decision, re-check,
+//! evaluation) and one per matched level (the print recorder).
 //!
 //! The order state of a pending stop is `Open`. When elected it takes the
 //! terminal state of its market order: `Filled` when the market order
@@ -599,9 +603,13 @@ impl PendingStops {
     /// Consumes the recorded sweep, ending at `last` (the book's last trade
     /// price), if a print was recorded since the last call.
     pub(super) fn take_path(&self, last: Option<u128>) -> Option<PrintSegment> {
-        if !self.path.open.swap(false, Ordering::Relaxed) {
+        // Load first: a call that cannot trade may reach here under the
+        // shared gate, and must not write (the path is only ever open
+        // after a trade, which runs exclusively while a stop is pending).
+        if !self.path.open.load(Ordering::Relaxed) {
             return None;
         }
+        self.path.open.store(false, Ordering::Relaxed);
         let first = self.path.first.load();
         Some(PrintSegment {
             prev: self
