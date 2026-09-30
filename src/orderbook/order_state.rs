@@ -21,6 +21,8 @@
 //! STP                              → Cancelled { SelfTradePrevention }
 //! IOC/FOK insufficient liquidity   → Cancelled { InsufficientLiquidity }
 //! sweep aborted by a level failure → Cancelled { MatchAborted } (filled = committed prefix)
+//! trailing stop admitted (#286)    → Open (pending off book)
+//! trailing stop elected            → Triggered { child_id, trigger_price } → Filled / Cancelled / Rejected
 //! ```
 
 use super::clock::{Clock, MonotonicClock};
@@ -139,6 +141,24 @@ pub enum OrderStatus {
         /// Closed wire-side reject code. See [`RejectReason`].
         reason: RejectReason,
     },
+
+    /// A pending trailing stop was elected by a trade (#286) and is being
+    /// executed as the market order `child_id`.
+    ///
+    /// Recorded for the **stop's** id right before its market order runs,
+    /// so a listener sees the election and the link to the child: the
+    /// child's trades carry the stop in `TradeResult::origin_stop_id`.
+    /// Not terminal: the stop then takes its market order's terminal state
+    /// (`Filled`, `Cancelled`, `Rejected`) in the same call. Appended
+    /// last, so the positional (bincode) index of every earlier variant is
+    /// unchanged.
+    Triggered {
+        /// The id of the stop's market order (see
+        /// `OrderBook::stop_trigger_order_id`).
+        child_id: Id,
+        /// The trade price that elected the stop, in price ticks.
+        trigger_price: u128,
+    },
 }
 
 impl OrderStatus {
@@ -164,12 +184,13 @@ impl OrderStatus {
         )
     }
 
-    /// Returns the filled quantity, or 0 for `Open` and `Rejected`.
+    /// Returns the filled quantity, or 0 for `Open`, `Rejected` and
+    /// `Triggered` (a stop's own id never fills; its market order does).
     #[must_use]
     #[inline]
     pub fn filled_quantity(&self) -> u64 {
         match self {
-            OrderStatus::Open => 0,
+            OrderStatus::Open | OrderStatus::Triggered { .. } => 0,
             OrderStatus::PartiallyFilled {
                 filled_quantity, ..
             } => *filled_quantity,
@@ -198,6 +219,10 @@ impl std::fmt::Display for OrderStatus {
                 reason,
             } => write!(f, "Cancelled({reason}, filled={filled_quantity})"),
             OrderStatus::Rejected { reason } => write!(f, "Rejected({reason})"),
+            OrderStatus::Triggered {
+                child_id,
+                trigger_price,
+            } => write!(f, "Triggered(child={child_id}, price={trigger_price})"),
         }
     }
 }
