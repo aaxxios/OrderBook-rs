@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Breaking (0.15.0): new public fields on `OrderBookSnapshotPackage` and
+`ReplayBookConfig` (`cargo semver-checks` against `v0.14.0`:
+`constructible_struct_adds_field`) and snapshot format 6.
+
+### Added
+
+- **Protection collar for elected stop orders (#302).** `StopProtection`
+  (`try_new(collar)`, `new(NonZeroU128)`, `collar()`, `limit_price(side,
+  stop)`, `check_tick_size`) and `OrderBook::set_stop_protection` /
+  `stop_protection`. With a collar, an elected trailing stop
+  (`special_orders`) executes as an immediate-or-cancel limit order at
+  `stop - collar` (sell) or `stop + collar` (buy), `stop` being its trailed
+  stop price at election and the collar an absolute offset in price units
+  (like CME protection points); the remainder is cancelled and nothing
+  rests, and a stop whose band is empty ends `Cancelled { filled_quantity:
+  0, reason: InsufficientLiquidity }`. The collar must be a multiple of the
+  tick size (`InvalidTickSize`; a later `set_tick_size` does not
+  re-validate it) and cannot be zero (new
+  `OrderBookError::InvalidStopProtection`, reject code `Other(0)`: a
+  configuration error). A band past the representable prices is clamped
+  to `0` / `u128::MAX`. Unset (the default) keeps the 0.14.0 unpriced IOC
+  market child. The type is available without `special_orders`, so
+  snapshots and replay configurations are identical in every build.
+  `ReplayBookConfig::with_stop_protection` carries it into replay. The
+  `pending_stops_hdr` bench gains `*_collar_*` elect and cascade
+  scenarios; `special_orders_demo` shows a collar.
+
+### Changed (breaking)
+
+- **Snapshot format 6 (#302).** `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is `6`
+  and `OrderBookSnapshotPackage::validate` reads `2..=6`. Packages carry
+  `stop_protection: Option<StopProtection>` (`#[serde(default)]`),
+  written by `create_snapshot_package` and installed by
+  `restore_from_snapshot_package` (as captured, without the tick-size
+  check). The snapshot payload and its checksum are unchanged from
+  version 5; config fields are not checksummed, as before.
+  - Migration: version-5 packages (0.14.0) keep verifying and restore with
+    no collar (covered by a verbatim 0.14.0 fixture); a package below
+    version 6 that carries a collar is rejected. A 0.14 reader rejects
+    every version-6 package ("Unsupported snapshot version") instead of
+    silently dropping the collar, so upgrade readers before writers. A
+    zero collar does not deserialize.
+- **`ReplayBookConfig::stop_protection` (#302).** New public field; code
+  building the struct with an exhaustive literal must set it (or use
+  `..Default::default()`). `ReplayBookConfig::new` leaves it `None`.
+- **`OrderBookSnapshotPackage::stop_protection` (#302).** New public
+  field; exhaustive literals must set it.
+
 ## [0.14.0] - 2026-09-30
 
 The panic-policy release. `pricelevel` is upgraded to 0.10.2; the

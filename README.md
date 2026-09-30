@@ -46,6 +46,52 @@ This order book engine is built with the following design principles:
 - **Research**: Platform for studying market microstructure and order flow
 - **Educational**: Reference implementation for understanding modern exchange architecture
 
+### What's New in Version 0.15.0 (unreleased)
+
+#### Added
+
+- **Protection collar for elected stop orders (#302).**
+  `OrderBook::set_stop_protection(Some(StopProtection::try_new(collar)?))`
+  bounds the child an elected trailing stop (`special_orders`) executes
+  as: an immediate-or-cancel **limit** order at `stop - collar` for a
+  sell stop and `stop + collar` for a buy stop, where `stop` is the
+  stop's trailed stop price at election and `collar` an absolute offset
+  in price units (like CME protection points). The child trades only
+  within that band; the remainder is cancelled and nothing rests. A
+  stop whose band is empty ends `Cancelled { filled_quantity: 0, reason:
+  InsufficientLiquidity }`. The collar must be a multiple of the tick
+  size (`InvalidTickSize`) and cannot be zero
+  (`OrderBookError::InvalidStopProtection`; "unset" is `None`); a band
+  past the representable prices is clamped to `0` / `u128::MAX`
+  (unbounded on that side). Unset (the default) keeps the 0.14 unpriced
+  IOC market child. The config type exists in every build; it only
+  acts where trailing stops exist. Paths without a pending stop never
+  read it.
+
+#### Breaking
+
+- **Snapshot format 6.** `OrderBookSnapshotPackage::stop_protection`
+  carries the collar; `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is `6` and
+  reads accept `2..=6`. The payload and its checksum are unchanged from
+  version 5; the bump makes a 0.14 reader refuse a 0.15 package instead
+  of silently restoring stops without their collar. Version-5 packages
+  restore with no collar; a package below 6 carrying one is rejected.
+- **New public fields.** `OrderBookSnapshotPackage::stop_protection` and
+  `ReplayBookConfig::stop_protection` break exhaustive struct literals
+  (add `..Default::default()` for `ReplayBookConfig`, or set the field).
+  Replay must be given the source book's collar
+  (`ReplayBookConfig::with_stop_protection`) to reproduce its elections.
+
+#### Migration from 0.14
+
+| 0.14 | 0.15 |
+|------|------|
+| elected stop: unpriced IOC market child only | unchanged by default; with `set_stop_protection` an IOC limit at `stop - collar` (sell) or `stop + collar` (buy) |
+| `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 5`; reads `2..=5` | `== 6`; reads `2..=6`; a 0.14 reader rejects v6 packages |
+| `OrderBookSnapshotPackage { .., has_market_close }` | adds `stop_protection: Option<StopProtection>` (`#[serde(default)]`) |
+| `ReplayBookConfig { .., trade_id_namespace }` | adds `stop_protection: Option<StopProtection>`; builder `with_stop_protection` |
+| `OrderBookError` | adds `InvalidStopProtection { collar, reason }` (maps to `RejectReason::Other(0)`) |
+
 ### What's New in Version 0.14.0
 
 0.14.0 is the panic-policy release: crate-owned code no longer initiates
