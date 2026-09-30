@@ -1973,6 +1973,12 @@ where
 
             // Process trades if any occurred
             if !level_trades.is_empty() {
+                // #286: a pending trailing stop is evaluated against every
+                // sweep's first and last print; record the first (one
+                // relaxed load when no stop is pending).
+                #[cfg(feature = "special_orders")]
+                self.pending_stops
+                    .record_print(self.last_trade_price(), price);
                 // Update last trade price atomically
                 self.last_trade_price.store(price);
                 self.has_traded.store(true, Ordering::Relaxed);

@@ -7,34 +7,49 @@
 //! is driven by the book's **last trade price**:
 //!
 //! - **Trail.** The watermark (the order's `last_reference_price`) follows
-//!   the last trade in the stop's favour: a sell stop keeps the highest last
-//!   trade seen since admission, a buy stop the lowest. The stop price
-//!   follows the watermark at `trail_amount` (sell: `watermark - trail`,
-//!   buy: `watermark + trail`) and only ever tightens: a sell stop never
-//!   moves down, a buy stop never moves up.
-//! - **Trigger.** A sell stop is elected when the last trade is at or below
-//!   its stop price, a buy stop when it is at or above. The elected stop
-//!   leaves the store, releases its risk reservation and executes as an
+//!   the prints in the stop's favour: a sell stop keeps the highest print
+//!   seen since admission, a buy stop the lowest. The stop price follows
+//!   the watermark at `trail_amount` (sell: `watermark - trail`, buy:
+//!   `watermark + trail`) and only ever tightens: a sell stop never moves
+//!   down, a buy stop never moves up. The watermark given at admission is
+//!   taken as is.
+//! - **Trigger.** A sell stop is elected by a print at or below its stop
+//!   price, a buy stop by a print at or above it. The elected stop leaves
+//!   the store, releases its risk reservation and executes as an
 //!   immediate-or-cancel **market order** for its quantity, on its side,
 //!   for its user (self-trade prevention, fees and the trade-id / notional
 //!   preflights apply as for any market taker); an unexecuted remainder is
-//!   cancelled.
+//!   cancelled. A stop the last trade already crosses is refused at
+//!   admission and on modify (`StopWouldTrigger`): a stop only triggers on
+//!   a new print.
+//! - **Path.** Each sweep is evaluated as a `PrintSegment`: the price it
+//!   arrived from and its first and last prints (a sweep's prints are
+//!   monotonic, so these are its extremes). At the first print, then at the
+//!   last, stops trail and then the print elects the stops it crosses, so a
+//!   falling sweep's first print can elect a buy stop its last print would
+//!   miss, and a favourable first print trails a stop before the last print
+//!   is tested against it.
 //! - **When.** Evaluation runs automatically, under the submit gate the
-//!   mutating call already holds, right before every call that can trade
+//!   mutating call already holds, right before every call that traded
 //!   returns (`add_order*`, `submit_market_order*`, the `match_*` entry
-//!   points, `update_order`), and when a stop is admitted or modified. It
-//!   is iterative: the trades of an elected stop can elect more stops, and
-//!   evaluation repeats until no stop is elected by the current last trade
-//!   price. Each stop is elected at most once (it leaves the store before
-//!   its market order runs), so a cascade ends after at most as many rounds
-//!   as there are pending stops.
-//! - **Order.** Stops elected by the same last trade price execute in
-//!   admission order (time priority), sell and buy alike. Stops are keyed
-//!   by `(price, admission sequence)` in lock-free skip lists, so the scan
-//!   for the next elected stop and the watermark update are ordered and
-//!   independent of hashing. The market order of stop `S` carries the id
-//!   [`stop_trigger_order_id`](crate::orderbook::stop_orders::stop_trigger_order_id) (UUIDv5 of the book's trade-id namespace and
-//!   `S`), so a replay with the same namespace reproduces it.
+//!   points, `update_order`). It is iterative: the sweep of an elected
+//!   stop's market order is evaluated next (first in, first out), until no
+//!   sweep is left. Each stop is elected at most once (it leaves the store
+//!   when elected), so a cascade is bounded by the number of pending stops.
+//! - **Order.** Stops one print elects execute in trigger order: sell stops
+//!   highest stop price first, buy stops lowest first, equal prices in
+//!   admission order; the side the price moved towards to reach the print
+//!   goes first. Stops of an earlier print execute before those of a later
+//!   one. Stops are keyed by `(price, admission sequence)` in lock-free
+//!   skip lists, so every scan is ordered and independent of hashing. The
+//!   market order of stop `S` carries the id
+//!   [`stop_trigger_order_id`](crate::orderbook::stop_orders::stop_trigger_order_id)
+//!   (UUIDv5 of the book's trade-id namespace and `S`), so a replay with
+//!   the same namespace reproduces it.
+//! - **Kill switch.** While it is engaged, elections are suspended (prints
+//!   still trail): a protective stop is not consumed by a market order the
+//!   kill switch would reject; the first print at or through its stop
+//!   price after the release elects it.
 //!
 //! Every mutation of the store happens under the **exclusive** submit gate:
 //! while a stop is pending, every gated mutator of the book takes the
@@ -58,12 +73,15 @@ use crate::orderbook::matching::SweepReservation;
 use crate::orderbook::modifications::OrderQuantity;
 use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::reject_reason::RejectReason;
+use crossbeam::atomic::AtomicCell;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use pricelevel::{
     Hash32, Id, OrderType, OrderUpdate, Price, Quantity, Side, TakerKind, TimeInForce,
 };
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, trace};
 use uuid::Uuid;
@@ -268,8 +286,82 @@ impl SideIndex {
 pub(super) struct PendingStops {
     /// The maps, built on the first stop.
     store: OnceLock<Box<StopStore>>,
-    /// Number of pending stops: the one relaxed load the fast path reads.
+    /// Number of pending stops: the relaxed load every fast path reads.
     count: AtomicUsize,
+    /// The prints of the current sweep, recorded while a stop is pending
+    /// (see [`PrintSegment`]). Written only under the exclusive gate.
+    path: PrintPath,
+}
+
+/// One sweep's prints, as the evaluation needs them (#286): the last trade
+/// price before the sweep (`prev`, the direction the price arrived from),
+/// the sweep's first print and its last print. A sweep walks the book away
+/// from the touch, so its prints move monotonically from `first` to `last`
+/// and the extremes of the sweep are its two ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrintSegment {
+    /// Last trade price before the sweep, if the book had traded.
+    pub(super) prev: Option<u128>,
+    /// The sweep's first print, in price ticks.
+    pub(super) first: u128,
+    /// The sweep's last print, in price ticks.
+    pub(super) last: u128,
+}
+
+/// Recorder of the current sweep's first print (#286). The last print is
+/// the book's last trade price.
+#[derive(Debug, Default)]
+struct PrintPath {
+    /// A print was recorded and not consumed yet.
+    open: AtomicBool,
+    /// The book had traded before the first recorded print.
+    has_prev: AtomicBool,
+    /// Last trade price before the first recorded print.
+    prev: AtomicCell<u128>,
+    /// The first recorded print.
+    first: AtomicCell<u128>,
+}
+
+/// Reusable scratch buffers of one evaluation pass (#286), kept per thread
+/// so a pass allocates nothing once warm.
+#[derive(Debug, Default)]
+struct StopScratch {
+    /// Segments waiting to be evaluated (the call's sweep, then the sweeps
+    /// of the elected stops' market orders, in execution order).
+    queue: VecDeque<PrintSegment>,
+    /// Stops elected by the current segment, with their trigger price.
+    elected: Vec<(StopEntry, u128)>,
+    /// Stops a print trailed: `(id, new stop price)`.
+    moved: Vec<(Id, u128)>,
+    /// Ids a print can trail.
+    stale: Vec<Id>,
+    /// Sell stops a print elects: `(stop price, seq, id)`.
+    candidates: Vec<(u128, u64, Id)>,
+}
+
+thread_local! {
+    static STOP_SCRATCH: Cell<StopScratch> = Cell::new(StopScratch::default());
+}
+
+impl StopScratch {
+    /// This thread's buffers (a fresh set when unavailable, e.g. during
+    /// thread teardown or a nested pass on another book).
+    fn take() -> Self {
+        STOP_SCRATCH
+            .try_with(|cell| cell.take())
+            .unwrap_or_default()
+    }
+
+    /// Hands the buffers back, emptied, for the next pass on this thread.
+    fn put(mut self) {
+        self.queue.clear();
+        self.elected.clear();
+        self.moved.clear();
+        self.stale.clear();
+        self.candidates.clear();
+        // Nothing to do if the thread is being torn down.
+        let _ = STOP_SCRATCH.try_with(|cell| cell.set(self));
+    }
 }
 
 /// The maps behind [`PendingStops`]: `entries` is the id index and the
@@ -411,6 +503,11 @@ impl PendingStops {
             }
         }
         store.index(terms.side).insert(terms, seq, id);
+        if next_count == 1 {
+            // Prints recorded while the previous stops were pending are
+            // stale for this one (the path is only recorded with stops).
+            self.reset_path();
+        }
         // Exclusive gate: no concurrent count update.
         self.count.store(next_count, Ordering::Relaxed);
         Ok(())
@@ -476,32 +573,133 @@ impl PendingStops {
         Ok(())
     }
 
+    /// Records a print of the current sweep (#286), called per matched
+    /// level with the last trade price before it. Only the sweep's first
+    /// print is kept (its last is the last trade price); nothing happens
+    /// while no stop is pending, so a book without stops pays one relaxed
+    /// load per matched level.
+    #[inline]
+    pub(super) fn record_print(&self, prev: Option<u128>, price: u128) {
+        if self.is_empty() || self.path.open.load(Ordering::Relaxed) {
+            return;
+        }
+        self.record_first_print(prev, price);
+    }
+
+    /// Opens the path at the sweep's first print (exclusive gate: a stop is
+    /// pending, so the trading call holds it).
+    #[inline(never)]
+    fn record_first_print(&self, prev: Option<u128>, price: u128) {
+        self.path.has_prev.store(prev.is_some(), Ordering::Relaxed);
+        self.path.prev.store(prev.unwrap_or(0));
+        self.path.first.store(price);
+        self.path.open.store(true, Ordering::Relaxed);
+    }
+
+    /// Consumes the recorded sweep, ending at `last` (the book's last trade
+    /// price), if a print was recorded since the last call.
+    pub(super) fn take_path(&self, last: Option<u128>) -> Option<PrintSegment> {
+        if !self.path.open.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        let first = self.path.first.load();
+        Some(PrintSegment {
+            prev: self
+                .path
+                .has_prev
+                .load(Ordering::Relaxed)
+                .then(|| self.path.prev.load()),
+            first,
+            last: last.unwrap_or(first),
+        })
+    }
+
+    /// Drops a recorded, unconsumed sweep.
+    #[inline]
+    pub(super) fn reset_path(&self) {
+        self.path.open.store(false, Ordering::Relaxed);
+    }
+
+    /// Removes and appends to `out`, with `price` as trigger price, every
+    /// stop a print at `price` elects, in trigger order: sell stops highest
+    /// stop price first, buy stops lowest first, equal prices in admission
+    /// order; `sells_first` picks which side goes first. `candidates` is
+    /// scratch. Visits only the elected stops (skip-list prefix per side).
+    fn pop_elected(
+        &self,
+        price: u128,
+        sells_first: bool,
+        candidates: &mut Vec<(u128, u64, Id)>,
+        out: &mut Vec<(StopEntry, u128)>,
+    ) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        candidates.clear();
+        // Sell stops elected: stop >= price. Reverse key order yields the
+        // highest stop first but equal stops in descending seq: re-sort.
+        for entry in store.sell.by_stop.iter().rev() {
+            if entry.key().0 < price {
+                break;
+            }
+            candidates.push((entry.key().0, entry.key().1, *entry.value()));
+        }
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let sells = candidates.len();
+        // Buy stops elected: stop <= price, key order is already lowest
+        // stop first, then admission order.
+        for entry in store.buy.by_stop.iter() {
+            if entry.key().0 > price {
+                break;
+            }
+            candidates.push((entry.key().0, entry.key().1, *entry.value()));
+        }
+        let (first, second) = if sells_first {
+            (0..sells, sells..candidates.len())
+        } else {
+            (sells..candidates.len(), 0..sells)
+        };
+        for index in first.chain(second) {
+            if let Some(&(_, _, id)) = candidates.get(index)
+                && let Some(entry) = self.remove(id)
+            {
+                out.push((entry, price));
+            }
+        }
+    }
+
     /// Trails every stop whose watermark a trade at `price` improves, and
     /// pushes `(id, new stop price)` onto `moved` for each stop whose stop
     /// price changed. Visits only those stops (skip-list prefix), in no
-    /// order that matters: each update is independent.
-    pub(super) fn trail(&self, price: u128, moved: &mut Vec<(Id, u128)>) {
+    /// order that matters: each update is independent. Each trailed stop
+    /// is re-keyed in both skip lists, so a favourable print costs
+    /// O(k log n) for the k stops it trails (every stop of a side when the
+    /// price makes a new extreme for all of them). `stale` is scratch.
+    fn trail_into(&self, price: u128, stale: &mut Vec<Id>, moved: &mut Vec<(Id, u128)>) {
         let Some(store) = self.store() else {
             return;
         };
         for side in [Side::Sell, Side::Buy] {
             let index = store.index(side);
-            let stale: Vec<Id> = match side {
-                Side::Sell => index
-                    .by_watermark
-                    .iter()
-                    .take_while(|entry| entry.key().0 < price)
-                    .map(|entry| *entry.value())
-                    .collect(),
-                Side::Buy => index
-                    .by_watermark
-                    .iter()
-                    .rev()
-                    .take_while(|entry| entry.key().0 > price)
-                    .map(|entry| *entry.value())
-                    .collect(),
-            };
-            for id in stale {
+            stale.clear();
+            match side {
+                Side::Sell => stale.extend(
+                    index
+                        .by_watermark
+                        .iter()
+                        .take_while(|entry| entry.key().0 < price)
+                        .map(|entry| *entry.value()),
+                ),
+                Side::Buy => stale.extend(
+                    index
+                        .by_watermark
+                        .iter()
+                        .rev()
+                        .take_while(|entry| entry.key().0 > price)
+                        .map(|entry| *entry.value()),
+                ),
+            }
+            for &id in stale.iter() {
                 let Some(mut entry) = store.entries.get_mut(&id) else {
                     continue;
                 };
@@ -521,29 +719,6 @@ impl PendingStops {
                 }
             }
         }
-    }
-
-    /// Pushes every stop a trade at `price` elects onto `out` as
-    /// `(admission sequence, id)`, sorted by sequence (time priority).
-    /// Visits only the elected stops (skip-list prefix per side).
-    pub(super) fn elected(&self, price: u128, out: &mut Vec<(u64, Id)>) {
-        let Some(store) = self.store() else {
-            return;
-        };
-        for entry in store.sell.by_stop.iter().rev() {
-            if entry.key().0 < price {
-                break;
-            }
-            out.push((entry.key().1, *entry.value()));
-        }
-        for entry in store.buy.by_stop.iter() {
-            if entry.key().0 > price {
-                break;
-            }
-            out.push((entry.key().1, *entry.value()));
-        }
-        // Sequences are unique, so the unstable sort is deterministic.
-        out.sort_unstable_by_key(|(seq, _)| *seq);
     }
 
     /// Every pending stop matching `keep`, in admission order.
@@ -578,6 +753,7 @@ impl PendingStops {
             store.next_seq.store(0, Ordering::Relaxed);
         }
         self.count.store(0, Ordering::Relaxed);
+        self.reset_path();
     }
 
     /// Sets the next admission sequence (restore path, after installing
@@ -973,72 +1149,120 @@ where
             .collect()
     }
 
-    /// Evaluates the pending stops against the last trade price (#286):
-    /// trails them, then elects and executes every stop the price crossed,
-    /// in admission order, and repeats with the new last trade price until
-    /// no stop is elected.
+    /// Evaluates the pending stops against the prints of the call that just
+    /// traded (#286), in path order, and executes the stops they elect.
+    ///
+    /// Each sweep is a [`PrintSegment`] (the price it arrived from, its
+    /// first and its last print; a sweep's prints are monotonic, so its
+    /// extremes are its ends). For each of the segment's points in order
+    /// (first, then last when it differs):
+    ///
+    /// 1. every stop the print improves trails (sell: the watermark rises
+    ///    to the print; buy: it falls), so a favourable first print trails
+    ///    a stop before the sweep's last print can elect it;
+    /// 2. every stop the print crosses is elected and leaves the store:
+    ///    sell stops highest stop price first, buy stops lowest first,
+    ///    equal prices in admission order; the side the price moved
+    ///    towards to reach the print goes first (sells when it fell, buys
+    ///    when it rose; for the first print of the book, the sweep's own
+    ///    direction, sells when flat).
+    ///
+    /// Then the segment's elected stops execute in that order, each as a
+    /// market order whose sweep is queued as a new segment. Segments are
+    /// processed first in, first out until none is left. Each stop is
+    /// elected at most once, so the cascade is bounded by the number of
+    /// pending stops. While the kill switch is engaged elections are
+    /// suspended (prints still trail): a protective stop is not consumed
+    /// by a market order the kill switch would reject, and the next print
+    /// at or through its stop price after the release elects it.
     ///
     /// Must be called with the submit gate held (exclusive whenever a stop
     /// is pending), right before a mutating entry point that can trade
-    /// returns. With no pending stop it is one relaxed load.
+    /// returns. Without a pending stop or a recorded print it reads two
+    /// relaxed atomics and returns.
     #[inline]
     pub(super) fn run_stop_triggers(&self) -> StopPass {
         if self.pending_stops.is_empty() {
             return StopPass::default();
         }
-        self.evaluate_pending_stops()
+        let Some(segment) = self.pending_stops.take_path(self.last_trade_price()) else {
+            return StopPass::default();
+        };
+        self.evaluate_pending_stops(segment)
     }
 
-    /// The body of [`Self::run_stop_triggers`] once a stop is pending.
+    /// The body of [`Self::run_stop_triggers`] for a recorded sweep.
     #[inline(never)]
-    fn evaluate_pending_stops(&self) -> StopPass {
+    fn evaluate_pending_stops(&self, segment: PrintSegment) -> StopPass {
         let mut pass = StopPass::default();
-        let mut moved: Vec<(Id, u128)> = Vec::new();
-        let mut elected: Vec<(u64, Id)> = Vec::new();
-        // Each round elects at least one stop (which never comes back) or
-        // ends the loop, so it runs at most `len + 1` rounds.
-        while let Some(price) = self.last_trade_price() {
+        let mut scratch = StopScratch::take();
+        scratch.queue.push_back(segment);
+        while let Some(segment) = scratch.queue.pop_front() {
             if self.pending_stops.is_empty() {
                 break;
             }
-            moved.clear();
-            self.pending_stops.trail(price, &mut moved);
-            for &(stop_id, stop) in &moved {
-                self.risk_state.rebook_price(stop_id, stop);
-                trace!(symbol = %self.symbol, order_id = %stop_id, stop, last_trade = price, "trailing stop trailed");
+            let second = (segment.last != segment.first).then_some(segment.last);
+            let points = [
+                (segment.prev, Some(segment.first)),
+                (Some(segment.first), second),
+            ];
+            for (arrived_from, point) in points {
+                let Some(price) = point else {
+                    continue;
+                };
+                scratch.moved.clear();
+                self.pending_stops
+                    .trail_into(price, &mut scratch.stale, &mut scratch.moved);
+                for &(stop_id, stop) in &scratch.moved {
+                    self.risk_state.rebook_price(stop_id, stop);
+                    trace!(symbol = %self.symbol, order_id = %stop_id, stop, print = price, "trailing stop trailed");
+                }
+                // Bounded by the stops trailed, each at most once per print.
+                if let Some(trailed) = pass.trailed.checked_add(scratch.moved.len()) {
+                    pass.trailed = trailed;
+                }
+                if self.is_kill_switch_engaged() {
+                    continue;
+                }
+                let sells_first = match arrived_from {
+                    Some(from) if price != from => price < from,
+                    _ => segment.last <= segment.first,
+                };
+                self.pending_stops.pop_elected(
+                    price,
+                    sells_first,
+                    &mut scratch.candidates,
+                    &mut scratch.elected,
+                );
             }
-            // Bounded by the stops trailed, each at most once per round.
-            if let Some(trailed) = pass.trailed.checked_add(moved.len()) {
-                pass.trailed = trailed;
-            }
-            elected.clear();
-            self.pending_stops.elected(price, &mut elected);
-            if elected.is_empty() {
-                break;
-            }
-            for &(_, stop_id) in &elected {
-                if let Some(entry) = self.pending_stops.get(stop_id) {
-                    self.execute_elected_stop(&entry.order, price);
-                    // Bounded by the pending stops (each elected once).
-                    if let Some(count) = pass.elected.checked_add(1) {
-                        pass.elected = count;
-                    }
+            let mut elected = std::mem::take(&mut scratch.elected);
+            for (entry, trigger_price) in elected.drain(..) {
+                if let Some(child_segment) = self.execute_elected_stop(entry, trigger_price) {
+                    scratch.queue.push_back(child_segment);
+                }
+                // Bounded by the pending stops (each elected once).
+                if let Some(count) = pass.elected.checked_add(1) {
+                    pass.elected = count;
                 }
             }
+            scratch.elected = elected;
         }
+        self.pending_stops.reset_path();
+        scratch.put();
         pass
     }
 
-    /// Executes one elected stop (#286): the stop leaves the store after
-    /// its risk reservation is released, then its market order runs and
-    /// the stop records that order's terminal state.
-    fn execute_elected_stop(&self, stop: &OrderType<()>, last_trade: u128) {
+    /// Executes one elected stop (#286), already out of the store: its
+    /// risk reservation is released, its market order runs and the stop
+    /// records that order's terminal state. Returns the market order's
+    /// sweep, if it traded.
+    fn execute_elected_stop(&self, entry: StopEntry, trigger_price: u128) -> Option<PrintSegment> {
+        let stop = entry.order;
         let stop_id = stop.id();
         let side = stop.side();
         let user_id = stop.user_id();
         let quantity = stop.visible_quantity().as_u64();
         self.risk_state.on_cancel(stop_id);
-        self.pending_stops.remove(stop_id);
         let child_id = self.stop_trigger_order_id(stop_id);
         debug!(
             symbol = %self.symbol,
@@ -1046,12 +1270,14 @@ where
             %child_id,
             %side,
             stop = stop.price().as_u128(),
-            last_trade,
+            trigger_price,
             quantity,
             "trailing stop elected; executing as a market order"
         );
+        self.pending_stops.reset_path();
         let status = self.execute_stop_market_order(child_id, side, quantity, user_id);
         self.track_state(stop_id, status);
+        self.pending_stops.take_path(self.last_trade_price())
     }
 
     /// Runs an elected stop's market order through the ungated market path
@@ -1285,30 +1511,49 @@ mod tests {
         assert!(store.is_empty());
     }
 
+    /// Pops the stops a print at `price` elects, as ids.
+    fn pop_ids(store: &PendingStops, price: u128, sells_first: bool) -> Vec<Id> {
+        let mut candidates = Vec::new();
+        let mut out = Vec::new();
+        store.pop_elected(price, sells_first, &mut candidates, &mut out);
+        out.into_iter().map(|(entry, _)| entry.order.id()).collect()
+    }
+
+    fn trail(store: &PendingStops, price: u128) -> Vec<(Id, u128)> {
+        let mut moved = Vec::new();
+        store.trail_into(price, &mut Vec::new(), &mut moved);
+        moved
+    }
+
     #[test]
-    fn test_pending_stops_elected_in_admission_order_across_sides() {
+    fn test_pending_stops_elected_in_trigger_order() {
         let store = PendingStops::new();
-        // seq 0: sell stop 90; seq 1: buy stop 100; seq 2: sell stop 99;
-        // seq 3: sell stop 80 (not elected at 95).
+        // seq 0: sell 90; seq 1: buy 100; seq 2: sell 99; seq 3: sell 80;
+        // seq 4: sell 99 (same price as seq 2); seq 5: buy 95.
         for order in [
             stop(10, Side::Sell, 90, 110, 20),
             stop(11, Side::Buy, 100, 80, 20),
             stop(12, Side::Sell, 99, 110, 11),
             stop(13, Side::Sell, 80, 110, 30),
+            stop(14, Side::Sell, 99, 110, 11),
+            stop(15, Side::Buy, 95, 80, 15),
         ] {
             store.insert(order).expect("insert");
         }
-        let mut out = Vec::new();
-        store.elected(95, &mut out);
-        // Sell 99 elected (95 <= 99), sell 90 not, buy 100 not (95 < 100).
-        assert_eq!(out, vec![(2, Id::from_u64(12))]);
-        out.clear();
-        store.elected(100, &mut out);
-        // Buy 100 elected (100 >= 100); sell 99 no longer (100 > 99).
-        assert_eq!(out, vec![(1, Id::from_u64(11))]);
-        out.clear();
-        store.elected(85, &mut out);
-        assert_eq!(out, vec![(0, Id::from_u64(10)), (2, Id::from_u64(12))]);
+        // At 96: sells 99 (seq 2, then 4) elected; buy 95 elected; sell
+        // 90 / 80 and buy 100 not.
+        assert_eq!(
+            pop_ids(&store, 96, true),
+            [12u64, 14, 15].map(Id::from_u64).to_vec(),
+            "sells highest first, equal prices in admission order, then buys"
+        );
+        assert_eq!(store.len(), 3);
+        // Buys first: buy 100 at 100 (lowest first), then no sell.
+        assert_eq!(pop_ids(&store, 100, false), vec![Id::from_u64(11)]);
+        // At 85: sell 90 elected, then (sells first) nothing else.
+        assert_eq!(pop_ids(&store, 85, true), vec![Id::from_u64(10)]);
+        assert_eq!(pop_ids(&store, 85, true), Vec::<Id>::new(), "popped once");
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
@@ -1320,27 +1565,18 @@ mod tests {
         store
             .insert(stop(2, Side::Buy, 105, 100, 5))
             .expect("insert");
-        let mut moved = Vec::new();
-        store.trail(110, &mut moved);
-        assert_eq!(moved, vec![(Id::from_u64(1), 105)]);
+        assert_eq!(trail(&store, 110), vec![(Id::from_u64(1), 105)]);
         let sell = store.get(Id::from_u64(1)).expect("pending");
         let terms = StopTerms::of(&sell.order).expect("stop");
         assert_eq!((terms.stop, terms.watermark), (105, 110));
-        // Re-keyed: now elected at 105, not at 106.
-        let mut out = Vec::new();
-        store.elected(106, &mut out);
-        assert!(out.iter().all(|(_, id)| *id != Id::from_u64(1)));
-        out.clear();
-        store.elected(105, &mut out);
-        assert!(out.contains(&(0, Id::from_u64(1))));
-        moved.clear();
-        store.trail(90, &mut moved);
-        assert_eq!(moved, vec![(Id::from_u64(2), 95)]);
+        assert_eq!(trail(&store, 90), vec![(Id::from_u64(2), 95)]);
         // Idempotent at the same price.
-        moved.clear();
-        store.trail(90, &mut moved);
-        store.trail(110, &mut moved);
-        assert!(moved.is_empty());
+        assert!(trail(&store, 90).is_empty());
+        assert!(trail(&store, 110).is_empty());
+        // Re-keyed: the buy stop (now 95) is elected at 106 but not the
+        // sell stop (now 105, elected at 105 and below).
+        assert_eq!(pop_ids(&store, 106, true), vec![Id::from_u64(2)]);
+        assert_eq!(pop_ids(&store, 105, true), vec![Id::from_u64(1)]);
     }
 
     #[test]
@@ -1353,19 +1589,45 @@ mod tests {
             .insert(stop(2, Side::Sell, 95, 100, 5))
             .expect("insert");
         store
-            .replace(Id::from_u64(1), stop(1, Side::Sell, 96, 100, 5), true)
+            .replace(Id::from_u64(1), stop(1, Side::Sell, 95, 100, 5), true)
             .expect("replace");
-        let mut out = Vec::new();
-        store.elected(90, &mut out);
-        assert_eq!(out, vec![(1, Id::from_u64(2)), (2, Id::from_u64(1))]);
+        assert_eq!(
+            pop_ids(&store, 90, true),
+            vec![Id::from_u64(2), Id::from_u64(1)],
+            "the requeued stop lost its priority"
+        );
         assert!(matches!(
             store.replace(Id::from_u64(3), stop(3, Side::Sell, 96, 100, 5), false),
             Err(OrderBookError::OrderNotFound(_))
         ));
-        assert!(matches!(
-            store.replace(Id::from_u64(1), stop(9, Side::Sell, 96, 100, 5), false),
-            Err(OrderBookError::InvalidOperation { .. })
-        ));
+    }
+
+    #[test]
+    fn test_print_path_records_the_first_print_only_with_stops() {
+        let store = PendingStops::new();
+        store.record_print(None, 100);
+        assert_eq!(
+            store.take_path(Some(100)),
+            None,
+            "no stop: nothing recorded"
+        );
+        store
+            .insert(stop(1, Side::Sell, 95, 100, 5))
+            .expect("insert");
+        store.record_print(Some(100), 102);
+        store.record_print(Some(102), 101);
+        assert_eq!(
+            store.take_path(Some(98)),
+            Some(PrintSegment {
+                prev: Some(100),
+                first: 102,
+                last: 98
+            })
+        );
+        assert_eq!(store.take_path(Some(98)), None, "consumed");
+        store.record_print(Some(98), 97);
+        store.clear();
+        assert_eq!(store.take_path(Some(97)), None, "cleared with the stops");
     }
 
     #[test]

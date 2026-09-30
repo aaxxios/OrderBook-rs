@@ -462,8 +462,12 @@ mod tests {
         assert_eq!(book.visible_quantity_at_price(90, Side::Buy), Some(98));
     }
 
+    /// Stops one print elects run in trigger order: sell stops highest
+    /// first, buy stops lowest first, equal prices in admission order; the
+    /// side the price moved towards goes first (here the first print of
+    /// the book, from a falling sweep: sells).
     #[test]
-    fn test_stops_elected_by_one_price_execute_in_admission_order() {
+    fn test_stops_elected_by_one_price_execute_in_trigger_order() {
         let mut book = new_book();
         let trades = record_trades(&mut book);
         book.add_order(limit(1, 96, 1, Side::Buy, user(1)))
@@ -472,14 +476,14 @@ mod tests {
             .expect("bid 90");
         book.add_order(limit(3, 200, 100, Side::Sell, user(1)))
             .expect("ask 200");
-        // Admitted first with the lower stop, then a higher sell stop and a
-        // buy stop; one trade at 96 elects all three.
         book.add_order(stop(60, Side::Sell, 97, 100, 3, 1))
             .expect("first");
         book.add_order(stop(61, Side::Sell, 98, 100, 2, 1))
             .expect("second");
         book.add_order(stop(62, Side::Buy, 96, 80, 16, 1))
             .expect("third");
+        book.add_order(stop(63, Side::Sell, 98, 100, 2, 1))
+            .expect("fourth");
         book.submit_market_order(id(4), 1, Side::Sell)
             .expect("trade at 96");
         let takers: Vec<String> = taken(&trades)
@@ -490,13 +494,100 @@ mod tests {
             takers,
             vec![
                 id(4).to_string(),
-                book.stop_trigger_order_id(id(60)).to_string(),
                 book.stop_trigger_order_id(id(61)).to_string(),
+                book.stop_trigger_order_id(id(63)).to_string(),
+                book.stop_trigger_order_id(id(60)).to_string(),
                 book.stop_trigger_order_id(id(62)).to_string(),
             ],
-            "time priority, sell and buy alike"
+            "sells 98 (61, 63), 97 (60), then the buy"
         );
         assert_eq!(book.trailing_stop_count(), 0);
+    }
+
+    // ---- the price path (microstructure review M1) --------------------
+
+    /// Liquidity for the path tests: last trade 100, asks at 110.
+    fn path_book(bids: &[(u64, u128)]) -> (OrderBook<()>, Trades) {
+        let mut book = new_book();
+        let trades = record_trades(&mut book);
+        book.add_order(limit(1, 100, 1, Side::Buy, user(1)))
+            .expect("bid 100");
+        book.submit_market_order(id(2), 1, Side::Sell)
+            .expect("trade at 100");
+        book.add_order(limit(3, 110, 100, Side::Sell, user(1)))
+            .expect("asks 110");
+        book.add_order(limit(4, 80, 100, Side::Buy, user(1)))
+            .expect("deep bid 80");
+        for &(raw, price) in bids {
+            book.add_order(limit(raw, price, 1, Side::Buy, user(1)))
+                .expect("bid");
+        }
+        (book, trades)
+    }
+
+    /// A falling sweep's first print can cross a buy stop its last print
+    /// does not: the sell sweep 102 -> 98 elects a buy stop at 101.
+    #[test]
+    fn test_first_print_of_a_sweep_elects_an_opposite_stop() {
+        let (book, trades) = path_book(&[(5, 102), (6, 98)]);
+        book.add_order(stop(50, Side::Buy, 101, 100, 1, 3))
+            .expect("buy stop 101");
+        book.submit_market_order(id(7), 2, Side::Sell)
+            .expect("sweep 102, 98");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Filled { filled_quantity: 3 }),
+            "elected at the first print, 102 >= 101"
+        );
+        assert!(
+            taken(&trades)
+                .last()
+                .is_some_and(|line| line.contains("@110x3"))
+        );
+    }
+
+    /// A favourable first print trails the stop before the sweep's last
+    /// print is tested: sell stop 95 / watermark 100 / trail 5 and a sell
+    /// sweep 105 -> 98 trails to 100 at 105, then 98 elects it.
+    #[test]
+    fn test_first_print_trails_before_the_last_print_elects() {
+        let (book, _trades) = path_book(&[(5, 105), (6, 98)]);
+        book.add_order(stop(50, Side::Sell, 95, 100, 5, 2))
+            .expect("sell stop 95");
+        book.submit_market_order(id(7), 2, Side::Sell)
+            .expect("sweep 105, 98");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Filled { filled_quantity: 2 }),
+            "trailed to 100 at 105, elected at 98"
+        );
+    }
+
+    /// Elections follow the path: the sell sweep 102 -> 96 elects the buy
+    /// stop at 101 on its first print, before the sell stop at 97 its last
+    /// print elects, although the sell stop was admitted first.
+    #[test]
+    fn test_elections_follow_the_price_path() {
+        let (mut book, _) = path_book(&[(5, 102), (6, 96)]);
+        let trades = record_trades(&mut book);
+        book.add_order(stop(50, Side::Sell, 97, 100, 3, 1))
+            .expect("sell stop, admitted first");
+        book.add_order(stop(51, Side::Buy, 101, 100, 1, 1))
+            .expect("buy stop");
+        book.submit_market_order(id(7), 2, Side::Sell)
+            .expect("sweep 102, 96");
+        let takers: Vec<String> = taken(&trades)
+            .iter()
+            .map(|line| line.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            takers,
+            vec![
+                id(7).to_string(),
+                book.stop_trigger_order_id(id(51)).to_string(),
+                book.stop_trigger_order_id(id(50)).to_string(),
+            ]
+        );
     }
 
     // ---- cancel / modify / mass cancel / expiry -------------------------
@@ -1036,28 +1127,42 @@ mod tests {
         assert_eq!(book.visible_quantity_at_price(93, Side::Buy), Some(3));
     }
 
+    /// While the kill switch is engaged elections are suspended (prints
+    /// still trail): the protective stop is not consumed by a market order
+    /// the kill switch would reject, and the next print at or through its
+    /// stop after the release elects it.
     #[test]
-    fn test_kill_switch_at_trigger_rejects_the_market_order() {
+    fn test_kill_switch_suspends_elections() {
         let book = new_book();
         book.add_order(limit(1, 94, 5, Side::Buy, user(1)))
             .expect("bid 94");
         book.add_order(limit(2, 96, 1, Side::Buy, user(1)))
             .expect("bid 96");
+        book.add_order(limit(4, 102, 1, Side::Sell, user(1)))
+            .expect("ask 102");
         book.add_order(stop(50, Side::Sell, 97, 100, 3, 2))
             .expect("stop");
         book.engage_kill_switch();
-        // The raw match entry points are not kill-switch gated; the stop
-        // they elect is, like any new flow.
-        book.match_market_order(id(3), 1, Side::Sell)
+        // The raw match entry points are not kill-switch gated.
+        book.match_market_order(id(3), 1, Side::Buy)
+            .expect("raw trade at 102");
+        assert_eq!(stop_price(&book, 50), (99, 102), "still trails");
+        book.match_market_order(id(5), 1, Side::Sell)
             .expect("raw trade at 96");
-        let child = book.stop_trigger_order_id(id(50));
-        let rejected = Some(OrderStatus::Rejected {
-            reason: RejectReason::KillSwitchActive,
-        });
-        assert_eq!(book.order_status(id(50)), rejected);
-        assert_eq!(book.order_status(child), rejected);
-        assert_eq!(book.trailing_stop_count(), 0);
+        assert_eq!(book.order_status(id(50)), Some(OrderStatus::Open));
+        assert_eq!(book.trailing_stop_count(), 1, "not elected while engaged");
         assert_eq!(book.visible_quantity_at_price(94, Side::Buy), Some(5));
+        let child = book.stop_trigger_order_id(id(50));
+        assert_eq!(book.order_status(child), None, "no child state");
+        book.release_kill_switch();
+        book.match_market_order(id(6), 1, Side::Sell)
+            .expect("trade at 94");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Filled { filled_quantity: 2 }),
+            "elected by the first print after the release"
+        );
+        assert_eq!(book.visible_quantity_at_price(94, Side::Buy), Some(2));
     }
 
     // ---- snapshot -------------------------------------------------------
