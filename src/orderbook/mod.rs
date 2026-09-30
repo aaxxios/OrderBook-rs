@@ -81,6 +81,10 @@ pub mod repricing;
 #[cfg(feature = "special_orders")]
 pub mod stop_orders;
 
+/// Protection collar for elected stop orders (#302); available in every
+/// build so snapshots and replay configurations carry it identically.
+pub mod stop_protection;
+
 /// Sequencer subsystem: types, journal trait, and file-based journal.
 pub mod sequencer;
 
@@ -121,3 +125,4 @@ pub use snapshot::{
     ORDERBOOK_SNAPSHOT_MIN_READ_VERSION, OrderBookSnapshot, OrderBookSnapshotPackage,
 };
 pub use statistics::{DepthStats, DistributionBin};
+pub use stop_protection::StopProtection;

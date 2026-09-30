@@ -34,6 +34,9 @@ Complete guide for using OrderBook-rs in your trading systems.
 doc/
 ├── README.md             # This file - documentation index
 ├── USER_GUIDE.md         # Complete user guide
+├── architecture.md       # Modules, layering, data flow, feature matrix, snapshot formats
+├── matching.md           # Sweep, order types, STP, fees, emission, stop execution and collar
+├── adr/                  # Architecture Decision Records (0001: stop protection collar)
 ├── panic-boundaries.md   # Production Panic Policy: what the gate cannot certify
 └── wire-protocol.md      # Binary wire codec (feature `wire`)
 ```

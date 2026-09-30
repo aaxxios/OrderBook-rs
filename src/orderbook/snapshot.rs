@@ -10,6 +10,7 @@ use super::error::OrderBookError;
 use super::fees::FeeSchedule;
 use super::iterators::{checked_depth_add, checked_notional_add};
 use super::risk::RiskConfig;
+use super::stop_protection::StopProtection;
 use super::stp::STPMode;
 
 /// A snapshot of the order book state at a specific point in time
@@ -224,6 +225,15 @@ fn total_value(
 
 /// Format version used for checksum-enabled order book snapshots.
 ///
+/// Bumped to `6` for the stop protection collar (#302): the package
+/// carries [`OrderBookSnapshotPackage::stop_protection`]. The snapshot
+/// payload and its checksum are unchanged from version 5 (the checksum
+/// covers the payload, not the configuration fields); the bump exists so
+/// that a 0.14 reader (which accepts `2..=5`) refuses a newer package
+/// instead of silently dropping the collar and restoring stops that would
+/// then execute unprotected. Version-5 packages keep verifying and restore
+/// with no collar; a package below version 6 that carries one is rejected.
+///
 /// Bumped to `5` for off-book trailing stops (#286): the snapshot carries
 /// the pending stops (`OrderBookSnapshot::pending_stops`) and the last
 /// trade price (`OrderBookSnapshot::last_trade_price`), and the checksum of
@@ -253,7 +263,7 @@ fn total_value(
 /// [`OrderBookSnapshotPackage::validate`] with the existing
 /// `Unsupported snapshot version` error — that format break is
 /// intentional, with no special-case migration path.
-pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 5;
+pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 6;
 
 /// Length of a hex-encoded SHA-256 digest (32 bytes, two hex digits each).
 const SHA256_HEX_LEN: usize = 64;
@@ -267,6 +277,9 @@ pub const ORDERBOOK_SNAPSHOT_MIN_READ_VERSION: u32 = 2;
 /// First package version whose snapshot carries pending stops and the last
 /// trade price, and whose checksum covers them (#286).
 const STOP_ORDERS_SNAPSHOT_VERSION: u32 = 5;
+
+/// First package version that carries the stop protection collar (#302).
+const STOP_PROTECTION_SNAPSHOT_VERSION: u32 = 6;
 
 /// The snapshot fields packages of versions `2..=4` checksummed, in their
 /// serialized order. Serializes byte-identically to the pre-#286
@@ -299,7 +312,8 @@ impl<'a> LegacySnapshotView<'a> {
 ///
 /// In addition to the snapshot payload and checksum, this package carries
 /// the order book's configuration fields (`fee_schedule`, `stp_mode`,
-/// `tick_size`, `lot_size`, `min_order_size`, `max_order_size`) so that
+/// `tick_size`, `lot_size`, `min_order_size`, `max_order_size`,
+/// `stop_protection`, ...) so that
 /// [`OrderBook::restore_from_snapshot_package`](super::book::OrderBook::restore_from_snapshot_package)
 /// can fully reconstruct the book's state, including validation rules and
 /// fee settings.
@@ -398,6 +412,19 @@ pub struct OrderBookSnapshotPackage {
     /// [`Self::market_close_timestamp`].
     #[serde(default)]
     pub has_market_close: bool,
+
+    /// Protection collar for elected stop orders active at the time of the
+    /// snapshot (#302), or `None` for unprotected (market) execution.
+    /// Restored as is by
+    /// [`OrderBook::restore_from_snapshot_package`](super::book::OrderBook::restore_from_snapshot_package).
+    ///
+    /// Introduced in format version 6. `#[serde(default)]`: absent from
+    /// older payloads, which restore with `None` (their writer had no
+    /// collar). A package below version 6 that carries one is rejected by
+    /// [`OrderBookSnapshotPackage::validate`]. A zero collar does not
+    /// deserialize.
+    #[serde(default)]
+    pub stop_protection: Option<StopProtection>,
 }
 
 impl OrderBookSnapshotPackage {
@@ -433,6 +460,7 @@ impl OrderBookSnapshotPackage {
             risk_config: None,
             market_close_timestamp: 0,
             has_market_close: false,
+            stop_protection: None,
         })
     }
 
@@ -462,7 +490,8 @@ impl OrderBookSnapshotPackage {
     /// their packages keep their original checksum. A package below
     /// version `5` that carries pending stops or a last trade price is
     /// rejected: those fields did not exist then and its checksum would
-    /// not cover them.
+    /// not cover them. Likewise a package below version 6 that carries a
+    /// stop protection collar (#302) is rejected: no such writer existed.
     #[must_use = "an unchecked snapshot package must not be restored"]
     pub fn validate(&self) -> Result<(), OrderBookError> {
         if self.version < ORDERBOOK_SNAPSHOT_MIN_READ_VERSION
@@ -485,6 +514,15 @@ impl OrderBookSnapshotPackage {
                 message: format!(
                     "snapshot version {} cannot carry pending stops or a last trade price (introduced in version {})",
                     self.version, STOP_ORDERS_SNAPSHOT_VERSION
+                ),
+            });
+        }
+
+        if self.version < STOP_PROTECTION_SNAPSHOT_VERSION && self.stop_protection.is_some() {
+            return Err(OrderBookError::InvalidOperation {
+                message: format!(
+                    "snapshot version {} cannot carry a stop protection collar (introduced in version {})",
+                    self.version, STOP_PROTECTION_SNAPSHOT_VERSION
                 ),
             });
         }
@@ -523,7 +561,8 @@ impl OrderBookSnapshotPackage {
     }
 
     /// SHA-256 (hex) of the checksummed payload of a `version` package:
-    /// the whole snapshot from version 5 on, the pre-#286 fields
+    /// the whole snapshot from version 5 on (version 6 changed the package,
+    /// not the payload), the pre-#286 fields
     /// ([`LegacySnapshotView`]) before it.
     fn compute_checksum(
         version: u32,

@@ -503,7 +503,9 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         // or with invalid terms; all rejected before anything changes.
         | OrderBookError::StopOrdersUnsupported { .. }
         | OrderBookError::StopWouldTrigger { .. }
-        | OrderBookError::InvalidStopTerms { .. } => false,
+        | OrderBookError::InvalidStopTerms { .. }
+        // #302: a configuration error, never raised by a submit.
+        | OrderBookError::InvalidStopProtection { .. } => false,
         #[cfg(feature = "nats")]
         OrderBookError::NatsPublishError { .. } | OrderBookError::NatsSerializationError { .. } => {
             false

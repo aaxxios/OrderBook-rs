@@ -311,7 +311,7 @@ mod tests {
     /// #286: a pending trailing stop's election runs under the gate of the
     /// call whose trade crossed it, so its market order's events follow
     /// that call's own events in the same batch: the crossing trade, the
-    /// stop's `Triggered { child_id, trigger_price }` election event, the
+    /// stop's `Triggered { child_id, trigger_price, limit_price }` election event, the
     /// market order's level and trade events, then the stop's terminal
     /// state. The pre-#286 stream above is unchanged (it has no stop).
     #[cfg(feature = "special_orders")]

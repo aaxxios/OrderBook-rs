@@ -33,12 +33,17 @@
 //   of N stops (5000, 4999, ...), whose market order elects the next, and
 //   so on down a ladder of one-lot bids. Re-seeded between samples,
 //   untimed.
+// - `pending_stops_elect_collar_{10,1000}` / `pending_stops_cascade_collar_
+//   {10,1000}` (#302): the same with a `StopProtection` collar, so each
+//   child is an IOC limit (elect: collar 10, every child still fills at
+//   900; cascade: collar 1, each child fills the next one-lot bid and the
+//   last one finds nothing within its band instead of the deep bid).
 
 #[path = "hdr_common.rs"]
 mod common;
 
 use common::{new_histogram, owner, persist, record, record_batch, report};
-use orderbook_rs::OrderBook;
+use orderbook_rs::{OrderBook, StopProtection};
 use pricelevel::{Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 
 const BATCH: u64 = 32;
@@ -151,9 +156,22 @@ fn trailing(n: u64, samples: u64) {
     persist(&scenario, &hist).expect("persist hgrm");
 }
 
-fn elect(n: u64, samples: u64) {
-    let scenario = format!("pending_stops_elect_{n}");
-    let book = common::fresh_book();
+/// `name` with a `_collar` infix when `collar` is set, and a book with it.
+fn book_for(name: &str, n: u64, collar: Option<u128>) -> (String, OrderBook<()>) {
+    let mut book = common::fresh_book();
+    let scenario = match collar {
+        Some(units) => {
+            book.set_stop_protection(Some(StopProtection::try_new(units).unwrap()))
+                .unwrap();
+            format!("{name}_collar_{n}")
+        }
+        None => format!("{name}_{n}"),
+    };
+    (scenario, book)
+}
+
+fn elect(n: u64, samples: u64, collar: Option<u128>) {
+    let (scenario, book) = book_for("pending_stops_elect", n, collar);
     let mut ids = Ids(0);
     limit(&book, &mut ids, 900, u64::MAX / 4, Side::Buy);
     let mut hist = new_histogram();
@@ -174,9 +192,8 @@ fn elect(n: u64, samples: u64) {
     persist(&scenario, &hist).expect("persist hgrm");
 }
 
-fn cascade(n: u64, samples: u64) {
-    let scenario = format!("pending_stops_cascade_{n}");
-    let book = common::fresh_book();
+fn cascade(n: u64, samples: u64, collar: Option<u128>) {
+    let (scenario, book) = book_for("pending_stops_cascade", n, collar);
     let mut ids = Ids(0);
     limit(&book, &mut ids, 100, u64::MAX / 4, Side::Buy);
     let mut hist = new_histogram();
@@ -207,8 +224,12 @@ fn main() {
     }
     trailing(10, 50_000);
     trailing(1000, 5_000);
-    elect(10, 5_000);
-    elect(1000, 200);
-    cascade(10, 5_000);
-    cascade(1000, 200);
+    for collar in [None, Some(10)] {
+        elect(10, 5_000, collar);
+        elect(1000, 200, collar);
+    }
+    for collar in [None, Some(1)] {
+        cascade(10, 5_000, collar);
+        cascade(1000, 200, collar);
+    }
 }

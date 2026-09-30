@@ -364,6 +364,7 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::StopOrdersUnsupported { .. } => Self::StopOrdersUnsupported,
             OrderBookError::StopWouldTrigger { .. } => Self::StopWouldTrigger,
             OrderBookError::InvalidStopTerms { .. } => Self::InvalidStopTerms,
+            OrderBookError::InvalidStopProtection { .. } => Self::Other(0),
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { .. } => Self::Other(0),
             #[cfg(feature = "nats")]
@@ -513,6 +514,13 @@ mod tests {
         };
         assert_eq!(RejectReason::from(&terms), RejectReason::InvalidStopTerms);
         assert!(terms.to_string().contains("trail amount is zero"));
+        // #302: a zero collar is a configuration error, not a reject code.
+        let collar = OrderBookError::InvalidStopProtection {
+            collar: 0,
+            reason: "collar is zero",
+        };
+        assert_eq!(RejectReason::from(&collar), RejectReason::Other(0));
+        assert!(collar.to_string().contains("collar 0"));
         for (code, text) in [(24u16, "stop would trigger"), (25, "invalid stop terms")] {
             let reason = RejectReason::from_u16(code);
             assert_eq!(reason.as_u16(), code);

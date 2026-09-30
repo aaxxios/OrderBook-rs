@@ -32,6 +32,89 @@
 //! - **Research**: Platform for studying market microstructure and order flow
 //! - **Educational**: Reference implementation for understanding modern exchange architecture
 //!
+//! ## What's New in Version 0.15.0 (unreleased)
+//!
+//! ### Added
+//!
+//! - **Protection collar for elected stop orders (#302).**
+//!   `OrderBook::set_stop_protection(Some(StopProtection::try_new(collar)?))`
+//!   bounds the child an elected trailing stop (`special_orders`) executes
+//!   as: an immediate-or-cancel **limit** order at `stop - collar` for a
+//!   sell stop and `stop + collar` for a buy stop, where `stop` is the
+//!   stop's trailed stop price at election and `collar` an absolute offset
+//!   in price units (like CME protection points, except that the remainder
+//!   is cancelled, not rested: a stop whose band is exhausted leaves its
+//!   position unprotected). The child trades only within that band and
+//!   nothing rests. A remainder the collar cut (liquidity left beyond the
+//!   limit, including an empty band) ends `Cancelled { reason:
+//!   StopProtectionBand }` (new `CancelReason`); one left because the side
+//!   ran out within the band keeps `InsufficientLiquidity`.
+//!   `OrderStatus::Triggered` records the child's `limit_price` (`None`
+//!   for a market child). `StopProtection` is in the prelude. The collar
+//!   must be a multiple of the tick size (`InvalidTickSize`) and cannot be
+//!   zero
+//!   (`OrderBookError::InvalidStopProtection`; "unset" is `None`); a band
+//!   that reaches or passes the representable bound (sell `collar >= stop`,
+//!   buy `stop + collar >= u128::MAX`) has the bound as its limit, `0` /
+//!   `u128::MAX` (unbounded on that side). Unset (the default) keeps the 0.14 unpriced
+//!   IOC market child. The config type exists in every build; it only
+//!   acts where trailing stops exist. Paths without a pending stop never
+//!   read it.
+//!
+//! ### Breaking
+//!
+//! - **Snapshot format 6.** `OrderBookSnapshotPackage::stop_protection`
+//!   carries the collar; `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is `6` and
+//!   reads accept `2..=6`. The payload and its checksum are unchanged from
+//!   version 5; the bump makes a 0.14 reader refuse a 0.15 package instead
+//!   of silently restoring stops without their collar. Version-5 packages
+//!   restore with no collar; a package below 6 carrying one is rejected.
+//! - **New public fields.** `OrderBookSnapshotPackage::stop_protection` and
+//!   `ReplayBookConfig::stop_protection` break exhaustive struct literals
+//!   (add `..Default::default()` for `ReplayBookConfig`, or set the field).
+//!   Replay must be given the source book's collar
+//!   (`ReplayBookConfig::with_stop_protection`), constant over the replayed
+//!   range, to reproduce its elections. A mismatch is not reported as
+//!   `ReplayError::OutcomeMismatch`, and `snapshots_match` catches it only
+//!   when it changed an outcome (a stop elected and filled differently):
+//!   `OrderBookSnapshot` does not carry the collar. Verify it explicitly by
+//!   comparing the replayed book's `stop_protection()` with the source
+//!   book's (or the snapshot package's `stop_protection`).
+//! - **`CancelReason::StopProtectionBand`** is appended (bincode index 10):
+//!   exhaustive matches need the arm.
+//! - **`OrderStatus::Triggered { child_id, trigger_price, limit_price }`**:
+//!   the new field breaks patterns and literals that name every field. JSON
+//!   written by 0.14 decodes (`limit_price: None`); bincode `Triggered`
+//!   payloads written by 0.14 do not decode, and vice versa. Nothing in the
+//!   journal or the wire codec carries an `OrderStatus` (the `ExecReport`
+//!   carries only the status code, still `5`).
+//!
+//! ### Known limitations
+//!
+//! - A gap of more than one collar through a stop's price always consumes
+//!   the stop with zero fill (`Cancelled { filled_quantity: 0, reason:
+//!   StopProtectionBand }`): the position is left unprotected.
+//! - The collar bounds each child's price, not the cascade: a ladder of
+//!   stops spaced one collar apart still walks the book `k × collar` in one
+//!   call (no cascade depth limit or velocity pause).
+//! - A sell collar that reaches or exceeds the stop price (`collar >=
+//!   stop`: limit `0`), or a buy stop whose `stop + collar` reaches or
+//!   exceeds `u128::MAX` (limit `u128::MAX`): that stop has no protection
+//!   at all, silently.
+//!
+//! ### Migration from 0.14
+//!
+//! | 0.14 | 0.15 |
+//! |------|------|
+//! | elected stop: unpriced IOC market child only | unchanged by default; with `set_stop_protection` an IOC limit at `stop - collar` (sell) or `stop + collar` (buy) |
+//! | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 5`; reads `2..=5` | `== 6`; reads `2..=6`; a 0.14 reader rejects v6 packages |
+//! | `OrderBookSnapshotPackage { .., has_market_close }` | adds `stop_protection: Option<StopProtection>` (`#[serde(default)]`) |
+//! | `ReplayBookConfig { .., trade_id_namespace }` | adds `stop_protection: Option<StopProtection>`; builder `with_stop_protection` |
+//! | `OrderBookError` | adds `InvalidStopProtection { collar, reason }` (maps to `RejectReason::Other(0)`) |
+//! | `CancelReason` (10 variants) | adds `StopProtectionBand` (appended) |
+//! | `OrderStatus::Triggered { child_id, trigger_price }` | adds `limit_price: Option<u128>` (`#[serde(default)]`) |
+//! | collared child remainder: n/a | `Cancelled { StopProtectionBand }` when the collar cut it, `InsufficientLiquidity` when the side ran out |
+//!
 //! ## What's New in Version 0.14.0
 //!
 //! 0.14.0 is the panic-policy release: crate-owned code no longer initiates
@@ -1689,6 +1772,7 @@ pub use orderbook::sequencer::{
 pub use orderbook::serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use orderbook::snapshot::{EnrichedSnapshot, MetricFlags};
 pub use orderbook::statistics::{DepthStats, DistributionBin};
+pub use orderbook::stop_protection::StopProtection;
 pub use orderbook::stp::STPMode;
 pub use orderbook::trade::{
     SubmitFailure, TradeArithmeticError, TradeEvent, TradeInfo, TradeListener, TradeResult,

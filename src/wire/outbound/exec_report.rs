@@ -215,6 +215,7 @@ mod tests {
             status_to_wire(&OrderStatus::Triggered {
                 child_id: pricelevel::Id::from_u64(1),
                 trigger_price: 100,
+                limit_price: Some(98),
             }),
             STATUS_TRIGGERED
         );

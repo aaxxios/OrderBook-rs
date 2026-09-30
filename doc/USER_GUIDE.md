@@ -228,29 +228,64 @@ driven by the book's **prints**:
   executes as an immediate-or-cancel **market order** for its quantity, on
   its side, for its user: self-trade prevention, fees and the notional /
   trade-id checks apply as for any market taker, and an unexecuted
-  remainder is cancelled.
+  remainder is cancelled. With a protection collar (below) it is an
+  immediate-or-cancel **limit** order instead.
+- **Protection collar (#302).** `book.set_stop_protection(Some(p))`
+  installs a per-book collar `p = StopProtection::try_new(units)?`, an
+  absolute offset in price units (like CME protection points, **except**
+  that the remainder is cancelled, not rested at the limit: a stop whose
+  band is exhausted is consumed and leaves its position unprotected). An
+  elected sell stop then executes as an IOC limit at `stop - collar`, a buy
+  stop at `stop + collar`, where `stop` is its current (trailed) stop price
+  at election, not the print that elected it. It trades only at levels at
+  or inside that limit and nothing ever rests. A remainder the collar cut
+  (liquidity left beyond the limit, including an empty band) ends
+  `Cancelled { reason: StopProtectionBand }`; a remainder left because the
+  side ran out within the band ends `Cancelled { reason:
+  InsufficientLiquidity }`. `Triggered { limit_price }` records the
+  child's limit (`None` for a market child). The collar must be a multiple
+  of the tick size (`InvalidTickSize`) and cannot be zero
+  (`InvalidStopProtection`; unset is `None`); a later `set_tick_size` does
+  not re-validate it. A band that reaches or passes the representable
+  bound (a sell collar `>=` the stop price, a buy `stop + collar >=
+  u128::MAX`) has the bound as its limit, `0` / `u128::MAX`: that stop is
+  **not protected** on that side, silently, so size the collar well below the stop prices. Without a
+  collar (the default) the child is the unpriced market order of 0.14.
+  The collar travels in the snapshot package (format 6). For replay, pass
+  it with `ReplayBookConfig::with_stop_protection`: it must match the
+  source book **and** have been constant over the replayed range
+  (`set_stop_protection` is not journaled). A mismatch is not reported as
+  `ReplayError::OutcomeMismatch`, and `snapshots_match` catches it only
+  when it changed an outcome (a stop elected and filled differently): the
+  snapshot does not carry the collar, so with no election in the range, or
+  coinciding fills, the snapshots match while future elections differ.
+  Verify the configuration explicitly:
+  `replayed.stop_protection() == source.stop_protection()` (or compare
+  with the snapshot package's `stop_protection`).
 - **Price path.** Each sweep is evaluated at its first print and then at
   its last one (a sweep's prints move one way, so these are its
   extremes): at each, stops trail first and are elected second. A falling
   sweep's first print can elect a buy stop, and a favourable first print
   trails a stop before the last print is tested against it.
 - **When.** Automatically, under the submit gate, before every call that
-  traded returns. Elections cascade (a stop's market order is a new sweep,
+  traded returns. Elections cascade (a stop's child order is a new sweep,
   evaluated next) until none is left; each stop fires at most once. The
   stops one print elects run in trigger order: sell stops highest first,
   buy stops lowest first, equal prices in admission order, the side the
   price moved towards first.
-- **Link to the market order.** At election the stop records
-  `OrderStatus::Triggered { child_id, trigger_price }` (the order-state
-  listener's election event), and the market order's `TradeResult`s carry
+- **Link to the child order.** At election the stop records
+  `OrderStatus::Triggered { child_id, trigger_price, limit_price }` (the
+  order-state listener's election event), and the child order's
+  `TradeResult`s carry
   `origin_stop_id = Some(stop_id)`; its taker id is
   `book.stop_trigger_order_id(stop_id)`, a UUIDv5 of the book's trade-id
   namespace (keep the namespace private: an order placed under that id
   first makes the stop end `Rejected { DuplicateOrderId }`). Replay with
   the same namespace reproduces it.
 - **Lifecycle.** `Open` while pending, `Triggered` at election, then the
-  market order's terminal state (`Filled`, `Cancelled { InsufficientLiquidity }`
-  for a remainder, `Cancelled { SelfTradePrevention }`, ...).
+  child order's terminal state (`Filled`, `Cancelled { InsufficientLiquidity }`
+  for a remainder, `Cancelled { StopProtectionBand }` for a remainder the
+  collar cut, `Cancelled { SelfTradePrevention }`, ...).
   `cancel_order`, `update_order` (quantity, stop price, replace), every mass
   cancel (the price range matches the **current**, trailed stop price),
   `evict_expired_orders` and `get_order` cover pending stops;
@@ -271,14 +306,19 @@ driven by the book's **prints**:
   `max_notional_per_account`, and that account's later admissions are then
   rejected. It is released on trigger or cancel.
 - **Kill switch.** While engaged, elections are suspended (prints still
-  trail), so protective stops are not consumed by market orders the kill
+  trail), so protective stops are not consumed by child orders the kill
   switch would reject; the next print at or through a stop after the
   release elects it.
-- **Limits.** The market order is unpriced: no protection collar, and the
-  book applies no price band to market orders, so a thin or gapped book
-  fills it far from the stop (and the risk booking at the stop price
-  understates that fill). A cascade is bounded only by the number of
-  pending stops.
+- **Limits.** Without a collar the market order is unpriced and the book
+  applies no price band to market orders, so a thin or gapped book fills
+  it far from the stop (and the risk booking at the stop price
+  understates that fill); a collar bounds each child's price, at the cost
+  of leaving a stop unexecuted when its band is empty: a gap of more than
+  one collar through the stop always consumes it with zero fill. A
+  cascade's length is bounded only by the number of pending stops: a
+  ladder of stops spaced one collar apart still walks the book
+  `k × collar` in one call (there is no cascade depth limit or velocity
+  pause).
 - **Cost.** While a stop is pending, every call on the book that can trade
   (limit and market orders, cancel-then-add modifies) and every call that
   targets a stop takes the exclusive submit gate; post-only adds and the
@@ -306,6 +346,17 @@ book.add_order(OrderType::TrailingStop {
     extra_fields: (),
 })?;
 // Trades at 104 move it to 99; a print at or below 99 sells 3 at market.
+```
+
+With a collar the same stop sells only down to its stop price minus the
+collar:
+
+```rust
+use orderbook_rs::{OrderBook, StopProtection};
+
+let mut book: OrderBook<()> = OrderBook::with_tick_size("BTC/USD", 1);
+// Elected at stop price 99: IOC limit at 97, the rest is cancelled.
+book.set_stop_protection(Some(StopProtection::try_new(2)?))?;
 ```
 
 Without the `special_orders` feature a `TrailingStop` is rejected untouched
@@ -827,10 +878,12 @@ of the book, so pushing onto a channel is still the recommended shape.
 ### 3. State Management
 
 Use a snapshot **package** for persistence: it carries the format version
-(currently 4; versions 2 to 4 restore), a checksum, and the book's
+(currently 6; versions 2 to 6 restore), a checksum, and the book's
 configuration (fees, STP mode, tick / lot size, order-size limits, risk
-config, kill switch, `engine_seq`), and restore validates all of it before
-touching the live book.
+config, kill switch, `engine_seq`, stop protection collar), and restore
+validates all of it before touching the live book. From version 5 the
+checksummed payload also carries the pending trailing stops and the last
+trade price; version 6 adds the collar (a 0.14 reader refuses it).
 
 ```rust
 use orderbook_rs::orderbook::OrderBookSnapshotPackage;

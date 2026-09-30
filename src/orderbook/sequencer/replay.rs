@@ -30,6 +30,7 @@ use crate::orderbook::clock::Clock;
 use crate::orderbook::fees::FeeSchedule;
 use crate::orderbook::mass_cancel::{MassCancelFailure, MassCancelResult};
 use crate::orderbook::reject_reason::RejectReason;
+use crate::orderbook::stop_protection::StopProtection;
 use crate::orderbook::stp::STPMode;
 use crate::orderbook::trade::SubmitFailure;
 use crate::orderbook::{OrderBook, OrderBookError, OrderBookSnapshot};
@@ -126,6 +127,33 @@ pub struct ReplayBookConfig {
     /// already produced trades under this namespace reissues their IDs,
     /// which the engine cannot detect.
     pub trade_id_namespace: Option<Uuid>,
+
+    /// Protection collar for elected stop orders the source book used
+    /// (#302), or `None` for unprotected (market) execution. Applied as
+    /// is (no tick-size re-check: the source book may hold a collar
+    /// admitted under a previous tick size). Chain
+    /// [`Self::with_stop_protection`] to set it.
+    ///
+    /// A collar changes which trades an elected stop makes, so it must
+    /// match the source book **and** have been constant over the replayed
+    /// range: `set_stop_protection` is not journaled, so a collar changed
+    /// mid-stream cannot be reproduced.
+    ///
+    /// A mismatch is **not** reported as [`ReplayError::OutcomeMismatch`]
+    /// at the election (stop elections are not journaled commands, and the
+    /// command that printed still succeeds), and [`snapshots_match`] only
+    /// catches it through its effects: [`OrderBookSnapshot`] does not carry
+    /// the collar, so the snapshots differ only when the mismatch changed
+    /// an outcome (a stop elected and filled differently). If no stop was
+    /// elected over the replayed range, or the fills happened to coincide,
+    /// the snapshots match while the two books would elect future stops
+    /// differently. Verify the configuration explicitly: compare the
+    /// replayed book's
+    /// [`OrderBook::stop_protection`] with the source book's (or with the
+    /// snapshot package's
+    /// [`stop_protection`](crate::OrderBookSnapshotPackage::stop_protection)
+    /// field).
+    pub stop_protection: Option<StopProtection>,
 }
 
 impl ReplayBookConfig {
@@ -162,6 +190,7 @@ impl ReplayBookConfig {
             min_order_size,
             max_order_size,
             trade_id_namespace: None,
+            stop_protection: None,
         }
     }
 
@@ -183,6 +212,23 @@ impl ReplayBookConfig {
         self
     }
 
+    /// Returns this configuration with the stop protection collar set
+    /// (#302).
+    ///
+    /// Builder-style companion to [`Self::new`] (which leaves it at
+    /// `None`): carry the source book's
+    /// [`OrderBook::stop_protection`] so replayed stop elections trade
+    /// within the same band.
+    ///
+    /// # Arguments
+    ///
+    /// * `protection` — the collar the source book used, or `None`
+    #[must_use = "with_stop_protection returns the updated config; it does not mutate in place"]
+    pub fn with_stop_protection(mut self, protection: Option<StopProtection>) -> Self {
+        self.stop_protection = protection;
+        self
+    }
+
     /// Applies this configuration to a freshly-constructed `book` in place,
     /// before any journal events are replayed into it.
     ///
@@ -194,7 +240,8 @@ impl ReplayBookConfig {
     /// value rather than an `Option`. `trade_id_namespace` is applied only
     /// when `Some` — the book is fresh (no orders yet), so replacing the
     /// generator here honors the counter-restart contract of
-    /// [`OrderBook::set_trade_id_namespace`].
+    /// [`OrderBook::set_trade_id_namespace`]. `stop_protection` is applied
+    /// unconditionally, without the tick-size check.
     fn apply_to<T>(&self, book: &mut OrderBook<T>)
     where
         T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + Default + 'static,
@@ -212,6 +259,7 @@ impl ReplayBookConfig {
         if let Some(namespace) = self.trade_id_namespace {
             book.set_trade_id_namespace(namespace);
         }
+        book.set_stop_protection_unchecked(self.stop_protection);
     }
 }
 

@@ -59,6 +59,10 @@ pub use crate::orderbook::reject_reason::RejectReason;
 // Pre-trade risk layer types
 pub use crate::orderbook::risk::{ReferencePriceSource, RiskConfig, RiskState};
 
+// Stop protection collar (#302); `ReplayBookConfig::with_stop_protection`
+// takes it.
+pub use crate::orderbook::stop_protection::StopProtection;
+
 // Event serialization types
 #[cfg(feature = "bincode")]
 pub use crate::orderbook::serialization::BincodeEventSerializer;

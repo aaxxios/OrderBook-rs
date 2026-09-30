@@ -19,9 +19,12 @@
 //!   immediate-or-cancel **market order** for its quantity, on its side,
 //!   for its user (self-trade prevention, fees and the trade-id / notional
 //!   preflights apply as for any market taker); an unexecuted remainder is
-//!   cancelled. A stop the last trade already crosses is refused at
-//!   admission and on modify (`StopWouldTrigger`): a stop only triggers on
-//!   a new print.
+//!   cancelled. With a [`StopProtection`](crate::StopProtection) collar on
+//!   the book (#302) the child is an immediate-or-cancel **limit** order
+//!   instead, at the stop price moved by the collar against it (see
+//!   "Protection collar" below). A stop the last trade already crosses is
+//!   refused at admission and on modify (`StopWouldTrigger`): a stop only
+//!   triggers on a new print.
 //! - **Path.** Each sweep is evaluated as a `PrintSegment`: the price it
 //!   arrived from and its first and last prints (a sweep's prints are
 //!   monotonic, so these are its extremes). At the first print, then at the
@@ -33,7 +36,7 @@
 //!   mutating call already holds, right before every call that traded
 //!   returns (`add_order*`, `submit_market_order*`, the `match_*` entry
 //!   points, `update_order`). It is iterative: the sweep of an elected
-//!   stop's market order is evaluated next (first in, first out), until no
+//!   stop's child order is evaluated next (first in, first out), until no
 //!   sweep is left. Each stop is elected at most once (it leaves the store
 //!   when elected), so a cascade is bounded by the number of pending stops.
 //! - **Order.** Stops one print elects execute in trigger order: sell stops
@@ -42,12 +45,12 @@
 //!   goes first. Stops of an earlier print execute before those of a later
 //!   one. Stops are keyed by `(price, admission sequence)` in lock-free
 //!   skip lists, so every scan is ordered and independent of hashing. The
-//!   market order of stop `S` carries the id
+//!   child order of stop `S` carries the id
 //!   [`stop_trigger_order_id`](crate::orderbook::stop_orders::stop_trigger_order_id)
 //!   (UUIDv5 of the book's trade-id namespace and `S`), so a replay with
 //!   the same namespace reproduces it.
 //! - **Kill switch.** While it is engaged, elections are suspended (prints
-//!   still trail): a protective stop is not consumed by a market order the
+//!   still trail): a protective stop is not consumed by a child order the
 //!   kill switch would reject; the first print at or through its stop
 //!   price after the release elects it.
 //!
@@ -62,42 +65,83 @@
 //! pays a few relaxed loads of that count (gate decision, re-check,
 //! evaluation) and one per matched level (the print recorder).
 //!
-//! # Lifecycle and the link to the market order
+//! # Protection collar (#302)
+//!
+//! [`OrderBook::set_stop_protection`] installs a per-book collar, an
+//! absolute offset in price units (like CME protection points, except that
+//! the remainder is cancelled, not rested at the limit: a stop whose band
+//! is exhausted leaves its position unprotected). The child of an elected
+//! stop is then an immediate-or-cancel limit order at
+//!
+//! - `stop - collar` for a sell stop,
+//! - `stop + collar` for a buy stop,
+//!
+//! where `stop` is the stop's current (trailed) stop price at election, not
+//! the print that elected it. The child trades only at levels at or inside
+//! that limit; whatever does not fill is cancelled and nothing rests. The
+//! remainder's reason tells why: `Cancelled { StopProtectionBand }` when
+//! the collar cut the sweep (liquidity remained beyond the limit),
+//! including an empty band over a non-empty side (a gap through the
+//! collar: `filled_quantity: 0`); `Cancelled { InsufficientLiquidity }`
+//! when the side ran out within the band. `Triggered` carries the child's
+//! `limit_price` (`None` for a market child). A band that reaches or
+//! passes the representable bound (a sell collar `>=` the stop price, a buy
+//! `stop + collar >= u128::MAX`) has the bound as its limit (`0` /
+//! `u128::MAX`): the collar does not restrict that side. With a tick size
+//! the collar must be a multiple of it, so the limit of a tick-aligned stop is tick-aligned; the
+//! limit is a bound on matching, never a resting price, so it is not
+//! rounded. An empty band is not counted in the `InsufficientLiquidity`
+//! reject metric (a limit that does not cross is not a rejection).
+//!
+//! No stop child trades beyond its own band (the taker whose print elects
+//! the first stop is not collared). A cascade is still unbounded in
+//! length: a ladder of stops spaced one collar apart walks the book
+//! `k × collar` in one call. Without a collar (the default) the child is
+//! the unpriced market order of 0.14.
+//! The collar is read once per elected stop: paths without a pending stop
+//! never touch it.
+//!
+//! # Lifecycle and the link to the child order
 //!
 //! The order state of a pending stop is `Open`. At election it records
-//! `Triggered { child_id, trigger_price }` (the listener's election event:
-//! stop id, market-order id, trigger print), and the market order's
+//! `Triggered { child_id, trigger_price, limit_price }` (the listener's
+//! election event: stop id, child-order id, trigger print, the child's
+//! collar limit or `None` for a market child), and the child order's
 //! `TradeResult`s carry `origin_stop_id = Some(stop)`. The stop then takes
-//! the terminal state of its market order: `Filled` when it executed its
+//! the terminal state of its child order: `Filled` when it executed its
 //! whole quantity, `Cancelled { InsufficientLiquidity }` for an unexecuted
-//! remainder (including none executed), `Cancelled { SelfTradePrevention }`
-//! / `Cancelled { MatchAborted }` when self-trade prevention or a failed
+//! remainder (including none executed), `Cancelled { StopProtectionBand }`
+//! when a collar cut it (#302), `Cancelled { SelfTradePrevention }` /
+//! `Cancelled { MatchAborted }` when self-trade prevention or a failed
 //! price level stopped it, and `Rejected` when it was rejected untouched
 //! (trade-id generator exhausted, notional or fee not representable, or a
-//! market-order id already in use: `DuplicateOrderId`). The market order's
-//! own id gets a tracker entry only on the paths every market order records
-//! one (an STP cancel with no fill, an abort, an untouched rejection); the
+//! child-order id already in use: `DuplicateOrderId`). The child order's
+//! own id gets a tracker entry only on the paths every taker records one
+//! (an STP cancel with no fill, an abort, an untouched rejection); the
 //! kill switch no longer produces one, since elections are suspended.
 //!
-//! The market-order id is a UUIDv5 of the book's trade-id namespace and
+//! The child-order id is a UUIDv5 of the book's trade-id namespace and
 //! the stop id. Keep the namespace private: someone who knows it can
 //! derive the id and place an order under it first, which refuses the
-//! stop's market order.
+//! stop's child order.
 //!
 //! # What a stop does not protect against
 //!
-//! - The market order is **unpriced**: it walks the opposite side as far as
-//!   its quantity needs, with no protection collar, and the book applies no
+//! - Without a collar the market order is **unpriced**: it walks the
+//!   opposite side as far as its quantity needs, and the book applies no
 //!   price band to market orders. A thin or gapped book fills it far from
-//!   the stop price.
+//!   the stop price. Configure a [`StopProtection`](crate::StopProtection)
+//!   to bound it; the price of that bound is that a stop whose band is
+//!   empty is cancelled unexecuted, leaving the position open.
 //! - The risk layer books a pending stop at its stop price (re-booked as it
 //!   trails, without enforcing limits: a trailing sell stop can lift its
 //!   account above `max_notional_per_account`, and the account's later
 //!   admissions are rejected until it shrinks). That booking understates a
-//!   market order that fills through a gap.
-//! - A cascade is bounded only by the number of pending stops: one print
-//!   can run every pending stop's market order within the call that
-//!   printed it.
+//!   child that fills through a gap (by up to the collar with one).
+//! - A cascade's **length** is bounded only by the number of pending stops:
+//!   one print can run every pending stop's child within the call that
+//!   printed it. A collar bounds each child's price range, not how many
+//!   children run (no cascade depth limit or velocity pause).
 //! - `cancel_orders_by_price_range` matches a stop by its **current**
 //!   (trailed) stop price, not the price it was admitted at.
 
@@ -120,7 +164,7 @@ use std::sync::{Arc, OnceLock};
 use tracing::{debug, trace};
 use uuid::Uuid;
 
-/// Label hashed into the name of every stop-trigger market order id (#286).
+/// Label hashed into the name of every stop-trigger child order id (#286).
 const STOP_TRIGGER_ID_LABEL: &[u8] = b"orderbook-rs/stop-trigger";
 
 /// Shards of the pending-stop id index (#286). Every mutation of the index
@@ -134,7 +178,9 @@ const PENDING_STOP_SHARDS: usize = 4;
 /// ticks. The sequence is unique per stop, so keys never collide.
 type StopKey = (u128, u64);
 
-/// The id of the market order an elected stop executes as (#286).
+/// The id of the child order an elected stop executes as (#286): a market
+/// order, or an immediate-or-cancel limit order with a
+/// [`StopProtection`](crate::StopProtection) collar (#302).
 ///
 /// UUIDv5 of `namespace` (the book's trade-id namespace) over a fixed label,
 /// the stop id's variant tag and its 16 id bytes. Deterministic: a replay
@@ -362,7 +408,7 @@ struct PrintPath {
 #[derive(Debug, Default)]
 struct StopScratch {
     /// Segments waiting to be evaluated (the call's sweep, then the sweeps
-    /// of the elected stops' market orders, in execution order).
+    /// of the elected stops' child orders, in execution order).
     queue: VecDeque<PrintSegment>,
     /// Stops elected by the current segment, with their trigger price.
     elected: Vec<(StopEntry, u128)>,
@@ -852,7 +898,7 @@ impl<T> OrderBook<T>
 where
     T: Clone + Send + Sync + Default + 'static,
 {
-    /// The id of the market order the pending stop `stop_id` executes as
+    /// The id of the child order the pending stop `stop_id` executes as
     /// when it is elected (#286): a UUIDv5 of this book's trade-id
     /// namespace and `stop_id`. Its trades carry it as `taker_order_id`.
     #[must_use]
@@ -1201,7 +1247,7 @@ where
     ///    direction, sells when flat).
     ///
     /// Then the segment's elected stops execute in that order, each as a
-    /// market order whose sweep is queued as a new segment. Segments are
+    /// child order whose sweep is queued as a new segment. Segments are
     /// processed first in, first out until none is left. Each stop is
     /// elected at most once, so the cascade is bounded by the number of
     /// pending stops. While the kill switch is engaged elections are
@@ -1286,13 +1332,19 @@ where
     }
 
     /// Executes one elected stop (#286), already out of the store: its
-    /// risk reservation is released, `Triggered { child_id, trigger_price }`
-    /// is recorded for the stop (the listener's election event), its
-    /// market order runs with `origin_stop_id` on its trades, and the stop
-    /// records that order's terminal state. Returns the market order's
-    /// sweep, if it traded.
+    /// risk reservation is released, `Triggered { child_id, trigger_price,
+    /// limit_price }` is recorded for the stop (the listener's election
+    /// event), its child order runs with `origin_stop_id` on its trades, and the stop
+    /// records that order's terminal state. Returns the child's sweep, if
+    /// it traded.
     ///
-    /// A market-order id that is already in use (a resting order or a
+    /// The child is an immediate-or-cancel market order, or, with a
+    /// [`StopProtection`](crate::StopProtection) on the book (#302), an
+    /// immediate-or-cancel limit order at the stop's (trailed) stop price
+    /// moved by the collar against it. The collar is read once per elected
+    /// stop, never on a path without one.
+    ///
+    /// A child-order id that is already in use (a resting order or a
     /// pending stop carrying the derived id: only possible when the
     /// trade-id namespace is known to whoever picks order ids, which is
     /// why it should stay private) does not run: the stop ends
@@ -1303,6 +1355,10 @@ where
         let side = stop.side();
         let user_id = stop.user_id();
         let quantity = stop.visible_quantity().as_u64();
+        let stop_price = stop.price().as_u128();
+        let limit = self
+            .stop_protection
+            .map(|protection| protection.limit_for(side, stop_price));
         self.risk_state.on_cancel(stop_id);
         let child_id = self.stop_trigger_order_id(stop_id);
         if self.order_locations.contains_key(&child_id) || self.pending_stops.contains(child_id) {
@@ -1314,6 +1370,7 @@ where
             OrderStatus::Triggered {
                 child_id,
                 trigger_price,
+                limit_price: limit,
             },
         );
         debug!(
@@ -1321,18 +1378,19 @@ where
             order_id = %stop_id,
             %child_id,
             %side,
-            stop = stop.price().as_u128(),
+            stop = stop_price,
             trigger_price,
             quantity,
-            "trailing stop elected; executing as a market order"
+            collar_limit = ?limit,
+            "trailing stop elected; executing as an immediate-or-cancel child"
         );
         self.pending_stops.reset_path();
-        let status = self.execute_stop_market_order(stop_id, child_id, side, quantity, user_id);
+        let status = self.execute_stop_child(stop_id, child_id, side, quantity, limit, user_id);
         self.track_state(stop_id, status);
         self.pending_stops.take_path(self.last_trade_price())
     }
 
-    /// An elected stop whose market-order id is already in use (#286):
+    /// An elected stop whose child-order id is already in use (#286):
     /// the stop ends `Rejected { DuplicateOrderId }`, nothing trades.
     #[cold]
     #[inline(never)]
@@ -1341,7 +1399,7 @@ where
             symbol = %self.symbol,
             order_id = %stop_id,
             %child_id,
-            "elected trailing stop's market-order id is already in use; stop rejected"
+            "elected trailing stop's child-order id is already in use; stop rejected"
         );
         self.track_state(
             stop_id,
@@ -1351,15 +1409,24 @@ where
         );
     }
 
-    /// Runs an elected stop's market order through the ungated market path
+    /// Runs an elected stop's child order through the ungated matching path
     /// (the body of `match_market_order_committed`; the caller holds the
     /// gate) and returns the terminal state its stop takes.
-    fn execute_stop_market_order(
+    ///
+    /// `limit` is `None` for the unpriced market child and the collar limit
+    /// with a [`StopProtection`](crate::StopProtection) (#302). Either way
+    /// the child only matches, it is never rested: the remainder is
+    /// cancelled, with the reason from
+    /// [`Self::stop_child_remainder_reason`] (`StopProtectionBand` when the
+    /// collar cut it, including a band with nothing in it,
+    /// `InsufficientLiquidity` otherwise).
+    fn execute_stop_child(
         &self,
         stop_id: Id,
         child_id: Id,
         side: Side,
         quantity: u64,
+        limit: Option<u128>,
         user_id: Hash32,
     ) -> OrderStatus {
         if self.check_kill_switch_or_reject(child_id).is_err() {
@@ -1367,12 +1434,13 @@ where
                 reason: RejectReason::KillSwitchActive,
             };
         }
-        if let Err(err) = self.check_trade_id_headroom(child_id, side, None) {
+        if let Err(err) = self.check_trade_id_headroom(child_id, side, limit) {
             return OrderStatus::Rejected {
                 reason: RejectReason::from(&err),
             };
         }
-        let verified = match self.check_trade_arithmetic_or_reject(child_id, side, quantity, None) {
+        let verified = match self.check_trade_arithmetic_or_reject(child_id, side, quantity, limit)
+        {
             Ok(verified) => verified,
             Err(err) => {
                 return OrderStatus::Rejected {
@@ -1384,7 +1452,7 @@ where
             child_id,
             side,
             quantity,
-            None,
+            limit,
             user_id,
             TakerKind::Standard,
             SweepReservation::NONE,
@@ -1408,7 +1476,7 @@ where
                     symbol = %self.symbol,
                     order_id = %child_id,
                     error = %err,
-                    "elected stop's market order rejected before trading"
+                    "elected stop's child order rejected before trading"
                 );
                 return OrderStatus::Rejected {
                     reason: RejectReason::from(&err),
@@ -1426,7 +1494,7 @@ where
                     order_id = %child_id,
                     quantity,
                     remaining,
-                    "elected stop's market order reports more remaining than its quantity"
+                    "elected stop's child order reports more remaining than its quantity"
                 );
                 0
             }
@@ -1445,8 +1513,32 @@ where
             },
             Ok(_) => OrderStatus::Cancelled {
                 filled_quantity: executed,
-                reason: CancelReason::InsufficientLiquidity,
+                reason: self.stop_child_remainder_reason(side, limit),
             },
+        }
+    }
+
+    /// Why an elected stop's child left a remainder (#302): with a collar
+    /// limit and liquidity left on the opposite side only beyond it (best
+    /// bid below a sell child's limit, best ask above a buy child's), the
+    /// collar cut the sweep: [`CancelReason::StopProtectionBand`].
+    /// Otherwise (no collar, or the side ran out within the band) the
+    /// immediate-or-cancel remainder reason,
+    /// [`CancelReason::InsufficientLiquidity`]. Reads the best-price cache
+    /// once, only for a collared child with a remainder.
+    #[inline]
+    fn stop_child_remainder_reason(&self, side: Side, limit: Option<u128>) -> CancelReason {
+        let Some(limit) = limit else {
+            return CancelReason::InsufficientLiquidity;
+        };
+        let beyond_band = match side {
+            Side::Sell => self.best_bid().is_some_and(|bid| bid < limit),
+            Side::Buy => self.best_ask().is_some_and(|ask| ask > limit),
+        };
+        if beyond_band {
+            CancelReason::StopProtectionBand
+        } else {
+            CancelReason::InsufficientLiquidity
         }
     }
 }
