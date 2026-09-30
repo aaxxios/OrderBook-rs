@@ -188,24 +188,36 @@ breaking release; see the migration table below.
   `RiskConfig`. The repricers keep a reused id's special-order registration.
 - **Trailing stops are pending off-book stops (#286).** With
   `special_orders` a `TrailingStop` is never placed on a price level: it
-  is held as a pending stop (not liquidity, not depth), its watermark
-  (`last_reference_price`) follows the book's **last trade price** in its
-  favour and its stop price trails it by `trail_amount`, and a last trade
-  at or through the stop price executes it as an immediate-or-cancel
-  market order for its quantity, side and user (STP, fees and risk apply
-  as for any taker; the remainder is cancelled). Evaluation is automatic,
-  under the gate of every mutating call that can trade and at admission,
-  iterative (a stop's trades can elect more stops) and deterministic
-  (same-price elections run in admission order; the market order's id is
-  `stop_trigger_order_id`, a UUIDv5 of the trade-id namespace). A pending
-  stop reserves its risk at the stop price, is `Open` until elected, then
-  takes its market order's terminal state; cancel, `update_order`, every
-  mass cancel, expiry and `get_order` cover it. While a stop is pending
-  every mutator of the book takes the exclusive submit gate. Without
-  `special_orders` a trailing stop is rejected untouched with
-  `OrderBookError::StopOrdersUnsupported` (code 23); before 0.14 it rested
-  as a limit order at its stop price. Snapshot format 5 carries the
-  pending stops and the last trade price.
+  is held as a pending stop (not liquidity, not depth). Its watermark
+  (`last_reference_price`) follows the book's prints in its favour and
+  its stop price trails it by `trail_amount`; a print at or through the
+  stop price elects it, and it executes as an immediate-or-cancel,
+  unpriced market order for its quantity, side and user (STP, fees and
+  the market preflights apply as for any taker; the remainder is
+  cancelled; no collar, no price band). Evaluation is automatic, under
+  the gate of every call that trades, along each sweep's price path
+  (its first and last print: a falling sweep's first print can elect a
+  buy stop, a favourable first print trails before the last print is
+  tested), iterative (a stop's market order can elect more stops,
+  bounded by the pending stops) and deterministic (one print's stops
+  in trigger order, sell highest / buy lowest first, then admission
+  order; the market order's id is `stop_trigger_order_id`, a UUIDv5 of
+  the trade-id namespace). A stop the last trade already crosses is
+  rejected untouched (`StopWouldTrigger`, code 24), and so are a zero
+  trail or quantity and a stop price beyond its watermark
+  (`InvalidStopTerms`, code 25). A pending stop reserves its risk at the
+  stop price, is `Open`, records `Triggered { child_id, trigger_price }`
+  when elected and then its market order's terminal state; that
+  order's `TradeResult`s carry `origin_stop_id`. While the kill switch
+  is engaged elections are suspended. Cancel, `update_order`, every
+  mass cancel, expiry and `get_order` cover pending stops. While a stop
+  is pending, calls that can trade and calls that target the stop take
+  the exclusive submit gate; post-only adds and cancels / resizes of
+  other orders keep the shared side. Without `special_orders` a
+  trailing stop is rejected untouched with
+  `OrderBookError::StopOrdersUnsupported` (code 23); before 0.14 it
+  rested as a limit order at its stop price. Snapshot format 5 carries
+  the pending stops and the last trade price.
 - **Core boundary gaps closed (#294).** A panic under the shared side of
   the submit gate (a `Clock`, metrics recorder or `tracing` subscriber
   running mid-mutation) engages the kill switch and latches
@@ -356,6 +368,15 @@ breaking release; see the migration table below.
   Journals written before 0.14 that hold trailing stops do not replay
   (the stop no longer rests), and a package holding a trailing stop on a
   level is refused with `StopOrdersUnsupported`.
+- **Trailing-stop protection limits (#286).** An elected stop runs an
+  unpriced market order with no protection collar (and market orders
+  get no price band), so a thin or gapped book fills it far from the
+  stop; its risk booking at the stop price understates such a fill, and
+  the trailing re-booking ignores limits (a trailing sell stop can lift
+  its account above `max_notional_per_account`). A cascade is bounded
+  only by the pending stops. While a stop is pending, every call that can
+  trade on that book is serialized (post-only adds and cancels / resizes
+  of other orders stay concurrent).
 - **Level statistics are advisory under concurrent takers (#241).**
   pricelevel 0.10 supports one concurrent writer of a level's execution
   statistics, while takers on the shared submit gate can sweep one level
@@ -428,6 +449,10 @@ See `doc/panic-boundaries.md` for the full statement of each.
 | `ORDERBOOK_SNAPSHOT_FORMAT_VERSION == 3` | `== 5`; reads `2..=5`; a v5 checksum also covers the pending stops and the last trade price (#286) |
 | `TrailingStop` (`special_orders`): rests as a limit order at its stop price, trades when marketable, `reprice_trailing_stops` re-prices it through the best bid / ask | pending off-book stop: trails and triggers on the last trade price, executes as an IOC market order (#286) |
 | `TrailingStop` without `special_orders`: rests as a limit order | rejected untouched: `Err(StopOrdersUnsupported { order_id })` (code 23) |
+| `TrailingStop` crossed by the last trade at entry: trades immediately as a limit order | rejected untouched: `Err(StopWouldTrigger { .. })` (code 24) |
+| `TrailingStop` with a zero trail / quantity or a stop beyond its watermark: accepted | rejected untouched: `Err(InvalidStopTerms { .. })` (code 25) |
+| `OrderStatus` (5 variants) | adds `Triggered { child_id, trigger_price }` (appended; wire `ExecReport` status 5) |
+| `TradeResult { .., quote_notional }` | adds `origin_stop_id: Option<Id>` (`#[serde(default)]`; appended, so bincode payloads without it do not decode) |
 | `OrderBookSnapshot { symbol, timestamp, bids, asks }` | adds `pending_stops: Vec<OrderType<()>>` and `last_trade_price: Option<u128>` (`#[serde(default)]`); a restore installs both (#286) |
 | restore of a snapshot holding a `TrailingStop` on a level | refused: `Err(StopOrdersUnsupported { order_id })` |
 | `snapshots_match` compares symbol and levels | also the pending stops and the last trade price |
@@ -476,7 +501,7 @@ See `doc/panic-boundaries.md` for the full statement of each.
 | `EnrichedSnapshot::{new, with_metrics}(..) -> EnrichedSnapshot` | `-> Result<EnrichedSnapshot, OrderBookError>` |
 | `OrderSimulation::total_cost() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
 | `DistributionBin::width() -> u128` (saturating) | `-> Result<u128, OrderBookError>` |
-| `OrderBookError` (0.13 variants) | adds `MatchAborted`, `FeeOverflow`, `NotionalOverflow`, `ArithmeticOverflow`, `AllocationFailed`, `EngineSeqExhausted`, `SnapshotCrossed`, `OrderRemovedWithLevelFault`, `ModifyRolledBack`, `ModifyOrderLost`, `OrderChangedDuringModify`, `RiskRejectedAfterTrades`, `StopOrdersUnsupported` (`#[non_exhaustive]`, so matches already have a wildcard arm) |
+| `OrderBookError` (0.13 variants) | adds `MatchAborted`, `FeeOverflow`, `NotionalOverflow`, `ArithmeticOverflow`, `AllocationFailed`, `EngineSeqExhausted`, `SnapshotCrossed`, `OrderRemovedWithLevelFault`, `ModifyRolledBack`, `ModifyOrderLost`, `OrderChangedDuringModify`, `RiskRejectedAfterTrades`, `StopOrdersUnsupported`, `StopWouldTrigger`, `InvalidStopTerms` (`#[non_exhaustive]`, so matches already have a wildcard arm) |
 | `OrderBook::peek_match(side, qty, limit) -> u64` (overflowing level read as empty) | `-> Result<u64, OrderBookError>` (`PriceLevelError` for an overflowing level) |
 | `Journal::last_sequence() -> Option<u64>` | `-> Result<Option<u64>, JournalError>` |
 | `InMemoryJournal::with_capacity(n) -> Self`; `len() -> usize`; `is_empty() -> bool` | `-> Result<Self, JournalError>`; `-> Result<usize, JournalError>`; `-> Result<bool, JournalError>` |
@@ -491,7 +516,7 @@ See `doc/panic-boundaries.md` for the full statement of each.
 | `OrderBookError::PriceCrossing { opposite_price: u128 }` (`0` when empty) | `opposite_price: Option<u128>` |
 | `update_order(Cancel)`: level error ignored, indices removed anyway | same removal as `cancel_order`; errors propagated |
 | modify re-add failing after the cancel: `Err(..)`, original lost | `Err(ModifyRolledBack { .. })` (original restored, back of queue) or `Err(ModifyOrderLost { .. })` |
-| `RejectReason` codes 1 to 14 | adds `MatchAborted` (15), `CapacityExceeded` (16), `CounterExhausted` (17), `FeeOverflow` (18), `NotionalOverflow` (19), `ModifyRolledBack` (20), `ModifyOrderLost` (21), `RiskRejectedAfterTrades` (22), `StopOrdersUnsupported` (23); pricelevel 0.10's `PriceLevelError::CapacityExceeded` / `CounterExhausted` map to 16 / 17, other `PriceLevelError`s stay `Other(0)`; older readers decode the new codes as `Other(n)` |
+| `RejectReason` codes 1 to 14 | adds `MatchAborted` (15), `CapacityExceeded` (16), `CounterExhausted` (17), `FeeOverflow` (18), `NotionalOverflow` (19), `ModifyRolledBack` (20), `ModifyOrderLost` (21), `RiskRejectedAfterTrades` (22), `StopOrdersUnsupported` (23), `StopWouldTrigger` (24), `InvalidStopTerms` (25); pricelevel 0.10's `PriceLevelError::CapacityExceeded` / `CounterExhausted` map to 16 / 17, other `PriceLevelError`s stay `Other(0)`; older readers decode the new codes as `Other(n)` |
 | risk refusal of a residual after trades: `Err(RiskMaxNotional { .. })` / `Err(RiskMaxOpenOrders { .. })`, journaled as never mutating | `Err(RiskRejectedAfterTrades { source, .. })`, journaled as may-have-mutated and replayed |
 | remainder not rested after trades: no terminal state | `Cancelled { filled_quantity, reason: RestFailed }` |
 | modify after a concurrent partial fill: re-add rested the quantity read before it | `UpdatePrice` moves the remainder; `UpdatePriceAndQuantity` / `Replace`: `Err(ModifyRolledBack { source: OrderChangedDuringModify, .. })` |

@@ -62,14 +62,44 @@
 //! pays a few relaxed loads of that count (gate decision, re-check,
 //! evaluation) and one per matched level (the print recorder).
 //!
-//! The order state of a pending stop is `Open`. When elected it takes the
-//! terminal state of its market order: `Filled` when the market order
-//! executed its whole quantity, `Cancelled { InsufficientLiquidity }` for
-//! an unexecuted remainder (including none executed), `Cancelled {
-//! SelfTradePrevention }` / `Cancelled { MatchAborted }` when self-trade
-//! prevention or a failed price level stopped it, and `Rejected` when the
-//! market order was rejected untouched (kill switch engaged, trade-id
-//! generator exhausted, notional or fee not representable).
+//! # Lifecycle and the link to the market order
+//!
+//! The order state of a pending stop is `Open`. At election it records
+//! `Triggered { child_id, trigger_price }` (the listener's election event:
+//! stop id, market-order id, trigger print), and the market order's
+//! `TradeResult`s carry `origin_stop_id = Some(stop)`. The stop then takes
+//! the terminal state of its market order: `Filled` when it executed its
+//! whole quantity, `Cancelled { InsufficientLiquidity }` for an unexecuted
+//! remainder (including none executed), `Cancelled { SelfTradePrevention }`
+//! / `Cancelled { MatchAborted }` when self-trade prevention or a failed
+//! price level stopped it, and `Rejected` when it was rejected untouched
+//! (trade-id generator exhausted, notional or fee not representable, or a
+//! market-order id already in use: `DuplicateOrderId`). The market order's
+//! own id gets a tracker entry only on the paths every market order records
+//! one (an STP cancel with no fill, an abort, an untouched rejection); the
+//! kill switch no longer produces one, since elections are suspended.
+//!
+//! The market-order id is a UUIDv5 of the book's trade-id namespace and
+//! the stop id. Keep the namespace private: someone who knows it can
+//! derive the id and place an order under it first, which refuses the
+//! stop's market order.
+//!
+//! # What a stop does not protect against
+//!
+//! - The market order is **unpriced**: it walks the opposite side as far as
+//!   its quantity needs, with no protection collar, and the book applies no
+//!   price band to market orders. A thin or gapped book fills it far from
+//!   the stop price.
+//! - The risk layer books a pending stop at its stop price (re-booked as it
+//!   trails, without enforcing limits: a trailing sell stop can lift its
+//!   account above `max_notional_per_account`, and the account's later
+//!   admissions are rejected until it shrinks). That booking understates a
+//!   market order that fills through a gap.
+//! - A cascade is bounded only by the number of pending stops: one print
+//!   can run every pending stop's market order within the call that
+//!   printed it.
+//! - `cancel_orders_by_price_range` matches a stop by its **current**
+//!   (trailed) stop price, not the price it was admitted at.
 
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::error::OrderBookError;
@@ -275,8 +305,9 @@ impl SideIndex {
 
 /// The book's store of pending trailing stops (#286).
 ///
-/// A book that never holds a stop pays for this field with one relaxed
-/// load per mutating call and allocates nothing: the maps are built on the
+/// A book that never holds a stop pays for this field with a few relaxed
+/// loads of `count` per mutating call (and one per matched level) and
+/// allocates nothing: the maps are built on the
 /// first admission (or restore) of a stop. Measured against main, building
 /// them with every book (a `DashMap` with the default shard count plus the
 /// skip-list heads, several KB) shifted the allocation pattern of books

@@ -4,16 +4,16 @@
 //!   ask, mid price, or last trade). [`RepricingOperations::reprice_pegged_orders`]
 //!   moves them through the gated `update_order`.
 //! - **TrailingStop**: held **off book** as pending stops and driven by the
-//!   book's last trade price (#286): the watermark follows the last trade in
-//!   the stop's favour, the stop price trails it by `trail_amount`, and a
-//!   last trade at or through the stop price executes it as a market order.
-//!   Evaluation is automatic after every trade, under the submit gate; see
-//!   the `stop_orders` module.
-//!   [`calculate_trailing_stop_price`](crate::orderbook::repricing::calculate_trailing_stop_price)
-//!   and
+//!   book's prints (#286): the watermark follows the prints in the stop's
+//!   favour, the stop price trails it by `trail_amount`, and a print at or
+//!   through the stop price executes it as a market order. Evaluation is
+//!   automatic after every trade, under the submit gate; see the
+//!   `stop_orders` module.
 //!   [`RepricingOperations::should_trigger_trailing_stop`](crate::orderbook::repricing::RepricingOperations::should_trigger_trailing_stop)
-//!   expose the same
-//!   rules as pure helpers.
+//!   is the engine's trigger rule as a pure helper.
+//!   [`calculate_trailing_stop_price`](crate::orderbook::repricing::calculate_trailing_stop_price)
+//!   computes the same new stop price, but reports only moves of the
+//!   stop: see its docs for how it differs from the engine's watermark.
 //!
 //! # Example
 //!
@@ -305,6 +305,15 @@ pub fn calculate_pegged_price(
 /// A tuple of (new_stop_price, new_reference_price) if adjustment is needed,
 /// `None` otherwise — including when the adjusted stop would fall below `0`
 /// or exceed `u128::MAX` (#244: checked, never saturated).
+///
+/// # Difference from the engine (#286)
+///
+/// The book's pending stops advance their watermark on **every** print in
+/// their favour, even when the stop price does not tighten (a looser
+/// initial stop, or a trail the checked arithmetic cannot apply). This
+/// helper returns `None` in those cases, so a caller that tracks the
+/// watermark from its result falls behind the engine. The new stop price
+/// it returns, when it returns one, is the engine's.
 pub fn calculate_trailing_stop_price(
     side: Side,
     current_stop_price: u128,

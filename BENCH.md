@@ -121,6 +121,7 @@ Per-run summaries land in `target/alloc-counters/<scenario>.md`.
 make bench-hdr                 # every _hdr bench binary, incl. stp_contention_hdr's 8 scenarios
 cargo bench --bench mixed_70_20_10_hdr   # single scenario
 cargo bench --bench stp_contention_hdr   # all 8 mode x thread-count scenarios in one binary
+cargo bench --features special_orders --bench pending_stops_hdr   # pending trailing stops (#286)
 ```
 
 Each bench writes its raw HDR histogram to
@@ -841,6 +842,57 @@ the clearer window onto its absolute cost.
 Like every scenario in this suite, this is **closed-loop, per-probe
 service time**: see "Coordinated omission" above; it under-reports the
 queueing delay a saturated real load generator would see.
+
+### `pending_stops` — books holding pending trailing stops (added for #286)
+
+`pending_stops_hdr` (needs `--features special_orders`; not part of
+`make bench-hdr`) measures what pending off-book trailing stops cost
+the call that trades. `N` is the number of pending sell stops. With a
+stop pending, every call that can trade runs under the exclusive
+submit gate and, if it traded, evaluates the stops along its price
+path before it returns; trailing re-keys every stop the print moves
+(`O(N log N)`), so the trailing and election rows grow linearly in `N`
+by construction.
+
+- `pending_stops_quiet_{0,10,1000}`: market buys of 1 at 1000 that
+  neither trail nor elect (stop 500, watermark 1000); `_0` is the
+  control with the same setup. Batched, 32 ops per clock pair.
+- `pending_stops_trailing_{10,1000}`: every market buy prints a new
+  high and trails all `N` stops. One clock pair per op.
+- `pending_stops_elect_{10,1000}`: one market sell elects all `N`
+  stops at one print; each runs its market order into a deep bid. The
+  book is re-seeded between samples, untimed.
+- `pending_stops_cascade_{10,1000}`: one market sell elects the first
+  of `N` stops on a ladder of one-lot bids; each stop's sale elects the
+  next. Re-seeded between samples, untimed.
+
+One run, host as in "Run conditions" but loaded (1-minute load average
+10 to 13 during the run), so read the tails as indicative; values in ns:
+
+| scenario | p50 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|
+| `pending_stops_quiet_0` | 325 | 466 | 790 | 895 |
+| `pending_stops_quiet_10` | 397 | 579 | 1 388 | 2 717 |
+| `pending_stops_quiet_1000` | 398 | 532 | 739 | 992 |
+| `pending_stops_trailing_10` | 2 209 | 3 251 | 8 335 | 22 751 |
+| `pending_stops_trailing_1000` | 220 287 | 243 199 | 278 783 | 331 263 |
+| `pending_stops_elect_10` | 6 335 | 7 375 | 13 631 | 38 399 |
+| `pending_stops_elect_1000` | 628 735 | 676 863 | 711 167 | 711 167 |
+| `pending_stops_cascade_10` | 10 047 | 13 007 | 19 919 | 46 975 |
+| `pending_stops_cascade_1000` | 1 880 063 | 2 420 735 | 2 539 519 | 2 539 519 |
+
+A quiet print costs about 70 ns more with stops pending than without,
+independent of `N` (the exclusive gate, recording the path, and the
+evaluation at its first and last print, which reads only the head of
+each side's ordered stop maps when nothing moves). Trailing
+costs about 220 ns per stop moved, and an election about 630 ns per
+stop including its market order's own match. The Criterion group
+"OrderBook - Pending Stops" in `benches/order_book/pending_stops.rs`
+carries the same shapes, plus `concurrent_add_limit_orders_{0,1}_stops`
+and `concurrent_post_only_adds_{0,1}_stops` at 2 and 4 threads: with
+one stop pending, limit adds (which can trade) serialize on the
+exclusive gate, while post-only adds stay on the shared side and match
+their `_0_stops` control.
 
 ## 0.11.0 → 0.12.0 delta
 
