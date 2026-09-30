@@ -21,11 +21,18 @@
 //! - a stop the last trade already crosses is rejected at admission
 //!   (`StopWouldTrigger`).
 //!
+//! ## Stop protection collar (#302)
+//! `OrderBook::set_stop_protection` bounds an elected stop: its child
+//! becomes an immediate-or-cancel limit at `stop - collar` (sell) or
+//! `stop + collar` (buy) and whatever does not fill within the band is
+//! cancelled, so a thin book is not swept to its last level.
+//!
 //! # Usage:
 //! ```bash
 //! cargo run -p examples --features special_orders --bin special_orders_demo
 //! ```
 
+use orderbook_rs::StopProtection;
 use orderbook_rs::orderbook::repricing::RepricingOperations;
 use orderbook_rs::prelude::*;
 use pricelevel::{Hash32, OrderType, PegReferenceType, Price, Quantity, TimestampMs, setup_logger};
@@ -41,6 +48,7 @@ fn main() {
 
     demo_pegged_orders();
     demo_trailing_stop_orders();
+    demo_stop_protection_collar();
     demo_combined_repricing();
 
     info!("\n=== Demo Complete ===");
@@ -262,6 +270,71 @@ fn demo_trailing_stop_orders() {
     match book.add_order(crossed) {
         Ok(_) => info!("  Unexpectedly admitted"),
         Err(err) => info!("  Rejected: {err}"),
+    }
+}
+
+fn demo_stop_protection_collar() {
+    info!("\n--- Stop Protection Collar Demo (#302) ---");
+    info!(
+        "The same sell stop (3000, quantity 8) elected in a thin book, without and with a collar.\n"
+    );
+
+    for collar in [None, Some(20u128)] {
+        let mut book = OrderBook::new("SOL/USD");
+        book.set_order_state_tracker(OrderStateTracker::new());
+        let protection = collar.and_then(|units| StopProtection::try_new(units).ok());
+        if let Err(err) = book.set_stop_protection(protection) {
+            info!("  Collar refused: {err}");
+            return;
+        }
+        // A thin bid ladder: 1 @ 3000, 1 @ 2990, 1 @ 2980, 5 @ 2950, 10 @ 2900.
+        for (raw, price, qty) in [
+            (1u64, 3000u128, 1u64),
+            (2, 2990, 1),
+            (3, 2980, 1),
+            (4, 2950, 5),
+            (5, 2900, 10),
+        ] {
+            let _ = book.add_limit_order(
+                Id::from_u64(raw),
+                price,
+                qty,
+                Side::Buy,
+                TimeInForce::Gtc,
+                None,
+            );
+        }
+        let stop_id = Id::from_u64(3000);
+        let stop = OrderType::TrailingStop {
+            id: stop_id,
+            price: Price::new(3000),
+            quantity: Quantity::new(8),
+            side: Side::Sell,
+            user_id: Hash32::new([9u8; 32]),
+            timestamp: TimestampMs::new(current_time_millis()),
+            time_in_force: TimeInForce::Gtc,
+            trail_amount: Quantity::new(50),
+            last_reference_price: Price::new(3050),
+            extra_fields: (),
+        };
+        book.add_order(stop)
+            .expect("pending trailing stop admitted");
+        // One unit sold at 3000 elects the stop.
+        let _ = book.submit_market_order(Id::from_u64(10), 1, Side::Sell);
+        match protection {
+            None => info!("Without a collar (market child):"),
+            Some(protection) => info!(
+                "With a collar of {} (IOC limit at {}):",
+                protection.collar(),
+                protection.limit_price(Side::Sell, Price::new(3000))
+            ),
+        }
+        info!(
+            "  Stop status: {:?} | last trade {} | best bid left {}",
+            book.order_status(stop_id),
+            book.last_trade_price().unwrap_or(0),
+            book.best_bid().unwrap_or(0)
+        );
     }
 }
 
