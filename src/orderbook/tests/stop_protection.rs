@@ -748,6 +748,62 @@ mod tests {
         }
     }
 
+    /// The limit of `snapshots_match` as a collar check (PR #304 review):
+    /// `OrderBookSnapshot` does not carry the collar, so a replay with a
+    /// different collar over a range where no stop elects matches the live
+    /// snapshot, although the books would elect the pending stop
+    /// differently. Only an explicit `stop_protection()` comparison sees it.
+    #[test]
+    fn test_replay_with_another_collar_and_no_election_passes_snapshots_match() {
+        let clock: Arc<dyn Clock> = Arc::new(StubClock::starting_at(0));
+        let mut live = OrderBook::with_clock_and_namespace(SYMBOL, Arc::clone(&clock), namespace());
+        live.set_stop_protection(collar(2)).expect("collar");
+        let journal: InMemoryJournal<()> = InMemoryJournal::new();
+        let orders = [
+            limit(1, 100, 5, Side::Buy, user(1)),
+            limit(2, 90, 5, Side::Buy, user(1)),
+            limit(3, 110, 5, Side::Sell, user(1)),
+            stop(50, Side::Sell, 95, 5, 3, user(2)),
+        ];
+        for (seq, order) in orders.into_iter().enumerate() {
+            live.add_order(order).expect("add");
+            journal
+                .append(&SequencerEvent {
+                    sequence_num: seq as u64,
+                    timestamp_ns: seq as u64,
+                    command: SequencerCommand::AddOrder(order),
+                    result: SequencerResult::OrderAdded {
+                        order_id: order.id(),
+                    },
+                })
+                .expect("append");
+        }
+        let live_snapshot = live.create_snapshot(usize::MAX).expect("snapshot");
+        assert_eq!(live_snapshot.pending_stops.len(), 1, "nothing elected");
+
+        let config = ReplayBookConfig::default()
+            .with_trade_id_namespace(namespace())
+            .with_stop_protection(collar(5));
+        let (replayed, _) = ReplayEngine::<()>::replay_from_with_clock_and_config(
+            &journal, 0, SYMBOL, clock, &config,
+        )
+        .expect("replay");
+        assert!(
+            snapshots_match(
+                &replayed.create_snapshot(usize::MAX).expect("snapshot"),
+                &live_snapshot
+            ),
+            "the snapshot does not carry the collar"
+        );
+        assert_ne!(
+            replayed.stop_protection(),
+            live.stop_protection(),
+            "only the explicit comparison sees the mismatch"
+        );
+        let package = live.create_snapshot_package(usize::MAX).expect("package");
+        assert_ne!(replayed.stop_protection(), package.stop_protection);
+    }
+
     // ---- review follow-ups: reasons, limit on Triggered, STP, lot, fees ----
 
     /// The stop's order-state history as a list.

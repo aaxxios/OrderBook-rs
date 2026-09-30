@@ -137,12 +137,22 @@ pub struct ReplayBookConfig {
     /// A collar changes which trades an elected stop makes, so it must
     /// match the source book **and** have been constant over the replayed
     /// range: `set_stop_protection` is not journaled, so a collar changed
-    /// mid-stream cannot be reproduced. A mismatch is **not** reported as
-    /// [`ReplayError::OutcomeMismatch`] at the election (stop elections are
-    /// not journaled commands, and the command that printed still
-    /// succeeds); it surfaces only when the replayed book is compared with
-    /// [`snapshots_match`] (or, incidentally, if the diverged book later
-    /// changes a journaled command's verdict).
+    /// mid-stream cannot be reproduced.
+    ///
+    /// A mismatch is **not** reported as [`ReplayError::OutcomeMismatch`]
+    /// at the election (stop elections are not journaled commands, and the
+    /// command that printed still succeeds), and [`snapshots_match`] only
+    /// catches it through its effects: [`OrderBookSnapshot`] does not carry
+    /// the collar, so the snapshots differ only when the mismatch changed
+    /// an outcome (a stop elected and filled differently). If no stop was
+    /// elected over the replayed range, or the fills happened to coincide,
+    /// the snapshots match while the two books would elect future stops
+    /// differently. Verify the configuration explicitly: compare the
+    /// replayed book's
+    /// [`OrderBook::stop_protection`] with the source book's (or with the
+    /// snapshot package's
+    /// [`stop_protection`](crate::OrderBookSnapshotPackage::stop_protection)
+    /// field).
     pub stop_protection: Option<StopProtection>,
 }
 
