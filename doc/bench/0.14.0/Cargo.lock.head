@@ -420,9 +420,9 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "pricelevel"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bbd03fc692f6b5cf803672fcbc02b937b902bddf1b4ec0f02235ce40c952893"
+checksum = "c780dd9a1ed96cc50b797ccab9c9f53c0b2eb40bc6200d79015b8e3b22c21bf1"
 dependencies = [
  "crossbeam-skiplist",
  "dashmap",
