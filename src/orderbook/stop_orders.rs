@@ -1085,21 +1085,14 @@ where
             quantity,
             None,
         )?;
-        // Re-book the risk contribution: the modify check above projected
-        // exactly this swap under the exclusive gate, so the re-admission
-        // can only fail on an exhausted reservation generation; the old
-        // booking is then restored.
-        self.risk_state.on_cancel(order_id);
-        if let Err(err) =
-            self.risk_state
-                .on_admission(order_id, projected.user_id(), terms.stop, quantity)
-        {
-            self.restore_stop_booking(&entry.order);
-            return Err(err);
-        }
+        // Re-book the risk contribution in place (the modify check above
+        // projected exactly this swap under the exclusive gate): nothing is
+        // released before the new booking exists, so a failure leaves the
+        // stop and its booking unchanged.
+        self.risk_state
+            .rebook_order(order_id, terms.stop, quantity)?;
         let unit = self.convert_to_unit_type(&projected);
         if let Err(err) = self.pending_stops.replace(order_id, unit, requeue) {
-            self.risk_state.on_cancel(order_id);
             self.restore_stop_booking(&entry.order);
             return Err(err);
         }
@@ -1115,7 +1108,8 @@ where
     }
 
     /// Re-books a pending stop's risk contribution as it was before a
-    /// modify that failed after releasing it.
+    /// modify whose store update failed after its re-booking (reverting a
+    /// re-booking that was just applied under the exclusive gate).
     #[cold]
     #[inline(never)]
     fn restore_stop_booking(&self, order: &OrderType<()>) {
@@ -1123,9 +1117,9 @@ where
             return;
         };
         let quantity = order.visible_quantity().as_u64();
-        if let Err(err) =
-            self.risk_state
-                .on_admission(order.id(), order.user_id(), terms.stop, quantity)
+        if let Err(err) = self
+            .risk_state
+            .rebook_order(order.id(), terms.stop, quantity)
         {
             tracing::error!(
                 order_id = %order.id(),

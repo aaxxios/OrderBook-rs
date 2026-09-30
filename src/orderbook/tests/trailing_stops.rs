@@ -1147,6 +1147,55 @@ mod tests {
         assert_eq!(book.risk_accounting_anomalies(), 0);
     }
 
+    /// Copilot on #301: a modify re-books the stop's risk in place, so it
+    /// needs no reservation generation and never leaves the stop without a
+    /// risk entry (it used to release and re-admit).
+    #[test]
+    fn test_modify_rebooks_risk_in_place() {
+        let mut book = new_book();
+        book.set_risk_config(RiskConfig::new().with_max_notional_per_account(10_000));
+        let trader = user(3);
+        book.add_order(stop_tif(
+            50,
+            Side::Sell,
+            95,
+            100,
+            5,
+            5,
+            trader,
+            TimeInForce::Gtc,
+        ))
+        .expect("stop");
+        assert_eq!(notional(&book, trader), 475);
+        // Exhaust the reservation generations: a release + re-admission
+        // would now fail and lose the booking.
+        book.risk_state
+            .generations
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        book.update_order(OrderUpdate::UpdatePriceAndQuantity {
+            order_id: id(50),
+            new_price: Price::new(90),
+            new_quantity: Quantity::new(10),
+        })
+        .expect("modify")
+        .expect("found");
+        assert_eq!(notional(&book, trader), 900);
+        assert_eq!(open_orders(&book, trader), 1);
+        // Over the limit: refused, stop and booking unchanged.
+        assert!(matches!(
+            book.update_order(OrderUpdate::UpdateQuantity {
+                order_id: id(50),
+                new_quantity: Quantity::new(200),
+            }),
+            Err(OrderBookError::RiskMaxNotional { .. })
+        ));
+        assert_eq!(notional(&book, trader), 900);
+        assert_eq!(stop_price(&book, 50), (90, 100));
+        book.cancel_order(id(50)).expect("cancel");
+        assert_eq!(notional(&book, trader), 0);
+        assert_eq!(book.risk_accounting_anomalies(), 0);
+    }
+
     // ---- STP and kill switch at trigger ---------------------------------
 
     #[test]
