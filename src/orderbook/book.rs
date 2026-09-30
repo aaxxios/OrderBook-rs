@@ -5216,7 +5216,8 @@ where
     /// (#194). The snapshot's last trade price is installed and, under
     /// `special_orders`, its pending trailing stops are reinstalled in
     /// admission order with their stop price and watermark (#286); they are
-    /// validated first and must be settled against that last trade price.
+    /// validated first (kind, time-in-force, quantity, consistent terms,
+    /// unique ids).
     /// The rebuild uses the deterministic price-then-insertion-sequence
     /// traversal so the restore stays replay-stable (#190 / #192).
     ///
@@ -5482,8 +5483,7 @@ where
             }
         }
 
-        let stops =
-            Self::prepare_pending_stops(pending_stops, last_trade_price, &mut seen, risk.as_mut())?;
+        let stops = Self::prepare_pending_stops(pending_stops, &mut seen, risk.as_mut())?;
         // Always empty without the feature (a stop fails the prepare).
         #[cfg(not(feature = "special_orders"))]
         drop(stops);
@@ -5503,30 +5503,31 @@ where
     /// fallible phase of a restore.
     ///
     /// Each must be a trailing stop with a positive quantity and a
-    /// time-in-force that can pend (`GTC`, `GTD`, `DAY`), carry an id no
-    /// resting order or other stop uses, and be **settled** against the
-    /// snapshot's last trade price: its watermark already at or beyond it
-    /// and its stop not elected by it (a book captured between calls always
-    /// is; a stop that is not would trigger on the next unrelated call and
-    /// break replay). Their risk contribution is accumulated at their stop
-    /// price. Without `special_orders` any pending stop fails with
-    /// [`OrderBookError::StopOrdersUnsupported`].
+    /// time-in-force that can pend (`GTC`, `GTD`, `DAY`), consistent terms
+    /// (positive trail, stop price not beyond its watermark, which trailing
+    /// preserves) and an id no resting order or other stop uses. A stop the
+    /// snapshot's last trade price crosses is legal (elections are
+    /// suspended while the kill switch is engaged): stops are only
+    /// evaluated against new trades, so it is elected by the next print at
+    /// or through its stop price. Their risk contribution is accumulated at
+    /// their stop price. Without `special_orders` any pending stop fails
+    /// with [`OrderBookError::StopOrdersUnsupported`].
     ///
     /// # Errors
     ///
     /// [`OrderBookError::StopOrdersUnsupported`],
+    /// [`OrderBookError::InvalidStopTerms`],
     /// [`OrderBookError::DuplicateOrderId`], the risk aggregate overflows of
     /// [`RiskRebuild::accumulate`], or [`OrderBookError::InvalidOperation`]
     /// naming the malformed stop.
     fn prepare_pending_stops(
         pending_stops: Vec<OrderType<()>>,
-        last_trade_price: Option<u128>,
         seen: &mut std::collections::HashSet<Id>,
         mut risk: Option<&mut RiskRebuild>,
     ) -> Result<Vec<OrderType<()>>, OrderBookError> {
         #[cfg(not(feature = "special_orders"))]
         {
-            let _ = (last_trade_price, seen, risk.as_mut());
+            let _ = (seen, risk.as_mut());
             match pending_stops.first() {
                 Some(stop) => Err(OrderBookError::StopOrdersUnsupported {
                     order_id: stop.id(),
@@ -5552,16 +5553,11 @@ where
                 if quantity == 0 {
                     return Err(malformed(order_id, "has no quantity"));
                 }
+                if let Some(reason) = terms.inconsistency() {
+                    return Err(OrderBookError::InvalidStopTerms { order_id, reason });
+                }
                 if !seen.insert(order_id) {
                     return Err(OrderBookError::DuplicateOrderId { order_id });
-                }
-                if let Some(price) = last_trade_price
-                    && (terms.trailed(price) != terms || terms.elected_by(price))
-                {
-                    return Err(malformed(
-                        order_id,
-                        "is not settled against the snapshot's last trade price",
-                    ));
                 }
                 if let Some(risk) = risk.as_deref_mut() {
                     risk.accumulate(order_id, stop.user_id(), terms.stop, quantity)?;

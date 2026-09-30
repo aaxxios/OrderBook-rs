@@ -313,8 +313,10 @@ mod tests {
         assert_eq!(book.visible_quantity_at_price(94, Side::Buy), Some(4));
     }
 
+    /// Maintainer decision (a): a stop the last trade already crosses is
+    /// rejected untouched (code 24), never turned into a market order.
     #[test]
-    fn test_stop_crossed_by_the_last_trade_triggers_at_admission() {
+    fn test_stop_crossed_by_the_last_trade_is_rejected_at_admission() {
         let book = new_book();
         book.add_order(limit(1, 90, 10, Side::Buy, user(1)))
             .expect("bid");
@@ -325,25 +327,74 @@ mod tests {
         book.submit_market_order(id(4), 1, Side::Buy)
             .expect("trade at 100");
 
-        // Sell stop at 100 with last trade 100: elected on admission.
-        book.add_order(stop(50, Side::Sell, 100, 100, 5, 2))
-            .expect("admitted then triggered");
-        assert_eq!(
-            book.order_status(id(50)),
-            Some(OrderStatus::Filled { filled_quantity: 2 })
-        );
-        assert_eq!(book.visible_quantity_at_price(90, Side::Buy), Some(8));
-        assert_eq!(book.last_trade_price(), Some(90));
+        for (raw, side, stop_px, watermark) in [
+            (50, Side::Sell, 100, 100),
+            (51, Side::Sell, 104, 110),
+            (52, Side::Buy, 100, 100),
+            (53, Side::Buy, 96, 90),
+        ] {
+            let err = book
+                .add_order(stop(raw, side, stop_px, watermark, 5, 2))
+                .expect_err("crossed by the last trade");
+            assert!(
+                matches!(
+                    err,
+                    OrderBookError::StopWouldTrigger {
+                        stop_price,
+                        last_trade_price: 100,
+                        ..
+                    } if stop_price == stop_px
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                book.order_status(id(raw)),
+                Some(OrderStatus::Rejected {
+                    reason: RejectReason::StopWouldTrigger
+                })
+            );
+        }
+        assert_eq!(book.trailing_stop_count(), 0);
+        assert_eq!(book.visible_quantity_at_price(90, Side::Buy), Some(10));
+        assert_eq!(book.last_trade_price(), Some(100));
+        // One tick away is fine on either side.
+        book.add_order(stop(54, Side::Sell, 99, 100, 5, 2))
+            .expect("sell stop below the last trade");
+        book.add_order(stop(55, Side::Buy, 101, 100, 5, 2))
+            .expect("buy stop above the last trade");
+        assert_eq!(book.trailing_stop_count(), 2);
+    }
 
-        // Buy stop at 90 with last trade 90: elected on admission, buys 3
-        // at 101.
-        book.add_order(stop(51, Side::Buy, 90, 90, 5, 3))
-            .expect("admitted then triggered");
-        assert_eq!(
-            book.order_status(id(51)),
-            Some(OrderStatus::Filled { filled_quantity: 3 })
-        );
-        assert_eq!(book.visible_quantity_at_price(101, Side::Sell), Some(7));
+    /// M3: a zero trail, a zero quantity and a stop price beyond its own
+    /// watermark are rejected untouched (code 25).
+    #[test]
+    fn test_inconsistent_stop_terms_are_rejected() {
+        let book = new_book();
+        for (order, reason) in [
+            (stop(50, Side::Sell, 95, 100, 0, 1), "trail amount is zero"),
+            (stop(51, Side::Sell, 95, 100, 5, 0), "quantity is zero"),
+            (
+                stop(52, Side::Sell, 101, 100, 5, 1),
+                "sell stop price is above its watermark (last_reference_price)",
+            ),
+            (
+                stop(53, Side::Buy, 99, 100, 5, 1),
+                "buy stop price is below its watermark (last_reference_price)",
+            ),
+        ] {
+            let order_id = order.id();
+            let err = book.add_order(order).expect_err("invalid terms");
+            assert!(
+                matches!(err, OrderBookError::InvalidStopTerms { order_id: got, reason: r } if got == order_id && r == reason),
+                "{err:?}"
+            );
+            assert_eq!(
+                book.order_status(order_id),
+                Some(OrderStatus::Rejected {
+                    reason: RejectReason::InvalidStopTerms
+                })
+            );
+        }
         assert_eq!(book.trailing_stop_count(), 0);
     }
 
@@ -352,8 +403,8 @@ mod tests {
         let book = new_book();
         book.add_order(limit(1, 90, 10, Side::Buy, user(1)))
             .expect("bid");
-        book.add_order(stop(50, Side::Sell, 120, 100, 5, 2))
-            .expect("pending stop above any price");
+        book.add_order(stop(50, Side::Sell, 120, 125, 5, 2))
+            .expect("no last trade: nothing to cross yet");
         assert_eq!(book.trailing_stop_count(), 1, "no trade yet: pending");
         book.submit_market_order(id(2), 1, Side::Sell)
             .expect("first trade at 90");
@@ -574,8 +625,11 @@ mod tests {
         assert_eq!(book.best_ask(), Some(110));
     }
 
+    /// A modify never elects a stop: moving it through the last trade is
+    /// rejected untouched (decision a), and so is a zero quantity on the
+    /// quantity-carrying variants (Copilot on #301).
     #[test]
-    fn test_modify_through_the_last_trade_elects_the_stop() {
+    fn test_modify_through_the_last_trade_or_to_zero_is_rejected() {
         let book = new_book();
         book.add_order(limit(1, 90, 10, Side::Buy, user(1)))
             .expect("bid");
@@ -585,16 +639,51 @@ mod tests {
             .expect("trade at 100");
         book.add_order(stop(50, Side::Sell, 95, 100, 5, 2))
             .expect("pending");
-        book.update_order(OrderUpdate::UpdatePrice {
-            order_id: id(50),
-            new_price: Price::new(100),
-        })
-        .expect("modify");
-        assert_eq!(
-            book.order_status(id(50)),
-            Some(OrderStatus::Filled { filled_quantity: 2 })
+        let err = book
+            .update_order(OrderUpdate::UpdatePrice {
+                order_id: id(50),
+                new_price: Price::new(100),
+            })
+            .expect_err("would trigger");
+        assert!(
+            matches!(err, OrderBookError::StopWouldTrigger { .. }),
+            "{err:?}"
         );
-        assert_eq!(book.visible_quantity_at_price(90, Side::Buy), Some(8));
+        for update in [
+            OrderUpdate::UpdatePriceAndQuantity {
+                order_id: id(50),
+                new_price: Price::new(94),
+                new_quantity: Quantity::new(0),
+            },
+            OrderUpdate::Replace {
+                order_id: id(50),
+                price: Price::new(94),
+                quantity: Quantity::new(0),
+                side: Side::Sell,
+            },
+        ] {
+            let err = book.update_order(update).expect_err("zero quantity");
+            assert!(
+                matches!(
+                    err,
+                    OrderBookError::InvalidStopTerms {
+                        reason: "quantity is zero",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+        assert!(matches!(
+            book.update_order(OrderUpdate::UpdatePrice {
+                order_id: id(50),
+                new_price: Price::new(101),
+            }),
+            Err(OrderBookError::InvalidStopTerms { .. })
+        ));
+        assert_eq!(stop_price(&book, 50), (95, 100), "unchanged");
+        assert_eq!(book.order_status(id(50)), Some(OrderStatus::Open));
+        assert_eq!(book.visible_quantity_at_price(90, Side::Buy), Some(10));
     }
 
     #[test]
@@ -1071,30 +1160,27 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_refuses_an_unsettled_pending_stop() {
+    fn test_restore_validates_pending_stop_terms() {
         let live = stateful_book();
-        let mut snapshot = live.create_snapshot(usize::MAX).expect("snapshot");
-        // A sell stop at or above the last trade (100) would trigger on the
-        // next unrelated call.
-        if let Some(OrderType::TrailingStop { price, .. }) = snapshot.pending_stops.first_mut() {
-            *price = Price::new(100);
-        }
         let target = new_book();
+        // A sell stop above its own watermark is inconsistent.
+        let mut snapshot = live.create_snapshot(usize::MAX).expect("snapshot");
+        if let Some(OrderType::TrailingStop { price, .. }) = snapshot.pending_stops.first_mut() {
+            *price = Price::new(101);
+        }
         let err = target
-            .restore_from_snapshot(snapshot.clone())
-            .expect_err("unsettled");
+            .restore_from_snapshot(snapshot)
+            .expect_err("inconsistent");
         assert!(
-            matches!(err, OrderBookError::InvalidOperation { .. }),
+            matches!(err, OrderBookError::InvalidStopTerms { .. }),
             "{err:?}"
         );
-        // A watermark behind the last trade is unsettled too.
+        // A zero trail too.
         let mut snapshot = live.create_snapshot(usize::MAX).expect("snapshot");
-        if let Some(OrderType::TrailingStop {
-            last_reference_price,
-            ..
-        }) = snapshot.pending_stops.first_mut()
+        if let Some(OrderType::TrailingStop { trail_amount, .. }) =
+            snapshot.pending_stops.first_mut()
         {
-            *last_reference_price = Price::new(99);
+            *trail_amount = Quantity::new(0);
         }
         assert!(target.restore_from_snapshot(snapshot).is_err());
         // A pending stop whose id rests on a level is a duplicate.
@@ -1108,6 +1194,16 @@ mod tests {
         ));
         assert!(target.best_bid().is_none(), "target untouched");
         assert_eq!(target.trailing_stop_count(), 0);
+        // A stop the last trade crosses (elections suspended by the kill
+        // switch) restores: it is elected by the next print.
+        let mut snapshot = live.create_snapshot(usize::MAX).expect("snapshot");
+        if let Some(OrderType::TrailingStop { price, .. }) = snapshot.pending_stops.first_mut() {
+            *price = Price::new(100);
+        }
+        target
+            .restore_from_snapshot(snapshot)
+            .expect("crossed stop restores");
+        assert_eq!(target.trailing_stop_count(), 2);
     }
 
     /// A verbatim `version: 4` package written on `main` before #286

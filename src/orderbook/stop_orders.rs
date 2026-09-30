@@ -169,6 +169,27 @@ impl StopTerms {
         }
     }
 
+    /// The first inconsistency in the terms, if any: a zero trail, or a
+    /// stop price on the wrong side of its own watermark (above it for a
+    /// sell stop, below it for a buy stop). Trailing preserves both
+    /// properties, so they hold for every pending stop.
+    #[inline]
+    #[must_use]
+    pub(super) fn inconsistency(self) -> Option<&'static str> {
+        if self.trail == 0 {
+            return Some("trail amount is zero");
+        }
+        match self.side {
+            Side::Sell if self.stop > self.watermark => {
+                Some("sell stop price is above its watermark (last_reference_price)")
+            }
+            Side::Buy if self.stop < self.watermark => {
+                Some("buy stop price is below its watermark (last_reference_price)")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a trade at `price` elects the stop: at or below a sell
     /// stop, at or above a buy stop.
     #[inline]
@@ -624,16 +645,56 @@ where
         stop_trigger_order_id(self.transaction_id_generator.namespace(), stop_id)
     }
 
+    /// Checks a stop's own terms and its position against the last trade
+    /// (#286): a positive quantity, the [`StopTerms::inconsistency`] rules,
+    /// and not already crossed by the book's last trade price (a sell stop
+    /// at or above it, a buy stop at or below it).
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::InvalidStopTerms`] or
+    /// [`OrderBookError::StopWouldTrigger`].
+    pub(super) fn check_stop_terms(
+        &self,
+        order_id: Id,
+        terms: StopTerms,
+        quantity: u64,
+    ) -> Result<(), OrderBookError> {
+        if quantity == 0 {
+            return Err(OrderBookError::InvalidStopTerms {
+                order_id,
+                reason: "quantity is zero",
+            });
+        }
+        if let Some(reason) = terms.inconsistency() {
+            return Err(OrderBookError::InvalidStopTerms { order_id, reason });
+        }
+        if let Some(last_trade_price) = self.last_trade_price()
+            && terms.elected_by(last_trade_price)
+        {
+            return Err(OrderBookError::StopWouldTrigger {
+                order_id,
+                stop_price: terms.stop,
+                last_trade_price,
+            });
+        }
+        Ok(())
+    }
+
     /// Admits a trailing stop as a pending off-book stop (#286).
     ///
     /// Checks, in order: kill switch, time-in-force (`GTC`, `GTD` or
-    /// `DAY`), duplicate id (resting or pending), the risk open-order and
-    /// notional limits at the stop price (the price band does not apply:
-    /// a stop price is a trigger, not a resting price), the shared shape
-    /// validator (tick, lot, size, expiry, STP user id) and the trail's
-    /// tick alignment. Then the risk contribution is reserved and the stop
-    /// enters the store as `Open`. Evaluation against the current last
-    /// trade happens when the gated entry point returns.
+    /// `DAY`), the stop's terms (positive quantity and trail, stop price
+    /// not beyond its watermark), the last trade price (a stop it already
+    /// crosses is refused with [`OrderBookError::StopWouldTrigger`]: a stop
+    /// never turns into a market order on entry), duplicate id (resting or
+    /// pending), the risk open-order and notional limits at the stop price
+    /// (the price band does not apply: a stop price is a trigger, not a
+    /// resting price), the shared shape validator (tick, lot, size, expiry,
+    /// STP user id) and the trail's tick alignment. Then the risk
+    /// contribution is reserved and the stop enters the store as `Open`.
+    /// The watermark is taken as given: the stop starts trailing at the
+    /// next trade.
     ///
     /// # Errors
     ///
@@ -669,6 +730,8 @@ where
             }));
         }
         let quantity = order.total_quantity().map_err(&reject)?;
+        self.check_stop_terms(order_id, terms, quantity)
+            .map_err(&reject)?;
         if self.order_locations.contains_key(&order_id) || self.pending_stops.contains(order_id) {
             if records_rejections {
                 crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
@@ -757,18 +820,22 @@ where
     /// Applies `update` to the pending stop it targets (#286), under the
     /// exclusive gate `update_order` holds.
     ///
-    /// - `Cancel` and a zero `UpdateQuantity` cancel it (`UserRequested`).
+    /// - `Cancel` and a zero `UpdateQuantity` cancel it (`UserRequested`),
+    ///   the removal semantics of a resting order.
     /// - `UpdateQuantity` resizes it in place and keeps its time priority.
     /// - `UpdatePrice` sets its stop price; `UpdatePriceAndQuantity` both;
     ///   `Replace` stop price, quantity and side. Each takes a fresh
     ///   admission sequence (the stop loses its time priority). The
     ///   watermark and trail are kept.
     ///
-    /// The projected stop runs the shape validator and the modify-aware
-    /// risk check (limits, no price band) before anything changes; its risk
-    /// contribution is then re-booked. The order state stays `Open`. The
-    /// caller evaluates the stops before returning, so a modify that moves
-    /// the stop through the last trade price elects it.
+    /// The projected stop must pass [`Self::check_stop_terms`]: a zero
+    /// quantity on `UpdatePriceAndQuantity` / `Replace` is refused with
+    /// [`OrderBookError::InvalidStopTerms`] (a pending stop never holds a
+    /// zero quantity), and a stop price the last trade already crosses with
+    /// [`OrderBookError::StopWouldTrigger`] (a modify never elects a stop).
+    /// It then runs the shape validator and the modify-aware risk check
+    /// (limits, no price band) before anything changes; its risk
+    /// contribution is then re-booked. The order state stays `Open`.
     ///
     /// # Errors
     ///
@@ -821,11 +888,12 @@ where
                 true
             }
         };
-        self.validate_order_shape(&projected)?;
         let quantity = projected.total_quantity()?;
         let Some(terms) = StopTerms::of(&projected) else {
             return Err(not_a_stop(order_id));
         };
+        self.check_stop_terms(order_id, terms, quantity)?;
+        self.validate_order_shape(&projected)?;
         self.risk_state.check_modify_admission(
             order_id,
             projected.user_id(),
