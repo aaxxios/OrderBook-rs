@@ -8,14 +8,18 @@
 //! can be re-priced with `reprice_pegged_orders`.
 //!
 //! ## TrailingStop (#286)
-//! Pending **off-book** stop orders driven by the book's last trade price:
+//! Pending **off-book** stop orders driven by the book's prints:
 //! - they are never liquidity (no level, no depth);
-//! - the watermark (`last_reference_price`) follows the last trade in the
+//! - the watermark (`last_reference_price`) follows the prints in the
 //!   stop's favour and the stop price trails it by `trail_amount`
-//!   (sell: below the highest trade, buy: above the lowest);
-//! - a last trade at or through the stop price executes the stop as an
+//!   (sell: below the highest print, buy: above the lowest);
+//! - a print at or through the stop price (along each sweep's price path,
+//!   not only its last print) elects the stop: it records
+//!   `OrderStatus::Triggered` and executes as an unpriced
 //!   immediate-or-cancel market order, automatically, inside the call whose
-//!   trade crossed it; stops can cascade.
+//!   trade crossed it; its trades carry `origin_stop_id`; stops can cascade;
+//! - a stop the last trade already crosses is rejected at admission
+//!   (`StopWouldTrigger`).
 //!
 //! # Usage:
 //! ```bash
@@ -128,11 +132,19 @@ fn demo_trailing_stop_orders() {
             .iter()
             .map(|t| format!("{} @ {}", t.quantity().as_u64(), t.price().as_u128()))
             .collect();
-        info!(
-            "  [trade] taker {} filled {}",
-            trade.match_result.order_id(),
-            fills.join(", ")
-        );
+        match trade.origin_stop_id {
+            Some(stop) => info!(
+                "  [trade] taker {} (elected stop {}) filled {}",
+                trade.match_result.order_id(),
+                stop,
+                fills.join(", ")
+            ),
+            None => info!(
+                "  [trade] taker {} filled {}",
+                trade.match_result.order_id(),
+                fills.join(", ")
+            ),
+        }
     }));
 
     // Establish an uncrossed market: bids 3000..2960, asks 3010..3050.
@@ -174,7 +186,7 @@ fn demo_trailing_stop_orders() {
         price: Price::new(2960),
         quantity: Quantity::new(150),
         side: Side::Sell,
-        user_id: Hash32::zero(),
+        user_id: Hash32::new([7u8; 32]),
         timestamp: TimestampMs::new(current_time_millis()),
         time_in_force: TimeInForce::Gtc,
         trail_amount: Quantity::new(50),
@@ -214,10 +226,43 @@ fn demo_trailing_stop_orders() {
         book.order_status(stop_id),
         book.trailing_stop_count()
     );
+    if let Some(history) = book
+        .order_state_tracker()
+        .and_then(|tracker| tracker.get_history(stop_id))
+    {
+        for (_, status) in history {
+            info!("  Stop history: {status}");
+        }
+    }
     info!(
         "  Best Bid after the stop's sale: {}",
         book.best_bid().unwrap_or(0)
     );
+
+    // A stop the last trade already crosses is rejected untouched.
+    let Some(last) = book.last_trade_price() else {
+        return;
+    };
+    let (Some(stop), Some(watermark)) = (last.checked_sub(50), last.checked_sub(100)) else {
+        return;
+    };
+    info!("\nStep 6: A BUY stop at {stop} with the last trade at {last}...");
+    let crossed = OrderType::TrailingStop {
+        id: Id::from_u64(2001),
+        price: Price::new(stop),
+        quantity: Quantity::new(10),
+        side: Side::Buy,
+        user_id: Hash32::new([7u8; 32]),
+        timestamp: TimestampMs::new(current_time_millis()),
+        time_in_force: TimeInForce::Gtc,
+        trail_amount: Quantity::new(50),
+        last_reference_price: Price::new(watermark),
+        extra_fields: (),
+    };
+    match book.add_order(crossed) {
+        Ok(_) => info!("  Unexpectedly admitted"),
+        Err(err) => info!("  Rejected: {err}"),
+    }
 }
 
 fn show_stop(book: &OrderBook, stop_id: Id) {
