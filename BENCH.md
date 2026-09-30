@@ -897,6 +897,53 @@ one stop pending, limit adds (which can trade) serialize on the
 exclusive gate, while post-only adds stay on the shared side and match
 their `_0_stops` control.
 
+### `pending_stops` with a protection collar (added for #302)
+
+`pending_stops_hdr` also runs the election and cascade shapes with a
+`StopProtection` on the book, so each elected stop's child is an
+immediate-or-cancel limit order instead of a market order:
+
+- `pending_stops_elect_collar_{10,1000}`: as `pending_stops_elect_*`
+  with a collar of 10; every child still fills at the deep bid (900,
+  inside its band), so the work matches the uncollared row.
+- `pending_stops_cascade_collar_{10,1000}`: as `pending_stops_cascade_*`
+  with a collar of 1; each child fills the next one-lot bid (its limit),
+  and the last child finds nothing within its band
+  (`Cancelled { StopProtectionBand }`) instead of trading the deep bid.
+
+Run conditions: 2026-09-30 11:32 UTC, Apple M5 Max (18 cores, 128 GiB,
+macOS 27.0, `arm64`), `rustc 1.98.1`, no pinning, system allocator,
+crate `0.15.0` (branch `issue-302-stop-protection-collar`), 1-minute load
+average 6.7 before and 6.9 after the run (a desktop host, not a bench
+rig). Command: `cargo bench --features special_orders --bench
+pending_stops_hdr`. One run; the uncollared rows are from the same run,
+as the paired control. Quantiles the sample count cannot resolve print
+`n/a` (the HDR report's rule: p99 needs at least 1 000 samples, p99.9
+10 000, p99.99 100 000). Values in ns:
+
+| scenario | samples | p50 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| `pending_stops_elect_10` | 5 000 | 6 375 | 7 375 | n/a | n/a |
+| `pending_stops_elect_collar_10` | 5 000 | 6 503 | 14 919 | n/a | n/a |
+| `pending_stops_elect_1000` | 200 | 633 343 | n/a | n/a | n/a |
+| `pending_stops_elect_collar_1000` | 200 | 657 919 | n/a | n/a | n/a |
+| `pending_stops_cascade_10` | 5 000 | 10 919 | 43 583 | n/a | n/a |
+| `pending_stops_cascade_collar_10` | 5 000 | 9 879 | 13 167 | n/a | n/a |
+| `pending_stops_cascade_1000` | 200 | 1 530 879 | n/a | n/a | n/a |
+| `pending_stops_cascade_collar_1000` | 200 | 1 368 063 | n/a | n/a | n/a |
+
+Interpretation: the collar adds no measurable cost to an election. It is
+one `Copy` read and one checked add or subtract per elected stop, plus
+one best-price cache read when a collared child leaves a remainder. The
+elect medians differ by 2 % (10 stops) and 4 % (1 000), within this
+host's run-to-run spread. The collared cascade is cheaper at the median
+because its last child trades nothing. The p99 gaps (elect 7.4 vs
+14.9 µs, cascade 43.6 vs 13.2 µs) point in opposite directions and are
+single-run tail noise on a loaded host, not an effect of the collar.
+Paths without a pending stop never read the collar: `quiet_0`,
+`thin_book_sweep` and `aggressive_walk` stayed within noise of `v0.14.0`
+in a paired comparison on the same host (two rounds each).
+
 ## 0.11.0 → 0.12.0 delta
 
 The 0.12.0 release combines the pricelevel 0.9 hardening upgrade with
