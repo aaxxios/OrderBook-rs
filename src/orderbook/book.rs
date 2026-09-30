@@ -6671,16 +6671,20 @@ where
         Ok(repriced_count)
     }
 
-    /// Evaluate the pending trailing stops against the last trade price
-    /// (#286) under the exclusive submit gate, returning how many stop
+    /// Evaluate the pending trailing stops against any print not evaluated
+    /// yet (#286) under the exclusive submit gate, returning how many stop
     /// prices trailed.
     ///
-    /// Stops are evaluated automatically before every mutating call that
-    /// can trade returns, so this normally finds nothing to do and returns
-    /// `0`; it exists for API compatibility and as an explicit
-    /// "evaluate now". Elected stops execute exactly as they would
-    /// automatically.
+    /// Every call that trades evaluates its own prints before it returns,
+    /// so this finds nothing to do and returns `0`; it exists for API
+    /// compatibility. Returns `0` without touching the gate when no stop
+    /// is pending.
     fn reprice_trailing_collecting(&self) -> Result<usize, OrderBookError> {
+        // Hot-path review P2-04: nothing to evaluate, and no reason to
+        // serialize the book behind an exclusive acquisition.
+        if !self.has_pending_stops() {
+            return Ok(0);
+        }
         let _gate = self.acquire_coherent_submit_gate(true);
         Ok(self.run_stop_triggers().trailed)
     }
