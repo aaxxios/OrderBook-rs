@@ -28,6 +28,7 @@ mod restore_validation;
 mod serialize_tests;
 mod snapshot;
 mod statistics_tests;
+mod stop_protection;
 mod stp;
 mod stp_concurrency;
 mod strandable_gate_concurrency;
