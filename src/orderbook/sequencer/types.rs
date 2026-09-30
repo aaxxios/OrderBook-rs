@@ -494,8 +494,11 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         | OrderBookError::EngineSeqExhausted { .. }
         | OrderBookError::SnapshotCrossed { .. }
         // #286: a trailing stop refused by a book without `special_orders`
-        // (or a restore that met one); rejected before any check runs.
-        | OrderBookError::StopOrdersUnsupported { .. } => false,
+        // (or a restore that met one), crossed by the last trade on entry,
+        // or with invalid terms; all rejected before anything changes.
+        | OrderBookError::StopOrdersUnsupported { .. }
+        | OrderBookError::StopWouldTrigger { .. }
+        | OrderBookError::InvalidStopTerms { .. } => false,
         #[cfg(feature = "nats")]
         OrderBookError::NatsPublishError { .. } | OrderBookError::NatsSerializationError { .. } => {
             false

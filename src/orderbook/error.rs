@@ -543,6 +543,34 @@ pub enum OrderBookError {
         order_id: pricelevel::Id,
     },
 
+    /// A trailing stop the book's last trade price has already crossed was
+    /// refused untouched (#286): a sell stop at or above the last trade, a
+    /// buy stop at or below it, at admission or through a modify. Like an
+    /// exchange's "stop would immediately trigger" reject, the book never
+    /// turns a stop order into an immediate market order on entry. Maps to
+    /// the stable wire code `RejectReason::StopWouldTrigger` (24).
+    StopWouldTrigger {
+        /// The refused trailing stop.
+        order_id: pricelevel::Id,
+        /// Its stop price, in price ticks.
+        stop_price: u128,
+        /// The book's last trade price, in price ticks.
+        last_trade_price: u128,
+    },
+
+    /// A trailing stop's terms were refused untouched (#286): a zero trail
+    /// amount, a zero quantity, or a stop price on the wrong side of its
+    /// own watermark (`last_reference_price`): above it for a sell stop,
+    /// below it for a buy stop. Raised at admission and by a modify of a
+    /// pending stop, which then keeps its previous terms. Maps to the
+    /// stable wire code `RejectReason::InvalidStopTerms` (25).
+    InvalidStopTerms {
+        /// The refused trailing stop.
+        order_id: pricelevel::Id,
+        /// Static description of the offending term.
+        reason: &'static str,
+    },
+
     /// Failed to publish a trade event to NATS JetStream.
     #[cfg(feature = "nats")]
     NatsPublishError {
@@ -815,6 +843,19 @@ impl fmt::Display for OrderBookError {
                     f,
                     "snapshot is crossed: best bid {best_bid} is at or above best ask {best_ask}"
                 )
+            }
+            OrderBookError::StopWouldTrigger {
+                order_id,
+                stop_price,
+                last_trade_price,
+            } => {
+                write!(
+                    f,
+                    "trailing stop {order_id} would trigger immediately: stop price {stop_price} is already crossed by the last trade at {last_trade_price}"
+                )
+            }
+            OrderBookError::InvalidStopTerms { order_id, reason } => {
+                write!(f, "invalid trailing stop {order_id}: {reason}")
             }
             OrderBookError::StopOrdersUnsupported { order_id } => {
                 write!(

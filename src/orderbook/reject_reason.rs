@@ -64,6 +64,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `ModifyOrderLost`        | 21  |
 /// | `RiskRejectedAfterTrades` | 22 |
 /// | `StopOrdersUnsupported`  | 23  |
+/// | `StopWouldTrigger`       | 24  |
+/// | `InvalidStopTerms`       | 25  |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -147,6 +149,14 @@ pub enum RejectReason {
     /// (#286). Rejected before the book changed. Carried by
     /// `OrderBookError::StopOrdersUnsupported`.
     StopOrdersUnsupported = 23,
+    /// A trailing stop the last trade price had already crossed was
+    /// rejected untouched instead of triggering on entry (#286). Carried by
+    /// `OrderBookError::StopWouldTrigger`.
+    StopWouldTrigger = 24,
+    /// A trailing stop's terms (trail, quantity, stop price against its
+    /// watermark) were rejected untouched (#286). Carried by
+    /// `OrderBookError::InvalidStopTerms`.
+    InvalidStopTerms = 25,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -186,6 +196,8 @@ impl RejectReason {
             Self::ModifyOrderLost => 21,
             Self::RiskRejectedAfterTrades => 22,
             Self::StopOrdersUnsupported => 23,
+            Self::StopWouldTrigger => 24,
+            Self::InvalidStopTerms => 25,
             Self::Other(code) => code,
         }
     }
@@ -221,6 +233,8 @@ impl RejectReason {
             21 => Self::ModifyOrderLost,
             22 => Self::RiskRejectedAfterTrades,
             23 => Self::StopOrdersUnsupported,
+            24 => Self::StopWouldTrigger,
+            25 => Self::InvalidStopTerms,
             other => Self::Other(other),
         }
     }
@@ -281,6 +295,8 @@ impl std::fmt::Display for RejectReason {
             Self::ModifyOrderLost => write!(f, "modify lost the order"),
             Self::RiskRejectedAfterTrades => write!(f, "risk rejected after trades"),
             Self::StopOrdersUnsupported => write!(f, "stop orders unsupported"),
+            Self::StopWouldTrigger => write!(f, "stop would trigger"),
+            Self::InvalidStopTerms => write!(f, "invalid stop terms"),
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -346,6 +362,8 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::EngineSeqExhausted { .. } => Self::Other(0),
             OrderBookError::SnapshotCrossed { .. } => Self::Other(0),
             OrderBookError::StopOrdersUnsupported { .. } => Self::StopOrdersUnsupported,
+            OrderBookError::StopWouldTrigger { .. } => Self::StopWouldTrigger,
+            OrderBookError::InvalidStopTerms { .. } => Self::InvalidStopTerms,
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { .. } => Self::Other(0),
             #[cfg(feature = "nats")]
@@ -366,7 +384,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 23] {
+    fn named_variants() -> [RejectReason; 25] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -391,6 +409,8 @@ mod tests {
             RejectReason::ModifyOrderLost,
             RejectReason::RiskRejectedAfterTrades,
             RejectReason::StopOrdersUnsupported,
+            RejectReason::StopWouldTrigger,
+            RejectReason::InvalidStopTerms,
         ]
     }
 
@@ -419,6 +439,8 @@ mod tests {
         assert_eq!(RejectReason::ModifyOrderLost.as_u16(), 21);
         assert_eq!(RejectReason::RiskRejectedAfterTrades.as_u16(), 22);
         assert_eq!(RejectReason::StopOrdersUnsupported.as_u16(), 23);
+        assert_eq!(RejectReason::StopWouldTrigger.as_u16(), 24);
+        assert_eq!(RejectReason::InvalidStopTerms.as_u16(), 25);
     }
 
     /// #247: both modify re-add outcomes have their own codes, round trip
@@ -473,6 +495,29 @@ mod tests {
         assert_eq!(reason.as_u16(), 23);
         assert_eq!(reason.to_string(), "stop orders unsupported");
         assert!(err.to_string().contains("special_orders"));
+    }
+
+    /// #286: the two stop-admission rejections have their own codes.
+    #[test]
+    fn test_from_order_book_error_maps_stop_admission_rejections() {
+        let would = OrderBookError::StopWouldTrigger {
+            order_id: Id::from_u64(9),
+            stop_price: 100,
+            last_trade_price: 99,
+        };
+        assert_eq!(RejectReason::from(&would), RejectReason::StopWouldTrigger);
+        assert!(would.to_string().contains("would trigger"));
+        let terms = OrderBookError::InvalidStopTerms {
+            order_id: Id::from_u64(9),
+            reason: "trail amount is zero",
+        };
+        assert_eq!(RejectReason::from(&terms), RejectReason::InvalidStopTerms);
+        assert!(terms.to_string().contains("trail amount is zero"));
+        for (code, text) in [(24u16, "stop would trigger"), (25, "invalid stop terms")] {
+            let reason = RejectReason::from_u16(code);
+            assert_eq!(reason.as_u16(), code);
+            assert_eq!(reason.to_string(), text);
+        }
     }
 
     /// #291: a post-trade risk refusal has its own code, distinct from the
