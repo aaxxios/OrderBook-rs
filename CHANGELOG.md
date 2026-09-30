@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-30
+
+The panic-policy release. `pricelevel` is upgraded to 0.10.1; the
+Production Panic Policy (crate-owned code no longer initiates a panic)
+is enforced mechanically by a `[lints.clippy]` deny set plus
+`scripts/check_panic_policy.py`, with no allowlist left. The audit that
+policy required surfaced a long list of engine and state failures that
+used to be clamped, ignored or silently recovered (matching, fees and
+notionals, risk, modifies, mass cancels, snapshots and restore, journals
+and replay, wire and bincode decoding); every one now returns a typed
+error instead. Off-book trailing stops (#286) land on top: a
+`TrailingStop` is held as a pending stop rather than resting as visible
+liquidity, trailing the last trade price and executing as an
+immediate-or-cancel market order when it elects. Performance is measured
+against the last release, `v0.13.1`, and re-measured after #286 merged;
+see `BENCHMARKS.md` / `BENCH.md`. It is a breaking release: see "Changed
+(breaking)" and the migration table in `src/lib.rs`.
+
 ### Added
 
 - **Off-book trailing stops (#286, `special_orders`).**
@@ -3956,3 +3974,6 @@ change.
 - **Implied Volatility**: Black-Scholes implied vol calculation.
 - **Market Metrics**: VWAP, micro price, queue analysis, depth
   statistics, and functional iterators.
+
+[Unreleased]: https://github.com/joaquinbejar/OrderBook-rs/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/joaquinbejar/OrderBook-rs/compare/v0.13.1...v0.14.0

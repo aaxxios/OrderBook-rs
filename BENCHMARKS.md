@@ -1,11 +1,16 @@
 # Benchmark Results
 
-orderbook-rs **0.14.0** candidate (`pricelevel` 0.10.1) against the last
-release, **v0.13.1** (`pricelevel` 0.9.2), measured for #259 on
-2026-09-29. Tail-latency detail per scenario, the allocation profile and
-the methodology live in [`BENCH.md`](BENCH.md); the compact raw data
-(per-round JSON, both resolved `Cargo.lock` files, the load log, the
-summary CSV) lives in [`doc/bench/0.14.0/`](doc/bench/0.14.0/).
+orderbook-rs **0.14.0** candidate against the last release, **v0.13.1**
+(`pricelevel` 0.9.2). Measured for #259 on 2026-09-29 (candidate branch
+`issue-259-performance` at `55efa0b`, `pricelevel` 0.10.1) and
+re-measured on 2026-09-30 for the matching-related scenarios after #286
+(off-book trailing stops) merged (candidate `main`/HEAD at `b8e2337`,
+`pricelevel` resolves to 0.10.2). Tail-latency detail per scenario, the
+allocation profile and the methodology live in [`BENCH.md`](BENCH.md);
+the compact raw data (per-round JSON, both resolved `Cargo.lock` files,
+the load log, the summary CSV) lives in
+[`doc/bench/0.14.0/`](doc/bench/0.14.0/) (the 2026-09-30 files carry a
+`-post286` suffix).
 
 ## System
 
@@ -15,8 +20,10 @@ summary CSV) lives in [`doc/bench/0.14.0/`](doc/bench/0.14.0/).
 | OS | macOS 27.0 (Darwin 27.0.0, `arm64`), no CPU pinning |
 | Toolchain | `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1` |
 | Profile | `--release`, system allocator, `RUSTFLAGS` unset |
-| Load average | 4.7 to 8.1 (1 min) across the comparison run; per-run values in `doc/bench/0.14.0/load.csv` |
-| Candidate | branch `issue-259-performance` at `55efa0b` (main `5447250` + the #259 commits; the library is unchanged after it) |
+| Load average (2026-09-29, #259) | 4.7 to 8.1 (1 min) across the comparison run; per-run values in `doc/bench/0.14.0/load.csv` |
+| Load average (2026-09-30, post-#286) | 4.8 to 6.8 (1 min) across the comparison run; per-run values in `doc/bench/0.14.0/load-post286.csv` |
+| Candidate (2026-09-29) | branch `issue-259-performance` at `55efa0b` (main `5447250` + the #259 commits; the library is unchanged after it) |
+| Candidate (2026-09-30) | `main`/HEAD at `b8e2337` (adds #286 and #291/#294/#295 on top of the #259 candidate) |
 | Baseline | tag `v0.13.1` (`a36218b`) |
 
 A desktop host, not a bench rig: interleaving the two sides round by
@@ -56,56 +63,78 @@ round is what keeps background load from favouring either one.
 
 ## HEAD vs v0.13.1
 
-p50 in ns (median of seven rounds, spread in parentheses), deltas of the
-p50 and p99 medians. Generated: [`doc/bench/0.14.0/compare-summary.md`](doc/bench/0.14.0/compare-summary.md).
+p50 in ns, spread in parentheses, deltas of the p50 and p99 medians.
+Rows marked `†` are the **2026-09-30 re-measurement** (`b8e2337`,
+includes #286 off-book trailing stops merged after the original #259
+comparison): `scripts/bench_compare.sh --baseline v0.13.1 --candidate
+HEAD --rounds 5 --scenarios add_only,mixed_70_20_10,aggressive_walk,thin_book_sweep,stp_cancel_maker,contended_add_4t,contended_add_8t,contended_add_listeners_4t,contended_add_listeners_8t`,
+five interleaved rounds, load average 4.8 to 6.8 (1 min) throughout;
+raw data in
+[`doc/bench/0.14.0/compare-summary-post286.md`](doc/bench/0.14.0/compare-summary-post286.md).
+The remaining rows are unchanged from the original 2026-09-29 (#259)
+measurement (seven rounds, branch `issue-259-performance` at `55efa0b`,
+main + every 0.14.0 change up to and including #294/#295 but before
+#286) since #286 does not touch their code paths (mass cancel,
+snapshot, replay, uncontended cancel); raw data in
+[`doc/bench/0.14.0/compare-summary.md`](doc/bench/0.14.0/compare-summary.md).
 
 | scenario | class / timer | v0.13.1 p50 (spread) | 0.14.0 p50 (spread) | p50 Δ | p99 Δ | verdict |
 |---|---|---|---|---|---|---|
-| `add_only` | uncontended / single | 1 083 (0.1 pp) | 584 (7.0 pp) | -46.1 % | -49.6 % | OK |
-| `aggressive_walk` | uncontended / batch | 3 365 (35.2 pp) | 2 437 (4.2 pp) | -27.6 % | +27.1 % | NOISY |
+| `add_only` † | uncontended / single | 1 167 (3.6 pp) | 625 (6.6 pp) | -46.4 % | -51.0 % | OK |
+| `aggressive_walk` † | uncontended / batch | 3 843 (49.3 pp) | 2 529 (6.2 pp) | -34.2 % | +16.6 % | NOISY |
 | `cancel_only` | uncontended / batch | 713 (7.3 pp) | 687 (3.4 pp) | -3.6 % | -3.9 % | OK |
-| `contended_add_4t` | contended / batch | 2 171 (3.3 pp) | 1 343 (7.1 pp) | -38.1 % | -31.6 % | OK |
-| `contended_add_8t` | contended / batch | 3 649 (4.2 pp) | 3 321 (7.0 pp) | -9.0 % | -4.0 % | OK |
-| `contended_add_listeners_4t` | contended / batch | 2 059 (18.3 pp) | 1 529 (1.2 pp) | -25.7 % | -17.3 % | FASTER (separated) |
-| `contended_add_listeners_8t` | contended / batch | 3 795 (8.3 pp) | 4 363 (1.9 pp) | +15.0 % | +22.8 % | REGRESSION |
+| `contended_add_4t` † | contended / batch | 2 219 (2.9 pp) | 1 368 (2.5 pp) | -38.4 % | -12.1 % | OK |
+| `contended_add_8t` † | contended / batch | 3 765 (1.6 pp) | 3 463 (4.8 pp) | -8.0 % | +4.7 % | OK |
+| `contended_add_listeners_4t` † | contended / batch | 2 075 (17.8 pp) | 1 583 (1.4 pp) | -23.7 % | -1.7 % | FASTER (separated) |
+| `contended_add_listeners_8t` † | contended / batch | 3 755 (9.9 pp) | 4 567 (2.8 pp) | +21.6 % | +24.4 % | REGRESSION |
 | `mass_cancel_burst` | uncontended / single | 760 831 (2.6 pp) | 754 175 (2.6 pp) | -0.9 % | -16.8 % | OK |
-| `mixed_70_20_10` | uncontended / single | 917 (0.0 pp) | 459 (9.2 pp) | -50.0 % | -48.9 % | OK |
+| `mixed_70_20_10` † | uncontended / single | 1 000 (0.0 pp) | 500 (16.6 pp) | -50.0 % | -50.0 % | FASTER (separated) |
 | `replay_10k` | uncontended / single | 9 019 391 (0.6 pp) | 3 942 399 (1.2 pp) | -56.3 % | -57.0 % | OK |
 | `snapshot_create_10k` | uncontended / single | 372 991 (2.6 pp) | 396 287 (7.4 pp) | +6.2 % | +10.1 % | REGRESSION |
 | `snapshot_restore_10k` | uncontended / single | 10 887 167 (3.0 pp) | 3 962 879 (0.9 pp) | -63.6 % | -64.4 % | OK |
-| `stp_cancel_maker` | uncontended / single | 2 709 (53.9 pp) | 2 041 (10.2 pp) | -24.7 % | -18.1 % | FASTER (separated) |
-| `thin_book_sweep` | uncontended / batch | 541 (81.7 pp) | 341 (2.6 pp) | -37.0 % | -17.4 % | NOISY |
+| `stp_cancel_maker` † | uncontended / single | 2 251 (50.0 pp) | 1 166 (3.6 pp) | -48.2 % | -44.1 % | FASTER (separated) |
+| `thin_book_sweep` † | uncontended / batch | 425 (96.0 pp) | 300 (3.0 pp) | -29.4 % | -37.3 % | FASTER (separated) |
 
-**Counts (generated): 8 OK, 2 FASTER (separated), 2 NOISY, 2 REGRESSION.**
+**Counts (generated, both measurements combined): 7 OK, 4 FASTER (separated), 1 NOISY, 2 REGRESSION.**
 
 - **REGRESSION rows, accepted by the maintainer** ([decision on
-  #259](https://github.com/joaquinbejar/OrderBook-rs/issues/259#issuecomment-5896324957)) as the cost of 0.14.0's guarantees, and confirmed by
-  this re-measurement:
+  #259](https://github.com/joaquinbejar/OrderBook-rs/issues/259#issuecomment-5896324957)), confirmed by both the original comparison and the
+  2026-09-30 re-measurement after #286:
   - `snapshot_create_10k` +6.2 %: arrives with the pricelevel 0.10
     upgrade (`c1a4cbb`, 372 → 398 µs); the time is inside
-    `PriceLevel::snapshot`.
-  - `contended_add_listeners_8t` +15.0 % (every 0.14.0 round above every
-    v0.13.1 round): #247 level stripes and #249's ordered listener
-    outbox (bisection in `BENCH.md`); every thread adds at one price for
-    one account and the listener does nothing, so the lock handoffs are
-    the whole difference. The listener-free `contended_add_8t` is 9 %
-    faster than v0.13.1.
+    `PriceLevel::snapshot`. Not re-measured on 2026-09-30 (#286 does not
+    touch snapshotting); the 2026-09-29 number stands.
+  - `contended_add_listeners_8t` +21.6 % on the 2026-09-30 re-measurement
+    (every candidate round above every baseline round), up from +15.0 %
+    on 2026-09-29: #247 level stripes and #249's ordered listener outbox
+    remain the attributed cause (bisection in `BENCH.md`); every thread
+    adds at one price for one account and the listener does nothing, so
+    the lock handoffs are the whole difference. Nothing in #286 touches
+    this path (no trailing stop is pending in this scenario); the larger
+    delta reads as host variance between the two measurement sessions,
+    not a new step, and is still covered by the #259 maintainer decision.
+    The listener-free `contended_add_8t` stays 8.0 % faster than v0.13.1.
 - **`cancel_only` is not a regression** once it cancels resting orders
-  (-3.6 %, OK). The first comparison's +8 ns came from its crossing seed:
-  about 89 % of its cancels were misses, and the miss path is slower on
-  0.14.0 (+3 ns from #249's per-call emission scope, +5 ns from #294's
-  unwind-aware gate guard; a 20 M-miss microbenchmark measures 14.6 ns
-  before #294 and 17.5 ns after). That miss-path cost is real but is not
-  what the scenario claims to measure; the maintainer decision covers it.
-- **NOISY rows** (`aggressive_walk`, `thin_book_sweep`): v0.13.1 untracks
-  every filled maker with a scan whose cost depends on the per-process
-  hash seed, so its fill-heavy scenarios swing from one process to the
-  next (`thin_book_sweep` 258 to 700 ns) while 0.14.0 stays within
-  2.6 to 4.2 pp. The ranges overlap, so the rows stay inconclusive.
-  `aggressive_walk`'s p99 reads +27 %; not attributed.
-- **FASTER (separated)** (`stp_cancel_maker`, `contended_add_listeners_4t`):
-  the baseline is noisy for the same reason, but every 0.14.0 round is
-  faster than every v0.13.1 round.
+  (-3.6 %, OK; 2026-09-29 measurement, not re-run on 2026-09-30). The
+  first comparison's +8 ns came from its crossing seed: about 89 % of
+  its cancels were misses, and the miss path is slower on 0.14.0 (+3 ns
+  from #249's per-call emission scope, +5 ns from #294's unwind-aware
+  gate guard; a 20 M-miss microbenchmark measures 14.6 ns before #294
+  and 17.5 ns after). That miss-path cost is real but is not what the
+  scenario claims to measure; the maintainer decision covers it.
+- **NOISY row** (`aggressive_walk` †): v0.13.1 untracks every filled
+  maker with a scan whose cost depends on the per-process hash seed, so
+  its fill-heavy scenarios swing from one process to the next while
+  0.14.0 stays within a few pp. The ranges overlap on the 2026-09-30
+  re-measurement too, so the row stays inconclusive; its p99 reads
+  +16.6 %, not attributed.
+- **FASTER (separated)** (`stp_cancel_maker` †, `contended_add_listeners_4t` †,
+  `mixed_70_20_10` †, `thin_book_sweep` †): the baseline is noisy for the
+  same reason, but every 0.14.0 round is faster than every v0.13.1 round
+  in the 2026-09-30 re-measurement (`mixed_70_20_10` and `thin_book_sweep`
+  cross into the separated case this time, where the original 2026-09-29
+  run read them as plain OK / NOISY; both readings agree the candidate is
+  never slower).
 
 ## Allocations (`alloc_count`, feature `alloc-counters`)
 

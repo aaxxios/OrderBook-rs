@@ -32,7 +32,7 @@
 //! - **Research**: Platform for studying market microstructure and order flow
 //! - **Educational**: Reference implementation for understanding modern exchange architecture
 //!
-//! ## What's New in Version 0.14.0 (unreleased)
+//! ## What's New in Version 0.14.0
 //!
 //! 0.14.0 is the panic-policy release: crate-owned code no longer initiates
 //! panics and the gate enforcing it is absolute. The engine and state
