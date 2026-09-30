@@ -87,7 +87,10 @@ child's shape is set per book by `StopProtection` (`stop_protection.rs`,
 | `stop_protection() == None` (default) | unpriced IOC market order (0.14 behaviour) |
 | `Some(collar)` | IOC limit at `stop - collar` (sell) or `stop + collar` (buy), `stop` being the trailed stop price at election |
 
-Either way the child never rests. The `StopProtection` type is compiled in
+Either way the child never rests: unlike CME protection points, a
+collared remainder is cancelled (`Cancelled { StopProtectionBand }` when
+the collar cut it), so a stop whose band is exhausted leaves its position
+unprotected. `Triggered { limit_price }` records the child's limit. The `StopProtection` type is compiled in
 every build (with and without `special_orders`) so snapshot packages and
 `ReplayBookConfig` have one shape everywhere; it only acts where trailing
 stops exist, and only the election path reads it.
@@ -118,7 +121,9 @@ stops exist, and only the election path reads it.
   `ReplayEngine` into a fresh book configured by `ReplayBookConfig`.
   Book configuration is not journaled: `ReplayBookConfig` must carry the
   source book's fees, STP mode, shape rules, trade-id namespace and stop
-  protection collar for the replay to reproduce its trades.
+  protection collar (constant over the replayed range) for the replay to
+  reproduce its trades; a collar mismatch is only detected by
+  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.
   `snapshots_match` is the equality oracle.
 
 ## Feature matrix

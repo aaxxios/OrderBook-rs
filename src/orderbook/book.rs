@@ -2370,10 +2370,14 @@ where
     /// stop price at election) moved by the collar against it: a sell stop
     /// at `stop - collar`, a buy stop at `stop + collar` (see
     /// [`StopProtection::limit_price`]). It trades only within that band and
-    /// whatever does not fill is cancelled (the stop ends `Cancelled {
-    /// InsufficientLiquidity }` with what it filled); an elected stop never
-    /// rests. Without one (the default) it executes as an unpriced
-    /// immediate-or-cancel market order, the 0.14 behaviour.
+    /// whatever does not fill is cancelled, not rested (unlike CME
+    /// protection points): the stop ends `Cancelled { StopProtectionBand }`
+    /// with what it filled when liquidity remained beyond the limit, or
+    /// `Cancelled { InsufficientLiquidity }` when the side ran out within
+    /// the band. A stop whose band is exhausted leaves its position
+    /// unprotected. `Triggered { limit_price }` records the limit. Without
+    /// one (the default) it executes as an unpriced immediate-or-cancel
+    /// market order, the 0.14 behaviour.
     ///
     /// Applies to stops elected after the call, including stops already
     /// pending. Trailing stops need the `special_orders` feature; without

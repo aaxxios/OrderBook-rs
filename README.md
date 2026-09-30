@@ -56,11 +56,17 @@ This order book engine is built with the following design principles:
   as: an immediate-or-cancel **limit** order at `stop - collar` for a
   sell stop and `stop + collar` for a buy stop, where `stop` is the
   stop's trailed stop price at election and `collar` an absolute offset
-  in price units (like CME protection points). The child trades only
-  within that band; the remainder is cancelled and nothing rests. A
-  stop whose band is empty ends `Cancelled { filled_quantity: 0, reason:
-  InsufficientLiquidity }`. The collar must be a multiple of the tick
-  size (`InvalidTickSize`) and cannot be zero
+  in price units (like CME protection points, except that the remainder
+  is cancelled, not rested: a stop whose band is exhausted leaves its
+  position unprotected). The child trades only within that band and
+  nothing rests. A remainder the collar cut (liquidity left beyond the
+  limit, including an empty band) ends `Cancelled { reason:
+  StopProtectionBand }` (new `CancelReason`); one left because the side
+  ran out within the band keeps `InsufficientLiquidity`.
+  `OrderStatus::Triggered` records the child's `limit_price` (`None`
+  for a market child). `StopProtection` is in the prelude. The collar
+  must be a multiple of the tick size (`InvalidTickSize`) and cannot be
+  zero
   (`OrderBookError::InvalidStopProtection`; "unset" is `None`); a band
   past the representable prices is clamped to `0` / `u128::MAX`
   (unbounded on that side). Unset (the default) keeps the 0.14 unpriced
@@ -80,7 +86,29 @@ This order book engine is built with the following design principles:
   `ReplayBookConfig::stop_protection` break exhaustive struct literals
   (add `..Default::default()` for `ReplayBookConfig`, or set the field).
   Replay must be given the source book's collar
-  (`ReplayBookConfig::with_stop_protection`) to reproduce its elections.
+  (`ReplayBookConfig::with_stop_protection`), constant over the replayed
+  range, to reproduce its elections; a mismatch is only detected by
+  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.
+- **`CancelReason::StopProtectionBand`** is appended (bincode index 10):
+  exhaustive matches need the arm.
+- **`OrderStatus::Triggered { child_id, trigger_price, limit_price }`**:
+  the new field breaks patterns and literals that name every field. JSON
+  written by 0.14 decodes (`limit_price: None`); bincode `Triggered`
+  payloads written by 0.14 do not decode, and vice versa. Nothing in the
+  journal or the wire codec carries an `OrderStatus` (the `ExecReport`
+  carries only the status code, still `5`).
+
+#### Known limitations
+
+- A gap of more than one collar through a stop's price always consumes
+  the stop with zero fill (`Cancelled { filled_quantity: 0, reason:
+  StopProtectionBand }`): the position is left unprotected.
+- The collar bounds each child's price, not the cascade: a ladder of
+  stops spaced one collar apart still walks the book `k × collar` in one
+  call (no cascade depth limit or velocity pause).
+- A sell collar larger than the stop price (or a buy `stop + collar`
+  above `u128::MAX`) is clamped: that stop has no protection at all,
+  silently.
 
 #### Migration from 0.14
 
@@ -91,6 +119,9 @@ This order book engine is built with the following design principles:
 | `OrderBookSnapshotPackage { .., has_market_close }` | adds `stop_protection: Option<StopProtection>` (`#[serde(default)]`) |
 | `ReplayBookConfig { .., trade_id_namespace }` | adds `stop_protection: Option<StopProtection>`; builder `with_stop_protection` |
 | `OrderBookError` | adds `InvalidStopProtection { collar, reason }` (maps to `RejectReason::Other(0)`) |
+| `CancelReason` (10 variants) | adds `StopProtectionBand` (appended) |
+| `OrderStatus::Triggered { child_id, trigger_price }` | adds `limit_price: Option<u128>` (`#[serde(default)]`) |
+| collared child remainder: n/a | `Cancelled { StopProtectionBand }` when the collar cut it, `InsufficientLiquidity` when the side ran out |
 
 ### What's New in Version 0.14.0
 

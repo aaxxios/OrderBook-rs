@@ -796,7 +796,7 @@ what it leaves on failure:
   holds; nothing re-acquires the gate. Its events land in the same
   emission scope, after the call's own events (#249).
 - **Bounded cascade.** An elected stop leaves the store when it is
-  elected, so it is elected at most once; every market order adds at
+  elected, so it is elected at most once; every child order adds at
   most one segment to evaluate, so a cascade evaluates at most
   `pending + 1` segments. Trailing only ever tightens a stop and is
   idempotent at a given price. The bound is the only limit on the
@@ -804,7 +804,9 @@ what it leaves on failure:
   the call that printed it. A protection collar (#302) bounds each child's
   price, not how many run; the collar is a `Copy` value read once per
   elected stop, with `checked_sub` / `checked_add` clamped to `0` /
-  `u128::MAX`, so it adds no failure mode.
+  `u128::MAX`, so it adds no failure mode. Classifying a collared
+  remainder (`StopProtectionBand` vs `InsufficientLiquidity`) reads the
+  best-price cache once; it cannot fail.
 - **Arithmetic.** Trailing uses `checked_sub` / `checked_add` (a stop the
   trail cannot represent keeps its price), the admission sequence and the
   pending count are checked. The risk re-booking of a trailed stop
@@ -817,13 +819,13 @@ what it leaves on failure:
   claimed before the `Open` state is recorded, and a cancel releases the
   risk entry and records the state before it removes the entry (under the
   exclusive gate, so no same-id admission can interleave). An elected
-  stop's market-order id (UUIDv5 of the trade-id namespace) that is
+  stop's child-order id (UUIDv5 of the trade-id namespace) that is
   already in use is refused (`Rejected { DuplicateOrderId }`).
 - **Unwind.** Caller code under the gate during an evaluation is the same
   as for any sweep (`Clock` through the tracker, metrics, `tracing`,
   `T::default()` in conversions) and follows the submit-gate policy: the
   kill switch is engaged. An unwind between an elected stop's removal and
-  the end of its market order loses that stop (it is out of the store,
+  the end of its child order loses that stop (it is out of the store,
   its risk released, possibly `Triggered` without a terminal state); the
   rest of the book is consistent. The per-thread scratch buffers are
   taken out of their cell for the pass and simply not returned on an

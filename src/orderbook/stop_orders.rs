@@ -84,10 +84,10 @@
 //! including an empty band over a non-empty side (a gap through the
 //! collar: `filled_quantity: 0`); `Cancelled { InsufficientLiquidity }`
 //! when the side ran out within the band. `Triggered` carries the child's
-//! `limit_price` (`None` for a market child). A band that runs past the representable prices (a
-//! sell collar above the stop price, a buy stop within the collar of
-//! `u128::MAX`) is clamped to the bound (`0` / `u128::MAX`): the collar
-//! does not restrict that side. With a tick size the collar must be a
+//! `limit_price` (`None` for a market child). A band that runs past the
+//! representable prices (a sell collar above the stop price, a buy stop
+//! within the collar of `u128::MAX`) is clamped to the bound (`0` /
+//! `u128::MAX`): the collar does not restrict that side. With a tick size the collar must be a
 //! multiple of it, so the limit of a tick-aligned stop is tick-aligned; the
 //! limit is a bound on matching, never a resting price, so it is not
 //! rounded. An empty band is not counted in the `InsufficientLiquidity`
@@ -1416,8 +1416,10 @@ where
     /// `limit` is `None` for the unpriced market child and the collar limit
     /// with a [`StopProtection`](crate::StopProtection) (#302). Either way
     /// the child only matches, it is never rested: the remainder is
-    /// cancelled (`InsufficientLiquidity`), including a collar child that
-    /// finds nothing within its band (`filled_quantity: 0`).
+    /// cancelled, with the reason from
+    /// [`Self::stop_child_remainder_reason`] (`StopProtectionBand` when the
+    /// collar cut it, including a band with nothing in it,
+    /// `InsufficientLiquidity` otherwise).
     fn execute_stop_child(
         &self,
         stop_id: Id,

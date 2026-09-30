@@ -76,7 +76,9 @@ trades; `snapshots_match` is the oracle.
 Pending trailing stops (`special_orders`) are off book. The prints of every
 call that trades trail them and elect those they cross (see the
 `stop_orders` module docs and `USER_GUIDE.md`). An elected stop leaves the
-store, records `Triggered { child_id, trigger_price }`, and runs a child
+store, records `Triggered { child_id, trigger_price, limit_price }`
+(`limit_price` is the child's collar limit, `None` for a market child),
+and runs a child
 order through the ungated matching path under the gate the call already
 holds, with `origin_stop_id` on its trades. The child is always
 immediate-or-cancel and never rests.
@@ -90,13 +92,17 @@ Its price depends on the book's `StopProtection` (#302,
 - **Collar `c`**: an IOC limit order at `stop - c` for a sell stop and
   `stop + c` for a buy stop, where `stop` is the stop's current (trailed)
   stop price at election, not the electing print. It trades only at levels
-  at or inside that limit; the remainder is cancelled.
+  at or inside that limit; the remainder is cancelled. This resembles CME
+  protection points, **except** that CME rests the remainder at the limit
+  while this book cancels it: a stop whose band is exhausted is consumed
+  and leaves its position unprotected.
 
 | Child outcome | Stop terminal state |
 |---|---|
 | fully filled | `Filled` |
-| partially filled, rest outside the band or no liquidity | `Cancelled { filled_quantity, reason: InsufficientLiquidity }` |
-| nothing within the band | `Cancelled { filled_quantity: 0, reason: InsufficientLiquidity }` |
+| market child (no collar) with a remainder | `Cancelled { filled_quantity, reason: InsufficientLiquidity }` |
+| collared child, remainder while liquidity is left beyond the limit (partial, or nothing within the band) | `Cancelled { filled_quantity, reason: StopProtectionBand }` |
+| collared child, remainder because the side ran out within the band | `Cancelled { filled_quantity, reason: InsufficientLiquidity }` |
 | self-trade prevented | `Cancelled { .., reason: SelfTradePrevention }` |
 | publication of the child's trades failed | `Cancelled { filled_quantity, reason: MatchAborted }` |
 | preflight failure (kill switch, arithmetic, duplicate child id) | `Rejected { reason }` |
@@ -109,16 +115,21 @@ Collar rules:
   is not rounded.
 - A band past the representable prices (a sell collar above the stop
   price, a buy stop within the collar of `u128::MAX`) is clamped to `0` /
-  `u128::MAX`: unbounded on that side.
+  `u128::MAX`: unbounded on that side, so that stop is not protected at
+  all (silently; no per-election log on this hot path).
 - An empty band is not counted in the `InsufficientLiquidity` reject
   metric: a limit that does not cross is not a rejection.
 - STP, fees, risk and the trade-id / notional preflights apply to the
   child as to any taker.
-- Every child of a cascade is bounded by its own collar, so a cascade
-  cannot trade beyond the band of the stop that reaches furthest. The
-  number of children one print can run is still bounded only by the number
-  of pending stops (no depth limit or velocity pause).
+- No stop child trades beyond its own band (the taker whose print elects
+  the first stop is not collared). The number of children one print can
+  run is still bounded only by the number of pending stops: a ladder of
+  stops spaced one collar apart walks the book `k × collar` in one call
+  (no depth limit or velocity pause). A gap of more than one collar
+  through a stop always consumes it with zero fill.
 - The collar is read once per elected stop; paths without a pending stop
   never read it. It travels in the snapshot package (format 6) and in
   `ReplayBookConfig::stop_protection`; replay must use the source book's
-  collar to reproduce its elections.
+  collar, constant over the replayed range (it is not journaled), to
+  reproduce its elections. A mismatch is only detected by
+  `snapshots_match`, not by `ReplayError::OutcomeMismatch`.

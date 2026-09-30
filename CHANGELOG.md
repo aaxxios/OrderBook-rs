@@ -20,9 +20,14 @@ Breaking (0.15.0): new public fields on `OrderBookSnapshotPackage` and
   (`special_orders`) executes as an immediate-or-cancel limit order at
   `stop - collar` (sell) or `stop + collar` (buy), `stop` being its trailed
   stop price at election and the collar an absolute offset in price units
-  (like CME protection points); the remainder is cancelled and nothing
-  rests, and a stop whose band is empty ends `Cancelled { filled_quantity:
-  0, reason: InsufficientLiquidity }`. The collar must be a multiple of the
+  (like CME protection points, except that the remainder is cancelled,
+  not rested: a stop whose band is exhausted leaves its position
+  unprotected); nothing rests. A remainder the collar cut (liquidity left
+  beyond the limit, including an empty band) ends `Cancelled { reason:
+  StopProtectionBand }`; one left because the side ran out within the band
+  keeps `InsufficientLiquidity`. `OrderStatus::Triggered` records the
+  child's `limit_price`. `StopProtection` is re-exported from the prelude.
+  The collar must be a multiple of the
   tick size (`InvalidTickSize`; a later `set_tick_size` does not
   re-validate it) and cannot be zero (new
   `OrderBookError::InvalidStopProtection`, reject code `Other(0)`: a
@@ -54,6 +59,29 @@ Breaking (0.15.0): new public fields on `OrderBookSnapshotPackage` and
   `..Default::default()`). `ReplayBookConfig::new` leaves it `None`.
 - **`OrderBookSnapshotPackage::stop_protection` (#302).** New public
   field; exhaustive literals must set it.
+- **`CancelReason::StopProtectionBand` (#302).** New variant, appended
+  (bincode index 10, JSON `"StopProtectionBand"`); exhaustive matches need
+  the arm. The collared child's terminal reason when the collar cut its
+  sweep; `InsufficientLiquidity` otherwise.
+- **`OrderStatus::Triggered::limit_price` (#302).** New field
+  (`Option<u128>`, `#[serde(default)]`): the child's collar limit, `None`
+  for a market child. 0.14 JSON decodes with `None`; bincode `Triggered`
+  payloads do not decode across 0.14 / 0.15. Patterns and literals naming
+  every field must add it. `Display` appends `, limit=<price>` when set.
+  Nothing journaled or on the wire carries `OrderStatus` (`ExecReport`
+  keeps status code 5).
+
+### Known limitations
+
+- **Stop protection collar (#302).** A gap of more than one collar through
+  a stop's price always consumes the stop with zero fill
+  (`StopProtectionBand`), leaving the position unprotected. The collar
+  bounds each child, not the cascade: a ladder of stops spaced one collar
+  apart still walks the book `k × collar` in one call (no cascade depth
+  limit or velocity pause). A sell collar larger than the stop price is
+  clamped to a limit of 0 and does not protect that stop. Replay needs the
+  source book's collar, constant over the replayed range; a mismatch is
+  only detected by `snapshots_match`.
 
 ## [0.14.0] - 2026-09-30
 
