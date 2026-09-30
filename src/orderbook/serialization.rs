@@ -17,7 +17,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! orderbook-rs = { version = "0.14", features = ["bincode"] }
+//! orderbook-rs = { version = "0.15", features = ["bincode"] }
 //! ```
 
 use crate::orderbook::book_change_event::PriceLevelChangedEvent;
@@ -235,7 +235,7 @@ pub const MAX_BINCODE_PAYLOAD_BYTES_CEILING: usize = 64 * 1024 * 1024;
 ///
 /// ```toml
 /// [dependencies]
-/// orderbook-rs = { version = "0.14", features = ["bincode"] }
+/// orderbook-rs = { version = "0.15", features = ["bincode"] }
 /// ```
 ///
 /// # Content Type

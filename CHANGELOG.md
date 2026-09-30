@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Breaking (0.15.0): new public fields on `OrderBookSnapshotPackage` and
-`ReplayBookConfig` (`cargo semver-checks` against `v0.14.0`:
-`constructible_struct_adds_field`) and snapshot format 6.
+## [0.15.0] - 2026-09-30
+
+The stop-protection release. Elected trailing stops (#286) can be bounded
+by a per-book protection collar (#302): with a collar configured, an
+elected stop's child is an immediate-or-cancel limit order at the trailed
+stop price minus (sell) or plus (buy) the collar, instead of an unpriced
+market order. Without a collar, behaviour is unchanged from 0.14.0.
+Breaking: new public fields on `OrderBookSnapshotPackage`,
+`ReplayBookConfig` and `OrderStatus::Triggered`, a new
+`CancelReason::StopProtectionBand` variant, and snapshot format 6.
 
 ### Added
 
@@ -4060,5 +4067,6 @@ change.
 - **Market Metrics**: VWAP, micro price, queue analysis, depth
   statistics, and functional iterators.
 
-[Unreleased]: https://github.com/joaquinbejar/OrderBook-rs/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/OrderBook-rs/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/joaquinbejar/OrderBook-rs/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/joaquinbejar/OrderBook-rs/compare/v0.13.1...v0.14.0

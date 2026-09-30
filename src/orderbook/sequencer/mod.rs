@@ -24,7 +24,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! orderbook-rs = { version = "0.14", features = ["journal"] }
+//! orderbook-rs = { version = "0.15", features = ["journal"] }
 //! ```
 //!
 //! The sequencer types and [`Journal`] trait are always available.
