@@ -1813,6 +1813,64 @@ mod tests {
         assert_eq!(book.risk_accounting_anomalies(), 0);
     }
 
+    /// Determinism review F1 / Copilot on #301: snapshots captured while
+    /// another thread runs cascades are coherent (levels, pending stops and
+    /// last trade from one state) and always restore.
+    #[test]
+    fn test_snapshots_during_cascades_restore() {
+        let book = Arc::new(new_book());
+        book.add_order(limit(1, 10, 1_000_000, Side::Buy, user(1)))
+            .expect("deep bid");
+        book.add_order(limit(2, 1_000, 1_000_000, Side::Sell, user(1)))
+            .expect("deep ask");
+        let writer = {
+            let book = Arc::clone(&book);
+            std::thread::spawn(move || {
+                let mut next = 1_000u64;
+                for round in 0..40u128 {
+                    // A cascade: three bids and three sell stops, then a
+                    // sweep that walks them.
+                    let top = 500 + round;
+                    for step in 0..3u128 {
+                        next += 1;
+                        book.add_order(limit(next, top - step, 1, Side::Buy, user(1)))
+                            .expect("bid");
+                    }
+                    next += 1;
+                    let _ = book.submit_market_order(id(next), 1, Side::Sell);
+                    for step in 0..3u128 {
+                        next += 1;
+                        let stop_px = top - 2 - step;
+                        let _ = book.add_order(stop(
+                            next,
+                            Side::Sell,
+                            stop_px,
+                            top + 5,
+                            (top + 5 - stop_px) as u64,
+                            1,
+                        ));
+                    }
+                    // Walks the two bids left and the deep bid: elects the
+                    // three stops, whose market orders sell into it.
+                    next += 1;
+                    let _ = book.submit_market_order(id(next), 3, Side::Sell);
+                }
+                assert!(book.trailing_stop_count() < 3, "cascades ran");
+            })
+        };
+        let mut restored = 0;
+        while !writer.is_finished() || restored == 0 {
+            let package = book.create_snapshot_package(usize::MAX).expect("package");
+            let mut target = new_book();
+            target
+                .restore_from_snapshot_package(package)
+                .expect("a snapshot taken during cascades restores");
+            restored += 1;
+        }
+        writer.join().expect("writer");
+        assert!(restored > 0);
+    }
+
     // ---- determinism and concurrency ------------------------------------
 
     fn scripted_trades() -> Vec<String> {

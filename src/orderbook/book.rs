@@ -5025,6 +5025,18 @@ where
     /// by `depth`, in admission order; never part of the level lists) and
     /// the last trade price, which a restore installs.
     ///
+    /// # Concurrency
+    ///
+    /// The whole capture holds the **shared** side of the submit gate, so a
+    /// call holding the exclusive side (every call that trades or touches a
+    /// pending stop while one is pending, mass cancels, restores) is never
+    /// captured half done: the levels, the pending stops (with their trailed
+    /// terms) and the last trade price describe one state between two such
+    /// calls. Shared-gate sweeps (books without pending stops) can still
+    /// overlap it, with the level-statistics caveat above. It must not be
+    /// called from caller code that runs under the book's gate (a `Clock`,
+    /// `T::clone`): the gate is not reentrant.
+    ///
     /// # Errors
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
@@ -5032,6 +5044,13 @@ where
     /// pricelevel 0.10, e.g. on a refused allocation or a walk that stays
     /// incoherent under concurrent mutation). No partial snapshot is returned.
     pub fn create_snapshot(&self, depth: usize) -> Result<OrderBookSnapshot, OrderBookError> {
+        // Copilot / determinism review on #301: sample levels, pending
+        // stops and the last trade price under one shared-gate window. A
+        // bare guard: the capture emits no events.
+        let _shared = self.submit_gate.read().unwrap_or_else(|poisoned| {
+            self.on_submit_gate_poisoned();
+            poisoned.into_inner()
+        });
         // Get all bid prices and sort them in descending order
         let mut bid_prices: Vec<u128> = self.bids.iter().map(|item| *item.key()).collect();
         bid_prices.sort_by(|a, b| b.cmp(a)); // Descending order
