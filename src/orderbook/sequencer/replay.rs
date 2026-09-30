@@ -131,10 +131,18 @@ pub struct ReplayBookConfig {
     /// Protection collar for elected stop orders the source book used
     /// (#302), or `None` for unprotected (market) execution. Applied as
     /// is (no tick-size re-check: the source book may hold a collar
-    /// admitted under a previous tick size). A collar changes which trades
-    /// an elected stop makes, so it must match the source book for the
-    /// replay to reproduce them. Chain [`Self::with_stop_protection`] to
-    /// set it.
+    /// admitted under a previous tick size). Chain
+    /// [`Self::with_stop_protection`] to set it.
+    ///
+    /// A collar changes which trades an elected stop makes, so it must
+    /// match the source book **and** have been constant over the replayed
+    /// range: `set_stop_protection` is not journaled, so a collar changed
+    /// mid-stream cannot be reproduced. A mismatch is **not** reported as
+    /// [`ReplayError::OutcomeMismatch`] at the election (stop elections are
+    /// not journaled commands, and the command that printed still
+    /// succeeds); it surfaces only when the replayed book is compared with
+    /// [`snapshots_match`] (or, incidentally, if the diverged book later
+    /// changes a journaled command's verdict).
     pub stop_protection: Option<StopProtection>,
 }
 

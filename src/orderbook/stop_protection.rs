@@ -3,7 +3,7 @@
 //! Without a collar an elected trailing stop executes as an unpriced
 //! immediate-or-cancel market order: in a thin book one print can elect a
 //! chain of stops that sweeps one side down to its last level. A
-//! [`StopProtection`] bounds that walk the way CME protection points do: the
+//! [`StopProtection`] bounds that walk much like CME protection points: the
 //! elected stop executes as an immediate-or-cancel **limit** order at its
 //! stop price moved by the collar against it,
 //!
@@ -13,6 +13,15 @@
 //! where `stop` is the stop's (trailed) stop price at election. Whatever does
 //! not fill within that band is cancelled: an elected stop never leaves
 //! liquidity on the book.
+//!
+//! **Unlike CME**, the remainder is cancelled, not rested at the limit: a
+//! stop whose band is exhausted is consumed and leaves its position
+//! **unprotected** (terminal state `Cancelled { StopProtectionBand }` when
+//! liquidity remained beyond the limit). A gap of more than one collar
+//! through the stop price therefore always consumes the stop with zero
+//! fill. The collar bounds each child's price, not the cascade: a ladder of
+//! stops spaced one collar apart still walks the book `k × collar` in one
+//! call (there is no cascade depth limit or velocity pause).
 //!
 //! The collar is an absolute offset in price units (the same `u128` units
 //! as order prices). It is configured per book with
@@ -41,9 +50,20 @@ const HIGHEST_PRICE: u128 = u128::MAX;
 ///
 /// An elected stop executes as an immediate-or-cancel limit order at its
 /// stop price moved by [`collar`](Self::collar) price units against it (see
-/// [`limit_price`](Self::limit_price)); any remainder is cancelled. The
-/// collar is never zero: "no protection" is `None` on the book, not a zero
-/// collar.
+/// [`limit_price`](Self::limit_price)); any remainder is cancelled (unlike
+/// CME protection points, which rest it). The collar is never zero: "no
+/// protection" is `None` on the book, not a zero collar.
+///
+/// # A collar wider than the price: no protection on that side
+///
+/// A **sell** stop whose collar is larger than its stop price gets a limit
+/// of `0`: every bid is within its band, so the collar does **not** protect
+/// it at all (the same for a buy stop whose `stop + collar` exceeds
+/// `u128::MAX`, limit `u128::MAX`). This is silent by design (no log per
+/// election, which is a hot path): size the collar well below the stop
+/// prices it protects. A stop trailing down towards the collar is covered
+/// by the same rule, since the limit is computed from the trailed stop
+/// price at election.
 ///
 /// Serialized as `{"collar": <u128>}`; a zero collar is refused on
 /// deserialization.

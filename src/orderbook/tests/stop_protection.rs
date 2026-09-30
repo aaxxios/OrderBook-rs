@@ -195,7 +195,7 @@ mod tests {
             book.order_status(id(51)),
             Some(OrderStatus::Cancelled {
                 filled_quantity: 1,
-                reason: CancelReason::InsufficientLiquidity,
+                reason: CancelReason::StopProtectionBand,
             })
         );
         // The cascade stopped at 97: stop 52 (96) is still pending.
@@ -248,7 +248,7 @@ mod tests {
             book.order_status(id(51)),
             Some(OrderStatus::Cancelled {
                 filled_quantity: 1,
-                reason: CancelReason::InsufficientLiquidity,
+                reason: CancelReason::StopProtectionBand,
             })
         );
         assert_eq!(book.trailing_stop_ids(), vec![id(52)]);
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nothing_within_the_collar_cancels_the_stop_unfilled() {
+    fn test_empty_sell_band_cancels_the_stop_unfilled_with_band_reason() {
         let mut book = new_book();
         book.set_stop_protection(collar(5)).expect("collar");
         let log = record_fills(&mut book);
@@ -285,10 +285,11 @@ mod tests {
                 OrderStatus::Triggered {
                     child_id: child,
                     trigger_price: 100,
+                    limit_price: Some(95),
                 },
                 OrderStatus::Cancelled {
                     filled_quantity: 0,
-                    reason: CancelReason::InsufficientLiquidity,
+                    reason: CancelReason::StopProtectionBand,
                 },
             ]
         );
@@ -333,7 +334,7 @@ mod tests {
             book.order_status(id(50)),
             Some(OrderStatus::Cancelled {
                 filled_quantity: 0,
-                reason: CancelReason::InsufficientLiquidity,
+                reason: CancelReason::StopProtectionBand,
             })
         );
         assert_eq!(book.visible_quantity_at_price(101, Side::Buy), Some(2));
@@ -496,7 +497,7 @@ mod tests {
             book.order_status(id(50)),
             Some(OrderStatus::Cancelled {
                 filled_quantity: 1,
-                reason: CancelReason::InsufficientLiquidity,
+                reason: CancelReason::StopProtectionBand,
             })
         );
         assert_eq!(book.visible_quantity_at_price(96, Side::Buy), Some(1));
@@ -558,7 +559,7 @@ mod tests {
                 book.order_status(id(50)),
                 Some(OrderStatus::Cancelled {
                     filled_quantity: 2,
-                    reason: CancelReason::InsufficientLiquidity,
+                    reason: CancelReason::StopProtectionBand,
                 })
             );
         }
@@ -745,6 +746,307 @@ mod tests {
             )),
             Err(err) => panic!("replay itself should not fail: {err:?}"),
         }
+    }
+
+    // ---- review follow-ups: reasons, limit on Triggered, STP, lot, fees ----
+
+    /// The stop's order-state history as a list.
+    fn history(book: &OrderBook<()>, raw: u64) -> Vec<OrderStatus> {
+        book.get_order_history(id(raw))
+            .expect("tracked")
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect()
+    }
+
+    #[test]
+    fn test_empty_buy_band_cancels_the_stop_unfilled_with_band_reason() {
+        let mut book = new_book();
+        book.set_stop_protection(collar(5)).expect("collar");
+        let log = record_fills(&mut book);
+        book.add_order(limit(1, 100, 1, Side::Sell, user(1)))
+            .expect("ask 100");
+        book.add_order(limit(2, 110, 5, Side::Sell, user(1)))
+            .expect("ask 110");
+        book.add_order(stop(50, Side::Buy, 100, 5, 2, user(2)))
+            .expect("stop");
+        book.submit_market_order(id(9), 1, Side::Buy)
+            .expect("trade at 100");
+        assert!(child_fills(&log, 50).is_empty(), "limit 105, best ask 110");
+        assert_eq!(
+            history(&book, 50),
+            vec![
+                OrderStatus::Open,
+                OrderStatus::Triggered {
+                    child_id: book.stop_trigger_order_id(id(50)),
+                    trigger_price: 100,
+                    limit_price: Some(105),
+                },
+                OrderStatus::Cancelled {
+                    filled_quantity: 0,
+                    reason: CancelReason::StopProtectionBand,
+                },
+            ]
+        );
+        assert_eq!(book.visible_quantity_at_price(110, Side::Sell), Some(5));
+        assert_eq!(book.best_bid(), None, "the child never rests");
+    }
+
+    /// `InsufficientLiquidity` when the side runs out within the band (partial
+    /// and empty), `StopProtectionBand` only when liquidity is left beyond it.
+    #[test]
+    fn test_side_exhausted_within_the_band_keeps_insufficient_liquidity() {
+        // Partial: 99 fills, then the bid side is empty.
+        let mut book = new_book();
+        book.set_stop_protection(collar(5)).expect("collar");
+        let log = record_fills(&mut book);
+        book.add_order(limit(1, 100, 1, Side::Buy, user(1)))
+            .expect("bid 100");
+        book.add_order(limit(2, 99, 1, Side::Buy, user(1)))
+            .expect("bid 99");
+        book.add_order(stop(50, Side::Sell, 100, 5, 3, user(2)))
+            .expect("stop");
+        book.submit_market_order(id(9), 1, Side::Sell)
+            .expect("trade at 100");
+        assert_eq!(child_fills(&log, 50), vec![(99, 1)]);
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 1,
+                reason: CancelReason::InsufficientLiquidity,
+            })
+        );
+
+        // Empty: the trigger took the only bid.
+        let mut book = new_book();
+        book.set_stop_protection(collar(5)).expect("collar");
+        book.add_order(limit(1, 100, 1, Side::Buy, user(1)))
+            .expect("bid 100");
+        book.add_order(stop(50, Side::Sell, 100, 5, 2, user(2)))
+            .expect("stop");
+        book.submit_market_order(id(9), 1, Side::Sell)
+            .expect("trade at 100");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 0,
+                reason: CancelReason::InsufficientLiquidity,
+            })
+        );
+
+        // Band clamped to 0 (collar above the stop): nothing can lie beyond
+        // it, so a remainder is always InsufficientLiquidity.
+        let mut book = new_book();
+        book.set_stop_protection(collar(10)).expect("collar");
+        book.add_order(limit(1, 3, 1, Side::Buy, user(1)))
+            .expect("bid 3");
+        book.add_order(limit(2, 1, 1, Side::Buy, user(1)))
+            .expect("bid 1");
+        book.add_order(stop(50, Side::Sell, 3, 5, 2, user(2)))
+            .expect("stop");
+        book.submit_market_order(id(9), 1, Side::Sell)
+            .expect("trade at 3");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 1,
+                reason: CancelReason::InsufficientLiquidity,
+            })
+        );
+    }
+
+    #[test]
+    fn test_triggered_carries_the_child_limit_or_none() {
+        for (protection, expected) in [(None, None), (collar(2), Some(98))] {
+            let mut book = new_book();
+            book.set_stop_protection(protection).expect("collar");
+            book.add_order(limit(1, 100, 1, Side::Buy, user(1)))
+                .expect("bid 100");
+            book.add_order(limit(2, 99, 5, Side::Buy, user(1)))
+                .expect("bid 99");
+            book.add_order(stop(50, Side::Sell, 100, 5, 2, user(2)))
+                .expect("stop");
+            book.submit_market_order(id(9), 1, Side::Sell)
+                .expect("trade at 100");
+            let child = book.stop_trigger_order_id(id(50));
+            let triggered = OrderStatus::Triggered {
+                child_id: child,
+                trigger_price: 100,
+                limit_price: expected,
+            };
+            assert_eq!(
+                history(&book, 50),
+                vec![
+                    OrderStatus::Open,
+                    triggered.clone(),
+                    OrderStatus::Filled { filled_quantity: 2 },
+                ]
+            );
+            let text = triggered.to_string();
+            match expected {
+                Some(limit) => assert!(text.ends_with(&format!(", limit={limit})")), "{text}"),
+                None => assert!(!text.contains("limit="), "{text}"),
+            }
+        }
+    }
+
+    /// A stop trailed by a sweep's first print and elected by its last in
+    /// the same sweep: the collar is anchored on the trailed stop price.
+    #[test]
+    fn test_stop_trailed_and_elected_in_one_sweep_anchors_on_the_trailed_stop() {
+        let mut book = new_book();
+        book.set_stop_protection(collar(2)).expect("collar");
+        let log = record_fills(&mut book);
+        for (raw, price) in [(1, 112), (2, 108), (3, 104), (4, 103), (5, 101)] {
+            book.add_order(limit(raw, price, 1, Side::Buy, user(1)))
+                .expect("bid");
+        }
+        // Stop 95, watermark 100, trail 5.
+        book.add_order(stop(50, Side::Sell, 95, 5, 2, user(2)))
+            .expect("stop");
+        // One sell sweep prints 112, 108, 104: the first print trails the
+        // stop to 107, the last (104) elects it. Limit 107 - 2 = 105: the
+        // bids at 103 / 101 are outside (an anchor on the admitted stop
+        // would give 93, on the print 102: both would fill 103).
+        book.submit_market_order(id(9), 3, Side::Sell)
+            .expect("sweep");
+        assert!(child_fills(&log, 50).is_empty());
+        assert_eq!(
+            history(&book, 50),
+            vec![
+                OrderStatus::Open,
+                OrderStatus::Triggered {
+                    child_id: book.stop_trigger_order_id(id(50)),
+                    trigger_price: 104,
+                    limit_price: Some(105),
+                },
+                OrderStatus::Cancelled {
+                    filled_quantity: 0,
+                    reason: CancelReason::StopProtectionBand,
+                },
+            ]
+        );
+        assert_eq!(book.visible_quantity_at_price(103, Side::Buy), Some(1));
+    }
+
+    #[test]
+    fn test_collar_child_with_stp_cancel_both() {
+        let mut book = new_book();
+        book.set_stp_mode(STPMode::CancelBoth);
+        book.set_stop_protection(collar(3)).expect("collar");
+        let log = record_fills(&mut book);
+        book.add_order(limit(1, 100, 1, Side::Buy, user(1)))
+            .expect("bid 100");
+        book.add_order(limit(2, 99, 1, Side::Buy, user(1)))
+            .expect("bid 99");
+        book.add_order(limit(3, 98, 1, Side::Buy, user(2)))
+            .expect("own bid 98");
+        book.add_order(limit(4, 96, 1, Side::Buy, user(1)))
+            .expect("bid 96");
+        book.add_order(stop(50, Side::Sell, 100, 5, 3, user(2)))
+            .expect("stop");
+        book.submit_market_order_with_user(id(9), 1, Side::Sell, user(3))
+            .expect("trade at 100");
+        // Limit 97: 99 fills, the own bid at 98 cancels both.
+        assert_eq!(child_fills(&log, 50), vec![(99, 1)]);
+        assert!(book.get_order(id(3)).is_none(), "own maker cancelled");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 1,
+                reason: CancelReason::SelfTradePrevention,
+            })
+        );
+        assert_eq!(book.visible_quantity_at_price(96, Side::Buy), Some(1));
+        assert_eq!(book.best_ask(), None, "the child never rests");
+    }
+
+    #[test]
+    fn test_collar_child_on_a_lot_size_book() {
+        let mut book = new_book();
+        book.set_lot_size(2);
+        book.set_stop_protection(collar(2)).expect("collar");
+        let log = record_fills(&mut book);
+        for (raw, price, qty) in [(1, 100, 2), (2, 99, 2), (3, 98, 2), (4, 95, 4)] {
+            book.add_order(limit(raw, price, qty, Side::Buy, user(1)))
+                .expect("bid");
+        }
+        book.add_order(stop(50, Side::Sell, 100, 5, 6, user(2)))
+            .expect("stop");
+        book.submit_market_order(id(9), 2, Side::Sell)
+            .expect("trade at 100");
+        assert_eq!(child_fills(&log, 50), vec![(99, 2), (98, 2)]);
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 4,
+                reason: CancelReason::StopProtectionBand,
+            })
+        );
+        assert_eq!(book.visible_quantity_at_price(95, Side::Buy), Some(4));
+    }
+
+    #[test]
+    fn test_collared_child_trades_carry_their_fees() {
+        let mut book = new_book();
+        let schedule = FeeSchedule::new(-2, 10);
+        book.set_fee_schedule(Some(schedule));
+        book.set_stop_protection(collar(10_000)).expect("collar");
+        type FeeLog = Arc<Mutex<Vec<(Option<Id>, i128, i128, Vec<(u128, u64)>)>>>;
+        let fees: FeeLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&fees);
+        book.set_trade_listener(Arc::new(move |result: &TradeResult| {
+            sink.lock().expect("log").push((
+                result.origin_stop_id,
+                result.total_maker_fees,
+                result.total_taker_fees,
+                result
+                    .match_result
+                    .trades()
+                    .as_vec()
+                    .iter()
+                    .map(|t| (t.price().as_u128(), t.quantity().as_u64()))
+                    .collect(),
+            ));
+        }));
+        for (raw, price) in [(1, 100_000), (2, 95_000), (3, 90_000), (4, 85_000)] {
+            book.add_order(limit(raw, price, 1, Side::Buy, user(1)))
+                .expect("bid");
+        }
+        book.add_order(stop(50, Side::Sell, 100_000, 5_000, 3, user(2)))
+            .expect("stop");
+        book.submit_market_order(id(9), 1, Side::Sell)
+            .expect("trade at 100000");
+
+        let log = fees.lock().expect("log").clone();
+        let child: Vec<_> = log
+            .into_iter()
+            .filter(|entry| entry.0 == Some(id(50)))
+            .collect();
+        assert_eq!(child.len(), 1, "one TradeResult for the child");
+        let (_, maker, taker, trades) = child[0].clone();
+        assert_eq!(trades, vec![(95_000, 1), (90_000, 1)], "limit 90000");
+        let expected = |is_maker: bool| -> i128 {
+            trades
+                .iter()
+                .map(|&(price, qty)| {
+                    schedule
+                        .calculate_fee(price * u128::from(qty), is_maker)
+                        .expect("fee")
+                })
+                .sum()
+        };
+        assert_eq!(taker, expected(false));
+        assert_eq!(taker, 95 + 90, "10 bps taker fee");
+        assert_eq!(maker, expected(true));
+        assert!(maker < 0, "maker rebate");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Cancelled {
+                filled_quantity: 2,
+                reason: CancelReason::StopProtectionBand,
+            })
+        );
     }
 }
 

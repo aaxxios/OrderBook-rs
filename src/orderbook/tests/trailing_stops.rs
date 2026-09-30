@@ -296,7 +296,8 @@ mod tests {
     }
 
     /// Maintainer decision (b): the election is an explicit transition of
-    /// the stop to `Triggered { child_id, trigger_price }` (then the
+    /// the stop to `Triggered { child_id, trigger_price, limit_price }`
+    /// (`limit_price: None` without a collar, #302; then the
     /// market order's terminal state), and the market order's trades carry
     /// the stop in `origin_stop_id`.
     #[test]
@@ -332,6 +333,7 @@ mod tests {
                 OrderStatus::Triggered {
                     child_id: child,
                     trigger_price: 95,
+                    limit_price: None,
                 },
                 OrderStatus::Filled { filled_quantity: 6 },
             ]

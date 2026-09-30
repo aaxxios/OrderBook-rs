@@ -22,7 +22,8 @@
 //! IOC/FOK insufficient liquidity   → Cancelled { InsufficientLiquidity }
 //! sweep aborted by a level failure → Cancelled { MatchAborted } (filled = committed prefix)
 //! trailing stop admitted (#286)    → Open (pending off book)
-//! trailing stop elected            → Triggered { child_id, trigger_price } → Filled / Cancelled / Rejected
+//! trailing stop elected            → Triggered { child_id, trigger_price, limit_price } → Filled / Cancelled / Rejected
+//! collared stop child cut by band  → Cancelled { StopProtectionBand } (#302)
 //! ```
 
 use super::clock::{Clock, MonotonicClock};
@@ -71,6 +72,16 @@ pub enum CancelReason {
     /// Appended last so the positional (bincode) index of every earlier
     /// variant is unchanged.
     RestFailed,
+    /// An elected stop's collared child (#302, see
+    /// [`StopProtection`](crate::StopProtection)) left a remainder because
+    /// the protection collar cut its sweep: liquidity remained on the
+    /// opposite side, but only beyond the child's limit. Includes an empty
+    /// band (`filled_quantity: 0`) over a non-empty side. When the side
+    /// itself ran out within the band the reason is
+    /// [`Self::InsufficientLiquidity`]. Recorded on the stop's id.
+    /// Appended last so the positional (bincode) index of every earlier
+    /// variant is unchanged.
+    StopProtectionBand,
 }
 
 impl std::fmt::Display for CancelReason {
@@ -86,6 +97,7 @@ impl std::fmt::Display for CancelReason {
             Self::InsufficientLiquidity => write!(f, "insufficient liquidity"),
             Self::MatchAborted => write!(f, "match aborted"),
             Self::RestFailed => write!(f, "rest failed"),
+            Self::StopProtectionBand => write!(f, "stop protection band"),
         }
     }
 }
@@ -143,21 +155,29 @@ pub enum OrderStatus {
     },
 
     /// A pending trailing stop was elected by a trade (#286) and is being
-    /// executed as the market order `child_id`.
+    /// executed as the child order `child_id`.
     ///
-    /// Recorded for the **stop's** id right before its market order runs,
+    /// Recorded for the **stop's** id right before its child order runs,
     /// so a listener sees the election and the link to the child: the
     /// child's trades carry the stop in `TradeResult::origin_stop_id`.
-    /// Not terminal: the stop then takes its market order's terminal state
+    /// Not terminal: the stop then takes its child order's terminal state
     /// (`Filled`, `Cancelled`, `Rejected`) in the same call. Appended
     /// last, so the positional (bincode) index of every earlier variant is
     /// unchanged.
     Triggered {
-        /// The id of the stop's market order (see
+        /// The id of the stop's child order (see
         /// `OrderBook::stop_trigger_order_id`).
         child_id: Id,
         /// The trade price that elected the stop, in price ticks.
         trigger_price: u128,
+        /// The child's limit price, in price ticks (#302): `Some` when the
+        /// book has a [`StopProtection`](crate::StopProtection) collar (an
+        /// immediate-or-cancel limit child), `None` for the unpriced
+        /// market child. `#[serde(default)]`: JSON written before 0.15
+        /// decodes with `None`; bincode payloads of this variant written
+        /// by 0.14 do not decode.
+        #[serde(default)]
+        limit_price: Option<u128>,
     },
 }
 
@@ -185,7 +205,7 @@ impl OrderStatus {
     }
 
     /// Returns the filled quantity, or 0 for `Open`, `Rejected` and
-    /// `Triggered` (a stop's own id never fills; its market order does).
+    /// `Triggered` (a stop's own id never fills; its child order does).
     #[must_use]
     #[inline]
     pub fn filled_quantity(&self) -> u64 {
@@ -222,7 +242,16 @@ impl std::fmt::Display for OrderStatus {
             OrderStatus::Triggered {
                 child_id,
                 trigger_price,
+                limit_price: None,
             } => write!(f, "Triggered(child={child_id}, price={trigger_price})"),
+            OrderStatus::Triggered {
+                child_id,
+                trigger_price,
+                limit_price: Some(limit_price),
+            } => write!(
+                f,
+                "Triggered(child={child_id}, price={trigger_price}, limit={limit_price})"
+            ),
         }
     }
 }
@@ -1168,6 +1197,9 @@ mod tests {
             CancelReason::MassCancelByUser,
             CancelReason::MassCancelByPriceRange,
             CancelReason::InsufficientLiquidity,
+            CancelReason::MatchAborted,
+            CancelReason::RestFailed,
+            CancelReason::StopProtectionBand,
         ];
 
         for reason in &reasons {
@@ -1177,6 +1209,81 @@ mod tests {
             assert!(decoded.is_ok());
             assert_eq!(&decoded.unwrap_or(CancelReason::UserRequested), reason);
         }
+    }
+
+    /// #302: `Triggered::limit_price` round-trips (`Some` / `None`), and a
+    /// 0.14 JSON `Triggered` without the field decodes with `None`.
+    #[test]
+    fn test_triggered_limit_price_json_round_trip_and_legacy_decode() {
+        let child_id = Id::from_u64(7);
+        for limit_price in [None, Some(98u128), Some(u128::MAX)] {
+            let status = OrderStatus::Triggered {
+                child_id,
+                trigger_price: 100,
+                limit_price,
+            };
+            let json = serde_json::to_string(&status).expect("encode");
+            let decoded: OrderStatus = serde_json::from_str(&json).expect("decode");
+            assert_eq!(decoded, status);
+        }
+        let legacy = format!(r#"{{"Triggered":{{"child_id":"{child_id}","trigger_price":95}}}}"#);
+        let decoded: OrderStatus = serde_json::from_str(&legacy).expect("0.14 JSON decodes");
+        assert_eq!(
+            decoded,
+            OrderStatus::Triggered {
+                child_id,
+                trigger_price: 95,
+                limit_price: None,
+            }
+        );
+        let band = OrderStatus::Cancelled {
+            filled_quantity: 0,
+            reason: CancelReason::StopProtectionBand,
+        };
+        let json = serde_json::to_string(&band).expect("encode");
+        assert!(json.contains("StopProtectionBand"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<OrderStatus>(&json).expect("decode"),
+            band
+        );
+        assert_eq!(
+            CancelReason::StopProtectionBand.to_string(),
+            "stop protection band"
+        );
+    }
+
+    /// #302: bincode round trip of the new variant and field. The variant
+    /// is appended, so every earlier `CancelReason` keeps its index.
+    #[cfg(feature = "bincode")]
+    #[test]
+    fn test_stop_protection_statuses_bincode_round_trip() {
+        let config = bincode::config::standard();
+        for status in [
+            OrderStatus::Triggered {
+                child_id: Id::from_u64(7),
+                trigger_price: 100,
+                limit_price: Some(98),
+            },
+            OrderStatus::Triggered {
+                child_id: Id::from_u64(7),
+                trigger_price: 100,
+                limit_price: None,
+            },
+            OrderStatus::Cancelled {
+                filled_quantity: 3,
+                reason: CancelReason::StopProtectionBand,
+            },
+        ] {
+            let bytes = bincode::serde::encode_to_vec(&status, config).expect("encode");
+            let (decoded, _): (OrderStatus, usize) =
+                bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+            assert_eq!(decoded, status);
+        }
+        let index =
+            |reason: CancelReason| bincode::serde::encode_to_vec(reason, config).expect("encode");
+        assert_eq!(index(CancelReason::UserRequested), vec![0]);
+        assert_eq!(index(CancelReason::RestFailed), vec![9]);
+        assert_eq!(index(CancelReason::StopProtectionBand), vec![10]);
     }
 
     /// #250: a poisoned terminal-queue mutex is recovered, so eviction keeps
