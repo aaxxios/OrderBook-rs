@@ -310,9 +310,10 @@ mod tests {
 
     /// #286: a pending trailing stop's election runs under the gate of the
     /// call whose trade crossed it, so its market order's events follow
-    /// that call's own events in the same batch: the crossing trade, then
-    /// the stop's terminal state after its market order's level and trade
-    /// events. The pre-#286 stream above is unchanged (it has no stop).
+    /// that call's own events in the same batch: the crossing trade, the
+    /// stop's `Triggered { child_id, trigger_price }` election event, the
+    /// market order's level and trade events, then the stop's terminal
+    /// state. The pre-#286 stream above is unchanged (it has no stop).
     #[cfg(feature = "special_orders")]
     const EXPECTED_WITH_STOP: &[&str] = &[
         "S 00000000-0000-0001-0000-000000000000 Open -> Open",
@@ -337,11 +338,12 @@ mod tests {
         "S 00000000-0000-0001-0000-000000000000 Open -> Filled(1)",
         "T seq=7 taker=00000000-0000-0006-0000-000000000000 makers=[00000000-0000-0001-0000-000000000000@95x1] maker_fees=0 taker_fees=0",
         "S 00000000-0000-0006-0000-000000000000 Filled(1) -> Filled(1)",
+        "S 00000000-0000-0032-0000-000000000000 Open -> Triggered(child=5e0c9aad-1fc6-598c-bd0d-c62ff57326d6, price=95)",
         "L seq=8 Buy 94 q=0",
         "L seq=9 Buy 93 q=3",
         "S 00000000-0000-0002-0000-000000000000 Open -> Filled(2)",
         "T seq=10 taker=5e0c9aad-1fc6-598c-bd0d-c62ff57326d6 makers=[00000000-0000-0002-0000-000000000000@94x2,00000000-0000-0003-0000-000000000000@93x2] maker_fees=0 taker_fees=0",
-        "S 00000000-0000-0032-0000-000000000000 Open -> Filled(4)",
+        "S 00000000-0000-0032-0000-000000000000 Triggered(child=5e0c9aad-1fc6-598c-bd0d-c62ff57326d6, price=95) -> Filled(4)",
         "C T seq=7 taker=00000000-0000-0006-0000-000000000000 makers=[00000000-0000-0001-0000-000000000000@95x1] maker_fees=0 taker_fees=0",
         "R elect ok",
     ];

@@ -4643,8 +4643,24 @@ where
         outcome: MatchOutcome,
         want_committed: bool,
     ) -> Result<MatchResult, SubmitFailure> {
+        self.publish_match_outcome_from(outcome, want_committed, None)
+    }
+
+    /// [`Self::publish_match_outcome`] for trades whose `TradeResult`
+    /// carries `origin_stop_id` (#286: the market order of an elected
+    /// trailing stop).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_match_outcome`].
+    pub(crate) fn publish_match_outcome_from(
+        &self,
+        outcome: MatchOutcome,
+        want_committed: bool,
+        origin_stop_id: Option<Id>,
+    ) -> Result<MatchResult, SubmitFailure> {
         let want_result = want_committed && outcome.aborted.is_some();
-        let committed = self.publish_trades(&outcome.result, want_result);
+        let committed = self.publish_trades_from(&outcome.result, want_result, origin_stop_id);
         match outcome.aborted {
             // Only a `*_with_committed` caller keeps the prefix; everyone
             // else would drop it, so it is not boxed for them.
@@ -4671,6 +4687,17 @@ where
         &self,
         match_result: &MatchResult,
         want_result: bool,
+    ) -> Option<TradeResult> {
+        self.publish_trades_from(match_result, want_result, None)
+    }
+
+    /// [`Self::publish_trades`] stamping `origin_stop_id` on the
+    /// `TradeResult` (#286).
+    pub(crate) fn publish_trades_from(
+        &self,
+        match_result: &MatchResult,
+        want_result: bool,
+        origin_stop_id: Option<Id>,
     ) -> Option<TradeResult> {
         let trade_count = match_result.trades().len();
         if trade_count == 0 {
@@ -4706,6 +4733,7 @@ where
                 return None;
             }
         };
+        trade_result.origin_stop_id = origin_stop_id;
         if !want_result {
             // Listener only: buffered, stamped at commit (#249).
             self.defer_trade(trade_result);

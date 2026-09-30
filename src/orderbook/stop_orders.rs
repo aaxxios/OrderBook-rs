@@ -1253,9 +1253,17 @@ where
     }
 
     /// Executes one elected stop (#286), already out of the store: its
-    /// risk reservation is released, its market order runs and the stop
+    /// risk reservation is released, `Triggered { child_id, trigger_price }`
+    /// is recorded for the stop (the listener's election event), its
+    /// market order runs with `origin_stop_id` on its trades, and the stop
     /// records that order's terminal state. Returns the market order's
     /// sweep, if it traded.
+    ///
+    /// A market-order id that is already in use (a resting order or a
+    /// pending stop carrying the derived id: only possible when the
+    /// trade-id namespace is known to whoever picks order ids, which is
+    /// why it should stay private) does not run: the stop ends
+    /// `Rejected { DuplicateOrderId }` and the collision is logged.
     fn execute_elected_stop(&self, entry: StopEntry, trigger_price: u128) -> Option<PrintSegment> {
         let stop = entry.order;
         let stop_id = stop.id();
@@ -1264,6 +1272,17 @@ where
         let quantity = stop.visible_quantity().as_u64();
         self.risk_state.on_cancel(stop_id);
         let child_id = self.stop_trigger_order_id(stop_id);
+        if self.order_locations.contains_key(&child_id) || self.pending_stops.contains(child_id) {
+            self.refuse_colliding_child(stop_id, child_id);
+            return None;
+        }
+        self.track_state(
+            stop_id,
+            OrderStatus::Triggered {
+                child_id,
+                trigger_price,
+            },
+        );
         debug!(
             symbol = %self.symbol,
             order_id = %stop_id,
@@ -1275,9 +1294,28 @@ where
             "trailing stop elected; executing as a market order"
         );
         self.pending_stops.reset_path();
-        let status = self.execute_stop_market_order(child_id, side, quantity, user_id);
+        let status = self.execute_stop_market_order(stop_id, child_id, side, quantity, user_id);
         self.track_state(stop_id, status);
         self.pending_stops.take_path(self.last_trade_price())
+    }
+
+    /// An elected stop whose market-order id is already in use (#286):
+    /// the stop ends `Rejected { DuplicateOrderId }`, nothing trades.
+    #[cold]
+    #[inline(never)]
+    fn refuse_colliding_child(&self, stop_id: Id, child_id: Id) {
+        tracing::error!(
+            symbol = %self.symbol,
+            order_id = %stop_id,
+            %child_id,
+            "elected trailing stop's market-order id is already in use; stop rejected"
+        );
+        self.track_state(
+            stop_id,
+            OrderStatus::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+            },
+        );
     }
 
     /// Runs an elected stop's market order through the ungated market path
@@ -1285,6 +1323,7 @@ where
     /// gate) and returns the terminal state its stop takes.
     fn execute_stop_market_order(
         &self,
+        stop_id: Id,
         child_id: Id,
         side: Side,
         quantity: u64,
@@ -1359,7 +1398,7 @@ where
                 0
             }
         };
-        match self.publish_match_outcome(outcome, false) {
+        match self.publish_match_outcome_from(outcome, false, Some(stop_id)) {
             Err(_) => OrderStatus::Cancelled {
                 filled_quantity: executed,
                 reason: CancelReason::MatchAborted,

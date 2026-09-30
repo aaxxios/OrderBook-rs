@@ -295,6 +295,90 @@ mod tests {
         assert_eq!(book.last_trade_price(), Some(93));
     }
 
+    /// Maintainer decision (b): the election is an explicit transition of
+    /// the stop to `Triggered { child_id, trigger_price }` (then the
+    /// market order's terminal state), and the market order's trades carry
+    /// the stop in `origin_stop_id`.
+    #[test]
+    fn test_election_links_stop_and_market_order() {
+        let mut book = new_book();
+        type Origins = Arc<Mutex<Vec<(Id, Option<Id>)>>>;
+        let origins: Origins = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&origins);
+        book.set_trade_listener(Arc::new(move |result: &TradeResult| {
+            sink.lock()
+                .expect("log")
+                .push((result.match_result.order_id(), result.origin_stop_id));
+        }));
+        book.add_order(limit(1, 94, 10, Side::Buy, user(1)))
+            .expect("bid 94");
+        book.add_order(limit(3, 95, 1, Side::Buy, user(1)))
+            .expect("bid 95");
+        book.add_order(stop(50, Side::Sell, 95, 100, 5, 6))
+            .expect("pending stop");
+        book.submit_market_order(id(4), 1, Side::Sell)
+            .expect("trade at 95");
+        let child = book.stop_trigger_order_id(id(50));
+        let history: Vec<OrderStatus> = book
+            .get_order_history(id(50))
+            .expect("tracked")
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect();
+        assert_eq!(
+            history,
+            vec![
+                OrderStatus::Open,
+                OrderStatus::Triggered {
+                    child_id: child,
+                    trigger_price: 95,
+                },
+                OrderStatus::Filled { filled_quantity: 6 },
+            ]
+        );
+        assert_eq!(
+            origins.lock().expect("log").clone(),
+            vec![(id(4), None), (child, Some(id(50)))]
+        );
+    }
+
+    /// M4: a market-order id already in use (only reachable by someone who
+    /// knows the trade-id namespace) is refused: nothing trades, the stop
+    /// ends `Rejected { DuplicateOrderId }`.
+    #[test]
+    fn test_colliding_market_order_id_is_refused() {
+        let book = new_book();
+        let child = book.stop_trigger_order_id(id(50));
+        book.add_order(OrderType::Standard {
+            id: child,
+            price: Price::new(80),
+            quantity: Quantity::new(1),
+            side: Side::Buy,
+            user_id: user(1),
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            extra_fields: (),
+        })
+        .expect("order squatting on the derived id");
+        book.add_order(limit(1, 94, 10, Side::Buy, user(1)))
+            .expect("bid 94");
+        book.add_order(limit(3, 95, 1, Side::Buy, user(1)))
+            .expect("bid 95");
+        book.add_order(stop(50, Side::Sell, 95, 100, 5, 6))
+            .expect("pending stop");
+        book.submit_market_order(id(4), 1, Side::Sell)
+            .expect("trade at 95");
+        assert_eq!(
+            book.order_status(id(50)),
+            Some(OrderStatus::Rejected {
+                reason: RejectReason::DuplicateOrderId
+            })
+        );
+        assert_eq!(book.trailing_stop_count(), 0);
+        assert_eq!(book.visible_quantity_at_price(94, Side::Buy), Some(10));
+        assert!(book.get_order(child).is_some(), "the squatter is untouched");
+    }
+
     #[test]
     fn test_elected_stop_filled_completely_ends_filled() {
         let book = new_book();
