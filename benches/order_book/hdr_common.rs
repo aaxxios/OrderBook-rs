@@ -96,13 +96,25 @@ where
 /// Print a fixed-format summary block to stdout. Matches what
 /// `BENCH.md` quotes: scenario, sample count, p50/p99/p99.9/p99.99,
 /// min, max — all in nanoseconds.
+///
+/// A quantile is printed only when the histogram holds enough samples to
+/// resolve it (at least 10 samples beyond it: 1,000 for p99, 10,000 for
+/// p99.9, 100,000 for p99.99); otherwise it prints `n/a`, so a low-sample
+/// row never reports its maximum as a tail quantile.
 pub fn report(name: &str, h: &Histogram<u64>) {
+    let quantile = |q: f64, min_samples: u64| -> String {
+        if h.len() >= min_samples {
+            h.value_at_quantile(q).to_string()
+        } else {
+            format!("n/a ({} samples)", h.len())
+        }
+    };
     println!("scenario     : {name}");
     println!("samples      : {}", h.len());
     println!("p50    (ns)  : {}", h.value_at_quantile(0.50));
-    println!("p99    (ns)  : {}", h.value_at_quantile(0.99));
-    println!("p99.9  (ns)  : {}", h.value_at_quantile(0.999));
-    println!("p99.99 (ns)  : {}", h.value_at_quantile(0.9999));
+    println!("p99    (ns)  : {}", quantile(0.99, 1_000));
+    println!("p99.9  (ns)  : {}", quantile(0.999, 10_000));
+    println!("p99.99 (ns)  : {}", quantile(0.9999, 100_000));
     println!("min    (ns)  : {}", h.min());
     println!("max    (ns)  : {}", h.max());
 }

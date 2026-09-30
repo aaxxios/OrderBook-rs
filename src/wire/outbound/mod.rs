@@ -16,7 +16,7 @@ pub mod trade_print;
 pub use book_update::{BOOK_UPDATE_SIZE, BookUpdateWire, decode_book_update, encode_book_update};
 pub use exec_report::{
     EXEC_REPORT_SIZE, ExecReport, STATUS_CANCELLED, STATUS_FILLED, STATUS_OPEN,
-    STATUS_PARTIALLY_FILLED, STATUS_REJECTED, decode_exec_report, encode_exec_report,
-    status_to_wire,
+    STATUS_PARTIALLY_FILLED, STATUS_REJECTED, STATUS_TRIGGERED, decode_exec_report,
+    encode_exec_report, status_to_wire,
 };
 pub use trade_print::{TRADE_PRINT_SIZE, TradePrintWire, decode_trade_print, encode_trade_print};

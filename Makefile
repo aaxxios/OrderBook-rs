@@ -228,6 +228,7 @@ bench-hdr:
 	cargo bench --bench stp_sweep_hdr
 	cargo bench --bench stp_contention_hdr
 	cargo bench --bench reserve_sweep_hdr
+	cargo bench --features special_orders --bench pending_stops_hdr
 
 
 .PHONY: workflow-coverage

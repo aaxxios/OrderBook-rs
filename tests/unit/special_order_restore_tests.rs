@@ -4,16 +4,15 @@
 //! `restore_from_snapshot` (the shared rebuild path behind both
 //! `restore_from_snapshot_package` and the JSON entry points) rebuilds the
 //! resting book but, before #194, left the `special_order_tracker`
-//! freshly-initialized. A restored pegged / trailing-stop order was therefore
-//! never re-registered and never re-priced again after a snapshot restore. The
-//! fix re-registers every restored resting special order from the same
+//! freshly-initialized. A restored pegged order was therefore never
+//! re-registered and never re-priced again after a snapshot restore. The fix
+//! re-registers every restored resting pegged order from the same
 //! deterministic price-then-insertion-sequence rebuild pass that repopulates
 //! `order_locations` / `user_orders`.
 //!
-//! The tracker holds only order ids; the trailing-stop watermark
-//! (`last_reference_price`) and the pegged / stop price live in the order data
-//! itself and survive the snapshot round-trip, so nothing is lost or
-//! re-initialized — re-registering the id fully restores re-pricing.
+//! Trailing stops are pending off-book stops since #286: the snapshot carries
+//! them (stop price and watermark included) with the last trade price, and the
+//! restore reinstalls them.
 //!
 //! These tests are gated on `special_orders`, the only configuration in which
 //! the tracker and the re-pricing path exist.
@@ -112,77 +111,72 @@ fn test_restore_reregisters_pegged_and_reprices_issue_194() {
     assert!(after.price().as_u128() > 90, "the peg moved off 90");
 }
 
-/// #194: a trailing-stop order recovered from a snapshot must be re-registered
-/// with the tracker.
+/// #194 / #286: a pending trailing stop recovered from a snapshot is
+/// reinstalled as a pending off-book stop, with its stop price, watermark and
+/// the last trade price it trails on, and keeps trailing after the restore.
 ///
-/// A trailing stop only re-prices when its stop price sits inside the market
-/// (a Sell stop below the bid) — a crossed book, which live matching never
-/// builds and which restore rejects since #250. The crossed re-price
-/// regression moved, assertions unchanged, to
-/// `src/orderbook/tests/restore_validation.rs`
-/// (`restore_reregisters_trailing_stop_and_reprices_issue_194`), which installs
-/// that fixture through a `cfg(test)`-only hook. Here the re-registration is
-/// pinned on an uncrossed recovered book (Sell stop at 100 above a bid of 95).
+/// Before 0.14 a trailing stop rested on a level and the tracker only held its
+/// id; it is now part of the snapshot itself (`pending_stops`, format v5), and
+/// the book, not the repricing tracker, owns it.
 #[test]
-fn test_restore_reregisters_trailing_stop_issue_194() {
+fn test_restore_reinstalls_pending_trailing_stop_issue_194() {
     let stop_id = Id::from_u64(2000);
 
-    // Market book: best bid 95 only.
-    let market = OrderBook::<()>::new("TS/USD");
-    let _ = market.add_limit_order(Id::from_u64(1), 95, 10, Side::Buy, TimeInForce::Gtc, None);
-    let market_snapshot = market.create_snapshot(usize::MAX).expect("snapshot");
+    // Market book: best bid 95, best ask 105, one trade at 100.
+    let book = OrderBook::<()>::new("TS/USD");
+    let _ = book.add_limit_order(Id::from_u64(1), 95, 10, Side::Buy, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(Id::from_u64(2), 100, 1, Side::Sell, TimeInForce::Gtc, None);
+    let _ = book.add_limit_order(Id::from_u64(3), 105, 10, Side::Sell, TimeInForce::Gtc, None);
+    book.submit_market_order(Id::from_u64(4), 1, Side::Buy)
+        .expect("trade at 100");
 
-    // Stop book: a lone Sell trailing stop resting at 100. Watermark 90,
-    // trail 5.
-    let stop_book = OrderBook::<()>::new("TS/USD");
-    stop_book
-        .add_order(OrderType::TrailingStop {
-            id: stop_id,
-            price: Price::new(100),
-            quantity: Quantity::new(5),
-            side: Side::Sell,
-            user_id: Hash32::zero(),
-            timestamp: TimestampMs::new(1),
-            time_in_force: TimeInForce::Gtc,
-            trail_amount: Quantity::new(5),
-            last_reference_price: Price::new(90),
-            extra_fields: (),
-        })
-        .expect("lone trailing stop rests");
-    let stop_snapshot = stop_book.create_snapshot(usize::MAX).expect("snapshot");
-
-    let merged = OrderBookSnapshot {
-        symbol: "TS/USD".to_string(),
-        timestamp: 0,
-        bids: market_snapshot.bids,
-        asks: stop_snapshot.asks,
-    };
+    // A sell stop at 90 (watermark 100, trail 5) is pending off book.
+    book.add_order(OrderType::TrailingStop {
+        id: stop_id,
+        price: Price::new(90),
+        quantity: Quantity::new(5),
+        side: Side::Sell,
+        user_id: Hash32::zero(),
+        timestamp: TimestampMs::new(1),
+        time_in_force: TimeInForce::Gtc,
+        trail_amount: Quantity::new(5),
+        last_reference_price: Price::new(100),
+        extra_fields: (),
+    })
+    .expect("pending trailing stop");
+    let snapshot: OrderBookSnapshot = book.create_snapshot(usize::MAX).expect("snapshot");
+    assert_eq!(snapshot.pending_stops.len(), 1);
+    assert_eq!(snapshot.last_trade_price, Some(100));
 
     let restored = OrderBook::<()>::new("TS/USD");
-    match restored.restore_from_snapshot(merged) {
+    match restored.restore_from_snapshot(snapshot.clone()) {
         Ok(()) => {}
         Err(e) => panic!("restore must succeed: {e}"),
     }
-
-    // The tracker is repopulated from the restored resting stop (#194).
-    assert_eq!(
-        restored.trailing_stop_count(),
-        1,
-        "restored book must re-register the trailing stop with the tracker"
+    assert!(
+        snapshots_match(
+            &restored.create_snapshot(usize::MAX).expect("snapshot"),
+            &snapshot
+        ),
+        "pending stop and last trade restored"
     );
     assert_eq!(restored.trailing_stop_ids(), vec![stop_id]);
     assert_eq!(restored.pegged_order_count(), 0, "no pegged orders present");
     assert_eq!(restored.best_bid(), Some(95), "bid liquidity restored");
+    assert_eq!(restored.best_ask(), Some(105), "no level holds the stop");
 
-    // best_bid 95 > watermark 90, but the trailed stop (95 - 5 = 90) is not
-    // above the current stop (100): the loop visits the re-registered stop
-    // and leaves it in place.
+    // Already settled against the restored last trade.
     let repriced = restored
         .reprice_trailing_stops()
-        .expect("reprice runs on the restored book");
-    assert_eq!(repriced, 0, "an uncrossed stop does not move");
-    let after = restored.get_order(stop_id).expect("stop still resting");
-    assert_eq!(after.price().as_u128(), 100, "stop unchanged");
+        .expect("evaluation runs on the restored book");
+    assert_eq!(repriced, 0, "nothing left to trail");
+
+    // A trade at 105 trails the stop to 100 (the initial 90 was looser).
+    restored
+        .submit_market_order(Id::from_u64(5), 1, Side::Buy)
+        .expect("trade at 105");
+    let after = restored.get_order(stop_id).expect("stop still pending");
+    assert_eq!(after.price().as_u128(), 100, "stop trailed to 105 - 5");
 }
 
 /// #194: a book with no special orders restores with an empty tracker, and a

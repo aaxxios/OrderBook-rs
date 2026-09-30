@@ -1,27 +1,19 @@
-//! Re-pricing logic for special order types (PeggedOrder and TrailingStop)
+//! Re-pricing logic for pegged orders, and the trailing-stop price helpers.
 //!
-//! This module provides automatic price adjustment for:
-//! - **PeggedOrder**: Orders that track a reference price (best bid, best ask, mid price, or last trade)
-//! - **TrailingStop**: Orders that follow the market price with a fixed trail amount
-//!
-//! # Known limitation: trailing stops rest as limit liquidity (#286)
-//!
-//! A trailing stop is placed by `add_order` as an ordinary resting limit
-//! order at its stop price, on its own side, instead of being held off-book
-//! until triggered. Consequences, all on a valid (uncrossed) book:
-//!
-//! - it provides liquidity at the stop price (a sell stop is a resting sell
-//!   and is filled by an incoming buy at that price, or trades immediately
-//!   when submitted below the best bid);
-//! - `reprice_trailing_stops` never moves it: a sell stop only moves when
-//!   `best_bid - trail > stop_price`, which a resting sell at or above the
-//!   best ask cannot satisfy (symmetric for a buy stop);
-//! - a re-price, when one happens, does not advance
-//!   `last_reference_price`, so the watermark goes stale.
-//!
-//! Do not use trailing stops as protective stops in production until #286
-//! (off-book storage, trigger rules, watermark update) lands. Pegged orders
-//! are unaffected.
+//! - **PeggedOrder**: orders that track a reference price (best bid, best
+//!   ask, mid price, or last trade). [`RepricingOperations::reprice_pegged_orders`]
+//!   moves them through the gated `update_order`.
+//! - **TrailingStop**: held **off book** as pending stops and driven by the
+//!   book's prints (#286): the watermark follows the prints in the stop's
+//!   favour, the stop price trails it by `trail_amount`, and a print at or
+//!   through the stop price executes it as a market order. Evaluation is
+//!   automatic after every trade, under the submit gate; see the
+//!   `stop_orders` module.
+//!   [`RepricingOperations::should_trigger_trailing_stop`](crate::orderbook::repricing::RepricingOperations::should_trigger_trailing_stop)
+//!   is the engine's trigger rule as a pure helper.
+//!   [`calculate_trailing_stop_price`](crate::orderbook::repricing::calculate_trailing_stop_price)
+//!   computes the same new stop price, but reports only moves of the
+//!   stop: see its docs for how it differs from the engine's watermark.
 //!
 //! # Example
 //!
@@ -30,13 +22,8 @@
 //!
 //! let book = OrderBook::<()>::new("BTC/USD");
 //!
-//! // Add a pegged order that tracks best bid with +5 offset
-//! // When best bid changes, the order price will be automatically adjusted
-//!
-//! // Add a trailing stop that trails by 10 units
-//! // When market moves favorably, the stop price adjusts automatically
-//!
-//! // Trigger re-pricing after market changes
+//! // Add a pegged order that tracks best bid with +5 offset, then re-price
+//! // it after the market moved.
 //! book.reprice_special_orders();
 //! ```
 
@@ -45,13 +32,15 @@ use dashmap::DashSet;
 use pricelevel::{Id, OrderType, PegReferenceType, Side};
 use tracing::trace;
 
-/// Tracks special orders that require re-pricing
+/// Tracks the pegged orders that re-price against the book.
+///
+/// Trailing stops are not tracked here: they are pending off-book stops
+/// held by the book itself (#286; `OrderBook::trailing_stop_count` /
+/// `trailing_stop_ids`).
 #[derive(Debug, Default)]
 pub struct SpecialOrderTracker {
     /// Order IDs of pegged orders that need re-pricing when reference prices change
     pegged_orders: DashSet<Id>,
-    /// Order IDs of trailing stop orders that need re-pricing when market moves
-    trailing_stop_orders: DashSet<Id>,
 }
 
 impl SpecialOrderTracker {
@@ -59,7 +48,6 @@ impl SpecialOrderTracker {
     pub fn new() -> Self {
         Self {
             pegged_orders: DashSet::new(),
-            trailing_stop_orders: DashSet::new(),
         }
     }
 
@@ -69,25 +57,10 @@ impl SpecialOrderTracker {
         trace!("Registered pegged order {} for re-pricing", order_id);
     }
 
-    /// Registers a trailing stop order for tracking
-    pub fn register_trailing_stop(&self, order_id: Id) {
-        self.trailing_stop_orders.insert(order_id);
-        trace!("Registered trailing stop order {} for re-pricing", order_id);
-    }
-
     /// Unregisters a pegged order (e.g., when cancelled or filled)
     pub fn unregister_pegged_order(&self, order_id: &Id) {
         self.pegged_orders.remove(order_id);
         trace!("Unregistered pegged order {} from re-pricing", order_id);
-    }
-
-    /// Unregisters a trailing stop order (e.g., when cancelled or filled)
-    pub fn unregister_trailing_stop(&self, order_id: &Id) {
-        self.trailing_stop_orders.remove(order_id);
-        trace!(
-            "Unregistered trailing stop order {} from re-pricing",
-            order_id
-        );
     }
 
     /// Unregisters a pegged order only if `unowned()` still holds (#291).
@@ -113,34 +86,9 @@ impl SpecialOrderTracker {
         removed
     }
 
-    /// Unregisters a trailing stop order only if `unowned()` still holds
-    /// (#291); see [`Self::unregister_pegged_order_if`].
-    pub(crate) fn unregister_trailing_stop_if(
-        &self,
-        order_id: &Id,
-        unowned: impl FnOnce() -> bool,
-    ) -> bool {
-        let removed = self
-            .trailing_stop_orders
-            .remove_if(order_id, |_| unowned())
-            .is_some();
-        if removed {
-            trace!(
-                "Unregistered trailing stop order {} from re-pricing",
-                order_id
-            );
-        }
-        removed
-    }
-
     /// Returns the number of tracked pegged orders
     pub fn pegged_order_count(&self) -> usize {
         self.pegged_orders.len()
-    }
-
-    /// Returns the number of tracked trailing stop orders
-    pub fn trailing_stop_count(&self) -> usize {
-        self.trailing_stop_orders.len()
     }
 
     /// Returns all tracked pegged order IDs in a deterministic order.
@@ -158,21 +106,9 @@ impl SpecialOrderTracker {
         ids
     }
 
-    /// Returns all tracked trailing stop order IDs in a deterministic order.
-    ///
-    /// See [`pegged_order_ids`](Self::pegged_order_ids) for why the order is
-    /// sorted by the `Display`/`to_string` key rather than relying on
-    /// [`DashSet`] iteration order.
-    pub fn trailing_stop_ids(&self) -> Vec<Id> {
-        let mut ids: Vec<Id> = self.trailing_stop_orders.iter().map(|r| *r).collect();
-        ids.sort_by_key(|id| id.to_string());
-        ids
-    }
-
     /// Clears all tracked orders
     pub fn clear(&self) {
         self.pegged_orders.clear();
-        self.trailing_stop_orders.clear();
     }
 }
 
@@ -181,7 +117,9 @@ impl SpecialOrderTracker {
 pub struct RepricingResult {
     /// Number of pegged orders that were re-priced
     pub pegged_orders_repriced: usize,
-    /// Number of trailing stops that were re-priced
+    /// Number of pending trailing stops whose stop price trailed during
+    /// the call (#286). Stops trail automatically after every trade, so
+    /// this is normally `0`.
     pub trailing_stops_repriced: usize,
     /// Order IDs that failed to re-price
     pub failed_orders: Vec<(Id, String)>,
@@ -360,12 +298,22 @@ pub fn calculate_pegged_price(
 /// * `current_stop_price` - Current stop price of the order
 /// * `trail_amount` - The trailing amount (distance from reference price)
 /// * `last_reference_price` - The last reference price used for calculation
-/// * `current_market_price` - Current market price (best bid for sell, best ask for buy)
+/// * `current_market_price` - Current market price; the book uses its last
+///   trade price (#286)
 ///
 /// # Returns
 /// A tuple of (new_stop_price, new_reference_price) if adjustment is needed,
 /// `None` otherwise — including when the adjusted stop would fall below `0`
 /// or exceed `u128::MAX` (#244: checked, never saturated).
+///
+/// # Difference from the engine (#286)
+///
+/// The book's pending stops advance their watermark on **every** print in
+/// their favour, even when the stop price does not tighten (a looser
+/// initial stop, or a trail the checked arithmetic cannot apply). This
+/// helper returns `None` in those cases, so a caller that tracks the
+/// watermark from its result falls behind the engine. The new stop price
+/// it returns, when it returns one, is the engine's.
 pub fn calculate_trailing_stop_price(
     side: Side,
     current_stop_price: u128,
@@ -417,22 +365,28 @@ pub trait RepricingOperations<T> {
     /// - A trade occurs (for LastTrade pegged orders)
     fn reprice_pegged_orders(&self) -> Result<usize, OrderBookError>;
 
-    /// Re-prices all trailing stop orders based on current market conditions
+    /// Evaluates the pending trailing stops against the last trade price
+    /// now (#286) and returns how many stop prices trailed.
     ///
-    /// This should be called when:
-    /// - Market price moves (after each trade)
+    /// Pending stops are evaluated automatically, under the submit gate,
+    /// before every mutating call that can trade returns, so there is
+    /// normally nothing left to do and this returns `0`. Kept for API
+    /// compatibility; elected stops execute exactly as they would
+    /// automatically.
     fn reprice_trailing_stops(&self) -> Result<usize, OrderBookError>;
 
-    /// Re-prices all special orders (both pegged and trailing stops)
-    ///
-    /// Convenience method that calls both `reprice_pegged_orders` and `reprice_trailing_stops`
+    /// Re-prices the pegged orders and evaluates the pending trailing
+    /// stops (see [`Self::reprice_trailing_stops`]).
     fn reprice_special_orders(&self) -> Result<RepricingResult, OrderBookError>;
 
-    /// Checks if a trailing stop order should be triggered
+    /// Checks if a trailing stop is elected by a trade at
+    /// `current_market_price`: at or below a sell stop's price, at or above
+    /// a buy stop's price. The book applies this rule to its **last trade
+    /// price** (#286).
     ///
     /// # Arguments
     /// * `order` - The trailing stop order to check
-    /// * `current_market_price` - Current market price
+    /// * `current_market_price` - Trade price to test, in price ticks
     ///
     /// # Returns
     /// `true` if the order should be triggered (converted to market order)
@@ -609,19 +563,17 @@ mod tests {
         // Register orders
         tracker.register_pegged_order(id1);
         tracker.register_pegged_order(id2);
-        tracker.register_trailing_stop(id3);
+        tracker.register_pegged_order(id3);
 
-        assert_eq!(tracker.pegged_order_count(), 2);
-        assert_eq!(tracker.trailing_stop_count(), 1);
+        assert_eq!(tracker.pegged_order_count(), 3);
 
         // Unregister
         tracker.unregister_pegged_order(&id1);
-        assert_eq!(tracker.pegged_order_count(), 1);
+        assert_eq!(tracker.pegged_order_count(), 2);
 
         // Clear
         tracker.clear();
         assert_eq!(tracker.pegged_order_count(), 0);
-        assert_eq!(tracker.trailing_stop_count(), 0);
     }
 
     /// Computes the deterministic order the tracker is expected to return:
@@ -663,32 +615,6 @@ mod tests {
         tracker2.register_pegged_order(id2);
         tracker2.register_pegged_order(id10);
         assert_eq!(tracker2.pegged_order_ids(), expected);
-    }
-
-    #[test]
-    fn test_trailing_stop_ids_deterministic_order_issue_106() {
-        let id10 = Id::sequential(10);
-        let id2 = Id::sequential(2);
-        let id33 = Id::sequential(33);
-        let id1 = Id::sequential(1);
-
-        let tracker = SpecialOrderTracker::new();
-        tracker.register_trailing_stop(id10);
-        tracker.register_trailing_stop(id2);
-        tracker.register_trailing_stop(id33);
-        tracker.register_trailing_stop(id1);
-
-        let expected = expected_sorted(&[id10, id2, id33, id1]);
-        let got = tracker.trailing_stop_ids();
-        assert_eq!(got, expected, "trailing_stop_ids must be to_string-sorted");
-        assert_eq!(tracker.trailing_stop_ids(), got);
-
-        let tracker2 = SpecialOrderTracker::new();
-        tracker2.register_trailing_stop(id1);
-        tracker2.register_trailing_stop(id33);
-        tracker2.register_trailing_stop(id2);
-        tracker2.register_trailing_stop(id10);
-        assert_eq!(tracker2.trailing_stop_ids(), expected);
     }
 
     #[test]

@@ -1,23 +1,29 @@
 //! Demonstration of special order types: PeggedOrder and TrailingStop
 //!
-//! This example shows how to use and re-price special order types that
-//! automatically adjust their prices based on market conditions.
-//!
 //! # Order Types Demonstrated:
 //!
 //! ## PeggedOrder
 //! Orders that track a reference price (best bid, best ask, mid price, or last trade)
 //! with an optional offset. When the reference price changes, the order price
-//! can be automatically adjusted.
+//! can be re-priced with `reprice_pegged_orders`.
 //!
-//! ## TrailingStop
-//! Stop orders that follow the market price with a fixed trail amount.
-//! - **Sell trailing stop**: Trails below the market high, adjusts upward when market rises
-//! - **Buy trailing stop**: Trails above the market low, adjusts downward when market falls
+//! ## TrailingStop (#286)
+//! Pending **off-book** stop orders driven by the book's prints:
+//! - they are never liquidity (no level, no depth);
+//! - the watermark (`last_reference_price`) follows the prints in the
+//!   stop's favour and the stop price trails it by `trail_amount`
+//!   (sell: below the highest print, buy: above the lowest);
+//! - a print at or through the stop price (along each sweep's price path,
+//!   not only its last print) elects the stop: it records
+//!   `OrderStatus::Triggered` and executes as an unpriced
+//!   immediate-or-cancel market order, automatically, inside the call whose
+//!   trade crossed it; its trades carry `origin_stop_id`; stops can cascade;
+//! - a stop the last trade already crosses is rejected at admission
+//!   (`StopWouldTrigger`).
 //!
 //! # Usage:
 //! ```bash
-//! cargo run --manifest-path examples/Cargo.toml --bin special_orders_demo
+//! cargo run -p examples --features special_orders --bin special_orders_demo
 //! ```
 
 use orderbook_rs::orderbook::repricing::RepricingOperations;
@@ -114,13 +120,35 @@ fn demo_pegged_orders() {
 
 fn demo_trailing_stop_orders() {
     info!("\n--- Trailing Stop Orders Demo ---");
-    info!("Trailing stops follow the market with a fixed trail amount.\n");
+    info!("Trailing stops are held off book and follow the last trade price.\n");
 
-    let book = OrderBook::new("ETH/USD");
+    let mut book = OrderBook::new("ETH/USD");
+    book.set_order_state_tracker(OrderStateTracker::new());
+    book.set_trade_listener(std::sync::Arc::new(|trade: &TradeResult| {
+        let fills: Vec<String> = trade
+            .match_result
+            .trades()
+            .as_vec()
+            .iter()
+            .map(|t| format!("{} @ {}", t.quantity().as_u64(), t.price().as_u128()))
+            .collect();
+        match trade.origin_stop_id {
+            Some(stop) => info!(
+                "  [trade] taker {} (elected stop {}) filled {}",
+                trade.match_result.order_id(),
+                stop,
+                fills.join(", ")
+            ),
+            None => info!(
+                "  [trade] taker {} filled {}",
+                trade.match_result.order_id(),
+                fills.join(", ")
+            ),
+        }
+    }));
 
-    // Establish market
-    info!("Step 1: Establishing market at 3000...");
-
+    // Establish an uncrossed market: bids 3000..2960, asks 3010..3050.
+    info!("Step 1: Establishing market (best bid 3000, best ask 3010)...");
     for i in 0u64..5 {
         let bid_price: u128 = 3000 - (i as u128 * 10);
         let ask_price: u128 = 3010 + (i as u128 * 10);
@@ -135,102 +163,121 @@ fn demo_trailing_stop_orders() {
         let _ = book.add_limit_order(
             Id::from_u64(i + 100),
             ask_price,
-            100,
+            5,
             Side::Sell,
             TimeInForce::Gtc,
             None,
         );
     }
-
+    // A first trade at 3010 sets the last trade price.
+    let _ = book.submit_market_order(Id::from_u64(500), 1, Side::Buy);
     info!(
-        "  Best Bid: {} | Best Ask: {}",
+        "  Best Bid: {} | Best Ask: {} | Last trade: {}",
         book.best_bid().unwrap_or(0),
-        book.best_ask().unwrap_or(0)
+        book.best_ask().unwrap_or(0),
+        book.last_trade_price().unwrap_or(0)
     );
 
-    // Add a sell trailing stop at a price ABOVE best bid (won't match)
-    // Sell orders only match with buy orders if sell_price <= buy_price
-    // So we need stop_price > best_bid to avoid matching
+    // A protective sell stop 50 below a watermark of 3010: stop price 2960.
     info!("\nStep 2: Adding SELL trailing stop (trail amount: 50)...");
-    info!("  This stop trails BELOW the market high.");
-    info!("  When market rises, the stop price rises with it.");
-
-    let trailing_sell_id = Id::from_u64(2000);
+    let stop_id = Id::from_u64(2000);
     let trailing_sell = OrderType::TrailingStop {
-        id: trailing_sell_id,
-        price: Price::new(3050), // Stop price ABOVE best bid (3000), won't match
-        quantity: Quantity::new(10),
+        id: stop_id,
+        price: Price::new(2960),
+        quantity: Quantity::new(150),
         side: Side::Sell,
-        user_id: Hash32::zero(),
+        user_id: Hash32::new([7u8; 32]),
         timestamp: TimestampMs::new(current_time_millis()),
         time_in_force: TimeInForce::Gtc,
         trail_amount: Quantity::new(50),
-        last_reference_price: Price::new(3100), // Market high was at 3100
+        last_reference_price: Price::new(3010),
         extra_fields: (),
     };
-
-    book.add_order(trailing_sell).unwrap();
-    info!("  Trailing stop added: stop at 3050 (market high 3100 - trail 50)");
-    info!("  Tracked trailing stops: {}", book.trailing_stop_count());
-
-    // Simulate market rising by adding higher bids
-    info!("\nStep 3: Simulating market rise to 3200...");
-
-    // Add new higher bids to simulate market rise
-    for i in 0u64..5 {
-        let price: u128 = 3200 - (i as u128 * 10);
-        let _ = book.add_limit_order(
-            Id::from_u64(i + 200),
-            price,
-            50,
-            Side::Buy,
-            TimeInForce::Gtc,
-            None,
-        );
-    }
-
-    let new_best_bid = book.best_bid().unwrap_or(0);
-    info!("  New Best Bid: {} (rose from 3100)", new_best_bid);
-
-    // Re-price trailing stops
-    info!("\nStep 4: Re-pricing trailing stops...");
-    info!("  Market rose from 3100 to {}", new_best_bid);
+    book.add_order(trailing_sell)
+        .expect("pending trailing stop admitted");
+    info!("  Pending trailing stops: {:?}", book.trailing_stop_ids());
     info!(
-        "  Stop should adjust: {} - 50 = {}",
-        new_best_bid,
-        new_best_bid - 50
+        "  It is not liquidity: best ask still {}, depth at 2960 on the ask side: {:?}",
+        book.best_ask().unwrap_or(0),
+        book.visible_quantity_at_price(2960, Side::Sell)
     );
-    let repriced = book.reprice_trailing_stops().unwrap();
-    info!("  Stops re-priced: {}", repriced);
 
-    if let Some(order) = book.get_order(trailing_sell_id) {
-        info!(
-            "  New stop price: {} (was 3050, now {} - 50 = {})",
-            order.price(),
-            new_best_bid,
-            new_best_bid.saturating_sub(50)
-        );
+    // The market rises: buyers lift the asks up to 3040.
+    info!("\nStep 3: Market rises; buyers lift the offers up to 3040...");
+    let _ = book.submit_market_order(Id::from_u64(501), 18, Side::Buy);
+    show_stop(&book, stop_id);
+
+    // The market falls: sellers hit the bids down to 2990.
+    info!("\nStep 4: Market falls; sellers take the whole bid at 3000...");
+    let _ = book.submit_market_order(Id::from_u64(502), 100, Side::Sell);
+    show_stop(&book, stop_id);
+    info!("  The stop did not move down with the market (a sell stop only tightens).");
+
+    // The next print at or below the stop price elects it.
+    info!("\nStep 5: A trade at 2990 reaches the stop price 2990...");
+    let _ = book.submit_market_order(Id::from_u64(503), 60, Side::Sell);
+    info!(
+        "  Stop {} elected and executed as market order {}",
+        stop_id,
+        book.stop_trigger_order_id(stop_id)
+    );
+    info!(
+        "  Stop status: {:?} | pending stops left: {}",
+        book.order_status(stop_id),
+        book.trailing_stop_count()
+    );
+    if let Some(history) = book
+        .order_state_tracker()
+        .and_then(|tracker| tracker.get_history(stop_id))
+    {
+        for (_, status) in history {
+            info!("  Stop history: {status}");
+        }
     }
+    info!(
+        "  Best Bid after the stop's sale: {}",
+        book.best_bid().unwrap_or(0)
+    );
 
-    // Demonstrate trigger check
-    info!("\n--- Trailing Stop Trigger Check ---");
-    if let Some(order) = book.get_order(trailing_sell_id) {
-        let current_bid = book.best_bid().unwrap_or(0);
-        let would_trigger = book.should_trigger_trailing_stop(&order, current_bid);
-        info!(
-            "  Current market: {} | Stop price: {} | Would trigger: {}",
-            current_bid,
-            order.price(),
-            would_trigger
-        );
+    // A stop the last trade already crosses is rejected untouched.
+    let Some(last) = book.last_trade_price() else {
+        return;
+    };
+    let (Some(stop), Some(watermark)) = (last.checked_sub(50), last.checked_sub(100)) else {
+        return;
+    };
+    info!("\nStep 6: A BUY stop at {stop} with the last trade at {last}...");
+    let crossed = OrderType::TrailingStop {
+        id: Id::from_u64(2001),
+        price: Price::new(stop),
+        quantity: Quantity::new(10),
+        side: Side::Buy,
+        user_id: Hash32::new([7u8; 32]),
+        timestamp: TimestampMs::new(current_time_millis()),
+        time_in_force: TimeInForce::Gtc,
+        trail_amount: Quantity::new(50),
+        last_reference_price: Price::new(watermark),
+        extra_fields: (),
+    };
+    match book.add_order(crossed) {
+        Ok(_) => info!("  Unexpectedly admitted"),
+        Err(err) => info!("  Rejected: {err}"),
+    }
+}
 
-        // Check at a lower price (below stop)
-        let lower_price = order.price().as_u128() - 100;
-        let would_trigger_lower = book.should_trigger_trailing_stop(&order, lower_price);
-        info!(
-            "  If market falls to {}: Would trigger: {}",
-            lower_price, would_trigger_lower
-        );
+fn show_stop(book: &OrderBook, stop_id: Id) {
+    match book.get_order(stop_id).as_deref() {
+        Some(OrderType::TrailingStop {
+            price,
+            last_reference_price,
+            ..
+        }) => info!(
+            "  Last trade {} | watermark {} | stop price {}",
+            book.last_trade_price().unwrap_or(0),
+            last_reference_price.as_u128(),
+            price.as_u128()
+        ),
+        _ => info!("  Stop {stop_id} is no longer pending"),
     }
 }
 
@@ -295,16 +342,18 @@ fn demo_combined_repricing() {
         extra_fields: (),
     };
 
+    // A pending sell stop 5 below a watermark of 100: stop price 95. It is
+    // off book, so it never interacts with the pegged orders' re-pricing.
     let trailing = OrderType::TrailingStop {
         id: Id::from_u64(2000),
-        price: Price::new(110), // Above best bid (100), won't match
+        price: Price::new(95),
         quantity: Quantity::new(10),
         side: Side::Sell,
         user_id: Hash32::zero(),
         timestamp: TimestampMs::new(current_time_millis()),
         time_in_force: TimeInForce::Gtc,
         trail_amount: Quantity::new(5),
-        last_reference_price: Price::new(99), // Market was at 99
+        last_reference_price: Price::new(100),
         extra_fields: (),
     };
 
@@ -326,7 +375,7 @@ fn demo_combined_repricing() {
         result.pegged_orders_repriced
     );
     info!(
-        "  Trailing stops re-priced: {}",
+        "  Trailing stops trailed by this call: {} (stops trail automatically on every trade)",
         result.trailing_stops_repriced
     );
 
@@ -339,16 +388,16 @@ fn demo_combined_repricing() {
     }
     for id in book.trailing_stop_ids() {
         if let Some(order) = book.get_order(id) {
-            info!("  Trailing {}: stop price = {}", id, order.price());
+            info!("  Trailing {}: pending stop price = {}", id, order.price());
         }
     }
 
     // Best practices
     info!("\n--- Best Practices ---");
-    info!("1. Call reprice_special_orders() after significant market changes");
+    info!("1. Call reprice_pegged_orders() after significant market changes");
     info!("2. Use price_level_changed_listener to trigger re-pricing automatically");
-    info!("3. Check should_trigger_trailing_stop() before executing stops");
-    info!("4. Consider using a timer to periodically re-price orders");
+    info!("3. Trailing stops need no calls: they trail and trigger on every trade");
+    info!("4. Correlate a stop with its fills through stop_trigger_order_id()");
 }
 
 fn current_time_millis() -> u64 {

@@ -3,6 +3,8 @@ pub mod mass_cancel;
 pub mod match_orders;
 pub mod matching;
 pub mod mixed_operations;
+#[cfg(feature = "special_orders")]
+pub mod pending_stops;
 pub mod replay;
 pub mod snapshot;
 pub mod update_orders;

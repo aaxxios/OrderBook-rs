@@ -140,6 +140,11 @@ pub enum SequencerCommand<T> {
 /// include a wildcard arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
+// `TradeExecuted` holds a whole `TradeResult` (grown past clippy's
+// threshold by `origin_stop_id`, #286). One result is built per journaled
+// command, off the matching hot path; boxing it would change the public
+// variant shape for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 pub enum SequencerResult {
     /// An order was successfully added to the book.
     OrderAdded {
@@ -492,7 +497,13 @@ fn may_have_mutated(err: &OrderBookError) -> bool {
         // the post-commit emission instead of returning it. A crossed
         // snapshot is a restore-only error.
         | OrderBookError::EngineSeqExhausted { .. }
-        | OrderBookError::SnapshotCrossed { .. } => false,
+        | OrderBookError::SnapshotCrossed { .. }
+        // #286: a trailing stop refused by a book without `special_orders`
+        // (or a restore that met one), crossed by the last trade on entry,
+        // or with invalid terms; all rejected before anything changes.
+        | OrderBookError::StopOrdersUnsupported { .. }
+        | OrderBookError::StopWouldTrigger { .. }
+        | OrderBookError::InvalidStopTerms { .. } => false,
         #[cfg(feature = "nats")]
         OrderBookError::NatsPublishError { .. } | OrderBookError::NatsSerializationError { .. } => {
             false

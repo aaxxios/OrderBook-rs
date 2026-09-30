@@ -430,21 +430,6 @@ mod tests {
             }
         }
 
-        fn trailing(raw: u64, price: u128, qty: u64) -> OrderType<()> {
-            OrderType::TrailingStop {
-                id: id(raw),
-                price: Price::new(price),
-                quantity: Quantity::new(qty),
-                side: Side::Sell,
-                user_id: user(1),
-                timestamp: TimestampMs::new(raw),
-                time_in_force: TimeInForce::Gtc,
-                trail_amount: Quantity::new(5),
-                last_reference_price: Price::new(price),
-                extra_fields: (),
-            }
-        }
-
         /// Rests `order`, then fills it completely with a taker: the sweep
         /// drains it without unregistering it, which leaves the stale
         /// registration a repricing pass cleans up.
@@ -482,32 +467,21 @@ mod tests {
             assert_eq!(book.pegged_order_ids(), vec![id(5)]);
         }
 
-        #[test]
-        fn test_trailing_id_reused_in_repricer_window_keeps_its_registration() {
-            let mut book = OrderBook::<()>::new("REPRICE_ABA");
-            rest_then_fill(&book, trailing(6, 100, 4), 4);
-            assert_eq!(book.trailing_stop_count(), 1, "stale registration");
-
-            reuse_id_in_window(&mut book, trailing(6, 110, 7));
-            book.reprice_trailing_stops().expect("reprice");
-
-            assert!(book.get_order(id(6)).is_some());
-            assert_eq!(book.trailing_stop_ids(), vec![id(6)]);
-        }
+        // #286: trailing stops are no longer tracked by the repricer (they
+        // are pending off-book stops the book owns), so only the pegged
+        // registration has a repricer id-reuse window.
 
         /// Without a reuse the stale registration is still released.
         #[test]
         fn test_stale_registrations_are_released_when_the_id_is_unowned() {
             let book = OrderBook::<()>::new("REPRICE_ABA");
             rest_then_fill(&book, pegged(5, 100, 4), 4);
-            rest_then_fill(&book, trailing(6, 100, 4), 4);
             assert_eq!(book.pegged_order_count(), 1);
-            assert_eq!(book.trailing_stop_count(), 1);
 
             let result = book.reprice_special_orders().expect("reprice");
             assert!(result.failed_orders.is_empty());
             assert_eq!(book.pegged_order_count(), 0);
-            assert_eq!(book.trailing_stop_count(), 0);
+            assert_eq!(result.trailing_stops_repriced, 0);
         }
     }
 }

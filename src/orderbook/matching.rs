@@ -817,21 +817,26 @@ where
         // has already captured and free its id for an unrelated order, and
         // the drain would then report a discard that never happened.
         let _gate = self.acquire_coherent_submit_gate(false);
-        // #244: worst-case notional / fee representability, before any
-        // mutation — identical to every publishing entry point.
-        let verified =
-            self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
-        self.match_order_with_user_outcome(
-            order_id,
-            side,
-            quantity,
-            limit_price,
-            Hash32::zero(),
-            TakerKind::Standard,
-            SweepReservation::NONE,
-            verified,
-        )
-        .and_then(MatchOutcome::into_result)
+        let result = (|| {
+            // #244: worst-case notional / fee representability, before any
+            // mutation — identical to every publishing entry point.
+            let verified =
+                self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
+            self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                limit_price,
+                Hash32::zero(),
+                TakerKind::Standard,
+                SweepReservation::NONE,
+                verified,
+            )
+            .and_then(MatchOutcome::into_result)
+        })();
+        // #286: under the same gate, after the taker's trades.
+        self.settle_pending_stops();
+        result
     }
 
     /// Internal matching function with Self-Trade Prevention support.
@@ -876,20 +881,25 @@ where
             false,
             false,
         ));
-        // #244: see `match_order`.
-        let verified =
-            self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
-        self.match_order_with_user_outcome(
-            order_id,
-            side,
-            quantity,
-            limit_price,
-            taker_user_id,
-            TakerKind::Standard,
-            SweepReservation::NONE,
-            verified,
-        )
-        .and_then(MatchOutcome::into_result)
+        let result = (|| {
+            // #244: see `match_order`.
+            let verified =
+                self.check_trade_arithmetic_or_reject(order_id, side, quantity, limit_price)?;
+            self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                limit_price,
+                taker_user_id,
+                TakerKind::Standard,
+                SweepReservation::NONE,
+                verified,
+            )
+            .and_then(MatchOutcome::into_result)
+        })();
+        // #286: under the same gate, after the taker's trades.
+        self.settle_pending_stops();
+        result
     }
 
     /// Like [`Self::match_order_with_user`] but returns the full [`MatchOutcome`],
@@ -1963,6 +1973,12 @@ where
 
             // Process trades if any occurred
             if !level_trades.is_empty() {
+                // #286: a pending trailing stop is evaluated against every
+                // sweep's first and last print; record the first (one
+                // relaxed load when no stop is pending).
+                #[cfg(feature = "special_orders")]
+                self.pending_stops
+                    .record_print(self.last_trade_price(), price);
                 // Update last trade price atomically
                 self.last_trade_price.store(price);
                 self.has_traded.store(true, Ordering::Relaxed);

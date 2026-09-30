@@ -52,6 +52,8 @@ mod tests_mutation_failure_atomicity {
                 timestamp: 1_700_000_000_000,
                 bids: vec![make_level(1, u64::MAX - 2, Side::Buy)],
                 asks: vec![make_level(2, 5, Side::Sell)],
+                pending_stops: Vec::new(),
+                last_trade_price: None,
             })
             .expect_err("a locked book is malformed restore input");
         assert!(

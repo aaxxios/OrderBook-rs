@@ -434,8 +434,12 @@ pub struct OrderBook<T = ()> {
     /// between the two steps. Every mass cancel and expiry eviction takes
     /// the **write** side too (#248): each collects its scope before it
     /// removes it, and `cancel_all_orders` clears the tracking maps
-    /// wholesale. Everything else takes the **read** side and
-    /// stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
+    /// wholesale. While a trailing stop is pending (#286) every call that
+    /// can trade, and every call that targets a pending stop, takes the
+    /// **write** side, so the stops are only ever touched (and evaluated
+    /// after a trade) by one call at a time; post-only adds and the
+    /// quantity updates and cancels of other orders keep the read side.
+    /// Everything else takes the **read** side and stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
     /// single place that picks the mode, and it documents the scope
     /// limitation.
     ///
@@ -618,9 +622,15 @@ pub struct OrderBook<T = ()> {
     /// listens to order book changes. This provides a point to update a corresponding external order book e.g. in the UI
     pub price_level_changed_listener: Option<PriceLevelChangedListener>,
 
-    /// Tracker for special orders that require re-pricing (PeggedOrder and TrailingStop)
+    /// Tracker for pegged orders, which re-price against the book.
     #[cfg(feature = "special_orders")]
     pub(super) special_order_tracker: SpecialOrderTracker,
+
+    /// Pending trailing stops, held off book and triggered by the last
+    /// trade price (#286); see `stop_orders.rs`. Part of the snapshot
+    /// format (version 5).
+    #[cfg(feature = "special_orders")]
+    pub(super) pending_stops: super::stop_orders::PendingStops,
 
     /// Minimum price increment for orders. When set, order prices must be
     /// exact multiples of this value. `None` disables validation (default).
@@ -868,6 +878,55 @@ impl<T> OrderBook<T> {
     }
 }
 
+/// Pending-stop fast path (#286), free of `T` bounds so the gate helpers can
+/// read it.
+impl<T> OrderBook<T> {
+    /// `true` while at least one trailing stop is pending (#286). One
+    /// relaxed load with `special_orders`, a constant `false` without it.
+    ///
+    /// The count only grows under the exclusive submit gate (admission and
+    /// restore), so a caller holding the shared side that reads `false`
+    /// keeps reading `false` until it releases the gate.
+    #[inline]
+    #[must_use]
+    pub(super) fn has_pending_stops(&self) -> bool {
+        #[cfg(feature = "special_orders")]
+        {
+            !self.pending_stops.is_empty()
+        }
+        #[cfg(not(feature = "special_orders"))]
+        {
+            false
+        }
+    }
+
+    /// Whether admitting `order` adds a pending stop, which must happen
+    /// under the exclusive submit gate (#286). Always `false` without
+    /// `special_orders`, where a trailing stop is rejected untouched.
+    #[inline]
+    #[must_use]
+    pub(super) fn admits_pending_stop<E>(order: &OrderType<E>) -> bool {
+        cfg!(feature = "special_orders") && matches!(order, OrderType::TrailingStop { .. })
+    }
+
+    /// Whether `order_id` is a pending trailing stop (#286): the id is
+    /// owned, like a resting order's location. `false` without
+    /// `special_orders`.
+    #[inline]
+    #[must_use]
+    pub(super) fn id_is_pending_stop(&self, order_id: Id) -> bool {
+        #[cfg(feature = "special_orders")]
+        {
+            self.pending_stops.contains(order_id)
+        }
+        #[cfg(not(feature = "special_orders"))]
+        {
+            let _ = order_id;
+            false
+        }
+    }
+}
+
 impl<T> OrderBook<T>
 where
     T: Default + Clone + Send + Sync + 'static,
@@ -1107,6 +1166,8 @@ where
             price_level_changed_listener: None,
             #[cfg(feature = "special_orders")]
             special_order_tracker: SpecialOrderTracker::new(),
+            #[cfg(feature = "special_orders")]
+            pending_stops: super::stop_orders::PendingStops::new(),
             tick_size: None,
             lot_size: None,
             min_order_size: None,
@@ -1751,6 +1812,25 @@ where
         &self,
         wants_exclusive: bool,
     ) -> SubmitGateGuard<'_, T> {
+        self.acquire_submit_gate_for(wants_exclusive, true)
+    }
+
+    /// [`Self::acquire_coherent_submit_gate`] for a call that may or may
+    /// not trade (#286).
+    ///
+    /// A call that can trade (`can_trade`) must run exclusively while a
+    /// trailing stop is pending: its trades are evaluated against the
+    /// pending stops before it returns, and every mutation of the stop
+    /// store runs under the exclusive side. A call that cannot trade (a
+    /// post-only add, a quantity update or cancel of a resting order) keeps
+    /// the shared side. Like the strandable-maker count, the pending count
+    /// only grows under the exclusive side, so the re-check after the
+    /// shared acquisition is final.
+    pub(super) fn acquire_submit_gate_for(
+        &self,
+        wants_exclusive: bool,
+        can_trade: bool,
+    ) -> SubmitGateGuard<'_, T> {
         if wants_exclusive {
             return self.submit_gate_write();
         }
@@ -1758,12 +1838,52 @@ where
             self.on_submit_gate_poisoned();
             poisoned.into_inner()
         });
-        if self.strandable_makers_resting.load(Ordering::Relaxed) == 0 {
+        if self.strandable_makers_resting.load(Ordering::Relaxed) == 0
+            && !(can_trade && self.has_pending_stops())
+        {
             return SubmitGateGuard::new(self, GateLock::Read { _guard: shared });
         }
-        // A strandable maker was admitted between the caller's decision and
-        // this acquisition. Release and start over on the exclusive side.
+        // A strandable maker or, for a call that can trade, a pending stop
+        // (#286) was admitted between the caller's decision and this
+        // acquisition. Release and start over on the exclusive side.
         drop(shared);
+        self.submit_gate_write()
+    }
+
+    /// Acquire the submit gate for a call that cannot trade but may target
+    /// `order_id` (#286): a single-order cancel (`coherent == false`: the
+    /// plain shared side, cancels ignore the strandable-maker count), or a
+    /// quantity update / cancel through `update_order` (`coherent == true`:
+    /// [`Self::acquire_submit_gate_for`] with `wants_exclusive`, that
+    /// call's own decision).
+    ///
+    /// Shared, unless `order_id` is a pending trailing stop: every mutation
+    /// of the stop store runs under the exclusive side. The target is
+    /// re-checked once the shared side is held (the stop set only changes
+    /// under the exclusive side, so the answer is final); a stop target
+    /// releases the shared side and takes the exclusive one. A call on any
+    /// other id runs concurrently, as it does on a book without stops.
+    pub(super) fn acquire_gate_for_target(
+        &self,
+        wants_exclusive: bool,
+        order_id: Id,
+        coherent: bool,
+    ) -> SubmitGateGuard<'_, T> {
+        if wants_exclusive || self.id_is_pending_stop(order_id) {
+            return self.submit_gate_write();
+        }
+        let gate = if coherent {
+            self.acquire_submit_gate_for(false, false)
+        } else {
+            self.submit_gate_read()
+        };
+        if !gate.is_shared() || !self.id_is_pending_stop(order_id) {
+            return gate;
+        }
+        // A stop with this id was admitted between the check and the
+        // acquisition. The shared guard's emission scope is still empty:
+        // dropping it commits nothing.
+        drop(gate);
         self.submit_gate_write()
     }
 
@@ -1780,7 +1900,12 @@ where
     /// - the order is a **strandable maker** — a
     ///   `ReserveOrder { auto_replenish: false, .. }` with hidden quantity —
     ///   in **every** [`STPMode`], including
-    ///   [`None`](super::stp::STPMode::None) (#230, see below).
+    ///   [`None`](super::stp::STPMode::None) (#230, see below); or
+    /// - a trailing stop is pending (#286) and the submit can trade, so the
+    ///   stops are evaluated after it with no concurrent mutation. A
+    ///   post-only submit never trades and stays on the **shared** side even
+    ///   while stops are pending (it cannot move the last trade price, and
+    ///   the stop store only changes under the exclusive side).
     ///
     /// # Why a strandable maker is admitted exclusively
     ///
@@ -1866,6 +1991,12 @@ where
             // strandable-maker capture of a concurrent sweep, nor have its
             // own capture invalidated by a concurrent cancel + id reuse.
             || self.strandable_makers_resting.load(Ordering::Relaxed) > 0
+            // #286: while a trailing stop is pending, every mutator runs
+            // exclusively, so the stops are evaluated (and their market
+            // orders executed) with no concurrent mutation. A post-only
+            // submit returns early above and stays shared: it cannot trade,
+            // so it cannot move the last trade price.
+            || self.has_pending_stops()
     }
 
     /// Decide the submit gate mode for an [`OrderUpdate`] (#225 / #230).
@@ -1908,6 +2039,21 @@ where
     #[inline]
     #[must_use]
     pub(super) fn modify_needs_exclusive_gate(&self, update: &OrderUpdate) -> bool {
+        // #286: while a trailing stop is pending, the variants that can
+        // trade (a re-add evaluates the stops before it returns) run
+        // exclusively; `UpdateQuantity` / `Cancel` only when they target a
+        // pending stop (re-checked under the gate, see
+        // `acquire_gate_for_target`).
+        if self.has_pending_stops() {
+            return match update {
+                OrderUpdate::UpdatePrice { .. }
+                | OrderUpdate::UpdatePriceAndQuantity { .. }
+                | OrderUpdate::Replace { .. } => true,
+                OrderUpdate::UpdateQuantity { order_id, .. } | OrderUpdate::Cancel { order_id } => {
+                    self.id_is_pending_stop(*order_id)
+                }
+            };
+        }
         // Exhaustive on purpose: a new `OrderUpdate` variant must force an
         // explicit decision here rather than silently inherit the shared
         // side. `OrderUpdate` is not `#[non_exhaustive]` in pricelevel
@@ -2059,6 +2205,8 @@ where
             price_level_changed_listener: None,
             #[cfg(feature = "special_orders")]
             special_order_tracker: SpecialOrderTracker::new(),
+            #[cfg(feature = "special_orders")]
+            pending_stops: super::stop_orders::PendingStops::new(),
             tick_size: None,
             lot_size: None,
             min_order_size: None,
@@ -2133,6 +2281,8 @@ where
             price_level_changed_listener: Some(book_changed_listener),
             #[cfg(feature = "special_orders")]
             special_order_tracker: SpecialOrderTracker::new(),
+            #[cfg(feature = "special_orders")]
+            pending_stops: super::stop_orders::PendingStops::new(),
             tick_size: None,
             lot_size: None,
             min_order_size: None,
@@ -4088,7 +4238,22 @@ where
         result
     }
 
-    /// Get an order by its ID
+    /// Evaluate the pending trailing stops (#286) before a mutating entry
+    /// point that can trade returns, under the submit gate it holds. One
+    /// relaxed load when no stop is pending; nothing without
+    /// `special_orders`. See `stop_orders.rs`.
+    #[inline]
+    pub(super) fn settle_pending_stops(&self) {
+        #[cfg(feature = "special_orders")]
+        {
+            let _pass = self.run_stop_triggers();
+        }
+    }
+
+    /// Get an order by its ID.
+    ///
+    /// Finds resting orders and, under `special_orders`, pending trailing
+    /// stops (#286), which rest on no level.
     pub fn get_order(&self, order_id: Id) -> Option<Arc<OrderType<T>>>
     where
         T: Default,
@@ -4112,8 +4277,13 @@ where
                     }
                 }
             }
+            return None;
         }
 
+        #[cfg(feature = "special_orders")]
+        if self.has_pending_stops() {
+            return self.pending_stop_order(order_id);
+        }
         None
     }
 
@@ -4183,21 +4353,26 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
-        // #240: under the same gate the sweep holds, before any mutation.
-        self.check_trade_id_headroom(order_id, side, None)?;
-        // #244: worst-case notional / fee representability, same place.
-        let verified = self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
-        let outcome = self.match_order_with_user_outcome(
-            order_id,
-            side,
-            quantity,
-            None,
-            user_id,
-            TakerKind::Standard,
-            SweepReservation::NONE,
-            verified,
-        )?;
-        self.publish_match_outcome(outcome, want_committed)
+        let result = (|| {
+            // #240: under the same gate the sweep holds, before any mutation.
+            self.check_trade_id_headroom(order_id, side, None)?;
+            // #244: worst-case notional / fee representability, same place.
+            let verified = self.check_trade_arithmetic_or_reject(order_id, side, quantity, None)?;
+            let outcome = self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                None,
+                user_id,
+                TakerKind::Standard,
+                SweepReservation::NONE,
+                verified,
+            )?;
+            self.publish_match_outcome(outcome, want_committed)
+        })();
+        // #286: under the same gate, after the taker's trades.
+        self.settle_pending_stops();
+        result
     }
 
     /// Reject a taker untouched when the trade-id generator is exhausted
@@ -4514,8 +4689,24 @@ where
         outcome: MatchOutcome,
         want_committed: bool,
     ) -> Result<MatchResult, SubmitFailure> {
+        self.publish_match_outcome_from(outcome, want_committed, None)
+    }
+
+    /// [`Self::publish_match_outcome`] for trades whose `TradeResult`
+    /// carries `origin_stop_id` (#286: the market order of an elected
+    /// trailing stop).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_match_outcome`].
+    pub(crate) fn publish_match_outcome_from(
+        &self,
+        outcome: MatchOutcome,
+        want_committed: bool,
+        origin_stop_id: Option<Id>,
+    ) -> Result<MatchResult, SubmitFailure> {
         let want_result = want_committed && outcome.aborted.is_some();
-        let committed = self.publish_trades(&outcome.result, want_result);
+        let committed = self.publish_trades_from(&outcome.result, want_result, origin_stop_id);
         match outcome.aborted {
             // Only a `*_with_committed` caller keeps the prefix; everyone
             // else would drop it, so it is not boxed for them.
@@ -4542,6 +4733,17 @@ where
         &self,
         match_result: &MatchResult,
         want_result: bool,
+    ) -> Option<TradeResult> {
+        self.publish_trades_from(match_result, want_result, None)
+    }
+
+    /// [`Self::publish_trades`] stamping `origin_stop_id` on the
+    /// `TradeResult` (#286).
+    pub(crate) fn publish_trades_from(
+        &self,
+        match_result: &MatchResult,
+        want_result: bool,
+        origin_stop_id: Option<Id>,
     ) -> Option<TradeResult> {
         let trade_count = match_result.trades().len();
         if trade_count == 0 {
@@ -4577,6 +4779,7 @@ where
                 return None;
             }
         };
+        trade_result.origin_stop_id = origin_stop_id;
         if !want_result {
             // Listener only: buffered, stamped at commit (#249).
             self.defer_trade(trade_result);
@@ -4707,14 +4910,20 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
-        // #240: under the gate the sweep holds, before any mutation.
-        self.check_trade_id_headroom(order_id, side, None)?;
-        // #244: the amount bounds the notional this sweep can consume.
-        self.check_amount_arithmetic(side, amount)
-            .map_err(|err| self.reject_arithmetic_untouched(order_id, err))?;
-        let outcome =
-            OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
-        self.publish_match_outcome(outcome, want_committed)
+        let result = (|| {
+            // #240: under the gate the sweep holds, before any mutation.
+            self.check_trade_id_headroom(order_id, side, None)?;
+            // #244: the amount bounds the notional this sweep can consume.
+            self.check_amount_arithmetic(side, amount)
+                .map_err(|err| self.reject_arithmetic_untouched(order_id, err))?;
+            let outcome = OrderBook::<T>::match_order_by_amount_with_user(
+                self, order_id, side, amount, user_id,
+            )?;
+            self.publish_match_outcome(outcome, want_committed)
+        })();
+        // #286: under the same gate, after the taker's trades.
+        self.settle_pending_stops();
+        result
     }
 
     /// Attempts to match a limit order in the order book.
@@ -4776,24 +4985,29 @@ where
         let _gate = self.acquire_coherent_submit_gate(
             self.submit_needs_exclusive_gate(false, user_id, false, false),
         );
-        // #240: under the same gate the sweep holds, before any
-        // mutation; only a limit that actually crosses is refused.
-        self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
-        // #244: worst-case notional / fee representability.
-        let verified =
-            self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
-        let outcome = self.match_order_with_user_outcome(
-            order_id,
-            side,
-            quantity,
-            Some(limit_price),
-            user_id,
-            TakerKind::Standard,
-            SweepReservation::NONE,
-            verified,
-        )?;
-        self.publish_match_outcome(outcome, false)
-            .map_err(SubmitFailure::into_error)
+        let result = (|| {
+            // #240: under the same gate the sweep holds, before any
+            // mutation; only a limit that actually crosses is refused.
+            self.check_trade_id_headroom(order_id, side, Some(limit_price))?;
+            // #244: worst-case notional / fee representability.
+            let verified =
+                self.check_trade_arithmetic_or_reject(order_id, side, quantity, Some(limit_price))?;
+            let outcome = self.match_order_with_user_outcome(
+                order_id,
+                side,
+                quantity,
+                Some(limit_price),
+                user_id,
+                TakerKind::Standard,
+                SweepReservation::NONE,
+                verified,
+            )?;
+            self.publish_match_outcome(outcome, false)
+                .map_err(SubmitFailure::into_error)
+        })();
+        // #286: under the same gate, after the taker's trades.
+        self.settle_pending_stops();
+        result
     }
 
     /// Create a snapshot of the current order book state, up to `depth`
@@ -4807,6 +5021,24 @@ where
     /// not affected. See [`OrderBook`]'s "Level statistics are advisory under
     /// concurrent takers" section for the exact contract.
     ///
+    /// # Pending stops and last trade (#286)
+    ///
+    /// The snapshot also carries every pending trailing stop (not limited
+    /// by `depth`, in admission order; never part of the level lists) and
+    /// the last trade price, which a restore installs.
+    ///
+    /// # Concurrency
+    ///
+    /// The whole capture holds the **shared** side of the submit gate, so a
+    /// call holding the exclusive side (every call that trades or touches a
+    /// pending stop while one is pending, mass cancels, restores) is never
+    /// captured half done: the levels, the pending stops (with their trailed
+    /// terms) and the last trade price describe one state between two such
+    /// calls. Shared-gate sweeps (books without pending stops) can still
+    /// overlap it, with the level-statistics caveat above. It must not be
+    /// called from caller code that runs under the book's gate (a `Clock`,
+    /// `T::clone`): the gate is not reentrant.
+    ///
     /// # Errors
     ///
     /// Returns [`OrderBookError::PriceLevelError`] when a price level cannot
@@ -4814,6 +5046,13 @@ where
     /// pricelevel 0.10, e.g. on a refused allocation or a walk that stays
     /// incoherent under concurrent mutation). No partial snapshot is returned.
     pub fn create_snapshot(&self, depth: usize) -> Result<OrderBookSnapshot, OrderBookError> {
+        // Copilot / determinism review on #301: sample levels, pending
+        // stops and the last trade price under one shared-gate window. A
+        // bare guard: the capture emits no events.
+        let _shared = self.submit_gate.read().unwrap_or_else(|poisoned| {
+            self.on_submit_gate_poisoned();
+            poisoned.into_inner()
+        });
         // Get all bid prices and sort them in descending order
         let mut bid_prices: Vec<u128> = self.bids.iter().map(|item| *item.key()).collect();
         bid_prices.sort_by(|a, b| b.cmp(a)); // Descending order
@@ -4846,7 +5085,19 @@ where
             timestamp: self.clock().now_millis().as_u64(),
             bids: bid_levels,
             asks: ask_levels,
+            pending_stops: self.pending_stops_for_snapshot(),
+            last_trade_price: self.last_trade_price(),
         })
+    }
+
+    /// Every pending trailing stop in admission order, for a snapshot
+    /// (#286). Empty without `special_orders`.
+    fn pending_stops_for_snapshot(&self) -> Vec<OrderType<()>> {
+        #[cfg(feature = "special_orders")]
+        if self.has_pending_stops() {
+            return self.pending_stop_snapshot();
+        }
+        Vec::new()
     }
 
     /// Create a checksum-protected snapshot package of the entire book.
@@ -4893,7 +5144,10 @@ where
     /// (`fee_schedule`, `stp_mode`, `tick_size`, `lot_size`,
     /// `min_order_size`, `max_order_size`, `engine_seq`,
     /// `kill_switch_engaged`, and the scheduled market close) that were captured by
-    /// [`create_snapshot_package`](Self::create_snapshot_package).
+    /// [`create_snapshot_package`](Self::create_snapshot_package), plus the
+    /// last trade price and the pending trailing stops (format version 5,
+    /// #286; older packages carry neither), whose risk is rebuilt with the
+    /// resting orders'.
     ///
     /// The kill-switch flag is operator-driven and not journaled by
     /// the sequencer; it travels with snapshot packages only. Replay
@@ -5051,13 +5305,14 @@ where
     ///
     /// Rebuilds the resting bids / asks, the `order_locations` and
     /// `user_orders` indices, and — under the `special_orders` feature — the
-    /// special-order tracker, so restored pegged / trailing-stop orders resume
-    /// re-pricing (#194). The tracker holds only order ids; the trailing-stop
-    /// watermark (`last_reference_price`) and the pegged / stop price are part
-    /// of the order data and survive the snapshot round-trip, so no watermark
-    /// state is lost or re-initialized. The rebuild uses the deterministic
-    /// price-then-insertion-sequence traversal so the restore stays
-    /// replay-stable (#190 / #192).
+    /// special-order tracker, so restored pegged orders resume re-pricing
+    /// (#194). The snapshot's last trade price is installed and, under
+    /// `special_orders`, its pending trailing stops are reinstalled in
+    /// admission order with their stop price and watermark (#286); they are
+    /// validated first (kind, time-in-force, quantity, consistent terms,
+    /// unique ids).
+    /// The rebuild uses the deterministic price-then-insertion-sequence
+    /// traversal so the restore stays replay-stable (#190 / #192).
     ///
     /// # Failure atomicity
     ///
@@ -5157,9 +5412,9 @@ where
 
     /// Test-only restore that skips [`Self::ensure_snapshot_not_crossed`]
     /// (#250), for regression tests of engine defences that only a crossed
-    /// or locked book can reach (the residual-headroom pre-check, trailing
-    /// stops resting inside the market). Every other prepare-phase check
-    /// still runs. Exists only in `cfg(test)` builds.
+    /// or locked book can reach (the residual-headroom pre-check). Every
+    /// other prepare-phase check still runs. Exists only in `cfg(test)`
+    /// builds.
     #[cfg(test)]
     pub(crate) fn restore_crossed_snapshot_for_test(
         &self,
@@ -5237,8 +5492,15 @@ where
             Ok(converted)
         };
 
-        let bids = convert(snapshot.bids, "bid")?;
-        let asks = convert(snapshot.asks, "ask")?;
+        let OrderBookSnapshot {
+            bids,
+            asks,
+            pending_stops,
+            last_trade_price,
+            ..
+        } = snapshot;
+        let bids = convert(bids, "bid")?;
+        let asks = convert(asks, "ask")?;
 
         // Cross-level duplicate-id check. Per-level duplicates are already
         // rejected by `PriceLevel::from_snapshot` (since pricelevel 0.9); an id
@@ -5276,6 +5538,15 @@ where
                         order_id: order.id(),
                     });
                 }
+                // #286: a trailing stop never rests on a level. A level that
+                // holds one comes from the pre-0.14 model (a stop rested as
+                // a limit order at its stop price) and cannot be restored
+                // faithfully: cancel it on the old version and re-submit it.
+                if matches!(order.as_ref(), OrderType::TrailingStop { .. }) {
+                    return Err(OrderBookError::StopOrdersUnsupported {
+                        order_id: order.id(),
+                    });
+                }
                 // #250: tranche representability is checked for every
                 // order, not only when risk is rebuilt: every quantity path
                 // downstream assumes an admitted order's total fits `u64`.
@@ -5305,12 +5576,88 @@ where
             }
         }
 
+        let stops = Self::prepare_pending_stops(pending_stops, &mut seen, risk.as_mut())?;
+        // Always empty without the feature (a stop fails the prepare).
+        #[cfg(not(feature = "special_orders"))]
+        drop(stops);
+
         Ok(PreparedSnapshotLevels {
             bids,
             asks,
             orders,
             risk,
+            #[cfg(feature = "special_orders")]
+            stops,
+            last_trade_price,
         })
+    }
+
+    /// Validates a snapshot's pending trailing stops (#286), in the
+    /// fallible phase of a restore.
+    ///
+    /// Each must be a trailing stop with a positive quantity and a
+    /// time-in-force that can pend (`GTC`, `GTD`, `DAY`), consistent terms
+    /// (positive trail, stop price not beyond its watermark, which trailing
+    /// preserves) and an id no resting order or other stop uses. A stop the
+    /// snapshot's last trade price crosses is legal (elections are
+    /// suspended while the kill switch is engaged): stops are only
+    /// evaluated against new trades, so it is elected by the next print at
+    /// or through its stop price. Their risk contribution is accumulated at
+    /// their stop price. Without `special_orders` any pending stop fails
+    /// with [`OrderBookError::StopOrdersUnsupported`].
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::StopOrdersUnsupported`],
+    /// [`OrderBookError::InvalidStopTerms`],
+    /// [`OrderBookError::DuplicateOrderId`], the risk aggregate overflows of
+    /// [`RiskRebuild::accumulate`], or [`OrderBookError::InvalidOperation`]
+    /// naming the malformed stop.
+    fn prepare_pending_stops(
+        pending_stops: Vec<OrderType<()>>,
+        seen: &mut std::collections::HashSet<Id>,
+        mut risk: Option<&mut RiskRebuild>,
+    ) -> Result<Vec<OrderType<()>>, OrderBookError> {
+        #[cfg(not(feature = "special_orders"))]
+        {
+            let _ = (seen, risk.as_mut());
+            match pending_stops.first() {
+                Some(stop) => Err(OrderBookError::StopOrdersUnsupported {
+                    order_id: stop.id(),
+                }),
+                None => Ok(pending_stops),
+            }
+        }
+        #[cfg(feature = "special_orders")]
+        {
+            use super::stop_orders::StopTerms;
+            let malformed = |order_id: Id, what: &str| OrderBookError::InvalidOperation {
+                message: format!("snapshot pending stop {order_id} {what}"),
+            };
+            for stop in &pending_stops {
+                let order_id = stop.id();
+                let Some(terms) = StopTerms::of(stop) else {
+                    return Err(malformed(order_id, "is not a trailing stop"));
+                };
+                if stop.is_immediate() {
+                    return Err(malformed(order_id, "has an immediate time-in-force"));
+                }
+                let quantity = stop.visible_quantity().as_u64();
+                if quantity == 0 {
+                    return Err(malformed(order_id, "has no quantity"));
+                }
+                if let Some(reason) = terms.inconsistency() {
+                    return Err(OrderBookError::InvalidStopTerms { order_id, reason });
+                }
+                if !seen.insert(order_id) {
+                    return Err(OrderBookError::DuplicateOrderId { order_id });
+                }
+                if let Some(risk) = risk.as_deref_mut() {
+                    risk.accumulate(order_id, stop.user_id(), terms.stop, quantity)?;
+                }
+            }
+            Ok(pending_stops)
+        }
     }
 
     /// Infallible commit phase of a snapshot restore (#207): clears the
@@ -5352,13 +5699,27 @@ where
         // here and rebuild it below from the restored resting orders, mirroring
         // the `user_orders` / `order_locations` rebuild (#194).
         #[cfg(feature = "special_orders")]
-        self.special_order_tracker.clear();
-        self.has_traded.store(false, Ordering::Relaxed);
+        {
+            self.special_order_tracker.clear();
+            self.pending_stops.clear();
+        }
+        // #286: the last trade price travels with the snapshot (format
+        // version 5; `None` for older ones), because pending stops trail
+        // and trigger on it.
+        match prepared.last_trade_price {
+            Some(price) => {
+                self.last_trade_price.store(price);
+                self.has_traded.store(true, Ordering::Relaxed);
+            }
+            None => {
+                self.has_traded.store(false, Ordering::Relaxed);
+                self.last_trade_price.store(0);
+            }
+        }
         // #230: recounted from the orders installed below, like every other
         // index this commit rebuilds. Reset here so a restore cannot inherit
         // the pre-restore book's strandable makers.
         self.strandable_makers_resting.store(0, Ordering::Relaxed);
-        self.last_trade_price.store(0);
         self.has_market_close.store(false, Ordering::Relaxed);
         self.market_close_timestamp.store(0, Ordering::Relaxed);
 
@@ -5386,11 +5747,38 @@ where
             #[cfg(feature = "special_orders")]
             self.reregister_special_order(order.as_ref());
         }
+        // #286: the pending stops, validated in the prepare phase, in
+        // admission order (sequences 0..n keep their relative priority).
+        #[cfg(feature = "special_orders")]
+        self.install_pending_stops(&prepared.stops);
         // #243: the risk aggregates were accumulated with checked
         // arithmetic in the prepare phase; installing them cannot fail.
         if let Some(risk) = prepared.risk.as_ref() {
             self.risk_state.install_rebuild(risk);
         }
+    }
+
+    /// Installs a restore's validated pending stops (#286) with admission
+    /// sequences `0..n`, in order, into the cleared store.
+    #[cfg(feature = "special_orders")]
+    fn install_pending_stops(&self, stops: &[OrderType<()>]) {
+        let mut seq: u64 = 0;
+        for stop in stops {
+            if let Err(err) = self.pending_stops.insert_at(*stop, seq) {
+                // Unreachable: the prepare phase validated kind and ids.
+                tracing::error!(
+                    symbol = %self.symbol,
+                    order_id = %stop.id(),
+                    error = %err,
+                    "restore could not install a validated pending stop"
+                );
+            }
+            match seq.checked_add(1) {
+                Some(next) => seq = next,
+                None => break,
+            }
+        }
+        self.pending_stops.set_next_seq(seq);
     }
 
     /// Is `order` the one two-tranche shape `pricelevel` cannot execute
@@ -5532,30 +5920,22 @@ where
     }
 
     /// Re-register a restored resting order with the special-order tracker
-    /// when it is a pegged or trailing-stop order.
+    /// when it is a pegged order.
     ///
     /// Mirrors the admission-time registration in
-    /// [`add_order`](Self::add_order) so restored pegged / trailing-stop
-    /// orders resume re-pricing after a snapshot restore (#194). Called once
-    /// per restored resting order from the deterministic price-then-sequence
-    /// rebuild pass in [`restore_from_snapshot`](Self::restore_from_snapshot),
-    /// so any tracker mutation stays replay-stable.
-    ///
-    /// The tracker holds only order ids — the trailing-stop watermark
-    /// (`last_reference_price`) and the pegged / stop price live in the
-    /// order data itself and survive the snapshot round-trip, so nothing is
-    /// re-initialized here; re-registering the id fully restores re-pricing.
+    /// [`add_order`](Self::add_order) so restored pegged orders resume
+    /// re-pricing after a snapshot restore (#194). Called once per restored
+    /// resting order from the deterministic price-then-sequence rebuild pass
+    /// in [`restore_from_snapshot`](Self::restore_from_snapshot), so any
+    /// tracker mutation stays replay-stable. The tracker holds only order
+    /// ids; the pegged price lives in the order data and survives the
+    /// snapshot round-trip. Trailing stops are not tracked here: they are
+    /// pending off-book stops the snapshot carries itself (#286).
     #[cfg(feature = "special_orders")]
     #[inline]
     fn reregister_special_order(&self, order: &OrderType<()>) {
-        match order {
-            OrderType::PeggedOrder { id, .. } => {
-                self.special_order_tracker.register_pegged_order(*id);
-            }
-            OrderType::TrailingStop { id, .. } => {
-                self.special_order_tracker.register_trailing_stop(*id);
-            }
-            _ => {}
+        if let OrderType::PeggedOrder { id, .. } = order {
+            self.special_order_tracker.register_pegged_order(*id);
         }
     }
 
@@ -6168,9 +6548,7 @@ fn engine_seq_exhausted(engine_seq: u64) -> OrderBookError {
 
 // Implementation of RepricingOperations trait for OrderBook
 #[cfg(feature = "special_orders")]
-use crate::orderbook::repricing::{
-    RepricingOperations, RepricingResult, calculate_pegged_price, calculate_trailing_stop_price,
-};
+use crate::orderbook::repricing::{RepricingOperations, RepricingResult, calculate_pegged_price};
 
 #[cfg(feature = "special_orders")]
 impl<T> OrderBook<T>
@@ -6295,100 +6673,22 @@ where
         Ok(repriced_count)
     }
 
-    /// Re-price every trailing stop, returning the count repriced and pushing a
-    /// `(order_id, reason)` pair onto `failures` for each rejected
-    /// `update_order` (mirrors [`Self::reprice_pegged_collecting`], #174),
-    /// including its per-order gate acquisition and the batch-atomicity
-    /// caveat that comes with it (#225).
+    /// Evaluate the pending trailing stops against any print not evaluated
+    /// yet (#286) under the exclusive submit gate, returning how many stop
+    /// prices trailed.
     ///
-    /// # Errors
-    ///
-    /// [`OrderBookError::ArithmeticOverflow`] if the repriced count cannot
-    /// be incremented (#250); unreachable for the same reason as in
-    /// `reprice_pegged_collecting`.
-    fn reprice_trailing_collecting(
-        &self,
-        failures: &mut Vec<(Id, String)>,
-    ) -> Result<usize, OrderBookError> {
-        let trailing_ids = self.special_order_tracker.trailing_stop_ids();
-        if trailing_ids.is_empty() {
+    /// Every call that trades evaluates its own prints before it returns,
+    /// so this finds nothing to do and returns `0`; it exists for API
+    /// compatibility. Returns `0` without touching the gate when no stop
+    /// is pending.
+    fn reprice_trailing_collecting(&self) -> Result<usize, OrderBookError> {
+        // Hot-path review P2-04: nothing to evaluate, and no reason to
+        // serialize the book behind an exclusive acquisition.
+        if !self.has_pending_stops() {
             return Ok(0);
         }
-
-        let mut repriced_count = 0;
-
-        for order_id in trailing_ids {
-            if let Some(order) = self.get_order(order_id) {
-                if let OrderType::TrailingStop {
-                    price: current_stop_price,
-                    side,
-                    trail_amount,
-                    last_reference_price,
-                    ..
-                } = order.as_ref()
-                {
-                    // Get current market price based on side
-                    let current_market_price = match side {
-                        Side::Sell => self.best_bid(), // Sell stop tracks bid (market high)
-                        Side::Buy => self.best_ask(),  // Buy stop tracks ask (market low)
-                    };
-
-                    if let Some(market_price) = current_market_price
-                        && let Some((new_stop_price, new_reference)) = calculate_trailing_stop_price(
-                            *side,
-                            current_stop_price.as_u128(),
-                            trail_amount.as_u64(),
-                            last_reference_price.as_u128(),
-                            market_price,
-                        )
-                    {
-                        // Update the order with new stop price
-                        // We need to update both price and last_reference_price
-                        // For now, we update the price; the reference price update
-                        // requires modifying the order directly
-                        let update = OrderUpdate::UpdatePrice {
-                            order_id,
-                            new_price: pricelevel::Price::new(new_stop_price),
-                        };
-                        match self.update_order(update) {
-                            Ok(_) => {
-                                repriced_count = checked_reprice_count(repriced_count)?;
-                                trace!(
-                                    "Re-priced trailing stop {} from {} to {} (ref: {} -> {})",
-                                    order_id,
-                                    current_stop_price,
-                                    new_stop_price,
-                                    last_reference_price,
-                                    new_reference
-                                );
-                            }
-                            Err(e) => {
-                                trace!(
-                                    "Trailing-stop re-price of {} to {} rejected: {}",
-                                    order_id, new_stop_price, e
-                                );
-                                failures.push((
-                                    order_id,
-                                    format!(
-                                        "trailing-stop re-price to {new_stop_price} rejected: {e}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else {
-                #[cfg(test)]
-                if let Some(hook) = self.reprice_interleave_hook.as_ref() {
-                    hook(self, order_id);
-                }
-                // As for pegged orders (#291).
-                self.special_order_tracker
-                    .unregister_trailing_stop_if(&order_id, || self.id_unowned(order_id));
-            }
-        }
-
-        Ok(repriced_count)
+        let _gate = self.acquire_coherent_submit_gate(true);
+        Ok(self.run_stop_triggers().trailed)
     }
 }
 
@@ -6419,17 +6719,17 @@ where
         self.reprice_pegged_collecting(&mut Vec::new())
     }
 
-    /// Re-prices all trailing stop orders based on current market conditions.
-    ///
-    /// Returns the number repriced. See
-    /// [`reprice_special_orders`](Self::reprice_special_orders) for the
-    /// failure-reporting variant.
+    /// Evaluates the pending trailing stops against the last trade price
+    /// under the exclusive submit gate (#286) and returns how many stop
+    /// prices trailed; elected stops execute. Stops are evaluated after
+    /// every trade anyway, so this normally returns `0`.
     fn reprice_trailing_stops(&self) -> Result<usize, OrderBookError> {
-        self.reprice_trailing_collecting(&mut Vec::new())
+        self.reprice_trailing_collecting()
     }
 
-    /// Re-prices all special orders (both pegged and trailing stops) and reports
-    /// per-order failures.
+    /// Re-prices the pegged orders, evaluates the pending trailing stops
+    /// (see [`reprice_trailing_stops`](Self::reprice_trailing_stops)) and
+    /// reports per-order failures.
     ///
     /// [`RepricingResult::failed_orders`] is populated with a `(order_id,
     /// reason)` pair for every re-price whose `update_order` was rejected (e.g.
@@ -6439,7 +6739,7 @@ where
     fn reprice_special_orders(&self) -> Result<RepricingResult, OrderBookError> {
         let mut failed_orders = Vec::new();
         let pegged_count = self.reprice_pegged_collecting(&mut failed_orders)?;
-        let trailing_count = self.reprice_trailing_collecting(&mut failed_orders)?;
+        let trailing_count = self.reprice_trailing_collecting()?;
 
         Ok(RepricingResult {
             pegged_orders_repriced: pegged_count,
@@ -6482,9 +6782,9 @@ where
         self.special_order_tracker.pegged_order_count()
     }
 
-    /// Returns the number of tracked trailing stop orders
+    /// Number of pending trailing stops (#286).
     pub fn trailing_stop_count(&self) -> usize {
-        self.special_order_tracker.trailing_stop_count()
+        self.pending_stops.len()
     }
 
     /// Returns all tracked pegged order IDs
@@ -6492,9 +6792,9 @@ where
         self.special_order_tracker.pegged_order_ids()
     }
 
-    /// Returns all tracked trailing stop order IDs
+    /// Ids of the pending trailing stops, in admission order (#286).
     pub fn trailing_stop_ids(&self) -> Vec<Id> {
-        self.special_order_tracker.trailing_stop_ids()
+        self.pending_stop_ids(|_| true)
     }
 }
 
@@ -6515,9 +6815,14 @@ struct PreparedSnapshotLevels {
     /// level read.
     orders: Vec<(u128, Side, Arc<OrderType<()>>)>,
     /// Checked per-account risk aggregates for the restored resting
-    /// orders (#243); `Some` only on the package-restore path with a risk
-    /// config.
+    /// orders and pending stops (#243, #286); `Some` only on the
+    /// package-restore path with a risk config.
     risk: Option<RiskRebuild>,
+    /// Validated pending trailing stops, in admission order (#286).
+    #[cfg(feature = "special_orders")]
+    stops: Vec<OrderType<()>>,
+    /// The snapshot's last trade price (#286).
+    last_trade_price: Option<u128>,
 }
 
 /// Number of [`OrderBook::level_locks`] stripes (#247). A power of two
@@ -6633,6 +6938,12 @@ impl<'a, T> SubmitGateGuard<'a, T> {
 }
 
 impl<T> SubmitGateGuard<'_, T> {
+    /// `true` while the shared side is held.
+    #[inline]
+    fn is_shared(&self) -> bool {
+        matches!(self.lock, GateLock::Read { .. })
+    }
+
     /// The held side's name for the poison log, `None` once released.
     #[inline]
     fn held_side(&self) -> Option<&'static str> {

@@ -340,8 +340,19 @@ mod test_modifications_remaining {
             extra_fields: (),
         };
 
-        // Add all orders to the book
-        let _ = book.add_order(trail_order);
+        // Add all orders to the book. #286: a trailing stop is a pending
+        // off-book stop with `special_orders`, rejected untouched without it.
+        let trail_admitted = book.add_order(trail_order);
+        #[cfg(feature = "special_orders")]
+        assert!(trail_admitted.is_ok(), "pending trailing stop admitted");
+        #[cfg(not(feature = "special_orders"))]
+        assert!(
+            matches!(
+                trail_admitted,
+                Err(crate::OrderBookError::StopOrdersUnsupported { order_id }) if order_id == id1
+            ),
+            "trailing stop rejected without special_orders"
+        );
         let _ = book.add_order(peg_order);
         let _ = book.add_order(mtl_order);
         let _ = book.add_order(reserve_order);
@@ -393,16 +404,25 @@ mod test_modifications_remaining {
         let order3 = book.get_order(id3);
         let order4 = book.get_order(id4);
 
-        assert!(order1.is_some());
         assert!(order2.is_some());
         assert!(order3.is_some());
         assert!(order4.is_some());
 
-        // Single-tranche kinds take the new quantity outright.
-        let Some(OrderType::TrailingStop { quantity, .. }) = order1.as_deref() else {
-            panic!("expected a trailing stop order after the update");
-        };
-        assert_eq!(quantity.as_u64(), 15);
+        // Single-tranche kinds take the new quantity outright; the pending
+        // stop takes the new stop price and quantity (#286).
+        #[cfg(feature = "special_orders")]
+        {
+            let Some(OrderType::TrailingStop {
+                quantity, price, ..
+            }) = order1.as_deref()
+            else {
+                panic!("expected a trailing stop order after the update");
+            };
+            assert_eq!(quantity.as_u64(), 15);
+            assert_eq!(price.as_u128(), 1010);
+        }
+        #[cfg(not(feature = "special_orders"))]
+        assert!(order1.is_none(), "a rejected trailing stop is not found");
 
         let Some(OrderType::PeggedOrder { quantity, .. }) = order2.as_deref() else {
             panic!("expected a pegged order after the update");
@@ -431,7 +451,6 @@ mod test_modifications_remaining {
         assert_eq!(visible_quantity.as_u64(), 15);
         assert_eq!(hidden_quantity.as_u64(), 5);
 
-        assert_eq!(order1.unwrap().price().as_u128(), 1010);
         assert_eq!(order2.unwrap().price().as_u128(), 1010);
         assert_eq!(order3.unwrap().price().as_u128(), 1010);
         assert_eq!(order4.unwrap().price().as_u128(), 1010);

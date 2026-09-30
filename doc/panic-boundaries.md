@@ -739,8 +739,9 @@ under a pre-trade risk code with `may_have_mutated: false`. Replay cannot
 tell it from a pre-trade rejection and still skips it; for those journals
 only `snapshots_match` detects the missing trades.
 
-**Repricer id reuse.** `reprice_pegged_collecting` /
-`reprice_trailing_collecting` release the tracker entry of an id whose
+**Repricer id reuse.** `reprice_pegged_collecting` (and, before #286
+moved trailing stops off book, `reprice_trailing_collecting`) releases the
+tracker entry of an id whose
 order `get_order` no longer finds (a maker the sweep filled is drained
 without unregistering). A same-id order admitted between that read and
 the release used to lose its registration: its own insert found the stale
@@ -755,6 +756,87 @@ sees, and one made after it re-inserts the id. Lock order is tracker shard
 then location shard; no path holds a location guard while touching the
 tracker. A same-id order of another kind keeps the stale entry until it is
 gone (a pass skips it: `get_order` finds a non-special order).
+
+## Off-book trailing stops (#286)
+
+Pending trailing stops (`special_orders`, `src/orderbook/stop_orders.rs`)
+are held in the book's `PendingStops` store, never on a level, and are
+evaluated against the prints of every call that trades (each sweep's
+first and last print, recorded per matched level while a stop is
+pending) before that call returns. What the evaluation relies on and
+what it leaves on failure:
+
+- **Gate mode.** Every mutation of the store (admission, modify, cancel,
+  mass cancel, expiry, trail, election, restore) runs under the
+  **exclusive** submit gate. While a stop is pending, every call that can
+  trade takes the exclusive side (`acquire_submit_gate_for` with
+  `can_trade`, re-checking the pending count once the shared side is
+  held), and so does every call that targets a pending stop
+  (`acquire_gate_for_target`: a cancel, or an `UpdateQuantity` /
+  `Cancel` modify, takes the shared side, re-checks whether its target is
+  a pending stop and only then upgrades). The stop set and count only
+  change under the exclusive side, so what a shared holder reads stays
+  true while it holds it: a post-only add or a cancel / resize of another
+  order runs concurrently and never touches the store, and the
+  evaluation it reaches only reads the print recorder (closed: the
+  recorder is only opened by a trade, which runs exclusively). A modify's
+  re-add, which may hold the shared side, refuses a trailing stop
+  instead of admitting one. The cost: a book holding a pending stop
+  serializes the calls that can trade, like a book with STP enabled.
+- **Snapshots.** `create_snapshot` holds the shared side for the whole
+  capture, so levels, pending stops (with their trailed terms) and the
+  last trade price come from one state between two exclusive calls. It is
+  a gated call: caller code running under the book's gate must not call
+  it (the gate is not reentrant).
+- **No reentrancy.** The elected stop's market order runs through the
+  ungated market path (the body of `match_market_order_committed`:
+  trade-id headroom, arithmetic preflight, `match_order_with_user_outcome`,
+  `publish_match_outcome_from`) under the gate the entry point already
+  holds; nothing re-acquires the gate. Its events land in the same
+  emission scope, after the call's own events (#249).
+- **Bounded cascade.** An elected stop leaves the store when it is
+  elected, so it is elected at most once; every market order adds at
+  most one segment to evaluate, so a cascade evaluates at most
+  `pending + 1` segments. Trailing only ever tightens a stop and is
+  idempotent at a given price. The bound is the only limit: one print can
+  run every pending stop's market order within the call that printed it.
+- **Arithmetic.** Trailing uses `checked_sub` / `checked_add` (a stop the
+  trail cannot represent keeps its price), the admission sequence and the
+  pending count are checked. The risk re-booking of a trailed stop
+  (`RiskState::rebook_price`) keeps the old booking and counts an
+  accounting anomaly when the new notional is not representable; a modify
+  re-books in place (`rebook_order`, one step under the entry lock, no
+  reservation generation consumed) or fails with nothing changed.
+- **Ownership.** A stop's id is owned by its store entry, like a resting
+  order's location (#288): admission checks both, the store entry is
+  claimed before the `Open` state is recorded, and a cancel releases the
+  risk entry and records the state before it removes the entry (under the
+  exclusive gate, so no same-id admission can interleave). An elected
+  stop's market-order id (UUIDv5 of the trade-id namespace) that is
+  already in use is refused (`Rejected { DuplicateOrderId }`).
+- **Unwind.** Caller code under the gate during an evaluation is the same
+  as for any sweep (`Clock` through the tracker, metrics, `tracing`,
+  `T::default()` in conversions) and follows the submit-gate policy: the
+  kill switch is engaged. An unwind between an elected stop's removal and
+  the end of its market order loses that stop (it is out of the store,
+  its risk released, possibly `Triggered` without a terminal state); the
+  rest of the book is consistent. The per-thread scratch buffers are
+  taken out of their cell for the pass and simply not returned on an
+  unwind.
+- **Kill switch.** While it is engaged, elections are suspended (prints
+  still trail): a stop the prints cross stays pending and is elected by
+  the first print at or through its stop after the release. No market
+  order is rejected by the kill switch, so no child-id state entry is
+  recorded for it. The sequencer's commands are refused by the kill switch
+  before they trade, so suspended elections only follow the raw `match_*`
+  entry points.
+- **Restore.** A snapshot's pending stops are validated in the prepare
+  phase (kind, time-in-force, quantity, consistent terms, id uniqueness
+  against the levels and each other) and their risk accumulated with
+  checked arithmetic, so the commit installs them infallibly. A stop the
+  snapshot's last trade price crosses is legal (suspended elections): it
+  is elected by the next print. A trailing stop found on a level is
+  refused with `StopOrdersUnsupported`.
 
 ## Listener emission and submit-gate poisoning (#249)
 

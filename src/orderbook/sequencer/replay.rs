@@ -1725,6 +1725,9 @@ where
 ///
 /// Two snapshots are considered equal when:
 /// - `symbol` is identical
+/// - the pending trailing stops are identical, in admission order (current
+///   stop price and watermark included), and so is the last trade price
+///   they trail and trigger on (#286)
 /// - The sorted bid price levels match, and the sorted ask price levels
 ///   match — where "match" means the **complete** per-level state (#208):
 ///   price, visible quantity, hidden quantity, order count, the full order
@@ -1802,7 +1805,13 @@ pub fn snapshots_match(actual: &OrderBookSnapshot, expected: &OrderBookSnapshot)
         return false;
     }
 
-    sides_match(&actual.bids, &expected.bids) && sides_match(&actual.asks, &expected.asks)
+    // #286: the pending trailing stops (element-wise, in admission order:
+    // stop price and watermark included) and the last trade price they
+    // trail on are book state a later trade depends on.
+    actual.pending_stops == expected.pending_stops
+        && actual.last_trade_price == expected.last_trade_price
+        && sides_match(&actual.bids, &expected.bids)
+        && sides_match(&actual.asks, &expected.asks)
 }
 
 /// Compares one side's levels, sorted ascending by price. The sort
@@ -1921,6 +1930,8 @@ mod tests {
             timestamp: 0,
             bids: vec![lvl(100, 10, 5, 2)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
         assert!(
             snapshots_match(&base, &base.clone()),
@@ -1932,6 +1943,8 @@ mod tests {
             timestamp: 0,
             bids: vec![lvl(100, 10, 7, 2)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
         assert!(
             !snapshots_match(&base, &diff_hidden),
@@ -1943,6 +1956,8 @@ mod tests {
             timestamp: 0,
             bids: vec![lvl(100, 10, 5, 3)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
         assert!(
             !snapshots_match(&base, &diff_count),
@@ -1983,6 +1998,8 @@ mod tests {
             timestamp: 0,
             bids: Vec::new(),
             asks: vec![level],
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -2088,12 +2105,16 @@ mod tests {
             timestamp: 0,
             bids: vec![lvl_with_stats(false, 1_000)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
         let degraded = OrderBookSnapshot {
             symbol: "STATS".to_string(),
             timestamp: 7,
             bids: vec![lvl_with_stats(true, 1_000)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
         assert!(
             !snapshots_match(&clean, &degraded),
@@ -2108,6 +2129,8 @@ mod tests {
             timestamp: 42,
             bids: vec![lvl_with_stats(false, 2_000)],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
         assert!(
             snapshots_match(&clean, &different_clock),

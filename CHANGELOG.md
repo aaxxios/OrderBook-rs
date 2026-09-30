@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Off-book trailing stops (#286, `special_orders`).**
+  `OrderBook::stop_trigger_order_id(stop_id)` (and the pure
+  `orderbook::stop_orders::stop_trigger_order_id(namespace, stop_id)`)
+  names the market order an elected stop executes as;
+  `OrderStatus::Triggered { child_id, trigger_price }` (wire `ExecReport`
+  status 5) and `TradeResult::origin_stop_id` link a stop and its market
+  order; `OrderBookError::StopOrdersUnsupported` / `StopWouldTrigger` /
+  `InvalidStopTerms` with reject codes 23 / 24 / 25; the Criterion group
+  "OrderBook - Pending Stops" (controls, trailing / elect / cascade at
+  N = 10 and 1000, contended adds with 0 or 1 stop) and the
+  `pending_stops_hdr` bench (both with `--features special_orders`). See
+  Changed (breaking). JSON `TradeResult`s without `origin_stop_id` decode
+  with `None`; bincode `TradeResult`s written without it (0.13, or 0.14
+  pre-releases) do not decode, and vice versa.
 - **Production Panic Policy CI gate (#242).** `[lints.clippy]` in
   `Cargo.toml` denies `unwrap_used`, `expect_used`, `panic`, `unreachable`,
   `todo`, `unimplemented`, `indexing_slicing`, `string_slice`,
@@ -38,6 +52,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed (breaking)
 
+- **Trailing stops are pending off-book stops (#286).** A
+  `OrderType::TrailingStop` used to be admitted as an ordinary limit order
+  at its stop price: it rested as visible liquidity, traded as soon as it
+  was marketable, and `reprice_trailing_stops` could only move it on a
+  crossed book (its watermark never advanced). With `special_orders` it is
+  now held off book and driven by the book's prints:
+  - never on a level: not liquidity, not depth, not in any analytics or
+    snapshot level list; `get_order` still finds it and
+    `trailing_stop_ids()` lists pending stops in admission order;
+  - its watermark (`last_reference_price`, taken as given at admission)
+    follows the prints in its favour and its stop price trails it by
+    `trail_amount`, only tightening;
+  - a print at or through the stop price elects it: it leaves the book,
+    releases its risk and executes as an immediate-or-cancel, unpriced
+    market order for its quantity, side and user (STP, fees and the market
+    preflights apply; the remainder is cancelled; no protection collar and
+    no price band), under the id `OrderBook::stop_trigger_order_id(stop_id)`
+    (UUIDv5 of the trade-id namespace, which should stay private);
+  - evaluation is automatic, under the submit gate the call already holds,
+    before every call that traded returns, along each sweep's price path
+    (its first print, then its last: stops trail, then the print elects),
+    iterative (a stop's market order is a new sweep, bounded by the pending
+    stops) and deterministic (one print's stops in trigger order, sell
+    highest / buy lowest first, then admission order);
+  - at election the stop records the new `OrderStatus::Triggered
+    { child_id, trigger_price }` and the market order's `TradeResult`s
+    carry `origin_stop_id`; then the stop takes the market order's
+    terminal state (`Filled`, `Cancelled { InsufficientLiquidity |
+    SelfTradePrevention | MatchAborted }`, or `Rejected` when it was
+    refused untouched, including a market-order id already in use);
+  - while the kill switch is engaged elections are suspended (prints still
+    trail), so protective stops are not consumed by rejected market orders;
+  - admission accepts `GTC` / `GTD` / `DAY` only and requires a positive
+    quantity and trail (a multiple of the tick size) and a stop price not
+    beyond its watermark (`InvalidStopTerms`, code 25); a stop the last
+    trade already crosses is rejected untouched (`StopWouldTrigger`, code
+    24), at admission and on modify; the risk open-order slot and notional
+    are reserved at the stop price (no price band) and follow the stop as
+    it trails, without enforcing limits (a trailing sell stop can lift its
+    account above `max_notional_per_account`); a modify re-books in place;
+  - cancel, `update_order` (quantity, stop price, replace; a zero quantity
+    on `UpdatePriceAndQuantity` / `Replace` is `InvalidStopTerms`), every
+    mass cancel scope (pending stops follow the resting orders in the
+    result; the price range matches the current, trailed stop price),
+    `cancel_all_orders` and `evict_expired_orders` cover pending stops;
+  - while a stop is pending, calls that can trade and calls that target a
+    stop take the exclusive submit gate; post-only adds and the cancels
+    and quantity updates of other orders keep the shared side;
+    `create_snapshot` captures under the shared side.
+  Without `special_orders` a trailing stop is rejected untouched with the
+  new `OrderBookError::StopOrdersUnsupported { order_id }` (reject code
+  `StopOrdersUnsupported` = 23, journaled as never mutating).
+  `SpecialOrderTracker` loses its trailing-stop methods
+  (`register_trailing_stop`, `unregister_trailing_stop`,
+  `trailing_stop_count`, `trailing_stop_ids`); `reprice_trailing_stops`
+  returns `0` (every call that trades evaluates its own prints).
+  Compatibility: code that relied on a trailing stop resting or trading at
+  its stop price must treat it as a stop order now, and a stop the last
+  trade already crosses is now a rejection; exhaustive matches on
+  `OrderStatus` need a `Triggered` arm; a journal written before 0.14 that
+  holds trailing stops does not replay (the stop no longer rests), and
+  replay of a live book's stops needs the recorded trade-id namespace for
+  identical market-order ids (`snapshots_match` holds either way). A
+  command's journaled `TradeResult` holds its own trades only; a stop it
+  elected reaches the trade listener as a separate `TradeResult`.
+  Cost, measured against main (5925a7a) with `special_orders` on a loaded
+  host (1-minute load 5 to 13): with no stop pending,
+  `match_market_against_limit` / `_iceberg` stay within -1.5 % / +1.0 %
+  of main (five interleaved rounds over every commit of this change; an
+  earlier six-round run at load 11 read +10 to +16 % and did not
+  reproduce once the load dropped), `add_limit_orders` +1.3 % and the
+  contended `concurrent_add_limit_orders` rows within their noise, HDR
+  `aggressive_walk` and the `benches/compare` rows NOISY with no
+  consistent direction (a book without stops never allocates the store).
+  With stops pending, a quiet print costs about 70 ns more than the
+  `_0_stops` control, independent of the stop count; trailing costs
+  about 220 ns and an election about 630 ns per stop (see
+  `pending_stops_hdr` in `BENCH.md`); with one stop pending, 4-thread
+  limit adds (which can trade) serialize on the exclusive gate (7.9 us
+  per add in Criterion against 2.8 us without a stop), while post-only
+  adds match their control.
+- **Snapshot package format v5 (#286).** `ORDERBOOK_SNAPSHOT_FORMAT_VERSION`
+  goes from 4 to 5: `OrderBookSnapshot` gains `pending_stops:
+  Vec<OrderType<()>>` (admission order, stop price and watermark included)
+  and `last_trade_price: Option<u128>`, both `#[serde(default)]`, and the
+  checksum of a v5 package covers them. Restore installs the last trade
+  price (a restored book used to come back with none) and the pending
+  stops after validating them (trailing-stop kind, `GTC` / `GTD` / `DAY`,
+  positive quantity, consistent terms, unique ids; a stop the last trade
+  crosses is legal, see the kill switch above), and
+  rebuilds their risk at the stop price. `snapshots_match` compares both
+  fields. Migration: none needed on read; v2, v3 and v4 packages validate
+  with their original checksum and restore with no pending stop and no
+  last trade price (pinned by a verbatim v4 fixture written on `main`
+  before #286). A v2-v4 package that carries either field is rejected
+  (its checksum would not cover it). A package holding a trailing stop on
+  a price level (written by 0.13 or by a 0.14 pre-release) is refused with
+  `StopOrdersUnsupported`: cancel trailing stops on the old version before
+  snapshotting, and re-submit them after the upgrade. Packages written by
+  0.14 are v5 and are rejected by older readers; upgrade readers before
+  writers. `OrderBookSnapshot` literals need the two new fields.
 - **`ReplayError` is `#[non_exhaustive]` (#260).** 0.14 already adds
   `JournalTruncated` and `MassCancelMismatch`; marking the enum now, in the
   breaking window, lets later failure modes land without another break.
@@ -390,8 +505,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pricelevel 0.10 and may exceed `u64::MAX`. Migration: none needed on read;
   v2 (0.11) and v3 (0.12 / 0.13) packages validate with their original
   checksum and restore (pinned by a verbatim 0.13.1 v3 fixture next to the
-  0.8.4 v2 fixture). Packages written by 0.14 are v4 and are rejected by
-  0.13 and earlier (version check, or a decode error when a
+  0.8.4 v2 fixture). Packages written by 0.14 (v4 here, v5 since #286,
+  above) are rejected by 0.13 and earlier (version check, or a decode error when a
   `value_executed` exceeds `u64::MAX`); upgrade readers before writers.
 - **Wire break: bincode `TradeResult` (NATS + `bincode`).** pricelevel 0.10
   appended a positional `error` field to `MatchResult`, so a bincode
@@ -1507,9 +1622,16 @@ change.
   and recommend `create_snapshot_package` / `restore_from_snapshot_package`;
   `doc/wire-protocol.md` documents `MAX_FRAME_BODY` (4096) and encoder
   validation. The trailing-stop limitation (#286: trailing stops rest as
-  limit liquidity and do not trail on an uncrossed book) is stated in the
-  crate docs, the `repricing` module docs and the user guide. Broken
-  rustdoc links in the NATS modules are fixed.
+  limit liquidity and do not trail on an uncrossed book) was stated in the
+  crate docs, the `repricing` module docs and the user guide until #286
+  lifted it (see Changed (breaking)). Broken rustdoc links in the NATS
+  modules are fixed.
+- **Trailing stops documented (#286).** The #286 warnings are gone from
+  the crate docs, the `repricing` / `orderbook` module docs, the user guide
+  and the README; the user guide gains a trailing-stop section,
+  `doc/panic-boundaries.md` a section on the evaluation's gate mode and
+  cascade bound, and `examples/src/bin/special_orders_demo.rs` shows a
+  stop trailing and triggering on an uncrossed book.
 - **Level statistics are advisory under concurrent takers (#241).**
   pricelevel 0.10 supports exactly one concurrent writer of a level's
   execution statistics (`orders_executed`, `quantity_executed`,

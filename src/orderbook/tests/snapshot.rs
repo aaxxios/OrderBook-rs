@@ -10,6 +10,8 @@ mod tests {
             timestamp: 12345678,
             bids: Vec::new(),
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -30,6 +32,8 @@ mod tests {
             timestamp: 12345678,
             bids: vec![bid1, bid2],
             asks: vec![ask1, ask2],
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -266,6 +270,8 @@ mod tests {
             timestamp: 12345678,
             bids: vec![bid1, bid2],
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
 
         // Best bid should still be the highest price (1000), even though it's not first in array
@@ -376,7 +382,9 @@ mod tests_bis {
             symbol: "TEST".to_string(),
             timestamp: 12345678,
             bids: vec![bid1, bid3, bid2], // Deliberately unordered
-            asks: vec![ask2, ask1, ask3], // Deliberately unordered
+            asks: vec![ask2, ask1, ask3], // Deliberately unordered,
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -537,6 +545,8 @@ mod test_orderbook_snapshot {
             timestamp: 12345678,
             bids: vec![bid1, bid2],
             asks: vec![ask1, ask2],
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
 
         // Test total_bid_volume
@@ -564,6 +574,8 @@ mod test_snapshot_remaining {
             timestamp: 12345678,
             bids: Vec::new(),
             asks: Vec::new(),
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
 
         // Test volume methods on empty snapshot
@@ -586,6 +598,8 @@ mod test_snapshot_remaining {
             timestamp: 12345678,
             bids: vec![bid],
             asks: vec![ask],
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
 
         // Test methods that involve tracing
@@ -628,6 +642,8 @@ mod test_snapshot_specific {
             timestamp: 12345678,
             bids: vec![bid],
             asks: vec![ask],
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         };
 
         // Call functions that have trace output
@@ -753,7 +769,7 @@ mod test_snapshot_engine_seq {
                     "error message must mention version 1, got: {message}"
                 );
                 assert!(
-                    message.contains("2..=4"),
+                    message.contains("2..=5"),
                     "error message must state the supported range, got: {message}"
                 );
             }
@@ -865,12 +881,12 @@ mod test_snapshot_format_v3 {
     };
     use pricelevel::{Hash32, Id, Side, TimeInForce};
 
-    /// New packages are stamped with the current (v4) format version, and a
+    /// New packages are stamped with the current (v5) format version, and a
     /// non-degraded book's payload carries no `stats_degraded` key at all
     /// (pricelevel serializes it only when `true`), which is exactly the
     /// shape a legacy v2 payload has.
     #[test]
-    fn test_new_package_is_v4_and_omits_stats_degraded_when_clean() {
+    fn test_new_package_is_v5_and_omits_stats_degraded_when_clean() {
         let book = DefaultOrderBook::new("V3");
         let added = book.add_limit_order_with_user(
             Id::from_u64(1),
@@ -888,7 +904,7 @@ mod test_snapshot_format_v3 {
             package.version, ORDERBOOK_SNAPSHOT_FORMAT_VERSION,
             "new packages carry the current format version"
         );
-        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 4, "current version is 4");
+        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 5, "current version is 5");
 
         let json = package.to_json().expect("serialize package");
         assert!(
@@ -931,11 +947,11 @@ mod test_snapshot_format_v3 {
         assert_eq!(restored.engine_seq(), 5, "engine_seq restored verbatim");
     }
 
-    /// A `version: 2`-labelled package with 0.9-produced content must also
-    /// stay readable (the version range check, independent of wire-shape
-    /// fidelity — the genuine 0.8.4 fixture above covers that). The
-    /// checksum covers the snapshot payload only, so relabelling keeps it
-    /// valid.
+    /// A `version: 2`-labelled package with current content must also stay
+    /// readable (the version range check, independent of wire-shape
+    /// fidelity — the genuine 0.8.4 fixture above covers that). Its
+    /// checksum is recomputed the way version 2 computes it (symbol,
+    /// timestamp and levels, #286).
     #[test]
     fn test_v2_package_still_validates_and_restores() {
         let book = DefaultOrderBook::new("V2C");
@@ -950,8 +966,11 @@ mod test_snapshot_format_v3 {
         );
         assert!(added.is_ok(), "resting order must be admitted");
 
-        let mut package = book.create_snapshot_package(10).expect("build package");
-        package.version = ORDERBOOK_SNAPSHOT_MIN_READ_VERSION;
+        let package = book
+            .create_snapshot_package(10)
+            .expect("build package")
+            .relabelled_for_test(ORDERBOOK_SNAPSHOT_MIN_READ_VERSION)
+            .expect("relabel");
 
         // Full wire round-trip of the v2-labelled package.
         let json = package.to_json().expect("serialize v2 package");
@@ -997,9 +1016,10 @@ mod test_snapshot_format_v3 {
     /// `value_executed` statistic is a `u128`. A single execution whose
     /// notional exceeds `u64::MAX` (which degraded the 0.9 statistics,
     /// #206) is now recorded exactly, serialized as a number above
-    /// `u64::MAX`, stamped v4, and survives the checksummed round trip.
+    /// `u64::MAX`, stamped with the current version (v5), and survives the
+    /// checksummed round trip, as does the `u128` last trade price (#286).
     #[test]
-    fn test_value_executed_above_u64_round_trips_as_v4() {
+    fn test_value_executed_above_u64_round_trips_as_current_version() {
         let book = DefaultOrderBook::new("WIDE");
         let price = u128::from(u64::MAX) + 1;
         let added = book.add_limit_order_with_user(
@@ -1028,13 +1048,22 @@ mod test_snapshot_format_v3 {
         );
 
         let package = OrderBookSnapshotPackage::from_json(&json).expect("parse package");
-        assert_eq!(package.version, 4, "new payloads are stamped v4");
+        assert_eq!(
+            package.version, ORDERBOOK_SNAPSHOT_FORMAT_VERSION,
+            "new payloads are stamped with the current version"
+        );
+        assert_eq!(
+            package.snapshot.last_trade_price,
+            Some(price),
+            "a u128 last trade price survives the JSON round trip"
+        );
         assert!(package.validate().is_ok(), "checksum must hold");
 
         let mut restored = DefaultOrderBook::new("WIDE");
         restored
             .restore_from_snapshot_package(package)
-            .expect("v4 package must restore");
+            .expect("current package must restore");
+        assert_eq!(restored.last_trade_price(), Some(price));
 
         let resnapshot = restored.create_snapshot(10).expect("snapshot");
         let level = resnapshot
@@ -1096,24 +1125,27 @@ mod test_snapshot_format_v3 {
             .create_snapshot_package(usize::MAX)
             .expect("re-package");
         assert_eq!(package.version, ORDERBOOK_SNAPSHOT_FORMAT_VERSION);
-        let json = package.to_json().expect("serialize v4");
+        let json = package.to_json().expect("serialize current version");
         let mut round_tripped = DefaultOrderBook::new("BTC/USD");
         round_tripped
             .restore_from_snapshot_json(&json)
-            .expect("v4 round trip");
+            .expect("current-version round trip");
         assert_eq!(round_tripped.best_bid(), Some(99));
         assert_eq!(round_tripped.best_ask(), Some(100));
     }
 
-    /// The version range read by `validate` is exactly 2..=4.
+    /// The version range read by `validate` is exactly 2..=5.
     #[test]
-    fn test_read_version_range_is_2_to_4() {
+    fn test_read_version_range_is_2_to_5() {
         assert_eq!(ORDERBOOK_SNAPSHOT_MIN_READ_VERSION, 2);
-        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 4);
+        assert_eq!(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, 5);
         let book = DefaultOrderBook::new("RANGE");
-        for version in 2..=4 {
-            let mut package = book.create_snapshot_package(10).expect("build package");
-            package.version = version;
+        for version in 2..=5 {
+            let package = book
+                .create_snapshot_package(10)
+                .expect("build package")
+                .relabelled_for_test(version)
+                .expect("relabel");
             assert!(package.validate().is_ok(), "version {version} readable");
         }
         let mut package = book.create_snapshot_package(10).expect("build package");

@@ -13,10 +13,9 @@
 //! - `spread` / `spread_bps` report `None` for a crossed read instead of a
 //!   clamped `0`.
 //! - Engine defences that only a crossed / locked book can reach (the
-//!   residual-headroom pre-check, trailing stops resting inside the market)
-//!   keep their regression coverage through the `cfg(test)`-only
-//!   `restore_crossed_snapshot_for_test` hook, since the public restore now
-//!   refuses such books.
+//!   residual-headroom pre-check) keep their regression coverage through
+//!   the `cfg(test)`-only `restore_crossed_snapshot_for_test` hook, since
+//!   the public restore now refuses such books.
 
 #[cfg(test)]
 mod tests {
@@ -65,6 +64,8 @@ mod tests {
             timestamp: TS,
             bids,
             asks,
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -597,65 +598,92 @@ mod tests {
         );
     }
 
-    /// Migrated from `tests/unit/special_order_restore_tests.rs` (#194). A
-    /// trailing stop only re-prices when its stop price sits inside the
-    /// market (a Sell stop below the bid) — a crossed book, which the live
-    /// matching path never builds and the public restore now rejects (#250).
-    /// The restore-side re-registration is what #194 pins; the crossed
-    /// fixture is installed through the test hook.
+    /// #194 rewritten for #286. Before 0.14 a trailing stop rested on a
+    /// level and only re-priced on a crossed book, which this test used to
+    /// install through the crossed-restore hook. A stop is now a pending
+    /// off-book stop: the restore reinstalls it as pending (not on a
+    /// level), with its stop price, watermark and the last trade price it
+    /// trails on, and it keeps trailing and triggering on the restored book.
     #[cfg(feature = "special_orders")]
     #[test]
-    fn restore_reregisters_trailing_stop_and_reprices_issue_194() {
-        use crate::orderbook::repricing::RepricingOperations;
-
+    fn restore_reinstalls_pending_trailing_stop_issue_194() {
         let stop_id = Id::from_u64(2000);
-        let stop = PriceLevel::new(100);
-        let admitted = stop.add_order(OrderType::TrailingStop {
+        let live: OrderBook<()> = OrderBook::new("TS/USD");
+        live.add_order(standard(1, 100, 10, Side::Sell))
+            .expect("ask");
+        live.add_order(standard(2, 90, 10, Side::Buy)).expect("bid");
+        live.submit_market_order(Id::from_u64(3), 1, Side::Buy)
+            .expect("trade at 100");
+        live.add_order(OrderType::TrailingStop {
             id: stop_id,
-            price: Price::new(100),
+            price: Price::new(95),
             quantity: Quantity::new(5),
             side: Side::Sell,
             user_id: Hash32::zero(),
             timestamp: TimestampMs::new(1),
             time_in_force: TimeInForce::Gtc,
             trail_amount: Quantity::new(5),
-            last_reference_price: Price::new(90),
+            last_reference_price: Price::new(100),
             extra_fields: (),
-        });
-        assert!(admitted.is_ok(), "fixture level admits the stop");
+        })
+        .expect("pending stop");
 
-        let restored: OrderBook<()> = OrderBook::new("TS/USD");
-        restored
-            .restore_crossed_snapshot_for_test(snapshot(
-                "TS/USD",
-                vec![level(1, 110, 10, Side::Buy)],
-                vec![stop.snapshot().expect("stop level snapshot")],
-            ))
-            .expect("restore crossed book");
-
-        assert_eq!(restored.trailing_stop_count(), 1, "stop re-registered");
-        assert_eq!(restored.trailing_stop_ids(), vec![stop_id]);
-        assert_eq!(restored.pegged_order_count(), 0, "no pegged orders");
-        assert_eq!(restored.best_bid(), Some(110), "bid liquidity restored");
-        let before = restored.get_order(stop_id).expect("stop restored");
-        assert_eq!(before.price().as_u128(), 100);
-
-        // best_bid 110 > watermark 90: the stop trails to 105, inside the
-        // bid, so the validate-first re-add matches it against the bid.
-        let repriced = restored
-            .reprice_trailing_stops()
-            .expect("reprice runs on the restored book");
-        assert_eq!(repriced, 1, "the restored trailing stop re-prices");
-        assert!(
-            restored.get_order(stop_id).is_none(),
-            "the trailing stop trailed into the market and triggered"
+        let package = live.create_snapshot_package(usize::MAX).expect("package");
+        assert_eq!(
+            package.snapshot.pending_stops.len(),
+            1,
+            "stop in the snapshot"
         );
-        assert_eq!(restored.best_bid(), Some(110), "bid still best");
+        assert_eq!(package.snapshot.last_trade_price, Some(100));
+        let mut restored: OrderBook<()> = OrderBook::new("TS/USD");
+        restored
+            .restore_from_snapshot_package(package)
+            .expect("restore");
+
+        assert_eq!(restored.trailing_stop_ids(), vec![stop_id], "stop pending");
+        assert_eq!(restored.last_trade_price(), Some(100));
+        assert_eq!(restored.best_ask(), Some(100), "no level holds the stop");
+        assert_eq!(restored.best_bid(), Some(90));
+        let pending = restored.get_order(stop_id).expect("stop found");
+        assert_eq!(pending.price().as_u128(), 95);
+
+        // A trade at 104 trails the sell stop to 99.
+        restored
+            .add_order(standard(4, 104, 1, Side::Sell))
+            .expect("ask at 104");
+        restored
+            .submit_market_order(Id::from_u64(5), 10, Side::Buy)
+            .expect("sweep to 104");
+        assert_eq!(restored.last_trade_price(), Some(104));
+        let trailed = restored.get_order(stop_id).expect("still pending");
+        assert_eq!(trailed.price().as_u128(), 99, "trailed to 104 - 5");
+        assert_eq!(
+            crate::orderbook::repricing::RepricingOperations::reprice_trailing_stops(&restored)
+                .expect("evaluate"),
+            0,
+            "already settled"
+        );
+
+        // A sell at 90 trades at 90 <= 99: the stop triggers and sells 5
+        // into the bid at 90.
+        restored
+            .submit_market_order(Id::from_u64(6), 1, Side::Sell)
+            .expect("trade at 90");
+        assert!(restored.get_order(stop_id).is_none(), "stop triggered");
+        assert_eq!(restored.trailing_stop_count(), 0);
+        assert_eq!(
+            restored.visible_quantity_at_price(90, Side::Buy),
+            Some(4),
+            "10 - 1 - 5 left on the bid"
+        );
     }
 
-    /// The public restore refuses the crossed #194 fixture.
+    /// A trailing stop resting on a level (the pre-0.14 model) cannot be
+    /// restored, in every feature set: it is refused with
+    /// `StopOrdersUnsupported` before any live state is touched, ahead of
+    /// the crossed-book check the old fixture also tripped (#286, #250).
     #[test]
-    fn public_restore_refuses_trailing_stop_inside_the_market() {
+    fn public_restore_refuses_trailing_stop_on_a_level() {
         let stop = PriceLevel::new(100);
         let admitted = stop.add_order(OrderType::TrailingStop {
             id: Id::from_u64(2000),
@@ -674,18 +702,12 @@ mod tests {
         let err = book
             .restore_from_snapshot(snapshot(
                 "TS/USD",
-                vec![level(1, 110, 10, Side::Buy)],
+                vec![level(1, 90, 10, Side::Buy)],
                 vec![stop.snapshot().expect("stop level snapshot")],
             ))
-            .expect_err("crossed");
+            .expect_err("a level holding a trailing stop is refused");
         assert!(
-            matches!(
-                err,
-                OrderBookError::SnapshotCrossed {
-                    best_bid: 110,
-                    best_ask: 100
-                }
-            ),
+            matches!(err, OrderBookError::StopOrdersUnsupported { order_id } if order_id == Id::from_u64(2000)),
             "got {err:?}"
         );
         assert!(book.best_bid().is_none(), "book untouched");

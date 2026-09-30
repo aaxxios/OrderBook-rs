@@ -1,7 +1,7 @@
 //! Order book snapshot for market data
 
 use bitflags::bitflags;
-use pricelevel::PriceLevelSnapshot;
+use pricelevel::{OrderType, PriceLevelSnapshot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::trace;
@@ -37,6 +37,26 @@ pub struct OrderBookSnapshot {
     /// Snapshot of ask price levels. Per-level execution statistics are
     /// advisory under concurrent takers (see the type docs).
     pub asks: Vec<PriceLevelSnapshot>,
+
+    /// Pending trailing stops (#286), in admission (trigger-priority) order.
+    ///
+    /// Held off book: they are not part of `bids` / `asks` and never count
+    /// as depth. Each carries its current stop price (`price`) and
+    /// watermark (`last_reference_price`). Not limited by the snapshot
+    /// depth. Always empty without the `special_orders` feature.
+    /// `#[serde(default)]`: absent from payloads written before format
+    /// version 5.
+    #[serde(default)]
+    pub pending_stops: Vec<OrderType<()>>,
+
+    /// The book's last trade price, in price ticks, or `None` when it has
+    /// not traded (#286). Pending stops trail and trigger on it, and a
+    /// restore installs it, so the restored book evaluates its stops (and
+    /// last-trade price references) exactly like the original.
+    /// `#[serde(default)]`: absent from payloads written before format
+    /// version 5.
+    #[serde(default)]
+    pub last_trade_price: Option<u128>,
 }
 
 impl OrderBookSnapshot {
@@ -204,6 +224,13 @@ fn total_value(
 
 /// Format version used for checksum-enabled order book snapshots.
 ///
+/// Bumped to `5` for off-book trailing stops (#286): the snapshot carries
+/// the pending stops (`OrderBookSnapshot::pending_stops`) and the last
+/// trade price (`OrderBookSnapshot::last_trade_price`), and the checksum of
+/// a version-5 package covers both. Packages of versions `2..=4` are
+/// verified with their original checksum (over symbol, timestamp and
+/// levels) and must not carry either field.
+///
 /// Bumped to `4` for pricelevel 0.10: the embedded level statistics'
 /// `value_executed` is a `u128` (was `u64`), so a payload may carry a value
 /// above `u64::MAX` that a pre-0.14 reader (pricelevel 0.9) cannot decode.
@@ -226,7 +253,7 @@ fn total_value(
 /// [`OrderBookSnapshotPackage::validate`] with the existing
 /// `Unsupported snapshot version` error — that format break is
 /// intentional, with no special-case migration path.
-pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 4;
+pub const ORDERBOOK_SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// Length of a hex-encoded SHA-256 digest (32 bytes, two hex digits each).
 const SHA256_HEX_LEN: usize = 64;
@@ -236,6 +263,37 @@ const SHA256_HEX_LEN: usize = 64;
 /// 0.9 `stats_degraded` statistics field and restore cleanly — the field
 /// simply defaults to `false`.
 pub const ORDERBOOK_SNAPSHOT_MIN_READ_VERSION: u32 = 2;
+
+/// First package version whose snapshot carries pending stops and the last
+/// trade price, and whose checksum covers them (#286).
+const STOP_ORDERS_SNAPSHOT_VERSION: u32 = 5;
+
+/// The snapshot fields packages of versions `2..=4` checksummed, in their
+/// serialized order. Serializes byte-identically to the pre-#286
+/// `OrderBookSnapshot`, so those packages keep verifying.
+#[derive(Serialize)]
+struct LegacySnapshotView<'a> {
+    /// See [`OrderBookSnapshot::symbol`].
+    symbol: &'a str,
+    /// See [`OrderBookSnapshot::timestamp`].
+    timestamp: u64,
+    /// See [`OrderBookSnapshot::bids`].
+    bids: &'a [PriceLevelSnapshot],
+    /// See [`OrderBookSnapshot::asks`].
+    asks: &'a [PriceLevelSnapshot],
+}
+
+impl<'a> LegacySnapshotView<'a> {
+    /// The legacy view of `snapshot`.
+    fn of(snapshot: &'a OrderBookSnapshot) -> Self {
+        Self {
+            symbol: &snapshot.symbol,
+            timestamp: snapshot.timestamp,
+            bids: &snapshot.bids,
+            asks: &snapshot.asks,
+        }
+    }
+}
 
 /// Wrapper that provides checksum validation for `OrderBookSnapshot` instances.
 ///
@@ -358,7 +416,7 @@ impl OrderBookSnapshotPackage {
     pub fn new(mut snapshot: OrderBookSnapshot) -> Result<Self, OrderBookError> {
         snapshot.refresh_aggregates()?;
 
-        let checksum = Self::compute_checksum(&snapshot)?;
+        let checksum = Self::compute_checksum(ORDERBOOK_SNAPSHOT_FORMAT_VERSION, &snapshot)?;
 
         Ok(Self {
             version: ORDERBOOK_SNAPSHOT_FORMAT_VERSION,
@@ -396,11 +454,15 @@ impl OrderBookSnapshotPackage {
     ///
     /// Accepts package versions
     /// [`ORDERBOOK_SNAPSHOT_MIN_READ_VERSION`]`..=`[`ORDERBOOK_SNAPSHOT_FORMAT_VERSION`]
-    /// — the current format plus the pre-pricelevel-0.9 legacy format —
     /// and rejects anything older or newer with a typed error. The
-    /// checksum covers the snapshot payload only (not the version
-    /// field), and its algorithm is identical for every supported
-    /// version.
+    /// checksum covers the snapshot payload only (not the version field
+    /// or the configuration fields): for version `5` the whole snapshot,
+    /// pending stops and last trade price included; for versions `2..=4`
+    /// the payload those versions wrote (symbol, timestamp and levels), so
+    /// their packages keep their original checksum. A package below
+    /// version `5` that carries pending stops or a last trade price is
+    /// rejected: those fields did not exist then and its checksum would
+    /// not cover them.
     #[must_use = "an unchecked snapshot package must not be restored"]
     pub fn validate(&self) -> Result<(), OrderBookError> {
         if self.version < ORDERBOOK_SNAPSHOT_MIN_READ_VERSION
@@ -416,7 +478,18 @@ impl OrderBookSnapshotPackage {
             });
         }
 
-        let computed = Self::compute_checksum(&self.snapshot)?;
+        if self.version < STOP_ORDERS_SNAPSHOT_VERSION
+            && (!self.snapshot.pending_stops.is_empty() || self.snapshot.last_trade_price.is_some())
+        {
+            return Err(OrderBookError::InvalidOperation {
+                message: format!(
+                    "snapshot version {} cannot carry pending stops or a last trade price (introduced in version {})",
+                    self.version, STOP_ORDERS_SNAPSHOT_VERSION
+                ),
+            });
+        }
+
+        let computed = Self::compute_checksum(self.version, &self.snapshot)?;
         if computed != self.checksum {
             return Err(OrderBookError::ChecksumMismatch {
                 expected: self.checksum.clone(),
@@ -427,6 +500,21 @@ impl OrderBookSnapshotPackage {
         Ok(())
     }
 
+    /// Test-only: stamps the package with `version` and recomputes its
+    /// checksum the way that version computes it, so a test can build a
+    /// valid legacy-labelled package from a current book.
+    ///
+    /// # Errors
+    ///
+    /// [`OrderBookError::SerializationError`] when the payload cannot be
+    /// encoded.
+    #[cfg(test)]
+    pub(crate) fn relabelled_for_test(mut self, version: u32) -> Result<Self, OrderBookError> {
+        self.version = version;
+        self.checksum = Self::compute_checksum(version, &self.snapshot)?;
+        Ok(self)
+    }
+
     /// Consumes the package and returns the validated snapshot.
     #[must_use = "the validated snapshot (or the validation error) must be handled"]
     pub fn into_snapshot(self) -> Result<OrderBookSnapshot, OrderBookError> {
@@ -434,11 +522,21 @@ impl OrderBookSnapshotPackage {
         Ok(self.snapshot)
     }
 
-    fn compute_checksum(snapshot: &OrderBookSnapshot) -> Result<String, OrderBookError> {
-        let payload =
-            serde_json::to_vec(snapshot).map_err(|error| OrderBookError::SerializationError {
-                message: error.to_string(),
-            })?;
+    /// SHA-256 (hex) of the checksummed payload of a `version` package:
+    /// the whole snapshot from version 5 on, the pre-#286 fields
+    /// ([`LegacySnapshotView`]) before it.
+    fn compute_checksum(
+        version: u32,
+        snapshot: &OrderBookSnapshot,
+    ) -> Result<String, OrderBookError> {
+        let payload = if version >= STOP_ORDERS_SNAPSHOT_VERSION {
+            serde_json::to_vec(snapshot)
+        } else {
+            serde_json::to_vec(&LegacySnapshotView::of(snapshot))
+        }
+        .map_err(|error| OrderBookError::SerializationError {
+            message: error.to_string(),
+        })?;
 
         let mut hasher = Sha256::new();
         hasher.update(payload);
@@ -837,6 +935,8 @@ mod tests {
             timestamp: 0,
             bids,
             asks,
+            pending_stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 

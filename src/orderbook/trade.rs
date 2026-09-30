@@ -6,7 +6,7 @@
 use crate::orderbook::error::OrderBookError;
 use crate::orderbook::fees::FeeOverflow;
 use crate::orderbook::fees::FeeSchedule;
-use pricelevel::{MatchResult, PriceLevelError, Trade};
+use pricelevel::{Id, MatchResult, PriceLevelError, Trade};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -49,6 +49,19 @@ pub struct TradeResult {
     /// that pre-date `quote_notional` so existing consumers keep parsing.
     #[serde(default)]
     pub quote_notional: u128,
+    /// The pending trailing stop whose election produced these trades
+    /// (#286), or `None` for any other taker. Set on the trades of a
+    /// stop's market order, whose taker id is
+    /// `OrderBook::stop_trigger_order_id(stop)`, so a consumer can link the
+    /// child's fills back to the stop without recomputing that id.
+    ///
+    /// JSON: `#[serde(default)]`, so payloads written before the field
+    /// existed decode with `None`. Bincode is positional: the field is
+    /// appended last and a bincode `TradeResult` written without it (0.13,
+    /// or a 0.14 build before #286) does not decode, and vice versa;
+    /// upgrade bincode producers and consumers together.
+    #[serde(default)]
+    pub origin_stop_id: Option<Id>,
 }
 
 /// Checked arithmetic failure while building a [`TradeResult`] or a
@@ -191,6 +204,7 @@ impl TradeResult {
             total_taker_fees,
             engine_seq: 0,
             quote_notional,
+            origin_stop_id: None,
         })
     }
 
@@ -522,6 +536,25 @@ mod tests {
         assert_eq!(tr.total_maker_fees, 0);
         assert_eq!(tr.total_taker_fees, 0);
         assert_eq!(tr.total_fees().unwrap(), 0);
+    }
+
+    /// #286: `origin_stop_id` defaults to `None`, round-trips through JSON
+    /// and is absent-tolerant for payloads written before it existed.
+    #[test]
+    fn test_trade_result_origin_stop_id_json_compat() {
+        let mr = make_match_result_with_trades(vec![make_trade(100, 5)]);
+        let mut result = TradeResult::new("SYM".to_string(), mr).expect("result");
+        assert_eq!(result.origin_stop_id, None);
+        result.origin_stop_id = Some(Id::from_u64(7));
+        let json = serde_json::to_string(&result).expect("json");
+        let back: TradeResult = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.origin_stop_id, Some(Id::from_u64(7)));
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("value");
+        if let Some(map) = value.as_object_mut() {
+            map.remove("origin_stop_id");
+        }
+        let legacy: TradeResult = serde_json::from_value(value).expect("legacy decode");
+        assert_eq!(legacy.origin_stop_id, None);
     }
 
     #[test]

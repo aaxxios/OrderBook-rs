@@ -165,6 +165,7 @@ never index, slice unchecked or panic on untrusted bytes.
 |    2 | `Filled`            |
 |    3 | `Cancelled`         |
 |    4 | `Rejected`          |
+|    5 | `Triggered` (#286: an elected trailing stop; decoders before 0.14 reject it) |
 
 The `reject_reason` field carries the `RejectReason` numeric code
 (stable across `0.7.x`); see `src/orderbook/reject_reason.rs`.

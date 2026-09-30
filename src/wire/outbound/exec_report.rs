@@ -21,6 +21,12 @@ pub const STATUS_FILLED: u8 = 2;
 pub const STATUS_CANCELLED: u8 = 3;
 /// Wire code for `OrderStatus::Rejected`.
 pub const STATUS_REJECTED: u8 = 4;
+/// Wire code for `OrderStatus::Triggered` (#286): a pending trailing stop
+/// was elected and runs as a market order. Decoders before 0.14 reject it.
+pub const STATUS_TRIGGERED: u8 = 5;
+
+/// Highest valid `STATUS_*` code.
+const STATUS_MAX: u8 = STATUS_TRIGGERED;
 
 /// Fixed payload size in bytes for an `ExecReport`.
 pub const EXEC_REPORT_SIZE: usize = 44;
@@ -71,6 +77,7 @@ pub fn status_to_wire(status: &OrderStatus) -> u8 {
         OrderStatus::Filled { .. } => STATUS_FILLED,
         OrderStatus::Cancelled { .. } => STATUS_CANCELLED,
         OrderStatus::Rejected { .. } => STATUS_REJECTED,
+        OrderStatus::Triggered { .. } => STATUS_TRIGGERED,
     }
 }
 
@@ -89,7 +96,7 @@ pub fn status_to_wire(status: &OrderStatus) -> u8 {
 /// [`EXEC_REPORT_SIZE`] bytes. `out` is left unchanged in either case.
 #[inline]
 pub fn encode_exec_report(report: &ExecReport, out: &mut Vec<u8>) -> Result<(), WireError> {
-    if report.status > STATUS_REJECTED {
+    if report.status > STATUS_MAX {
         return Err(WireError::InvalidPayload("ExecReport: unknown status"));
     }
     if report._pad != 0 {
@@ -126,7 +133,7 @@ pub fn decode_exec_report(payload: &[u8]) -> Result<ExecReport, WireError> {
     let engine_seq = read_u64_le(payload, 0)?;
     let order_id = read_u64_le(payload, 8)?;
     let status = read_u8(payload, 16)?;
-    if status > STATUS_REJECTED {
+    if status > STATUS_MAX {
         return Err(WireError::InvalidPayload("ExecReport: unknown status"));
     }
     let filled_qty = read_u64_le(payload, 17)?;
@@ -204,6 +211,13 @@ mod tests {
             }),
             STATUS_REJECTED
         );
+        assert_eq!(
+            status_to_wire(&OrderStatus::Triggered {
+                child_id: pricelevel::Id::from_u64(1),
+                trigger_price: 100,
+            }),
+            STATUS_TRIGGERED
+        );
     }
 
     proptest! {
@@ -211,7 +225,7 @@ mod tests {
         fn roundtrip_through_frame(
             engine_seq in any::<u64>(),
             order_id in any::<u64>(),
-            status in 0u8..=4u8,
+            status in 0u8..=5u8,
             filled_qty in any::<u64>(),
             remaining_qty in any::<u64>(),
             price in any::<i64>(),
@@ -297,7 +311,7 @@ mod tests {
         let mut out = vec![0xEE];
         for bad in [
             ExecReport {
-                status: STATUS_REJECTED + 1,
+                status: STATUS_MAX + 1,
                 ..valid
             },
             ExecReport {
