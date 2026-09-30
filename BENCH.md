@@ -845,8 +845,11 @@ queueing delay a saturated real load generator would see.
 
 ### `pending_stops` — books holding pending trailing stops (added for #286)
 
-Low-sample rows (the 1,000-stop election and cascade rows take 200
-samples) print `n/a` for the tail quantiles they cannot resolve.
+Quantiles a row's sample count cannot resolve are `n/a` (the HDR
+report's rule: p99 needs at least 1 000 samples, p99.9 10 000, p99.99
+100 000). The quiet rows take 3 125 batched samples (32 ops each), the
+trailing rows 50 000 and 5 000, the election and cascade rows 5 000 (10
+stops) and 200 (1 000 stops).
 
 `pending_stops_hdr` (needs `--features special_orders`; `make bench-hdr`
 runs it with that feature) measures what pending off-book trailing stops cost
@@ -872,17 +875,17 @@ by construction.
 One run, host as in "Run conditions" but loaded (1-minute load average
 10 to 13 during the run), so read the tails as indicative; values in ns:
 
-| scenario | p50 | p99 | p99.9 | p99.99 |
-|---|---|---|---|---|
-| `pending_stops_quiet_0` | 325 | 466 | 790 | 895 |
-| `pending_stops_quiet_10` | 397 | 579 | 1 388 | 2 717 |
-| `pending_stops_quiet_1000` | 398 | 532 | 739 | 992 |
-| `pending_stops_trailing_10` | 2 209 | 3 251 | 8 335 | 22 751 |
-| `pending_stops_trailing_1000` | 220 287 | 243 199 | 278 783 | 331 263 |
-| `pending_stops_elect_10` | 6 335 | 7 375 | 13 631 | 38 399 |
-| `pending_stops_elect_1000` | 628 735 | 676 863 | 711 167 | 711 167 |
-| `pending_stops_cascade_10` | 10 047 | 13 007 | 19 919 | 46 975 |
-| `pending_stops_cascade_1000` | 1 880 063 | 2 420 735 | 2 539 519 | 2 539 519 |
+| scenario | samples | p50 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| `pending_stops_quiet_0` | 3 125 | 325 | 466 | n/a | n/a |
+| `pending_stops_quiet_10` | 3 125 | 397 | 579 | n/a | n/a |
+| `pending_stops_quiet_1000` | 3 125 | 398 | 532 | n/a | n/a |
+| `pending_stops_trailing_10` | 50 000 | 2 209 | 3 251 | 8 335 | n/a |
+| `pending_stops_trailing_1000` | 5 000 | 220 287 | 243 199 | n/a | n/a |
+| `pending_stops_elect_10` | 5 000 | 6 335 | 7 375 | n/a | n/a |
+| `pending_stops_elect_1000` | 200 | 628 735 | n/a | n/a | n/a |
+| `pending_stops_cascade_10` | 5 000 | 10 047 | 13 007 | n/a | n/a |
+| `pending_stops_cascade_1000` | 200 | 1 880 063 | n/a | n/a | n/a |
 
 A quiet print costs about 70 ns more with stops pending than without,
 independent of `N` (the exclusive gate, recording the path, and the
