@@ -328,7 +328,7 @@ pub(crate) async fn throttle_or_shutdown(
 #[must_use]
 pub(crate) fn checked_reserve(counter: &AtomicU64, n: u64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(n)
         })
         .ok()
@@ -349,8 +349,8 @@ pub(crate) fn increment_metric(counter: &AtomicU64, name: &'static str) {
 pub(crate) fn add_metric(counter: &AtomicU64, n: usize, name: &'static str) {
     let n = u64::try_from(n).unwrap_or(u64::MAX);
     let mut overflowed = false;
-    // The closure always returns `Some`, so `fetch_update` cannot fail.
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    // The closure always returns `Some`, so `try_update` cannot fail.
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.checked_add(n).unwrap_or_else(|| {
             overflowed = true;
             u64::MAX
@@ -616,7 +616,7 @@ fn jitter_hash(seed: u64, sequence: u64, retry: u64) -> u64 {
 #[must_use]
 pub(crate) fn new_jitter_seed() -> u64 {
     let counter = SEED_COUNTER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .unwrap_or_else(|current| current);

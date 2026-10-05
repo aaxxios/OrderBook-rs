@@ -151,7 +151,7 @@ pub struct ReplayBookConfig {
     /// replayed book's
     /// [`OrderBook::stop_protection`] with the source book's (or with the
     /// snapshot package's
-    /// [`stop_protection`](crate::OrderBookSnapshotPackage::stop_protection)
+    /// [`stop_protection`](crate::orderbook::OrderBookSnapshotPackage::stop_protection)
     /// field).
     pub stop_protection: Option<StopProtection>,
 }

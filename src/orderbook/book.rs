@@ -54,7 +54,7 @@ static DEFAULT_TRADE_ID_NAMESPACE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// untouched) once the counter is exhausted. Never panics or wraps.
 #[must_use]
 pub(crate) fn next_namespace_seq(counter: &AtomicU64) -> u64 {
-    match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    match counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         current.checked_add(1)
     }) {
         Ok(previous) => previous,
@@ -88,7 +88,7 @@ pub(crate) fn next_namespace_seq(counter: &AtomicU64) -> u64 {
 ///
 /// Uniqueness argument:
 ///
-/// - **Same process.** `seq` is taken with an atomic `fetch_update` +
+/// - **Same process.** `seq` is taken with an atomic `try_update` +
 ///   `checked_add`, so every construction sees a distinct value, whatever
 ///   the thread, symbol or clock reading.
 /// - **Concurrent processes.** Live processes have distinct pids.
@@ -804,7 +804,7 @@ impl<T> OrderBook<T> {
     ///
     /// Called exactly once per outbound event (trade emission, price-level
     /// change emission). Internally a checked
-    /// `AtomicU64::fetch_update(checked_add(1))` — strict total order across
+    /// `AtomicU64::try_update(checked_add(1))` — strict total order across
     /// all events of this `OrderBook<T>` instance. Single source of truth
     /// for the minting contract; every emission path in the matching engine
     /// routes through this method so the counter cannot drift between
@@ -836,7 +836,7 @@ impl<T> OrderBook<T> {
     #[inline]
     pub fn next_engine_seq(&self) -> Result<u64, OrderBookError> {
         self.engine_seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
                 seq.checked_add(1)
             })
             .map_err(engine_seq_exhausted)
@@ -1298,7 +1298,7 @@ where
     #[inline]
     pub(super) fn bump_diagnostic_counter(counter: &AtomicU64, name: &'static str) {
         if counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .is_err()
         {
             tracing::warn!(
@@ -5944,7 +5944,7 @@ where
         if Self::is_strandable_maker(order)
             && self
                 .strandable_makers_resting
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(1)
                 })
                 .is_err()
@@ -5970,7 +5970,7 @@ where
     pub(super) fn note_removed_strandable_maker(&self) {
         if self
             .strandable_makers_resting
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
             .is_err()

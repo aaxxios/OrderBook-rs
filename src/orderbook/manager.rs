@@ -76,12 +76,12 @@ impl DropTracker {
     /// Count one undeliverable trade event for `symbol`.
     #[cold]
     fn record_drop(&self, symbol: &str) {
-        // Checked increment (never wraps). `fetch_update` stores nothing when
+        // Checked increment (never wraps). `try_update` stores nothing when
         // the closure returns `None`, so the counter stays at `u64::MAX` in
         // the unreachable overflow case instead of wrapping to zero.
         let _ = self
             .dropped
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             });
         crate::orderbook::metrics::record_manager_trade_event_dropped();
@@ -137,10 +137,10 @@ impl Drop for AdmissionGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         // Checked: `enter` incremented before creating the guard, so this
-        // never underflows; `fetch_update` stores nothing if it would.
+        // never underflows; `try_update` stores nothing if it would.
         let _ = self
             .in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             });
     }
@@ -156,7 +156,7 @@ impl StdAdmission {
             return None;
         }
         self.in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             })
             .ok()?;
