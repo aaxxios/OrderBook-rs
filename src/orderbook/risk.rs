@@ -7,7 +7,7 @@
 //!   orders, per-account notional, price band against a reference price).
 //! - [`ReferencePriceSource`] — selects the reference price used by the
 //!   price-band check.
-//! - [`RiskState`] — bound to an [`OrderBook`](crate::OrderBook),
+//! - [`RiskState`] — bound to an [`OrderBook`],
 //!   carries the optional config plus per-account counters
 //!   (`DashMap<Hash32, RiskCounters>`) and per-resting-order entries
 //!   (`DashMap<Id, RiskEntry>`). When [`RiskConfig`] is `None`, every
@@ -303,14 +303,14 @@ fn checked_notional(quantity: u64, price: u128) -> Option<u128> {
     u128::from(quantity).checked_mul(price)
 }
 
-/// Checked increment of an `AtomicU64` via a CAS loop (`fetch_update`).
+/// Checked increment of an `AtomicU64` via a CAS loop (`try_update`).
 ///
 /// Returns `Ok(previous)` on success, or `Err(current)` without storing
 /// anything when `current + delta` would overflow. `Relaxed` on both
 /// success and failure: see [`RiskCounters`].
 #[inline]
 fn checked_add_u64(counter: &AtomicU64, delta: u64) -> Result<u64, u64> {
-    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         current.checked_add(delta)
     })
 }
@@ -526,7 +526,7 @@ impl RiskState {
     #[inline(never)]
     fn count_anomaly(&self) {
         // Checked increment; a count already at `u64::MAX` stays there
-        // (`fetch_update` returns `Err` and stores nothing).
+        // (`try_update` returns `Err` and stores nothing).
         let _ = checked_add_u64(&self.accounting_anomalies, 1);
         crate::orderbook::metrics::record_risk_accounting_anomaly();
     }

@@ -356,7 +356,7 @@ impl EventOutbox {
     /// `u64::MAX` the counter stays put and the refusal is logged.
     fn bump(counter: &AtomicU64, n: u64, name: &'static str) {
         if counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(n))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(n))
             .is_err()
         {
             tracing::warn!(

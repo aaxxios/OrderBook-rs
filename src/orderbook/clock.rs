@@ -141,7 +141,7 @@ impl Clock for StubClock {
         // overflows, so the counter stays put and `current` is returned.
         let v = match self
             .counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(self.step)
             }) {
             Ok(previous) => previous,

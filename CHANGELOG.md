@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI and `make coverage*` now require cargo-tarpaulin >= 0.37.5, the first
+  release that reads Rust 1.99 coverage data.
+
 ## [0.15.0] - 2026-09-30
 
 The stop-protection release. Elected trailing stops (#286) can be bounded

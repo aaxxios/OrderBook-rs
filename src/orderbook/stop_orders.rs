@@ -483,7 +483,7 @@ impl StopStore {
     /// Takes the next admission sequence (checked).
     fn take_seq(&self) -> Result<u64, OrderBookError> {
         self.next_seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
                 seq.checked_add(1)
             })
             .map_err(|_| OrderBookError::ArithmeticOverflow {
@@ -990,9 +990,9 @@ where
                 ),
             }));
         }
-        let quantity = order.total_quantity().map_err(&reject)?;
+        let quantity = order.total_quantity().map_err(reject)?;
         self.check_stop_terms(order_id, terms, quantity)
-            .map_err(&reject)?;
+            .map_err(reject)?;
         if self.order_locations.contains_key(&order_id) || self.pending_stops.contains(order_id) {
             if records_rejections {
                 crate::orderbook::metrics::record_reject(RejectReason::DuplicateOrderId);
@@ -1026,7 +1026,7 @@ where
         let reservation = self
             .risk_state
             .on_admission(order_id, order.user_id(), terms.stop, quantity)
-            .map_err(&reject)?;
+            .map_err(reject)?;
         let unit = self.convert_to_unit_type(&order);
         if let Err(err) = self.pending_stops.insert(unit) {
             self.risk_state.release_reservation(reservation);
