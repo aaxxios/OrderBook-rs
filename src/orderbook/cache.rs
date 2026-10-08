@@ -196,4 +196,46 @@ mod tests {
         assert_eq!(cache.get_cached_best_bid(), None);
         assert_eq!(cache.get_cached_best_ask(), None);
     }
+
+    #[test]
+    fn test_empty_bid_side_is_a_miss_and_does_not_touch_the_other() {
+        let cache = PriceLevelCache::new();
+        cache.update_best_ask(Some(110));
+        cache.update_best_bid(None);
+        assert_eq!(cache.get_cached_best_bid(), None);
+        assert_eq!(cache.get_cached_best_ask(), Some(110));
+    }
+
+    #[test]
+    fn test_u128_max_handling() {
+        assert_eq!(PriceLevelCache::encode(u128::MAX), u128::MAX);
+        assert_eq!(PriceLevelCache::decode(u128::MAX), (false, u128::MAX));
+
+        let cache = PriceLevelCache::new();
+        cache.update_best_bid(Some(u128::MAX));
+        assert_eq!(cache.get_cached_best_bid(), None);
+
+        cache.update_best_ask(Some(u128::MAX));
+        assert_eq!(cache.get_cached_best_ask(), None);
+    }
+
+    #[test]
+    fn test_price_level_cache_serialization() {
+        let cache = PriceLevelCache::new();
+        cache.update_best_bid(Some(100));
+        cache.update_best_ask(Some(200));
+
+        let json = serde_json::to_string(&cache).expect("serialization must succeed");
+        assert!(json.contains("\"best_bid_price\":100"));
+        assert!(json.contains("\"best_ask_price\":200"));
+        assert!(json.contains("\"bid_valid\":true"));
+        assert!(json.contains("\"ask_valid\":true"));
+
+        cache.invalidate();
+        let json_invalid = serde_json::to_string(&cache).expect("serialization must succeed");
+        assert!(json_invalid.contains("\"best_bid_price\":100"));
+        assert!(json_invalid.contains("\"best_ask_price\":200"));
+        assert!(json_invalid.contains("\"bid_valid\":false"));
+        assert!(json_invalid.contains("\"ask_valid\":false"));
+    }
 }
