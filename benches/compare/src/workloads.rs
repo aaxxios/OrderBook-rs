@@ -183,10 +183,11 @@ fn dense_book(book: &Book, rng: &mut Rng, first_id: u64, orders: u64, owners: u6
     ids
 }
 
-/// Owners of the cancel / mass-cancel seeds: enough that no owner's
-/// `user_orders` list is long (a cancel removes its id from that list
-/// with an order-preserving `Vec::remove`, linear in the list, on both
-/// versions; with 4 owners and 200 000 orders that shift would dominate).
+/// Owners of the cancel / mass-cancel seeds, spreading the book over many
+/// `user_orders` entries. Before the per-user index removal became a
+/// binary search, a cancel shifted its owner's whole id list, so few
+/// owners would have made that shift dominate; `cancel_single_owner`,
+/// `fill_single_owner` and `mass_cancel_by_user` now measure that end.
 const SEED_OWNERS: u64 = 4_096;
 
 /// Pre-loaded NON-crossing book (every seeded order rests, asserted),
