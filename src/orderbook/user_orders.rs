@@ -122,6 +122,17 @@ impl UserOrderIds {
         self.live
     }
 
+    /// The id tracked under `seq`, if that slot is live.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn id_at(&self, seq: u64) -> Option<Id> {
+        self.slots
+            .binary_search_by_key(&seq, |slot| slot.seq)
+            .ok()
+            .and_then(|index| self.slots.get(index))
+            .and_then(|slot| slot.id)
+    }
+
     /// Index of the live slot holding `id`. Cold: one scan of the slots.
     #[cold]
     fn position_of(&self, id: &Id) -> Option<usize> {
@@ -129,15 +140,14 @@ impl UserOrderIds {
     }
 
     /// Mark the slot at `index` dead, then compact if dead slots outnumber
-    /// live ones. Returns whether a live slot was marked.
+    /// live ones. Returns whether a slot was marked. Both callers resolve
+    /// `index` to a slot holding the id they remove, so it is live.
     #[inline]
     fn kill(&mut self, index: Option<usize>) -> bool {
         let Some(slot) = index.and_then(|index| self.slots.get_mut(index)) else {
             return false;
         };
-        if slot.id.take().is_none() {
-            return false;
-        }
+        slot.id = None;
         if let Some(live) = self.live.checked_sub(1) {
             self.live = live;
         }

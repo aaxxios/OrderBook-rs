@@ -472,6 +472,89 @@ mod tests {
         assert_book_consistent(&book);
     }
 
+    /// #311: the user index is updated before the location claim, so an
+    /// admission whose claim is refused has already appended a slot and
+    /// must take out exactly that one. Admission A of id 1 is parked just
+    /// before its claim (the pre-claim risk hook); admission B of the same
+    /// id and owner rests in the meantime; A then resumes, appends its own
+    /// slot to the shared entry, loses the claim and untracks by its
+    /// sequence. B's slot, the one its location points at, must survive.
+    #[test]
+    fn test_refused_claim_untracks_only_its_own_slot() {
+        // No risk config: its per-order entry would refuse A on its own,
+        // before the claim this test is about.
+        let mut book = OrderBook::<()>::new("RACE-311");
+        book.set_order_state_tracker(OrderStateTracker::with_capacity(1_000));
+        let reused = Id::from_u64(1);
+        let (parked_tx, parked_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
+        {
+            let parked_tx = Mutex::new(parked_tx);
+            let resume_rx = Mutex::new(resume_rx);
+            // Parks the first admission of the id only; B passes through.
+            let fired = AtomicBool::new(false);
+            book.rest_risk_fault_hook = Some(Arc::new(move |order_id: Id| {
+                if order_id == reused && !fired.swap(true, Ordering::SeqCst) {
+                    parked_tx
+                        .lock()
+                        .expect("parked sender")
+                        .send(())
+                        .expect("the test thread is waiting");
+                    resume_rx
+                        .lock()
+                        .expect("resume receiver")
+                        .recv_timeout(RENDEZVOUS_TIMEOUT)
+                        .expect("resumed by the test thread");
+                }
+                None
+            }));
+        }
+        let book = Arc::new(book);
+        let first = {
+            let book = Arc::clone(&book);
+            thread::spawn(move || book.add_order(order(1, 0, Side::Sell, 102, 4)))
+        };
+        parked_rx
+            .recv_timeout(RENDEZVOUS_TIMEOUT)
+            .expect("A reached the pre-claim hook");
+        book.add_order(order(1, 0, Side::Sell, 100, 3))
+            .expect("B rests while A is parked");
+        resume_tx.send(()).expect("A is parked");
+        let refused = first.join().expect("A's thread");
+        assert!(matches!(
+            refused,
+            Err(crate::orderbook::OrderBookError::DuplicateOrderId { .. })
+        ));
+
+        assert_eq!(
+            book.user_orders.get(&user(0)).map(|ids| ids.to_vec()),
+            Some(vec![reused]),
+            "one slot is left"
+        );
+        let b_seq = book
+            .order_locations
+            .get(&reused)
+            .map(|location| location.user_seq)
+            .expect("B is located");
+        assert_eq!(
+            book.user_orders
+                .get(&user(0))
+                .and_then(|ids| ids.id_at(b_seq)),
+            Some(reused),
+            "the slot left is B's, the one its location points at"
+        );
+        assert_eq!(
+            book.get_order(reused)
+                .map(|o| o.visible_quantity().as_u64()),
+            Some(3)
+        );
+        assert_book_consistent(&book);
+        // B's location still finds its own slot: cancelling B empties the
+        // owner's entry.
+        assert!(book.cancel_order(reused).expect("cancel").is_some());
+        assert!(book.user_orders.get(&user(0)).is_none(), "entry dropped");
+    }
+
     /// 8 threads x 400 mixed operations per book, repeated over
     /// `SCENARIOS` books; the book must be consistent after each run.
     #[test]
