@@ -164,6 +164,7 @@ mod tests {
                 price,
                 side,
                 user_id,
+                ..
             } = *location.value();
             let rests = resting.get(location.key());
             assert!(
@@ -174,8 +175,10 @@ mod tests {
         }
         for (id, (price, side, owner, _)) in &resting {
             assert_eq!(
-                book.order_locations.get(id).map(|loc| *loc),
-                Some(OrderLocation::new(*price, *side, *owner)),
+                book.order_locations
+                    .get(id)
+                    .map(|loc| (loc.price, loc.side, loc.user_id)),
+                Some((*price, *side, *owner)),
                 "order {id} rests but is not indexed"
             );
         }
@@ -184,9 +187,9 @@ mod tests {
         let mut seen: HashSet<Id> = HashSet::new();
         for entry in book.user_orders.iter() {
             assert!(!entry.value().is_empty(), "empty user entry kept");
-            for id in entry.value() {
-                assert!(seen.insert(*id), "order {id} is in the user index twice");
-                let rests = resting.get(id);
+            for id in entry.value().to_vec() {
+                assert!(seen.insert(id), "order {id} is in the user index twice");
+                let rests = resting.get(&id);
                 assert!(
                     rests.is_some_and(|r| r.2 == *entry.key()),
                     "order {id} is in the user index but does not rest (rests: {rests:?})"
@@ -432,12 +435,7 @@ mod tests {
         let entries: Vec<(Hash32, usize)> = book
             .user_orders
             .iter()
-            .map(|entry| {
-                (
-                    *entry.key(),
-                    entry.value().iter().filter(|id| **id == reused).count(),
-                )
-            })
+            .map(|entry| (*entry.key(), usize::from(entry.value().contains(&reused))))
             .filter(|(_, count)| *count > 0)
             .collect();
         assert_eq!(entries, vec![(user(2), 1)], "one entry, the new owner's");
