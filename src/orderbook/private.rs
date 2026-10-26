@@ -612,4 +612,39 @@ mod tests {
         assert!(book.user_orders.get(&alice).is_none());
         assert!(book.order_locations.is_empty());
     }
+
+    /// `untrack_located_order` falls back to scanning every user's entry
+    /// when the id has no location. The scan removes the id from its
+    /// owner's entry only, keeps the owner's other ids in admission order,
+    /// and drops an entry it empties.
+    #[test]
+    fn test_untrack_without_location_scans_user_entries() {
+        let book: OrderBook<()> = OrderBook::new("TEST");
+        let alice = Hash32::new([1; 32]);
+        let bob = Hash32::new([2; 32]);
+        for raw in [1, 2, 3] {
+            book.track_user_order(alice, Id::from_u64(raw));
+        }
+        book.track_user_order(bob, Id::from_u64(4));
+
+        book.untrack_located_order(&Id::from_u64(2));
+        assert_eq!(
+            book.user_orders.get(&alice).map(|ids| ids.to_vec()),
+            Some(vec![Id::from_u64(1), Id::from_u64(3)])
+        );
+        assert_eq!(
+            book.user_orders.get(&bob).map(|ids| ids.to_vec()),
+            Some(vec![Id::from_u64(4)])
+        );
+
+        book.untrack_located_order(&Id::from_u64(4));
+        assert!(
+            book.user_orders.get(&bob).is_none(),
+            "emptied entry dropped"
+        );
+
+        // An id tracked nowhere is a no-op.
+        book.untrack_located_order(&Id::from_u64(99));
+        assert_eq!(book.user_orders.len(), 1);
+    }
 }
