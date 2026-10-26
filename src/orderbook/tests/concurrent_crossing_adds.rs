@@ -555,6 +555,74 @@ mod tests {
         assert!(book.user_orders.get(&user(0)).is_none(), "entry dropped");
     }
 
+    /// #311: an `UpdateQuantity` validated against a resting order, whose
+    /// order a sweep then fully consumes before the level applies the
+    /// update. The level reports the order absent and is left empty; the
+    /// update returns `None` and leaves no location, user-index or risk
+    /// entry behind.
+    #[test]
+    fn test_update_quantity_of_an_order_filled_mid_update_leaves_no_index() {
+        let mut book = book();
+        let maker = Id::from_u64(1);
+        let (parked_tx, parked_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
+        {
+            let parked_tx = Mutex::new(parked_tx);
+            let resume_rx = Mutex::new(resume_rx);
+            let fired = AtomicBool::new(false);
+            book.update_interleave_hook = Some(Arc::new(move |order_id: Id| {
+                if order_id == maker && !fired.swap(true, Ordering::SeqCst) {
+                    parked_tx
+                        .lock()
+                        .expect("parked sender")
+                        .send(())
+                        .expect("the test thread is waiting");
+                    resume_rx
+                        .lock()
+                        .expect("resume receiver")
+                        .recv_timeout(RENDEZVOUS_TIMEOUT)
+                        .expect("resumed by the test thread");
+                }
+            }));
+        }
+        book.add_order(order(1, 0, Side::Sell, 100, 3))
+            .expect("the maker rests");
+        let book = Arc::new(book);
+        let updater = {
+            let book = Arc::clone(&book);
+            thread::spawn(move || {
+                book.update_order(pricelevel::OrderUpdate::UpdateQuantity {
+                    order_id: maker,
+                    new_quantity: Quantity::new(2),
+                })
+            })
+        };
+        parked_rx
+            .recv_timeout(RENDEZVOUS_TIMEOUT)
+            .expect("the update reached the hook");
+        book.add_order(order(2, 1, Side::Buy, 100, 3))
+            .expect("the taker fills the maker");
+        resume_tx.send(()).expect("the update is parked");
+        let updated = updater
+            .join()
+            .expect("updater")
+            .expect("an absent order is not an error");
+        assert!(updated.is_none(), "the order was gone");
+
+        assert!(book.order_locations.get(&maker).is_none(), "no location");
+        assert!(book.user_orders.get(&user(0)).is_none(), "no user entry");
+        assert!(
+            book.risk_state.orders.get(&maker).is_none(),
+            "no risk entry"
+        );
+        assert_eq!(
+            book.order_status(maker),
+            Some(OrderStatus::Filled { filled_quantity: 3 })
+        );
+        assert!(book.asks.is_empty(), "the emptied level was removed");
+        assert_book_consistent(&book);
+    }
+
     /// 8 threads x 400 mixed operations per book, repeated over
     /// `SCENARIOS` books; the book must be consistent after each run.
     #[test]

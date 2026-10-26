@@ -613,6 +613,15 @@ pub struct OrderBook<T = ()> {
     pub(super) rest_risk_fault_hook:
         Option<std::sync::Arc<dyn Fn(Id) -> Option<OrderBookError> + Send + Sync>>,
 
+    /// Test-only interleaving point in `UpdateQuantity` (#311), fired with
+    /// the order's id after the update was validated against the resting
+    /// order and right before the level applies it. A test can park the
+    /// update there and consume the order from another thread, so the level
+    /// reports it absent. Like its siblings it exists only in `cfg(test)`
+    /// builds.
+    #[cfg(test)]
+    pub(super) update_interleave_hook: Option<std::sync::Arc<dyn Fn(Id) + Send + Sync>>,
+
     /// Test-only interleaving point in the repricers (#291), fired with the
     /// book and a tracked id right after `get_order` found no order for it
     /// and before the tracker entry is released, so a test can rest a
@@ -1168,6 +1177,8 @@ where
             rest_interleave_hook: None,
             #[cfg(test)]
             rest_risk_fault_hook: None,
+            #[cfg(test)]
+            update_interleave_hook: None,
             #[cfg(all(test, feature = "special_orders"))]
             reprice_interleave_hook: None,
             #[cfg(test)]
@@ -2208,6 +2219,8 @@ where
             rest_interleave_hook: None,
             #[cfg(test)]
             rest_risk_fault_hook: None,
+            #[cfg(test)]
+            update_interleave_hook: None,
             #[cfg(all(test, feature = "special_orders"))]
             reprice_interleave_hook: None,
             #[cfg(test)]
@@ -2285,6 +2298,8 @@ where
             rest_interleave_hook: None,
             #[cfg(test)]
             rest_risk_fault_hook: None,
+            #[cfg(test)]
+            update_interleave_hook: None,
             #[cfg(all(test, feature = "special_orders"))]
             reprice_interleave_hook: None,
             #[cfg(test)]

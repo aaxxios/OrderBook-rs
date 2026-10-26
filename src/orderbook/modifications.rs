@@ -998,6 +998,13 @@ where
                             new_quantity,
                         };
 
+                        #[cfg(test)]
+                        {
+                            if let Some(hook) = self.update_interleave_hook.as_ref() {
+                                hook(order_id);
+                            }
+                        }
+
                         // Propagate upstream validation / counter errors
                         // (#211): `Ok(None)` is reserved for a genuinely
                         // absent order, never an error swallowed silently.
